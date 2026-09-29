@@ -3,6 +3,10 @@ package ai
 
 import "core:strings"
 import "core:testing"
+import "core:time"
+
+import "nabla:http"
+import "nabla:http/client"
 
 // A frozen request holds the bytes a one-shot send would have produced, so a retry
 // chain sends exactly them instead of a fresh encoding that has to be assumed
@@ -48,6 +52,34 @@ test_freeze_refuses_an_invalid_request :: proc(t: ^testing.T) {
 	testing.expect_value(t, freeze_err.kind, Provider_Operation_Error_Kind.Invalid_Request)
 	testing.expect(t, freeze_err.detail != "", "a refused request says why")
 	testing.expect_value(t, len(frozen.Body), 0)
+}
+
+@(test)
+test_response_head_retry_after_milliseconds :: proc(t: ^testing.T) {
+	cases := []struct {
+		milliseconds_line: string,
+		seconds_line:      string,
+		expected:          time.Duration,
+	}{{"retry-after-ms: 1250", "retry-after: 20", 1250 * time.Millisecond}, {"retry-after-ms: invalid", "retry-after: 3", 3 * time.Second}}
+	for test_case in cases {
+		headers: http.Headers
+		http.headers_init(&headers, context.temp_allocator)
+		_, milliseconds_parsed := http.header_parse(&headers, test_case.milliseconds_line)
+		_, seconds_parsed := http.header_parse(&headers, test_case.seconds_line)
+		if !testing.expect(t, milliseconds_parsed && seconds_parsed) {
+			http.headers_destroy(&headers)
+			return
+		}
+		state := Provider_Request_Stream_State {
+			api       = .Anthropic_Messages,
+			allocator = context.allocator,
+		}
+		provider_response_head(&state, client.Response_Head{status = 429}, headers)
+		delay, present := state.response_head.retry_after.?
+		testing.expect(t, present)
+		if present { testing.expect_value(t, delay, test_case.expected) }
+		http.headers_destroy(&headers)
+	}
 }
 
 // A cache decides how much of a request is written again, never what is written: a

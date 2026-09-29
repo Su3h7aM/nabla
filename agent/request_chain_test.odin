@@ -105,11 +105,11 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(test: ^testing.T) {
 	testing.expect(test, !evidence.text_exposed && !evidence.completion_accepted)
 }
 
-// A refusal before the model ran is resent on the same bytes. A stream the provider had
-// accepted may have run the model, so it is never resent: the model is told the response
-// was lost, and the turn continues with a new request that carries the notice.
+// A refusal and a stream the provider broke off are both failures of the request, not of
+// the model: each is resent on the same bytes, the user is told about each retry, and the
+// model is told nothing.
 @(test)
-test_a_stream_lost_after_acceptance_is_answered_with_a_notice :: proc(test: ^testing.T) {
+test_a_stream_lost_after_acceptance_is_resent :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -137,14 +137,13 @@ test_a_stream_lost_after_acceptance_is_answered_with_a_notice :: proc(test: ^tes
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), retry_log_observer(&retries)), "the turn completed")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
 	testing.expect(test, agent_provider_request(&provider, 1) == agent_provider_request(&provider, 0), "the refused send is repeated as frozen")
-	testing.expect(test, strings.contains(agent_provider_request(&provider, 2), chat_notice_text(.Response_Lost)), "the next request tells the model")
+	testing.expect(test, agent_provider_request(&provider, 2) == agent_provider_request(&provider, 0), "the broken stream is repeated as frozen")
 	sent := _test_records(test, chat, {.Request_Sent})
 	if !testing.expect_value(test, len(sent), 3) { return }
 	testing.expect_value(test, sent[1].request, sent[0].request)
-	testing.expect(test, sent[2].request != sent[0].request, "the lost response is followed by a new request, not a resend")
+	testing.expect_value(test, sent[2].request, sent[0].request)
 	rejected := _test_records(test, chat, {.Response_Rejected})
-	// The lost response is committed with its notice, so only the refusal is a rejection.
-	if !testing.expect_value(test, len(rejected), 1) { return }
+	if !testing.expect_value(test, len(rejected), 2) { return }
 	testing.expect_value(test, rejected[0].request, sent[0].request)
 	testing.expect_value(test, rejected[0].attempt, journal.Attempt_No(1))
 	evidence: journal.Response_Rejected
@@ -152,8 +151,9 @@ test_a_stream_lost_after_acceptance_is_answered_with_a_notice :: proc(test: ^tes
 		testing.expect_value(test, evidence.failure_class, "rate_limited")
 		testing.expect_value(test, evidence.recovery, "transient_failure")
 	}
-	if !testing.expect_value(test, len(retries.events), 1) { return }
+	if !testing.expect_value(test, len(retries.events), 2) { return }
 	testing.expect_value(test, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)
+	testing.expect_value(test, retries.events[1].failure_class, ai.Provider_Failure_Class.Incomplete_Stream)
 	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
 	if !testing.expect_value(test, ancestry_error, nil) { return }
 	notices, answers := 0, 0
@@ -161,15 +161,15 @@ test_a_stream_lost_after_acceptance_is_answered_with_a_notice :: proc(test: ^tes
 		if node.kind == .Notice { notices += 1 }
 		if node.kind == .Assistant && string(node.body) == "third try" { answers += 1 }
 	}
-	testing.expect_value(test, notices, 1)
+	testing.expect_value(test, notices, 0)
 	testing.expect_value(test, answers, 1)
 }
 
-// A refused request is first resent without its cache hints, and then it is feedback once.
-// The same refusal of the request that carried that feedback means nothing the model adds
-// will fix it, so the turn ends.
+// A refused request is resent once without its cache hints. Refused again, it is nothing
+// the harness can repair and nothing the model sent, so the turn ends with the provider's
+// words for the user and the model is told nothing.
 @(test)
-test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T) {
+test_a_repeated_refusal_ends_the_turn_for_the_user :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -178,7 +178,7 @@ test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T)
 	_test_accept(test, chat, "say something")
 	refusal := `{"error":{"message":"Unsupported parameter: frobnicate"}}`
 	refused := agent_provider_refusal("400 Bad Request", refusal, "")
-	responses := []string{refused, refused, refused, refused}
+	responses := []string{refused, refused}
 	provider: Agent_Provider
 	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
@@ -188,12 +188,53 @@ test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T)
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 	testing.expect(test, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends on the repeated refusal")
-	if !testing.expect_value(test, agent_provider_request_count(&provider), 4) { return }
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
 	testing.expect(test, !strings.contains(agent_provider_request(&provider, 1), "prompt_cache_key"), "the first resend leaves the cache hints out")
-	noticed := agent_provider_request(&provider, 2)
-	testing.expect(test, strings.contains(noticed, chat_notice_text(.Provider_Refused)), "the request after the refusal carries the notice")
-	testing.expect(test, strings.contains(noticed, "Unsupported parameter: frobnicate"), "the notice carries the provider's words")
-	testing.expect(test, strings.contains(noticed, "prompt_cache_key"), "hints that were not the cause are sent again")
+	testing.expectf(
+		test,
+		strings.contains(chat.last_error, "Unsupported parameter: frobnicate"),
+		"the user is told in the provider's words: %q",
+		chat.last_error,
+	)
+	testing.expect(test, !chat.cache_hints_refused, "hints that were not the cause are sent again")
+}
+
+// A stream that turns unreadable after the model started answering is a failure of the
+// request: the partial answer is dropped, the request is resent, and the model sees only the
+// answer that arrived whole, with no notice about the failure.
+@(test)
+test_an_unreadable_stream_is_resent_and_its_partial_answer_dropped :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+	unreadable := strings.concatenate(
+		{
+			"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
+			"data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"},\"finish_reason\":null}]}\n\n",
+			"data: {not json\n\n",
+		},
+		context.temp_allocator,
+	)
+	responses := []string{unreadable, agent_provider_reply("whole answer")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completes")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if !testing.expect_value(test, ancestry_error, nil) { return }
+	for node in ancestry {
+		testing.expect(test, node.kind != .Notice, "the model is not told about a failed request")
+		if node.kind == .Assistant { testing.expect_value(test, string(node.body), "whole answer") }
+	}
 }
 
 // A request refused while it carries the harness's optional cache hints is sent again
@@ -222,7 +263,7 @@ test_a_refused_request_is_resent_without_its_cache_hints :: proc(test: ^testing.
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "prompt_cache_key"))
 	resent := agent_provider_request(&provider, 1)
 	testing.expect(test, !strings.contains(resent, "prompt_cache_key"), "the resend leaves the cache hints out")
-	testing.expect(test, !strings.contains(resent, chat_notice_text(.Provider_Refused)), "the model is not told about a refusal the harness repaired")
+	testing.expect(test, !strings.contains(resent, "refused"), "the model is not told about a refusal the harness repaired")
 	_test_accept(test, chat, "and again")
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the next turn completes")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }

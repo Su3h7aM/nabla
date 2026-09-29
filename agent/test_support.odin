@@ -15,15 +15,15 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// test_retry_policy is the policy the suites run with: the production backoff, with a
-// wait short enough that a retry costs a test milliseconds instead of a second. A suite
-// that cares about the decision itself states its own policy and calls
-// chat_recovery_decide directly.
+// TEST_RETRY_DELAYS is the production schedule's length with waits short enough that a
+// retry costs a test milliseconds instead of seconds.
+@(rodata)
+TEST_RETRY_DELAYS := [len(CHAT_RETRY_DELAYS)]time.Duration{2 * time.Millisecond, 3 * time.Millisecond, 4 * time.Millisecond}
+
+// test_retry_policy is the policy the suites run with. A suite that cares about the decision
+// itself calls chat_recovery_decide directly.
 test_retry_policy :: proc() -> Chat_Retry_Policy {
-	policy := chat_retry_policy_default()
-	policy.base_delay = 2 * time.Millisecond
-	policy.max_delay = 4 * time.Millisecond
-	return policy
+	return {delays = TEST_RETRY_DELAYS[:]}
 }
 
 // Chat_Test binds a running session to a journal in a temporary directory. The

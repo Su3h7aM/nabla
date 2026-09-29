@@ -471,9 +471,10 @@ test_sigint_cuts_a_retry_backoff_short :: proc(test: ^testing.T) {
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	policy := test_retry_policy()
-	policy.base_delay = BACKOFF_DELAY
-	policy.max_delay = BACKOFF_DELAY
+	delays := [1]time.Duration{BACKOFF_DELAY}
+	policy := Chat_Retry_Policy {
+		delays = delays[:],
+	}
 
 	// The handler stays armed for the whole test, so a signal that arrives after the turn
 	// restored the default disposition cannot terminate this process.

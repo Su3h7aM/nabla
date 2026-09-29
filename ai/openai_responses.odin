@@ -705,12 +705,14 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 				error_code, _, code_ok := openai_value_string(error_object, "code")
 				if !message_ok || !code_ok { return provider_stream_fail(state, .Invalid_Data, "response error is invalid") }
 				if error_message != "" { message = error_message }
-				code = error_code
+				error_type := ""
+				if value, type_present, valid := openai_value_string(error_object, "type"); valid && type_present { error_type = value }
+				code = openai_error_class_code(error_code, error_type)
 			}
 		}
 		// A failed response may still carry usage. Deliver usage first, then
 		// the error; a malformed terminal payload yields the error alone.
-		failed_event, failed_event_error := openai_error_event(.API_Error, message, code, state.Allocator)
+		failed_event, failed_event_error := openai_error_event(.API_Error, message, code, allocator = state.Allocator)
 		if failed_event_error != nil {
 			return provider_stream_fail_allocation(state, "the provider error could not be retained")
 		}
@@ -785,7 +787,7 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if message == "" { message = "provider returned an API error" }
 		code, _, code_ok := openai_value_string(object, "code")
 		if !code_ok { return provider_stream_fail(state, .Invalid_Data, "error code is invalid") }
-		error_event, error_event_error := openai_error_event(.API_Error, message, code, state.Allocator)
+		error_event, error_event_error := openai_error_event(.API_Error, message, code, allocator = state.Allocator)
 		if error_event_error != nil {
 			return provider_stream_fail_allocation(state, "the provider error could not be retained")
 		}

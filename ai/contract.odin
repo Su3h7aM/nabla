@@ -302,9 +302,10 @@ Provider_Completed_Event :: struct {
 	Raw_Output:  string, // owned by receiver,
 } // Tool_Calls and Raw_Output owned by receiver
 Provider_Error_Event :: struct {
-	Kind:          Provider_Error_Kind,
-	Message:       string,
-	Provider_Code: string,
+	Kind:                 Provider_Error_Kind,
+	Message:              string,
+	Provider_Code:        string,
+	Provider_Detail_Code: string,
 } // strings owned by receiver
 Provider_Event :: union {
 	Provider_Text_Event,
@@ -345,6 +346,7 @@ Provider_Event_Destroy :: proc(event: ^Provider_Event, allocator := context.allo
 	case Provider_Error_Event:
 		if value.Message != "" { delete(value.Message, allocator) }
 		if value.Provider_Code != "" { delete(value.Provider_Code, allocator) }
+		if value.Provider_Detail_Code != "" { delete(value.Provider_Detail_Code, allocator) }
 	}
 	event^ = nil
 }
@@ -414,7 +416,7 @@ provider_stream_fail :: proc(
 	code := "",
 ) -> Provider_Stream_Error {
 	provider_stream_batch_clear(state)
-	event, event_error := openai_error_event(kind, message, code, state.Allocator)
+	event, event_error := openai_error_event(kind, message, code, allocator = state.Allocator)
 	if event_error != nil {
 		// The wording could not be retained. The kind still names the failure, so the
 		// caller learns why the stream stopped rather than nothing at all.

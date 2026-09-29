@@ -272,6 +272,39 @@ test_anthropic_stream_error_event :: proc(t: ^testing.T) {
 	destroy_events(events)
 }
 
+@(test)
+test_anthropic_spend_limit_detail_classification :: proc(t: ^testing.T) {
+	body_text := `{"error":{"type":"rate_limit_error","message":"You have reached your API usage limits","details":{"error_code":"enforced_spend_limit_reached"}}}`
+	body := transmute([]u8)body_text
+	rejection, parse_error := provider_rejection_parse(.Anthropic_Messages, body, context.allocator)
+	if !testing.expect_value(t, parse_error, nil) { return }
+	defer provider_rejection_destroy(&rejection, context.allocator)
+	testing.expect_value(t, rejection.detail_code, "enforced_spend_limit_reached")
+	class := provider_classify_failure(Provider_Evidence{api = .Anthropic_Messages, kind = .HTTP, head_seen = true, status = 429, rejection = rejection})
+	testing.expect_value(t, class, Provider_Failure_Class.Quota)
+
+	stream := Provider_Stream_Start(.Anthropic_Messages, context.allocator)
+	defer Provider_Stream_Destroy(&stream)
+	stream_error := Provider_Consume_SSE_Data(
+		`{"type":"error","error":{"type":"rate_limit_error","message":"limit","details":{"error_code":"enforced_spend_limit_reached"}}}`,
+		&stream,
+	)
+	if !testing.expect_value(t, stream_error, Provider_Stream_Error.None) { return }
+	operation := Provider_Request_Stream_State {
+		api       = .Anthropic_Messages,
+		allocator = context.allocator,
+	}
+	defer provider_state_release(&operation)
+	event, drained := Provider_Stream_Drain(&stream)
+	if !testing.expect(t, drained) { return }
+	provider_accept_event(&operation, event)
+	testing.expect_value(t, operation.rejection.detail_code, "enforced_spend_limit_reached")
+	stream_class := provider_classify_failure(
+		Provider_Evidence{api = .Anthropic_Messages, kind = .Stream, event = Provider_Error_Kind.API_Error, rejection = operation.rejection},
+	)
+	testing.expect_value(t, stream_class, Provider_Failure_Class.Quota)
+}
+
 // A checkpoint summary is projected as an assistant turn, which is how the
 // OpenAI APIs carry it, but this API opens a conversation with a user turn. The
 // adapter is where that difference belongs.

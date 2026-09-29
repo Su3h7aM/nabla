@@ -48,8 +48,9 @@ test_lost_worker_fact_becomes_a_notice_the_model_can_act_on :: proc(test: ^testi
 	event := Chat_Event(lost)
 
 	chat_session_apply(chat, &event)
-	testing.expect_value(test, chat.pending_notice, Chat_Notice.Not_Kept)
-	testing.expect_value(test, chat.state, Chat_State.Preparing)
+	testing.expect_value(test, chat.pending_notice, Chat_Notice.None)
+	testing.expect(test, chat.active_failed, "a response the harness could not keep is not used")
+	testing.expect_value(test, chat.last_error, CHAT_RESPONSE_NOT_KEPT)
 }
 
 chat_loss_failing_allocate :: proc(

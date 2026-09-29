@@ -2,7 +2,6 @@ package agent
 
 import "core:fmt"
 import "core:mem"
-import "core:strings"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -273,11 +272,9 @@ chat_session_feed_text :: proc(chat: ^Chat_Session, source: Chat_Event_Source, t
 	if !chat_session_accepts_event(chat, source) { return false }
 	if _, append_error := append(&chat.partial_assistant, text); append_error != nil {
 		// An answer missing a fragment of what the model wrote is not that answer, so what
-		// arrived of it is dropped rather than committed as a shorter answer. The model is
-		// told with the notice of a response the harness could not keep, nothing in the
-		// response runs, and the turn continues.
+		// arrived of it is dropped rather than committed as a shorter answer.
 		chat_partial_assistant_clear(chat)
-		chat_session_note_notice(chat, source, .Not_Kept)
+		chat_session_feed_error(chat, source, CHAT_RESPONSE_NOT_KEPT)
 		return false
 	}
 	return true
@@ -399,24 +396,22 @@ chat_tool_call_clone :: proc(call: ai.Provider_Tool_Call, allocator: mem.Allocat
 
 // Chat_Notice is why a completed response could not be used as it stood. None
 // means it was usable, and Ignored means the event did not belong to the running
-// operation and nothing should happen at all. Every other member is a defect the
-// model is told about: the response executes nothing, and the turn goes on to
-// another request so the model can correct itself.
+// operation and nothing should happen at all. Every other member is a mistake in
+// what the model sent, which only the model can correct: the response executes
+// nothing, the model is told, and the turn goes on to another request. A failure of
+// the request, the transport, or the harness is never a notice; the chain retries,
+// repairs, or stops it, and the user is the one told.
 Chat_Notice :: enum {
 	None,
 	Ignored,
 	Truncated,
 	Missing_Call_Identity,
 	Duplicate_Call_ID,
-	Unreadable_Response,
-	Incomplete_Response,
-	Response_Lost,
-	// Not_Kept is a response the harness could not hold on to: a fragment of its text, one
-	// of its calls, or the response itself did not fit in memory. What the harness holds of
-	// it is not what the model sent, so none of it is used as an answer.
-	Not_Kept,
-	Provider_Refused,
 }
+
+// CHAT_RESPONSE_NOT_KEPT is why a response the harness could not hold in memory ends the
+// turn: what it holds of the response is not what the model sent.
+CHAT_RESPONSE_NOT_KEPT :: "the response could not be held in memory"
 
 // chat_notice_text is the harness's own explanation of an unusable response. The
 // text is a literal: the same notice always puts the same bytes into the
@@ -430,102 +425,77 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 		return "a proposed tool call carried no id or no tool name, so none of the calls ran; every call needs the provider's id and the tool's name"
 	case .Duplicate_Call_ID:
 		return "two proposed tool calls shared one id, so none of them ran; every call needs its own id"
-	case .Unreadable_Response:
-		return "the previous response arrived in a form that could not be decoded, so none of it was executed; continue the work by sending it again"
-	case .Incomplete_Response:
-		return "the provider ended the previous response before it was complete, so none of it was executed; continue the work by sending it again"
-	case .Response_Lost:
-		return "the connection failed after the previous request was sent and its response was lost, so nothing from it was executed; continue the work"
-	case .Not_Kept:
-		return "the harness could not keep the previous response, so none of it was executed; send the work again"
-	case .Provider_Refused:
-		return "the provider refused the previous request, so nothing from it was executed; change what caused the refusal and continue"
 	case .None, .Ignored:
 		return ""
 	}
 	return ""
 }
 
-// chat_notice_committed_text is the exact text a notice puts into the conversation: the
-// harness's explanation of the refusal, and, when the provider gave one, the provider's own
-// account of it. The explanation is a literal and the provider's words vary, so the composed
-// text is built in the caller's memory. A refusal the model cannot read is one it cannot
-// correct, so nothing the provider said is dropped.
-@(require_results)
-chat_notice_committed_text :: proc(chat: ^Chat_Session, allocator: mem.Allocator) -> string {
-	explanation := chat_notice_text(chat.pending_notice)
-	if chat.notice_detail == "" { return explanation }
-	return fmt.aprintf("%s The provider reported: %s", explanation, chat.notice_detail, allocator = allocator)
-}
-
-// chat_notice_clear drops a notice that was committed or abandoned, with whatever the
-// provider said about it.
-chat_notice_clear :: proc(chat: ^Chat_Session) {
-	delete(chat.notice_detail, chat.allocator)
-	chat.notice_detail = ""
-	chat.pending_notice = .None
-}
-
-// chat_session_note_notice records that the running response was unusable and
-// moves the turn on to another request. The notice itself is committed with the
-// response that caused it, so the explanation follows the text it explains. detail
-// is the provider's account of the refusal, kept when it gave one so the model is
-// told what happened and can correct the work it asked for.
-chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source, notice: Chat_Notice, detail := "") -> bool {
+// chat_session_note_notice records that the model's response was unusable and moves the
+// turn on to another request. The notice itself is committed with the response that caused
+// it, so the explanation follows the text it explains.
+chat_session_note_notice :: proc(chat: ^Chat_Session, source: Chat_Event_Source, notice: Chat_Notice) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
-	chat_notice_set(chat, notice, detail)
+	chat.pending_notice = notice
+	chat.state = .Preparing
 	return true
 }
 
-// chat_notice_set makes notice the running response's explanation and moves the turn on
-// to another request.
-chat_notice_set :: proc(chat: ^Chat_Session, notice: Chat_Notice, detail: string) {
-	delete(chat.notice_detail, chat.allocator)
-	chat.notice_detail = ""
-	if detail != "" {
-		// Without memory for the provider's words the notice still says what happened.
-		cloned, clone_error := strings.clone(detail, chat.allocator)
-		if clone_error == nil { chat.notice_detail = cloned }
+// chat_session_note_unusable records that the provider ended the running response without
+// an answer the harness can use. class is what that means for the send, which the chain
+// resends or stops like any other failure; reason is the provider's own name for the end.
+chat_session_note_unusable :: proc(chat: ^Chat_Session, source: Chat_Event_Source, class: ai.Provider_Failure_Class, reason: string) -> bool {
+	if !chat_session_accepts_event(chat, source) { return false }
+	chat.response_unusable = class
+	if reason == "" {
+		chat_last_error_set(chat, "the provider ended the response without an answer")
+	} else {
+		chat_last_error_set(chat, fmt.tprintf("the provider ended the response: %s", reason))
 	}
-	chat.pending_notice = notice
-	chat.state = .Preparing
+	chat.state = .Finalizing
+	return true
 }
 
 // chat_session_feed_tool_calls validates the calls a response assembled and
 // stages them for execution. It reports None when they were staged, Ignored when
-// the event did not belong to the running operation, and otherwise why the whole
-// response was refused: calls are staged all at once or not at all, so a
-// response is never half executed.
-chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Source, calls: []ai.Provider_Tool_Call) -> Chat_Notice {
-	if !chat_session_accepts_event(chat, source) { return .Ignored }
-	if len(calls) == 0 { return .Ignored }
+// the event did not belong to the running operation, and otherwise the model's
+// mistake that refused the whole response: calls are staged all at once or not at
+// all, so a response is never half executed. An allocation error means the calls
+// could not be held, and nothing was staged.
+chat_session_feed_tool_calls :: proc(
+	chat: ^Chat_Session,
+	source: Chat_Event_Source,
+	calls: []ai.Provider_Tool_Call,
+) -> (
+	notice: Chat_Notice,
+	err: mem.Allocator_Error,
+) {
+	if !chat_session_accepts_event(chat, source) { return .Ignored, nil }
+	if len(calls) == 0 { return .Ignored, nil }
 
-	// Calls that could not be kept are calls that never ran, so a response whose calls do not
-	// all fit is refused whole, the way a response the harness could not decode is.
-	staged, allocation_error := make([dynamic]Chat_Tool_Call, 0, len(calls), chat.allocator)
-	if allocation_error != nil { return .Not_Kept }
+	staged := make([dynamic]Chat_Tool_Call, 0, len(calls), chat.allocator) or_return
 	defer delete(staged)
 	for call in calls {
 		cloned, valid, clone_error := chat_tool_call_clone(call, chat.allocator)
 		if clone_error != nil {
 			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
-			return .Not_Kept
+			return .None, clone_error
 		}
 		if !valid {
 			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
-			return .Missing_Call_Identity
+			return .Missing_Call_Identity, nil
 		}
 		for prior in staged {
 			if prior.id == cloned.id {
 				chat_tool_call_destroy(&cloned, chat.allocator)
 				for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
-				return .Duplicate_Call_ID
+				return .Duplicate_Call_ID, nil
 			}
 		}
 		if _, stage_error := append(&staged, cloned); stage_error != nil {
 			chat_tool_call_destroy(&cloned, chat.allocator)
 			for &leftover in staged { chat_tool_call_destroy(&leftover, chat.allocator) }
-			return .Not_Kept
+			return .None, stage_error
 		}
 	}
 	// The calls move into the session's table before any of them can run, and a move that
@@ -536,12 +506,12 @@ chat_session_feed_tool_calls :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 		if _, move_error := append(&chat.pending_calls, staged[index]); move_error != nil {
 			chat_pending_calls_clear(chat)
 			for &leftover in staged[index:] { chat_tool_call_destroy(&leftover, chat.allocator) }
-			return .Not_Kept
+			return .None, move_error
 		}
 	}
 	clear(&staged)
 	chat.state = .Executing_Tools
-	return .None
+	return .None, nil
 }
 
 // chat_session_tools_done closes the batch a response committed and reports whether the turn
@@ -686,11 +656,6 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 		// that is already stopping.
 		if chat_session_cancelled(chat) {
 			chat_session_note_cancel(chat)
-		} else if value.kind == .Invalid_Data {
-			// The response itself could not be decoded. The model can still be reached, so
-			// it is told, in the provider's own words when it gave any, and the turn goes on
-			// instead of ending on a failure the model cannot see.
-			chat_session_note_notice(chat, value.source, .Unreadable_Response, value.message)
 		} else {
 			chat_session_feed_error(chat, value.source, value.message)
 		}
@@ -700,21 +665,24 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 		// transition; nothing about the turn changes here.
 		return {}
 	case Chat_Lost_Event:
-		// A response the harness could not keep whole is not the response the model sent:
-		// nothing in it is executed, the model is told so, and the turn continues.
-		chat_session_note_notice(chat, value.source, .Not_Kept)
+		// A response the harness could not keep whole is not the response the model sent,
+		// so nothing in it is executed.
+		chat_session_feed_error(chat, value.source, CHAT_RESPONSE_NOT_KEPT)
 		return {}
 	case Chat_Provider_Completion:
 		// One response feeds one path: tool handoff when the provider assembled calls, plain
-		// completion on stop, failure otherwise. A length limit or content filter is not a
-		// usable answer, so it must not finalize as success. Partial argument fragments never
-		// reach the executor; only a validated completion carries executable calls. The
-		// verbatim output array is staged for the commit, which stores it as the replay record.
+		// completion on stop, a notice for the model's own mistakes, and an unusable response
+		// otherwise, which the chain resends or stops like any failed send. Partial argument
+		// fragments never reach the executor; only a validated completion carries executable
+		// calls. The verbatim output array is staged for the commit, which stores it as the
+		// replay record.
 		if !chat_session_feed_response_output(chat, value.source, value.output) {
-			chat_session_feed_error(chat, value.source, "tool response was rejected")
+			chat_session_feed_error(chat, value.source, CHAT_RESPONSE_NOT_KEPT)
 		} else if value.reason == .Tool_Call && len(value.calls) > 0 {
-			notice := chat_session_feed_tool_calls(chat, value.source, value.calls)
-			if notice != .None && notice != .Ignored {
+			notice, calls_error := chat_session_feed_tool_calls(chat, value.source, value.calls)
+			if calls_error != nil {
+				chat_session_feed_error(chat, value.source, CHAT_RESPONSE_NOT_KEPT)
+			} else if notice != .None && notice != .Ignored {
 				// The response proposed calls the harness cannot use. Executing nothing and
 				// telling the model why keeps the turn alive.
 				chat_session_note_notice(chat, value.source, notice)
@@ -724,7 +692,13 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 		} else if value.reason == .Length {
 			chat_session_note_notice(chat, value.source, .Truncated)
 		} else {
-			chat_session_note_notice(chat, value.source, .Incomplete_Response, value.reason_text)
+			// The provider ended the response without an answer the harness can use. A content
+			// filter is the provider's policy, which only the user can act on; any other end
+			// is one a resend may not repeat.
+			class := ai.Provider_Failure_Class.Invalid_Output
+			if value.reason == .Content_Filter { class = .Content_Policy }
+			chat_session_note_unusable(chat, value.source, class, value.reason_text)
+			return {}
 		}
 		return {completion_accepted = true}
 	}

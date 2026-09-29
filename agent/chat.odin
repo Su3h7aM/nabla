@@ -158,7 +158,7 @@ chat_commit_response :: proc(
 	}
 	// A notice is only ever committed with the response that raised it. One that
 	// did not commit, because the turn failed or was cancelled, is dropped.
-	chat_notice_clear(chat)
+	chat.pending_notice = .None
 
 	finished := [3]Log_Field {
 		{key = "outcome", value = CHAT_SEND_OUTCOME_NAMES[outcome]},
@@ -189,10 +189,8 @@ chat_commit_response_nodes :: proc(
 	finish: ai.Provider_Finish_Reason,
 	usages: ^[dynamic]Chat_Request_Usage,
 ) -> bool {
-	// The notice's text is composed in temp memory and copied by the journal.
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	text := string(chat.partial_assistant[:])
-	notice_text := chat_notice_committed_text(chat, context.temp_allocator)
+	notice_text := chat_notice_text(chat.pending_notice)
 	chat.response_cost = chat_response_cost(chat, text, notice_text)
 
 	assistant := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
@@ -360,14 +358,19 @@ chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
 	}
 }
 
-// chat_session_clear_attempt forgets the failure of an attempt that exposed
-// nothing, so the next attempt starts as if it were the first. Only a retry that
-// is about to happen calls it, and only while the operation is still running.
+// chat_session_clear_attempt forgets the failed attempt and everything it produced, so
+// the next attempt starts as if it were the first. Only a resend that is about to happen
+// calls it, and only while the operation is still running.
 chat_session_clear_attempt :: proc(chat: ^Chat_Session) {
 	if chat.operation.state != .Running { return }
 	delete(chat.last_error, chat.allocator)
 	chat.last_error = ""
 	chat.active_failed = false
+	chat.pending_notice = .None
+	chat.response_unusable = .None
+	chat_partial_assistant_clear(chat)
+	chat_pending_calls_clear(chat)
+	chat_pending_response_clear(chat)
 	chat.state = .Requesting
 }
 

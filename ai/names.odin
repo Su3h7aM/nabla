@@ -42,6 +42,10 @@ provider_failure_class_name :: proc(class: Provider_Failure_Class) -> string {
 		return "quota"
 	case .Rate_Limited:
 		return "rate_limited"
+	case .Not_Found:
+		return "not_found"
+	case .Untrusted_Connection:
+		return "untrusted_connection"
 	case .Context_Overflow:
 		return "context_overflow"
 	case .Payload_Too_Large:

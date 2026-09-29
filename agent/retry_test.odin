@@ -6,9 +6,9 @@ import "core:time"
 
 import "nabla:ai"
 
-// The decision follows the failure class: a class a second send can plausibly repair is
-// retried, and everything else stops. The test names the action and the reason, because
-// a stop nobody can explain is what the reasons exist to prevent.
+// The decision follows the failure class: every class has one recovery, and the test names
+// the action and the reason, because a stop nobody can explain is what the reasons exist to
+// prevent.
 @(test)
 test_recovery_decision_follows_the_failure_class :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
@@ -24,25 +24,25 @@ test_recovery_decision_follows_the_failure_class :: proc(test: ^testing.T) {
 		{"provider unavailable", .HTTP, .Provider_Unavailable, .Retry, .Transient_Failure},
 		{"incomplete stream", .Stream, .Incomplete_Stream, .Retry, .Transient_Failure},
 		{"connection lost", .Transport, .Provider_Unavailable, .Retry, .Transient_Failure},
+		{"unreadable output", .Stream, .Invalid_Output, .Retry, .Transient_Failure},
+		{"unnamed failure", .HTTP, .Unknown, .Retry, .Transient_Failure},
+		{"context overflow", .HTTP, .Context_Overflow, .Repair_Context, .Context_Exhausted},
+		{"payload too large", .HTTP, .Payload_Too_Large, .Repair_Context, .Context_Exhausted},
+		{"invalid request", .HTTP, .Invalid_Request, .Stop, .Terminal_Failure},
 		{"credentials", .HTTP, .Authentication, .Stop, .Terminal_Failure},
 		{"quota", .HTTP, .Quota, .Stop, .Terminal_Failure},
-		{"context overflow", .HTTP, .Context_Overflow, .Repair_Context, .Context_Exhausted},
-		{"payload too large", .HTTP, .Payload_Too_Large, .Stop, .Terminal_Failure},
-		{"invalid request", .HTTP, .Invalid_Request, .Stop, .Terminal_Failure},
+		{"missing model", .HTTP, .Not_Found, .Stop, .Terminal_Failure},
 		{"content policy", .HTTP, .Content_Policy, .Stop, .Terminal_Failure},
-		{"invalid output", .Stream, .Invalid_Output, .Stop, .Terminal_Failure},
-		{"unknown refusal", .HTTP, .Unknown, .Stop, .Terminal_Failure},
+		{"untrusted peer", .TLS, .Untrusted_Connection, .Stop, .Terminal_Failure},
 	}
 	for entry in cases {
-		decision := chat_recovery_decide(policy, {attempts = 1, error = {kind = entry.kind, failure_class = entry.class}}, 0.5)
+		decision := chat_recovery_decide(policy, {error = {kind = entry.kind, failure_class = entry.class}})
 		testing.expectf(test, decision.action == entry.action, "%s: action is %v", entry.name, decision.action)
 		testing.expectf(test, decision.reason == entry.reason, "%s: reason is %v", entry.name, decision.reason)
 	}
 }
 
-// A fact that is not about the provider wins over the class. A stop that could have been
-// a retry is the case worth naming: it says the chain stopped for a reason the provider
-// had nothing to do with.
+// A fact that is not about the provider wins over the class, and each repair is used once.
 @(test)
 test_recovery_decision_stops_for_its_own_facts :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
@@ -57,94 +57,74 @@ test_recovery_decision_stops_for_its_own_facts :: proc(test: ^testing.T) {
 		reason: Request_Recovery_Reason,
 	}
 	cases := []Case {
-		{"cancelled", {attempts = 1, error = transient, cancelled = true}, .Stop, .Cancelled},
-		{"store failed", {attempts = 1, error = transient, storage_failed = true}, .Stop, .Storage_Failed},
-		{"harness failed the send", {attempts = 1, error = transient, failed = true}, .Stop, .Harness_Failure},
-		{"text was published", {attempts = 1, error = transient, text_exposed = true}, .Stop, .Output_Exposed},
-		{"a completion was accepted", {attempts = 1, error = transient, completion_accepted = true}, .Stop, .Output_Exposed},
+		{"cancelled", {error = transient, cancelled = true}, .Stop, .Cancelled},
+		{"store failed", {error = transient, storage_failed = true}, .Stop, .Storage_Failed},
+		{"harness failed the send", {error = transient, failed = true}, .Stop, .Harness_Failure},
+		{"a completion was accepted", {error = transient, completion_accepted = true}, .Stop, .Output_Exposed},
+		{"operation finished", {error = {kind = .None}}, .Stop, .Completed},
+		{"overflow repaired once", {error = {kind = .HTTP, failure_class = .Context_Overflow}, repaired = true}, .Stop, .Context_Exhausted},
 		{
-			"model send was ambiguous",
-			{attempts = 1, error = {kind = .Transport, failure_class = .Provider_Unavailable, delivery = .Model_Send_Started, delivery_present = true}},
-			.Stop,
-			.Ambiguous_Delivery,
+			"refused with cache hints",
+			{error = {kind = .HTTP, failure_class = .Invalid_Request}, cache_hints_sent = true},
+			.Omit_Cache_Hints,
+			.Cache_Hints_Refused,
 		},
-		{"operation finished", {attempts = 1, error = {kind = .None}}, .Stop, .Completed},
-		// The one repair is the chain's whole allowance: a second refusal is terminal.
-		{"overflow repaired once", {attempts = 2, error = {kind = .HTTP, failure_class = .Context_Overflow}, repaired = true}, .Stop, .Context_Exhausted},
 	}
 	for entry in cases {
-		decision := chat_recovery_decide(policy, entry.facts, 0.5)
+		decision := chat_recovery_decide(policy, entry.facts)
 		testing.expectf(test, decision.action == entry.action, "%s: action is %v", entry.name, decision.action)
 		testing.expectf(test, decision.reason == entry.reason, "%s: reason is %v", entry.name, decision.reason)
 	}
 }
 
-// The wait before a transient retry: it doubles per retry, it never exceeds the policy
-// ceiling, and the sample only moves it inside the upper half of that ceiling.
+// A retried class waits each scheduled delay in turn, or the provider's own delay when it is
+// longer, and stops once the schedule is spent.
 @(test)
-test_retry_backoff_delay_doubles_and_sampled :: proc(test: ^testing.T) {
+test_recovery_decision_follows_the_schedule :: proc(test: ^testing.T) {
 	policy := chat_retry_policy_default()
-	testing.expect_value(test, chat_retry_backoff_delay(policy, 1, 0), CHAT_RETRY_BASE_DELAY / 2)
-	testing.expect_value(test, chat_retry_backoff_delay(policy, 1, 1), CHAT_RETRY_BASE_DELAY)
-	testing.expect_value(test, chat_retry_backoff_delay(policy, 2, 0), CHAT_RETRY_BASE_DELAY)
-	testing.expect_value(test, chat_retry_backoff_delay(policy, 3, 1), 4 * CHAT_RETRY_BASE_DELAY)
-	// The ceiling is clamped, and the sample still spreads the wait under it.
-	testing.expect_value(test, chat_retry_backoff_delay(policy, 99, 1), CHAT_RETRY_BACKOFF_CEILING)
-	testing.expect_value(test, chat_retry_backoff_delay(policy, 99, 0), CHAT_RETRY_BACKOFF_CEILING / 2)
-}
-
-// A wait the provider asked for by name is waited on in full, however long it is, and no
-// number of earlier sends stops a transient chain.
-@(test)
-test_recovery_decision_waits_for_the_provider :: proc(test: ^testing.T) {
-	policy := test_retry_policy()
-	rate_limited := ai.Provider_Operation_Error {
+	unavailable := ai.Provider_Operation_Error {
 		kind          = .HTTP,
-		failure_class = .Rate_Limited,
+		failure_class = .Provider_Unavailable,
 	}
+	for delay, retries in CHAT_RETRY_DELAYS {
+		decision := chat_recovery_decide(policy, {retries = retries, error = unavailable})
+		testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
+		testing.expect_value(test, decision.delay, delay)
+	}
+	decision := chat_recovery_decide(policy, {retries = len(CHAT_RETRY_DELAYS), error = unavailable})
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Stop)
+	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Retries_Exhausted)
 
-	asked := rate_limited
-	asked.retry_after = 2 * time.Second
-	decision := chat_recovery_decide(policy, {attempts = 1, error = asked}, 0)
-	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
-	testing.expect_value(test, decision.delay, 2 * time.Second)
-
-	// A reported zero is a value, not an absence: the provider said to send again now,
-	// and the harness still spreads the retry.
-	immediate := rate_limited
-	immediate.retry_after = 0
-	decision = chat_recovery_decide(policy, {attempts = 1, error = immediate}, 0)
-	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
-	testing.expect_value(test, decision.delay, policy.base_delay / 2)
-
-	long := rate_limited
-	long.retry_after = time.Hour
-	decision = chat_recovery_decide(policy, {attempts = 1_000, error = long}, 0)
-	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
+	asked := unavailable
+	asked.retry_after = time.Hour
+	decision = chat_recovery_decide(policy, {error = asked})
 	testing.expect_value(test, decision.delay, time.Hour)
+	shorter := unavailable
+	shorter.retry_after = 0
+	decision = chat_recovery_decide(policy, {error = shorter})
+	testing.expect_value(test, decision.delay, CHAT_RETRY_DELAYS[0])
 }
 
-// A provider directive to stop is authoritative within the transient classes, and a
-// directive to continue never widens them.
+// The provider's own directive overrides the class: a retried class stops when it forbids a
+// resend, and a class that stops is retried when it says a resend can help.
 @(test)
 test_recovery_decision_reads_the_provider_directive :: proc(test: ^testing.T) {
 	policy := test_retry_policy()
-
 	forbidden := ai.Provider_Operation_Error {
 		kind            = .HTTP,
 		failure_class   = .Rate_Limited,
 		retry_directive = .Forbid,
 	}
-	decision := chat_recovery_decide(policy, {attempts = 1, error = forbidden}, 0.5)
+	decision := chat_recovery_decide(policy, {error = forbidden})
 	testing.expect_value(test, decision.action, Request_Recovery_Action.Stop)
 	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Terminal_Failure)
 
 	allowed := ai.Provider_Operation_Error {
 		kind            = .HTTP,
-		failure_class   = .Unknown,
+		failure_class   = .Not_Found,
 		retry_directive = .Allow,
 	}
-	decision = chat_recovery_decide(policy, {attempts = 1, error = allowed}, 0.5)
-	testing.expect_value(test, decision.action, Request_Recovery_Action.Stop)
-	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Terminal_Failure)
+	decision = chat_recovery_decide(policy, {error = allowed})
+	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
+	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Transient_Failure)
 }

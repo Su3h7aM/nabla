@@ -1,34 +1,31 @@
 package agent
 
-// Recovery policy for one response chain: whether a failed send is sent again, and how
-// long the chain waits first. A transient failure is resent for as long as delivery
-// evidence proves the model never received it; there is no attempt count, and a delay the
-// provider asks for is honored as given.
+// Recovery policy for one response chain: what happens to a send that did not produce a
+// usable response. Every failure class has exactly one recovery: the request is resent after
+// a fixed schedule of waits, repaired once and resent, or stopped because only the user can
+// fix what failed. The decision is a function of documented facts alone, so the same failure
+// is always handled the same way.
 
-import "core:math/rand"
 import "core:time"
 
 import "nabla:ai"
 
-// CHAT_RETRY_BASE_DELAY is the first backoff ceiling. Each retry after it doubles the
-// ceiling until CHAT_RETRY_BACKOFF_CEILING.
-CHAT_RETRY_BASE_DELAY :: 500 * time.Millisecond
+// CHAT_RETRY_DELAYS is the wait before each resend of a request that failed for a reason the
+// provider calls temporary or nobody names. Once they are spent the request stops: a failure
+// that outlasts them is not the passing kind.
+@(rodata)
+CHAT_RETRY_DELAYS := [3]time.Duration{1 * time.Second, 3 * time.Second, 5 * time.Second}
 
-// CHAT_RETRY_BACKOFF_CEILING bounds computed backoff. It never shortens a wait the
-// provider asked for.
-CHAT_RETRY_BACKOFF_CEILING :: 60 * time.Second
-
-// Chat_Retry_Policy is the backoff one chain waits with.
+// Chat_Retry_Policy is the schedule one chain resends a failed request on: delays[n] is the
+// wait before resend n + 1. delays is borrowed and outlives every chain that uses it.
 Chat_Retry_Policy :: struct {
-	base_delay: time.Duration,
-	max_delay:  time.Duration,
+	delays: []time.Duration,
 }
 
 // chat_retry_policy_default is the policy a session runs with unless its caller says
-// otherwise. A caller that wants only a shorter wait starts from this and changes the
-// fields it means to change.
+// otherwise.
 chat_retry_policy_default :: proc() -> Chat_Retry_Policy {
-	return {base_delay = CHAT_RETRY_BASE_DELAY, max_delay = CHAT_RETRY_BACKOFF_CEILING}
+	return {delays = CHAT_RETRY_DELAYS[:]}
 }
 
 // Request_Recovery_Action is what the chain does with a send that did not complete.
@@ -59,26 +56,23 @@ Request_Recovery_Reason :: enum {
 	Storage_Failed,
 	// Cancelled is a turn the user or the driver stopped.
 	Cancelled,
-	// Ambiguous_Delivery is a failed operation after model-send bytes may have
-	// reached the provider, or an operation that established nothing about delivery.
-	// Replaying could create a second response even when no output reached the caller.
-	Ambiguous_Delivery,
-	// Output_Exposed is a failure after the attempt had already published text or an
-	// accepted completion. Sending again could publish a second answer, so the chain
-	// stops and keeps what was published as partial.
+	// Output_Exposed is a failure after the harness had accepted the response's completion.
+	// The completion is the response, so the chain stops and keeps it.
 	Output_Exposed,
 	// Context_Exhausted is a provider-confirmed refusal because the input does not fit.
 	// Ordinary backoff cannot make it fit, so the chain either repairs the context once
 	// or the turn ends here with the cause of the refusal.
 	Context_Exhausted,
-	// Terminal_Failure is a failure class, or a provider directive, that says sending the
-	// same request again cannot help.
+	// Terminal_Failure is a failure only the user can fix: credentials, quota, a model the
+	// provider does not serve, a content policy, or a refusal nothing left can repair.
 	Terminal_Failure,
-	// Transient_Failure is a failure the chain retries after the reported delay.
+	// Transient_Failure is a failure the chain resends after the scheduled delay.
 	Transient_Failure,
 	// Cache_Hints_Refused is a request refused as invalid while it carried the harness's
 	// optional cache hints, which the chain drops before sending it again.
 	Cache_Hints_Refused,
+	// Retries_Exhausted is a transient failure that outlasted every scheduled resend.
+	Retries_Exhausted,
 }
 
 // request_recovery_reason_name is the stable spelling a record and a log line keep for a
@@ -93,8 +87,6 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "storage_failed"
 	case .Cancelled:
 		return "cancelled"
-	case .Ambiguous_Delivery:
-		return "ambiguous_delivery"
 	case .Output_Exposed:
 		return "output_exposed"
 	case .Context_Exhausted:
@@ -105,17 +97,19 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "transient_failure"
 	case .Cache_Hints_Refused:
 		return "cache_hints_refused"
+	case .Retries_Exhausted:
+		return "retries_exhausted"
 	}
 	return "unknown"
 }
 
 // Chat_Attempt_Facts is one send as the policy sees it. Every field is a fact from the
 // layer that observed it: the operation reports its own failure, the runtime knows what
-// the attempt exposed, and the session knows whether the turn was stopped or whether a
+// the attempt produced, and the session knows whether the turn was stopped or whether a
 // write landed.
 Chat_Attempt_Facts :: struct {
-	// attempts counts the sends this chain has made, including this one.
-	attempts:            int,
+	// retries counts the scheduled resends this chain has already made. A repair is not one.
+	retries:             int,
 	error:               ai.Provider_Operation_Error,
 	// failed records that the harness failed this send itself rather than the provider
 	// refusing it, which happens when it rejected the completion or could not record it.
@@ -128,7 +122,6 @@ Chat_Attempt_Facts :: struct {
 	// cache hints, which a resend can leave out.
 	cache_hints_sent:    bool,
 	storage_failed:      bool,
-	text_exposed:        bool,
 	completion_accepted: bool,
 	cancelled:           bool,
 }
@@ -137,8 +130,31 @@ Chat_Attempt_Facts :: struct {
 Chat_Recovery_Decision :: struct {
 	action: Request_Recovery_Action,
 	reason: Request_Recovery_Reason,
-	// delay is what the chain waits before its next send, and zero when it stops.
+	// delay is what the chain waits before its next send, and zero when it does not wait.
 	delay:  time.Duration,
+}
+
+// Chat_Failure_Recovery is what a failure class allows: a resend of the same request, a
+// repair of what the harness added to it, or nothing short of the user.
+Chat_Failure_Recovery :: enum {
+	Stop,
+	Retry,
+	Repair,
+}
+
+// chat_failure_recovery is the one table from failure class to recovery. A class nobody
+// names is retried, because the schedule bounds what that costs and stopping would end work
+// a resend may finish.
+chat_failure_recovery :: proc(class: ai.Provider_Failure_Class) -> Chat_Failure_Recovery {
+	switch class {
+	case .Unknown, .Rate_Limited, .Provider_Unavailable, .Incomplete_Stream, .Invalid_Output:
+		return .Retry
+	case .Context_Overflow, .Payload_Too_Large, .Invalid_Request:
+		return .Repair
+	case .None, .Authentication, .Quota, .Not_Found, .Content_Policy, .Untrusted_Connection:
+		return .Stop
+	}
+	return .Stop
 }
 
 // chat_recovery_decide answers what happens after one send. It is a function of its
@@ -148,91 +164,46 @@ Chat_Recovery_Decision :: struct {
 //
 //  1. Cancellation, then a failed write, then a turn the harness already failed. None of
 //     these is about the provider, and none can be repaired by sending again.
-//  2. A send whose operation finished and whose completion was accepted.
-//  3. Published output, because a retry could publish a second answer.
-//  4. Confirmed overflow, which ordinary backoff cannot fix.
-//  5. An invalid request that carried the harness's optional cache hints, resent without them.
-//  6. A failure class, or a provider directive, that says the same request cannot work.
-//  7. A transient class, after the backoff or the provider's own delay, whichever is longer.
-chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Facts, fraction: f64) -> Chat_Recovery_Decision {
+//  2. A send that completed, or whose completion was accepted before a later failure.
+//  3. The recovery the failure class allows, overridden by the provider's own directive
+//     where it gave one: a class that is retried is stopped when the provider forbids it,
+//     and a class that stops is retried when the provider says a resend can help.
+//  4. A repair is used once; a resend waits the scheduled delay or the provider's own
+//     delay, whichever is longer, until the schedule is spent.
+chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Facts) -> Chat_Recovery_Decision {
 	if facts.cancelled || facts.error.kind == .Cancelled { return {action = .Stop, reason = .Cancelled} }
 	if facts.storage_failed { return {action = .Stop, reason = .Storage_Failed} }
 	if facts.failed { return {action = .Stop, reason = .Harness_Failure} }
 	if facts.error.kind == .None { return {action = .Stop, reason = .Completed} }
-	if facts.text_exposed || facts.completion_accepted {
-		return {action = .Stop, reason = .Output_Exposed}
+	if facts.completion_accepted { return {action = .Stop, reason = .Output_Exposed} }
+
+	class := facts.error.failure_class
+	recovery := chat_failure_recovery(class)
+	switch facts.error.retry_directive {
+	case .Forbid:
+		if recovery == .Retry { recovery = .Stop }
+	case .Allow:
+		if recovery == .Stop && class != .None { recovery = .Retry }
+	case .Unspecified:
 	}
-	if facts.error.delivery_present && facts.error.delivery != .None {
-		return {action = .Stop, reason = .Ambiguous_Delivery}
-	}
-	if facts.error.failure_class == .Context_Overflow {
+
+	switch recovery {
+	case .Stop:
+		return {action = .Stop, reason = .Terminal_Failure}
+	case .Repair:
+		if class == .Invalid_Request {
+			if facts.cache_hints_sent { return {action = .Omit_Cache_Hints, reason = .Cache_Hints_Refused} }
+			return {action = .Stop, reason = .Terminal_Failure}
+		}
 		// A rejected payload is never resent. The chain either makes room for a rebuilt
 		// request, once, or the turn ends as context exhaustion.
 		if facts.repaired { return {action = .Stop, reason = .Context_Exhausted} }
 		return {action = .Repair_Context, reason = .Context_Exhausted}
+	case .Retry:
+		if facts.retries >= len(policy.delays) { return {action = .Stop, reason = .Retries_Exhausted} }
+		delay := policy.delays[facts.retries]
+		if asked, present := facts.error.retry_after.?; present { delay = max(delay, asked) }
+		return {action = .Retry, reason = .Transient_Failure, delay = delay}
 	}
-	if facts.error.failure_class == .Invalid_Request && facts.cache_hints_sent {
-		return {action = .Omit_Cache_Hints, reason = .Cache_Hints_Refused}
-	}
-	if facts.error.retry_directive == .Forbid { return {action = .Stop, reason = .Terminal_Failure} }
-	if !chat_failure_transient(facts.error.failure_class) {
-		return {action = .Stop, reason = .Terminal_Failure}
-	}
-	delay := chat_retry_backoff_delay(policy, facts.attempts, fraction)
-	if asked, present := facts.error.retry_after.?; present { delay = max(delay, asked) }
-	return {action = .Retry, reason = .Transient_Failure, delay = delay}
-}
-
-// chat_failure_transient names the classes a second send can plausibly repair. Every
-// other class is terminal here: it either needs a change the harness cannot make
-// (credentials, quota, configuration, the request itself), or it is a refusal nobody has
-// named, and guessing is what the classification exists to avoid.
-chat_failure_transient :: proc(class: ai.Provider_Failure_Class) -> bool {
-	switch class {
-	case .Rate_Limited, .Provider_Unavailable, .Incomplete_Stream:
-		return true
-	case .None, .Unknown, .Authentication, .Quota, .Context_Overflow, .Payload_Too_Large, .Invalid_Request, .Content_Policy, .Invalid_Output:
-		return false
-	}
-	return false
-}
-
-// chat_failure_model_reachable reports whether a terminal class still lets the model be
-// reached, so the refusal is feedback: every class except the ones that need the user
-// (credentials, quota) or were already repaired (context overflow).
-chat_failure_model_reachable :: proc(class: ai.Provider_Failure_Class) -> bool {
-	switch class {
-	case .Unknown, .Payload_Too_Large, .Invalid_Request, .Content_Policy, .Invalid_Output:
-		return true
-	case .None, .Authentication, .Quota, .Context_Overflow, .Rate_Limited, .Provider_Unavailable, .Incomplete_Stream:
-		return false
-	}
-	return false
-}
-
-// chat_retry_backoff_delay is the computed wait before transient retry number `attempt`,
-// which starts at 1:
-//
-//	ceiling = min(max_delay, base_delay * 2^(attempt - 1))
-//	delay   = ceiling * (1 + fraction) / 2
-//
-// So the wait is never shorter than half the ceiling, and `fraction`, a uniform sample
-// in [0, 1), spreads retries that failed together so they do not arrive together.
-// Sampling is the caller's step, which keeps this a function of its inputs.
-chat_retry_backoff_delay :: proc(policy: Chat_Retry_Policy, attempt: int, fraction: f64) -> time.Duration {
-	ceiling := policy.base_delay
-	for _ in 1 ..< attempt {
-		if ceiling >= policy.max_delay { break }
-		ceiling += ceiling
-	}
-	ceiling = min(ceiling, policy.max_delay)
-	share := (1 + clamp(fraction, 0, 1)) / 2
-	return time.Duration(f64(ceiling) * share)
-}
-
-// chat_retry_fraction samples the jitter fraction a wait is computed from, using the
-// thread's generator. It is sampled in one place, so the decision procedure stays pure
-// and a test can state the fraction it means.
-chat_retry_fraction :: proc() -> f64 {
-	return rand.float64_range(0.0, 1.0)
+	return {action = .Stop, reason = .Terminal_Failure}
 }

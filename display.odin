@@ -181,18 +181,20 @@ display_clean :: proc(text: string, allocator := context.allocator) -> string {
 // reports the failure class and the attempt numbers; turning them into a sentence for a
 // user is the front-end's job, and this is the one place either front-end asks for it.
 retry_display_text :: proc(event: agent.Chat_Retry_Event) -> string {
-	reason := "the attempt did not complete"
+	reason := "the request failed"
 	switch event.failure_class {
 	case .Rate_Limited:
 		reason = "the provider is rate limiting this session"
 	case .Provider_Unavailable:
-		reason = "the provider is unavailable"
+		reason = "the provider or the connection is unavailable"
 	case .Incomplete_Stream:
-		reason = "the response ended before it was complete"
+		reason = "the response was cut off before it was complete"
+	case .Invalid_Output:
+		reason = "the response could not be read"
 	case .Invalid_Request:
 		// The only invalid request that is sent again is one resent without its cache hints.
 		reason = "the endpoint refused the request's cache hints; sending it without them"
-	case .None, .Unknown, .Authentication, .Quota, .Context_Overflow, .Payload_Too_Large, .Content_Policy, .Invalid_Output:
+	case .None, .Unknown, .Authentication, .Quota, .Not_Found, .Context_Overflow, .Payload_Too_Large, .Content_Policy, .Untrusted_Connection:
 	}
 	return fmt.tprintf("%s; retrying in %s (attempt %d)", reason, display_duration(event.delay), event.next_attempt)
 }

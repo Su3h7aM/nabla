@@ -572,7 +572,8 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(test: ^testing.T) 
 		{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"a","working_directory":null,"timeout_ms":null}`},
 		{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"b","working_directory":null,"timeout_ms":null}`},
 	}
-	testing.expect_value(test, chat_session_feed_tool_calls(chat, source, calls), Chat_Notice.Duplicate_Call_ID)
+	duplicate_notice, _ := chat_session_feed_tool_calls(chat, source, calls)
+	testing.expect_value(test, duplicate_notice, Chat_Notice.Duplicate_Call_ID)
 	testing.expect(test, chat_session_note_notice(chat, source, .Duplicate_Call_ID))
 	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
@@ -593,74 +594,6 @@ test_unusable_response_becomes_feedback_not_a_failure :: proc(test: ^testing.T) 
 	if !testing.expect(test, is_notice, "the harness explanation is conversation") { return }
 	testing.expect_value(test, notice.origin, journal.User_Origin.Harness)
 	testing.expect(test, strings.contains(notice.text, "own id"), "the explanation names the defect")
-	testing.expect_value(test, chat.state, Chat_State.Preparing)
-
-	// The next step is another request, not a stop.
-	next := chat_session_advance(chat)
-	testing.expect_value(test, next.kind, Chat_Effect_Kind.Start_Request)
-}
-
-// A response the stream could not decode does not end the turn either. The failure
-// becomes the same kind of harness feedback as an unusable response, and the chain
-// commit that follows the failed attempt must not turn it back into a failure.
-@(test)
-test_an_unreadable_response_becomes_feedback_not_a_failure :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-	_test_accept(test, chat, "work that gets an unreadable response")
-	_test_begin_request(test, chat)
-
-	// The stream could not be decoded. The model can still be reached, so the turn
-	// must not fail: the failure becomes feedback and the turn prepares again.
-	source := chat_session_event_source(chat)
-	message := strings.clone("malformed provider stream event", os.heap_allocator())
-	event: Chat_Event = Chat_Failure_Event {
-		source  = source,
-		kind    = .Invalid_Data,
-		message = message,
-	}
-	chat_session_apply(chat, &event)
-	chat_event_destroy(&event, os.heap_allocator())
-	testing.expect(test, !chat.active_failed, "an unreadable response must not fail the turn")
-	testing.expect_value(test, chat.pending_notice, Chat_Notice.Unreadable_Response)
-	testing.expect_value(test, chat.state, Chat_State.Preparing)
-
-	// The chain ends the way a real attempt does: the operation failed, and the retry
-	// policy stopped the chain. Its commit must keep the turn going.
-	request := journal.next_request(chat.store)
-	chat.chain.active = true
-	chat.chain.stage = .Committing
-	chat.chain.attempts = 1
-	chat.chain.request = request
-	chat.chain.source = source
-	chat.chain.operation_error = {
-		kind          = .Stream,
-		failure_class = .Invalid_Output,
-		detail        = strings.clone("malformed provider stream event", os.heap_allocator()),
-	}
-	chat.chain.decision = {
-		action = .Stop,
-		reason = .Terminal_Failure,
-	}
-	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
-	defer delete(usages)
-	chat_chain_commit(chat, &usages)
-	testing.expect(test, !chat.active_failed, "the chain commit must not turn feedback into a failure")
-
-	// The prompt and the harness explanation; no call and no result were recorded.
-	testing.expect_value(test, len(_test_records(test, chat, {.Tool_Proposed, .Tool_Admitted, .Tool_Completed})), 0)
-	arena: virtual.Arena
-	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
-	defer virtual.arena_destroy(&arena)
-	projection := _test_projection(test, chat, &arena)
-	if !testing.expect_value(test, len(projection.items), 2) { return }
-	notice, is_notice := projection.items[1].payload.(Projected_User)
-	if !testing.expect(test, is_notice, "the harness explanation is conversation") { return }
-	testing.expect_value(test, notice.origin, journal.User_Origin.Harness)
-	testing.expect(test, strings.contains(notice.text, "sending it again"), "the explanation names the correction")
 	testing.expect_value(test, chat.state, Chat_State.Preparing)
 
 	// The next step is another request, not a stop.

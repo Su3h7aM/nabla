@@ -370,6 +370,34 @@ test_responses_stream_incomplete_failed_tool :: proc(t: ^testing.T) {
 	testing.expect_value(t, failure.Kind, Provider_Error_Kind.API_Error)
 	testing.expect_value(t, failure.Message, "boom")
 	testing.expect_value(t, failure.Provider_Code, "server_error")
+	class := provider_classify_failure(
+		Provider_Evidence {
+			api = .OpenAI_Responses,
+			kind = .Stream,
+			head_seen = true,
+			status = 200,
+			event = failure.Kind,
+			rejection = {code = failure.Provider_Code, message = failure.Message},
+		},
+	)
+	testing.expect_value(t, class, Provider_Failure_Class.Provider_Unavailable)
+	destroy_events(events)
+	Provider_Stream_Destroy(&state)
+
+	state = Provider_Stream_Start(.OpenAI_Responses, context.temp_allocator)
+	events = consume(t, `{"type":"error","code":"rate_limit_exceeded","message":"slow down","param":null,"sequence_number":1}`, &state, 1)
+	failure = expect_event(t, events[0], Provider_Error_Event)
+	class = provider_classify_failure(
+		Provider_Evidence {
+			api = .OpenAI_Responses,
+			kind = .Stream,
+			head_seen = true,
+			status = 200,
+			event = failure.Kind,
+			rejection = {code = failure.Provider_Code, message = failure.Message},
+		},
+	)
+	testing.expect_value(t, class, Provider_Failure_Class.Rate_Limited)
 	destroy_events(events)
 	Provider_Stream_Destroy(&state)
 

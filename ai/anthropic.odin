@@ -479,7 +479,13 @@ anthropic_error_event :: proc(object: json.Object, allocator := context.allocato
 	if message == "" { message = "provider returned an API error" }
 	code, _, code_ok := openai_value_string(error_object, "type")
 	if !code_ok { code = "" }
-	parsed, parsed_error := openai_error_event(.API_Error, message, code, allocator)
+	detail_code := ""
+	if raw_details, details_present := error_object["details"]; details_present {
+		if details, is_object := raw_details.(json.Object); is_object {
+			if value, code_present, valid := openai_value_string(details, "error_code"); valid && code_present { detail_code = value }
+		}
+	}
+	parsed, parsed_error := openai_error_event(.API_Error, message, code, detail_code, allocator)
 	return parsed, true, parsed_error
 }
 
@@ -502,29 +508,41 @@ anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) ->
 		return {}, nil
 	}
 	// The rejection takes the strings the parsed event built; nothing is cloned again.
-	return Provider_Rejection{code = error_event.Provider_Code, message = error_event.Message}, nil
+	return Provider_Rejection{code = error_event.Provider_Code, detail_code = error_event.Provider_Detail_Code, message = error_event.Message}, nil
 }
 
-// ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE is this API's own wording for a rejected
-// payload whose prompt was too long. It is the only prose this package reads, and
-// only ever beside the single code that covers every malformed request.
+// These are the only prose this package reads, and only beside invalid_request_error,
+// the one code that covers every malformed request. ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE is
+// this API's wording for a prompt too long for the model; the spend-limit prefixes are the
+// wording its documentation gives for a spend limit the user set.
 ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE :: "prompt is too long"
+ANTHROPIC_API_SPEND_LIMIT_PREFIX :: "You have reached your specified API usage limits"
+ANTHROPIC_WORKSPACE_SPEND_LIMIT_PREFIX :: "You have reached your specified workspace API usage limits"
 
 // anthropic_failure_class names the meaning this API gives to one of its own error
-// types. `invalid_request_error` covers every malformed request, so overflow is
-// read from the provider's own wording for it and nothing else: a mention of
-// tokens or limits is not evidence, the way every other refusal stays unknown.
+// types. `invalid_request_error` covers malformed requests and spend limits, so it
+// reads only the documented spend-limit prefixes and its existing overflow wording.
 @(require_results)
-anthropic_failure_class :: proc(code, message: string) -> (Provider_Failure_Class, bool) {
+anthropic_failure_class :: proc(code, detail_code, message: string) -> (Provider_Failure_Class, bool) {
 	switch code {
 	case "rate_limit_error":
+		if detail_code == "enforced_spend_limit_reached" { return .Quota, true }
 		return .Rate_Limited, true
-	case "overloaded_error":
+	case "conflict_error", "api_error", "timeout_error", "overloaded_error":
 		return .Provider_Unavailable, true
 	case "authentication_error", "permission_error":
 		return .Authentication, true
+	case "billing_error":
+		return .Quota, true
+	case "not_found_error":
+		return .Not_Found, true
+	case "request_too_large":
+		return .Payload_Too_Large, true
 	case "invalid_request_error":
 		if strings.contains(message, ANTHROPIC_CONTEXT_OVERFLOW_MESSAGE) { return .Context_Overflow, true }
+		if strings.has_prefix(message, ANTHROPIC_API_SPEND_LIMIT_PREFIX) || strings.has_prefix(message, ANTHROPIC_WORKSPACE_SPEND_LIMIT_PREFIX) {
+			return .Quota, true
+		}
 		return .Invalid_Request, true
 	}
 	return .None, false

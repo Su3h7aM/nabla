@@ -746,7 +746,7 @@ chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, deci
 @(private)
 chat_compact_suppressible :: proc(job: ^Compact_Job) -> bool {
 	switch job.operation.failure_class {
-	case .Authentication, .Quota, .Invalid_Request, .Payload_Too_Large, .Content_Policy:
+	case .Authentication, .Quota, .Not_Found, .Untrusted_Connection, .Invalid_Request, .Payload_Too_Large, .Content_Policy:
 		return true
 	case .None, .Unknown, .Rate_Limited, .Context_Overflow, .Provider_Unavailable, .Incomplete_Stream, .Invalid_Output:
 		return false
@@ -772,12 +772,12 @@ chat_compact_retryable :: proc(job: ^Compact_Job) -> bool {
 @(private)
 chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Recovery_Decision {
 	facts := Chat_Attempt_Facts {
-		attempts       = job.attempts,
+		retries        = max(job.attempts - 1, 0),
 		error          = job.operation,
 		failed         = !chat_compact_retryable(job),
 		storage_failed = chat_session_storage_failed(chat),
 	}
-	return chat_recovery_decide(chat.compact_retry, facts, chat_retry_fraction())
+	return chat_recovery_decide(chat.compact_retry, facts)
 }
 
 // chat_compact_deadline is when compaction next acts without a publication: the due time

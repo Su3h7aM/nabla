@@ -252,7 +252,8 @@ test_input_waits_until_the_tool_batch_settles :: proc(test: ^testing.T) {
 	_test_begin_request(test, chat)
 
 	calls := []ai.Provider_Tool_Call{{ID = "call_1", Name = TOOL_SHELL_NAME, Arguments = `{"command":"true"}`}}
-	testing.expect_value(test, chat_session_feed_tool_calls(chat, chat_session_event_source(chat), calls), Chat_Notice.None)
+	staged_notice, _ := chat_session_feed_tool_calls(chat, chat_session_event_source(chat), calls)
+	testing.expect_value(test, staged_notice, Chat_Notice.None)
 	testing.expect_value(test, chat.state, Chat_State.Executing_Tools)
 
 	queue := steer_queue_init(context.temp_allocator)

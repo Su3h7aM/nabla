@@ -27,11 +27,11 @@ Terms: "must" is a hard rule, "default" is a named, tunable value. Every numeric
 
 ## 2. Limits, failures, and resources
 
-The harness gets out of the model's way. It adds no limit of its own, and it turns every failure the model can act on into feedback instead of a stop.
+The harness gets out of the model's way. It adds no limit of its own, turns every mistake the model can correct into feedback for the model, and handles every other failure itself: it retries, repairs, or stops and tells the user.
 
 ### 2.1 Limits come from outside
 
-A limit exists only when an external constraint imposes it: the provider or its API (request size, rate, error responses), the model (context window, maximum output), a protocol (a frame format, a JSON-RPC rule), or the operating system (memory, file descriptors, process limits). Nabla and its packages never invent a cap on tool arguments, tool output, calls per response, requests per turn, retries, script size, instruction counts, or execution time. `http`, `sse`, `ai`, `mcp`, and `acp` report what the peer sent in full; they do not refuse data for being large.
+A limit exists only when an external constraint imposes it: the provider or its API (request size, rate, error responses), the model (context window, maximum output), a protocol (a frame format, a JSON-RPC rule), or the operating system (memory, file descriptors, process limits). Nabla and its packages never invent a cap on tool arguments, tool output, calls per response, requests per turn, script size, instruction counts, or execution time. `http`, `sse`, `ai`, `mcp`, and `acp` report what the peer sent in full; they do not refuse data for being large. The one bounded schedule is the resend of a failed provider request (section 11.3): it is not model work, and a failure that outlasts it is not a passing one.
 
 - A limit is data from its source: a catalog fact (`context_window`, `max_output`), a provider refusal classified by `ai`, or an OS error. A constant in source that caps model-driven work is a defect.
 - The context window is the one limit the harness applies before sending, because it is the model's own. Large content is kept whole in a file and the model is shown a preview that names it (section 14.3); the bytes are never discarded.
@@ -39,21 +39,22 @@ A limit exists only when an external constraint imposes it: the provider or its 
 - Internal buffers (view queue, diagnostic ring, journal batch) size memory, not work. When one fills, the producer degrades its own output (drops a redraw delta and resyncs, drops a diagnostic line and counts it) and never refuses or truncates model-visible data.
 - Hooks, config, and material metadata run user code on the owner or the watcher. Their wall-time bound (section 17) keeps those threads responsive; it is a system constraint on the harness's own threads, not a limit on the model.
 
-### 2.2 Failures are feedback
+### 2.2 Feedback goes to whoever can act
 
-When a request, a response, or a tool fails, the next step is to tell the model what happened and let it correct itself. The work loop never stops because something went wrong while the model can still be reached.
+A failure is reported to whoever can correct it. The model is told about what it sent: a tool call, its arguments, or a response it cut short or malformed. Everything else, the request, the provider, the transport, the harness itself, is the harness's to handle: it retries, repairs, or stops (section 11.3), and the user is the one told. The model never receives a notice about a failure it cannot correct, and the work loop stops only when nothing is left to try without the user.
 
-| Failure | What the model receives | Turn |
-| --- | --- | --- |
-| tool failure, invalid arguments, denial, timeout, unknown outcome | the typed result for that call (section 14.3) | continues |
-| response that cannot be decoded, is incomplete, is truncated at the output limit, or has defective calls | a `Notice` node saying what was wrong and that nothing ran | continues |
-| provider refusal of the request (invalid request, payload too large, content policy) | a `Notice` node naming the provider's code, message, and stated limit; after a checkpoint when the context is the cause | continues once; a second refusal of the same class in a row ends the turn |
-| transient provider or network failure | nothing; the request is resent with backoff while the model send is provably not entered, otherwise a `Notice` | continues |
-| authentication, quota, missing model, configuration error | nothing: the model cannot be reached | ends, reported to the user with the provider's message |
-| user cancel, storage failure | nothing | ends |
+| Failure | Model | User | Turn |
+| --- | --- | --- | --- |
+| tool failure, invalid arguments, denial, timeout, unknown outcome | the typed result for that call (section 14.3) | the result | continues |
+| repaired tool call | the result, naming what was repaired | the result | continues |
+| response truncated at the output limit, or with defective calls | a `Notice` node saying what was wrong and that nothing ran | the notice | continues |
+| transient provider or network failure, a stream cut off or unreadable, a failure nothing names | nothing | each retry and its wait | continues; the request is resent on the fixed schedule, then the turn ends |
+| request the harness can repair: context overflow, payload too large, refused cache hints | nothing | the repair | continues after one repair |
+| authentication, quota, missing model, content policy, untrusted peer, an invalid request nothing can repair | nothing | the provider's message and what would fix it | ends |
+| user cancel, storage failure, a response the harness could not hold | nothing | the reason | ends |
 
 - Feedback is actionable: it names the failing call or response, the cause, the external limit with its value when one applies, and what was not executed.
-- A refusal gets one `Notice` because the model can often fix what it sent, but the harness cannot tell a model-correctable refusal from a request the harness itself built wrong (an unsupported field, an invalid schema). If the request that follows the notice is refused for the same class, nothing the model adds will fix it: the model cannot be reached with this conversation, so the turn ends and the user sees the provider's message.
+- The request is the harness's, so a refusal of it is never the model's to fix. The harness decides from documented facts alone (status, the API's error type and code, the provider's retry headers), never from a guess about who caused it.
 - A malformed call is feedback, not an error path: an unknown tool, arguments that are not JSON, a missing or mistyped field, or a value outside the schema returns a result that names the field, what was expected, and what was received, so the model can correct the call and retry.
 - Every layer of the loop handles its failures: the state machine, the request path, tool dispatch, and each tool map an error to one row of this table. No failure escapes as a panic, an unhandled return value, or a silent stop.
 - A notice is committed as a node, so resume, forks, and the cache see the same bytes.
@@ -72,7 +73,7 @@ When a request, a response, or a tool fails, the next step is to tell the model 
 
 The harness keeps running for as long as it reasonably can. Robustness comes first from prevention: small, simple, idiomatic code with errors as values has fewer places to fail. What still fails is contained to the work it touched, and the recovery for it stays proportionate.
 
-- A non-critical failure degrades only its own work. A failed tool, request, hook, config reload, catalog refresh, MCP server, or subagent becomes feedback (section 2.2) or a recorded diagnostic, and the session and process continue.
+- A non-critical failure degrades only its own work. A failed tool, request, hook, config reload, catalog refresh, MCP server, or subagent is recovered or reported to whoever can act (section 2.2), or recorded as a diagnostic, and the session and process continue.
 - A worker that stops responding costs only its own resources. It is abandoned (section 7.2): its call reports `Unknown`, its memory leaks, and the session keeps admitting turns.
 - No non-critical failure blocks the agent permanently. Every wait on another job ends when that job commits, times out, or is abandoned, and an abandoned job's claims pass to the next job that needs them. Letting new work take over from stuck work is preferred over holding the agent back.
 - A thread is never killed. `thread.terminate` cancels at an arbitrary point, possibly while it holds a `sync.Mutex` or is inside an allocator, and `core:sync` locks have no owner-death recovery, so every later waiter would deadlock. Stopping is cooperative through `Stop` tokens (section 7.4).
@@ -628,9 +629,11 @@ Replay: provider-native opaque items (encrypted reasoning, Responses output) are
 - `Prepare_Request` copies the projection and encodes into the chain arena, runs `request.prepare` hooks, checks capacity (section 23), then freezes: the encoded body is immutable for every attempt of this request.
 - `Send_Attempt` commits `request.sent{attempt, body digest, sizes}` (barrier), then starts an `Attempt` job that borrows the frozen bytes and streams into its handoff.
 - The owner forwards new stream bytes to the view queue as progress. Completion is validated (identities, count, argument sizes) before `Commit_Response` writes the `Assistant` node and `tool.proposed` records in one barrier.
-- Recovery authorization lives only in `agent`, and every branch keeps the turn going unless section 2.2 says it ends. Order: end on cancel or storage failure; accept a validated completion; answer an unusable or partially exposed response with a `Notice` and a new request; for proven context overflow, install a checkpoint and rebuild; for an invalid request that carried the harness's optional cache hints (cache breakpoint, cache key, cache options), resend it once without them, with no `Notice`, and leave them out of later requests for the model unless that resend is refused too; for a refusal of the request (invalid request, payload too large, content policy), a `Notice` carrying the provider's code, message, and stated limit, then a new request, and end the turn if that request is refused for the same class; resend a transient class (rate limited, unavailable, incomplete stream) only while delivery evidence proves the model send was not entered, otherwise a `Notice`; end only on authentication, quota, missing model, or configuration errors, reporting the provider's message to the user.
-- Delivery evidence: a received response head (an HTTP status line of any status, or the first WebSocket response event) proves the send was entered. A stream that breaks after it is answered with a `Notice`, never resent. Only a failure before the head (connect, TLS, or a write the peer never read) permits a resend.
-- Backoff: `ceiling = min(RETRY_BACKOFF_CEILING, 500 ms * 2^(n-1))`, `delay = max(uniform(ceiling/2, ceiling), retry_after)`. Transient resends have no attempt count and honor any provider-requested delay; a network outage while the user is away delays the turn instead of ending it. The wait is an owner deadline, not a sleep, and cancel ends it.
+- Recovery authorization lives only in `agent` (`agent/retry.odin`), and it is one table from the failure class `ai` names to one recovery: resend, repair, or stop. Order: end on cancel or storage failure; end on a response the harness failed itself; accept a validated completion, including one a later transport failure followed; then the class decides, overridden by the provider's documented `x-should-retry` directive where it gave one.
+- Resend: rate limited, provider or connection unavailable, a stream cut off or unreadable, a response the provider ended without a usable answer, and a failure nothing names. The same frozen bytes are sent again after each wait of the fixed schedule `CHAT_RETRY_DELAYS` (1 s, 3 s, 5 s), or after the provider's `retry-after` when it is longer; once the schedule is spent the turn ends. A resend is safe after the stream started: nothing in a response runs before it is committed, so the partial answer is dropped and the front-end closes what it showed of it.
+- Repair, once per chain: for context overflow or a payload too large, install a checkpoint and rebuild; for an invalid request that carried the harness's optional cache hints (cache breakpoint, cache key, cache options), resend it without them and leave them out of later requests for the model unless that resend is refused too.
+- Stop and tell the user what failed and what would fix it: authentication, quota, a model the provider does not serve, content policy, an untrusted peer, an invalid request nothing can repair, and a spent schedule. The model is never sent a notice about any of these.
+- Every retry is reported to the front-end as it is scheduled, and recorded on the failed send's `response.rejected` row with its reason and delay. The wait is an owner deadline, not a sleep, and cancel ends it.
 - Transport: per provider `http | websocket | auto`. `auto` uses WebSocket for APIs that implement it and falls back to HTTP for the affinity only on evidence that no model message was sent. The WebSocket connection is session-owned, used by one attempt at a time, and destroyed on affinity change or any unsuccessful operation.
 
 ### 11.4 Usage and cache accounting

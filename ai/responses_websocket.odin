@@ -305,9 +305,9 @@ provider_websocket_dial :: proc(
 		} else {
 			result.detail = detail
 		}
-		if kind == .Transport && result.transport_cause != .Trust && result.transport_cause != .Configuration {
-			result.failure_class = .Provider_Unavailable
-		}
+		result.failure_class = provider_classify_failure(
+			Provider_Evidence{api = .OpenAI_Responses, kind = result.kind, head_seen = kind == .HTTP, status = result.status, cause = result.transport_cause},
+		)
 		return result
 	}
 	session.socket = socket

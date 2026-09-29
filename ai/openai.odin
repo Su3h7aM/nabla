@@ -54,7 +54,16 @@ openai_value_integer :: proc(object: json.Object, key: string) -> (i64, bool, bo
 // event owns its strings, and a failure to retain them yields no event and the allocator
 // error, so a caller never delivers a failure whose wording was silently dropped.
 @(require_results)
-openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "", allocator := context.allocator) -> (Provider_Event, mem.Allocator_Error) {
+openai_error_event :: proc(
+	kind: Provider_Error_Kind,
+	message: string,
+	code := "",
+	detail_code := "",
+	allocator := context.allocator,
+) -> (
+	Provider_Event,
+	mem.Allocator_Error,
+) {
 	owned_message, message_error := strings.clone(message, allocator)
 	if message_error != nil { return nil, message_error }
 	owned_code, code_error := strings.clone(code, allocator)
@@ -62,7 +71,13 @@ openai_error_event :: proc(kind: Provider_Error_Kind, message: string, code := "
 		if owned_message != "" { delete(owned_message, allocator) }
 		return nil, code_error
 	}
-	return Provider_Error_Event{Kind = kind, Message = owned_message, Provider_Code = owned_code}, nil
+	owned_detail_code, detail_code_error := strings.clone(detail_code, allocator)
+	if detail_code_error != nil {
+		if owned_message != "" { delete(owned_message, allocator) }
+		if owned_code != "" { delete(owned_code, allocator) }
+		return nil, detail_code_error
+	}
+	return Provider_Error_Event{Kind = kind, Message = owned_message, Provider_Code = owned_code, Provider_Detail_Code = owned_detail_code}, nil
 }
 
 // openai_error_rejection decodes the error document this API returns for a refused
@@ -85,25 +100,58 @@ openai_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (P
 		return {}, nil
 	}
 	// The rejection takes the strings the parsed event built; nothing is cloned again.
-	return Provider_Rejection{code = error_event.Provider_Code, message = error_event.Message}, nil
+	return Provider_Rejection{code = error_event.Provider_Code, detail_code = error_event.Provider_Detail_Code, message = error_event.Message}, nil
 }
 
 // openai_failure_class names the meaning this API gives to one of its own error
-// codes. The codes are matched exactly: they are machine-readable tokens the API
-// documents, and a prefix or substring rule would classify codes it never wrote
-// down. An unrecognized code is left to the status that carried it, which is the
-// fallback a compatible endpoint depends on.
+// codes or types. The tokens are matched exactly, and an unrecognized one is left
+// to the status that carried it.
 @(require_results)
 openai_failure_class :: proc(code: string) -> (Provider_Failure_Class, bool) {
 	switch code {
 	case "context_length_exceeded":
 		return .Context_Overflow, true
-	case "insufficient_quota":
+	case "insufficient_quota", "credit_balance_exhausted", "usage_limit_exceeded", "organization_spend_limit_exceeded", "project_spend_limit_exceeded":
 		return .Quota, true
-	case "content_policy_violation":
+	case "invalid_api_key", "authentication_error":
+		return .Authentication, true
+	case "model_not_found", "not_found_error":
+		return .Not_Found, true
+	case "content_policy_violation", "bio_policy", "cyber_policy", "misalignment_policy_violation", "image_content_policy_violation":
 		return .Content_Policy, true
+	case "server_error", "server_is_overloaded", "vector_store_timeout", "service_unavailable_error":
+		return .Provider_Unavailable, true
+	case "rate_limit_exceeded", "slow_down", "rate_limit_error":
+		return .Rate_Limited, true
+	case "invalid_prompt",
+	     "data_residency_mismatch",
+	     "invalid_image",
+	     "invalid_image_format",
+	     "invalid_base64_image",
+	     "invalid_image_url",
+	     "image_too_large",
+	     "image_too_small",
+	     "image_parse_error",
+	     "invalid_image_mode",
+	     "image_file_too_large",
+	     "unsupported_image_media_type",
+	     "empty_image_file",
+	     "failed_to_download_image",
+	     "image_file_not_found":
+		return .Invalid_Request, true
 	}
 	return .None, false
+}
+
+// openai_error_class_code picks the token a rejection is classified by: the error's code
+// when it is one this package knows, otherwise its type, which names a broader class. The
+// generic invalid_request_error type is not classified here, so the status decides it.
+openai_error_class_code :: proc(code, error_type: string) -> string {
+	if code != "" {
+		if _, known := openai_failure_class(code); known { return code }
+	}
+	if error_type != "" { return error_type }
+	return code
 }
 
 // openai_parse_api_error reads the error envelope both OpenAI APIs return. is_error says the
@@ -134,7 +182,10 @@ openai_parse_api_error :: proc(object: json.Object, allocator := context.allocat
 			return invalid, true, invalid_error
 		}
 	}
-	parsed, parsed_error := openai_error_event(.API_Error, message, code, allocator)
+	error_type := ""
+	if value, type_present, valid := openai_value_string(error_object, "type"); valid && type_present { error_type = value }
+	code = openai_error_class_code(code, error_type)
+	parsed, parsed_error := openai_error_event(.API_Error, message, code, allocator = allocator)
 	return parsed, true, parsed_error
 }
 

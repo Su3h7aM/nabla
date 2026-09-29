@@ -8,9 +8,8 @@ package ai
 // because the connection broke. This file turns all three into one vocabulary.
 //
 // The vocabulary is names, not prose. Nothing here reads English out of a message
-// to guess a cause, apart from the one narrow check an API needs because a single
-// code covers several causes, and an unrecognized refusal stays Unknown rather
-// than becoming retryable by accident.
+// to guess a cause, apart from the narrow checks an API requires because a single
+// code covers several causes.
 
 import "base:intrinsics"
 import "core:encoding/json"
@@ -27,12 +26,14 @@ Provider_Failure_Class :: enum {
 	// None means no provider classification applies: the attempt failed locally,
 	// before the provider could refuse anything.
 	None,
-	// Unknown is a refusal this package recognized as one but could not name. It is
-	// terminal, because guessing is what this vocabulary exists to avoid.
+	// Unknown is a refusal or failure nothing names; the recovery policy retries it
+	// a bounded number of times.
 	Unknown,
 	Authentication,
 	Quota,
 	Rate_Limited,
+	Not_Found,
+	Untrusted_Connection,
 	Context_Overflow,
 	Payload_Too_Large,
 	Invalid_Request,
@@ -50,9 +51,8 @@ Provider_Retry_Directive :: enum {
 	Allow,
 }
 
-// PROVIDER_RETRY_DIRECTIVE_HEADER is the response field the OpenAI APIs document
-// for telling a client whether sending the same request again could help. No other
-// API family this package speaks has one, so no other family reads one.
+// PROVIDER_RETRY_DIRECTIVE_HEADER is the response field all three APIs use to tell
+// a client whether sending the same request again could help.
 PROVIDER_RETRY_DIRECTIVE_HEADER :: "x-should-retry"
 
 // Provider_Transport_Cause is what the transport reported, in the terms a recovery
@@ -74,23 +74,25 @@ Provider_Transport_Cause :: enum {
 }
 
 // Provider_Rejection is the provider's own account of a refused request, decoded
-// from its error document or its in-stream error event. Both strings are owned by
+// from its error document or its in-stream error event. Its strings are owned by
 // whoever holds the rejection and are released with provider_rejection_destroy.
 Provider_Rejection :: struct {
-	code:    string,
-	message: string,
+	code:        string,
+	detail_code: string,
+	message:     string,
 }
 
 // provider_rejection_present reports whether a rejection carries anything at all.
 // A provider may name a cause without writing about it, or write about it without
 // naming one; either is a rejection.
 provider_rejection_present :: proc(rejection: Provider_Rejection) -> bool {
-	return rejection.code != "" || rejection.message != ""
+	return rejection.code != "" || rejection.detail_code != "" || rejection.message != ""
 }
 
 provider_rejection_destroy :: proc(rejection: ^Provider_Rejection, allocator: mem.Allocator) {
 	if rejection == nil { return }
 	if rejection.code != "" { delete(rejection.code, allocator) }
+	if rejection.detail_code != "" { delete(rejection.detail_code, allocator) }
 	if rejection.message != "" { delete(rejection.message, allocator) }
 	rejection^ = {}
 }
@@ -152,7 +154,9 @@ provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failu
 	case .HTTP, .Transport, .Stream, .TLS, .None:
 	}
 
-	if class, known := provider_rejection_class(evidence.api, evidence.rejection); known { return class }
+	if evidence.kind == .HTTP || evidence.kind == .Stream {
+		if class, known := provider_rejection_class(evidence.api, evidence.rejection); known { return class }
+	}
 
 	switch evidence.kind {
 	case .HTTP:
@@ -162,15 +166,15 @@ provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failu
 		switch evidence.cause {
 		case .Connection, .IO:
 			return .Provider_Unavailable
-		case .None, .Trust, .Configuration:
+		case .Trust, .Configuration:
+			return .Untrusted_Connection
+		case .None:
 			return .Unknown
 		}
 	case .Stream:
 		return provider_stream_class(evidence.event)
 	case .TLS:
-		// A peer that did not authenticate carries no provider meaning, and it is
-		// never retried.
-		return .Unknown
+		return .Untrusted_Connection
 	case .None:
 		return .Unknown
 	case .Cancelled, .Timed_Out, .Invalid_Request, .Allocation:
@@ -181,13 +185,15 @@ provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failu
 
 // provider_status_class reads a status the way HTTP defines it, with the meaning
 // these provider APIs attach to a few of them. Anything outside the classes HTTP
-// defines is Unknown, and never retryable because its number is large.
+// defines is Unknown.
 provider_status_class :: proc(status: int) -> Provider_Failure_Class {
 	switch {
 	case status == 401 || status == 403:
 		return .Authentication
 	case status == 402:
 		return .Quota
+	case status == 404:
+		return .Not_Found
 	case status == 408 || status == 409:
 		return .Provider_Unavailable
 	case status == 413:
@@ -206,8 +212,7 @@ provider_status_class :: proc(status: int) -> Provider_Failure_Class {
 
 // provider_stream_class names why a stream was unusable. A stream that ended
 // without its required marker is incomplete; output that cannot be read as the
-// API's own is invalid. Both are terminal until a sender decides otherwise, and
-// neither is a network disconnect.
+// API's own is invalid. Neither is a network disconnect.
 provider_stream_class :: proc(event: Maybe(Provider_Error_Kind)) -> Provider_Failure_Class {
 	kind, present := event.?
 	if !present { return .Unknown }
@@ -230,7 +235,7 @@ provider_stream_class :: proc(event: Maybe(Provider_Error_Kind)) -> Provider_Fai
 	return .Unknown
 }
 
-// provider_rejection_class maps a provider's own code onto the meaning this
+// provider_rejection_class maps a provider's own code or type onto the meaning this
 // package gives it. A code no adapter knows is not classified here, and the status
 // decides whatever it can.
 @(require_results)
@@ -240,7 +245,7 @@ provider_rejection_class :: proc(api: API_Kind, rejection: Provider_Rejection) -
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
 		return openai_failure_class(rejection.code)
 	case .Anthropic_Messages:
-		return anthropic_failure_class(rejection.code, rejection.message)
+		return anthropic_failure_class(rejection.code, rejection.detail_code, rejection.message)
 	case .Invalid:
 	}
 	return .None, false
@@ -296,17 +301,17 @@ provider_request_id_header :: proc(api: API_Kind) -> string {
 }
 
 // provider_retry_directive reads the directive an API documents for whether to
-// send again. Every other family leaves it unspecified.
+// send again.
 provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provider_Retry_Directive {
 	switch api {
-	case .OpenAI_Chat_Completions, .OpenAI_Responses:
+	case .OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages:
 		value, present := http.headers_get_unsafe(headers, PROVIDER_RETRY_DIRECTIVE_HEADER)
 		if !present { return .Unspecified }
 		if strings.equal_fold(value, "false") { return .Forbid }
 		if strings.equal_fold(value, "true") { return .Allow }
 		// Anything else is not a directive this client reads as one.
 		return .Unspecified
-	case .Anthropic_Messages, .Invalid:
+	case .Invalid:
 	}
 	return .Unspecified
 }
@@ -318,29 +323,10 @@ provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provid
 // past what a Duration can hold, which becomes that type's longest delay rather than none,
 // because a caller that read it as silence would send again.
 provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
-	if len(value) == 0 { return nil }
 	text := http.trim_ows(value)
 	if text == "" { return nil }
 
-	digits := true
-	for character in text {
-		if character < '0' || character > '9' {
-			digits = false
-			break
-		}
-	}
-	if digits {
-		seconds: i64
-		for character in text {
-			scaled, mul_overflow := intrinsics.overflow_mul(seconds, 10)
-			next, add_overflow := intrinsics.overflow_add(scaled, i64(character - '0'))
-			if mul_overflow || add_overflow { return max(time.Duration) }
-			seconds = next
-		}
-		nanoseconds, mul_overflow := intrinsics.overflow_mul(seconds, i64(time.Second))
-		if mul_overflow { return max(time.Duration) }
-		return time.Duration(nanoseconds)
-	}
+	if delay, numeric := provider_retry_after_numeric(text, time.Second); numeric { return delay }
 
 	// An HTTP-date, and only in the three formats RFC 9110 5.6.1 defines. An
 	// ISO 8601 timestamp is not one of them, and is not read as one.
@@ -350,4 +336,32 @@ provider_retry_after :: proc(value: string) -> Maybe(time.Duration) {
 		return delay
 	}
 	return nil
+}
+
+// provider_retry_after_milliseconds reads the integer-millisecond form used by
+// provider response headers. An absent or invalid value has no delay.
+provider_retry_after_milliseconds :: proc(value: string) -> Maybe(time.Duration) {
+	delay, numeric := provider_retry_after_numeric(value, time.Millisecond)
+	if !numeric { return nil }
+	return delay
+}
+
+@(private)
+provider_retry_after_numeric :: proc(value: string, unit: time.Duration) -> (Maybe(time.Duration), bool) {
+	text := http.trim_ows(value)
+	if text == "" { return nil, false }
+	for character in text {
+		if character < '0' || character > '9' { return nil, false }
+	}
+
+	amount: i64
+	for character in text {
+		scaled, mul_overflow := intrinsics.overflow_mul(amount, 10)
+		next, add_overflow := intrinsics.overflow_add(scaled, i64(character - '0'))
+		if mul_overflow || add_overflow { return max(time.Duration), true }
+		amount = next
+	}
+	nanoseconds, mul_overflow := intrinsics.overflow_mul(amount, i64(unit))
+	if mul_overflow { return max(time.Duration), true }
+	return time.Duration(nanoseconds), true
 }

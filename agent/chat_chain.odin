@@ -79,8 +79,8 @@ Chat_Request_Chain :: struct {
 	finish_reason:       ai.Provider_Finish_Reason,
 	text_exposed:        bool,
 	completion_accepted: bool,
-	// assistant_open records that the observer was told a response is streaming. A retry
-	// after partial text continues the same response, so it opens once per chain.
+	// assistant_open records that the observer was told a response is streaming. A resend
+	// closes it, because the response it showed part of is dropped and the resend is a new one.
 	assistant_open:      bool,
 	// source is the event source of the last attempt, which its staged output commits under.
 	source:              Chat_Event_Source,
@@ -91,6 +91,8 @@ Chat_Request_Chain :: struct {
 	// repaired records that this chain has used its one context repair. It never resets,
 	// because the bound belongs to the chain rather than to the payload it sends.
 	repaired:            bool,
+	// retries counts the scheduled resends this chain made, which the policy bounds.
+	retries:             int,
 	// cache_hints_omitted records that this chain resent its request without the cache
 	// hints after a refusal, which it does once.
 	cache_hints_omitted: bool,
@@ -715,23 +717,27 @@ chat_session_observe_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_R
 @(private)
 chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
 	chain := &chat.chain
+	// A response the provider ended without a usable answer failed like a stream the
+	// provider broke off, whatever the operation reported.
+	if chain.operation_error.kind == .None && chat.response_unusable != .None {
+		chain.operation_error.kind = .Stream
+		chain.operation_error.failure_class = chat.response_unusable
+	}
 	// The send is over, so the policy answers from the facts the layers observed: what the
 	// operation reported, what this attempt exposed, and whether the turn or the store had
 	// already failed.
 	chain.decision = chat_recovery_decide(
 		chain.policy,
 		{
-			attempts = chain.attempts,
+			retries = chain.retries,
 			error = chain.operation_error,
 			failed = chat.active_failed && chain.operation_error.kind == .None,
 			repaired = chain.repaired,
 			cache_hints_sent = chat_request_cache_hints(chain.prep.request),
 			storage_failed = chat_session_storage_failed(chat),
-			text_exposed = chain.text_exposed,
 			completion_accepted = chain.completion_accepted,
 			cancelled = chat_session_cancelled(chat),
 		},
-		chat_retry_fraction(),
 	)
 	if chain.decision.action == .Stop {
 		chain.stage = .Committing
@@ -771,9 +777,15 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		chain.cache_hints_omitted = true
 		chain.recovery_kind = .Cache_Hints_Omitted
 	}
-	// Retry: the failed attempt's state is cleared now, so the turn stays cancellable while
-	// it waits and the next attempt starts from a clean runtime.
+	if chain.decision.action == .Retry { chain.retries += 1 }
+	// The failed attempt's state and everything it produced are cleared now, so the turn
+	// stays cancellable while it waits and the next attempt starts from a clean runtime. A
+	// response the front-end already showed part of is closed there: the resend is a new one.
 	chat_session_clear_attempt(chat)
+	if chain.assistant_open {
+		_observer_assistant_end(chain.observer)
+		chain.assistant_open = false
+	}
 	// The row is in the store before the front-end is told, so a front-end that reads the
 	// failure it is told about finds it.
 	_observer_retry_scheduled(
@@ -859,10 +871,12 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	// have followed never happened.
 	reason := chain.decision.reason
 	if chat_session_cancelled(chat) { reason = .Cancelled }
-	if reason == .Completed { chat.refused = .None }
-	if !chat_session_cancelled(chat) && chat.pending_notice == .None { chat_chain_notice(chat, reason) }
+	class := chain.operation_error.failure_class
+	// The request was refused without its cache hints too, so they were not the cause and
+	// later requests carry them again.
+	if reason == .Terminal_Failure && chain.cache_hints_omitted && class == .Invalid_Request { chat.cache_hints_refused = false }
 	// A response answered with a notice is feedback for the model, not the end of the turn:
-	// the turn goes on to another request whatever this chain decided about its own send.
+	// the turn goes on to another request so the model can correct what it sent.
 	turn_continues := chat.pending_notice != .None && !chat_session_cancelled(chat)
 	// A chain that stopped says why, which is the one thing the finished request row cannot
 	// say: the row reports the outcome of its own send, not the reason the harness stopped.
@@ -890,11 +904,20 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	}
 	_observer_assistant_flush(observer)
 	// Cancellation is the reason the turn ended, so it wins over any error the transport
-	// also reported.
+	// also reported. Any other stop is the user's to act on, so they are told what failed
+	// and what would fix it, in the provider's own words where it gave any.
 	if chat_session_cancelled(chat) {
 		chat_session_note_cancel(chat)
-	} else if chain.operation_error.kind != .None && chat.state != .Finalizing && !turn_continues {
-		chat_session_feed_error(chat, chain.source, chain.operation_error.detail)
+	} else if chain.operation_error.kind != .None && reason != .Output_Exposed && !turn_continues {
+		// A stop the provider caused is told in the provider's words, which the operation
+		// carries; any other stop keeps the account the harness already gave.
+		detail := chat.last_error
+		provider_stop := reason == .Terminal_Failure || reason == .Retries_Exhausted
+		if detail == "" || (provider_stop && chain.operation_error.detail != "") { detail = chain.operation_error.detail }
+		// A failure event may already have finalized the operation with the transport's own
+		// words, and then the event is refused; the user is still told the whole account.
+		message := chat_failure_message(reason, class, detail)
+		if !chat_session_feed_error(chat, chain.source, message) { chat_last_error_set(chat, message) }
 	}
 	chat_session_retire_operation(chat)
 	chat_commit_response(chat, chain.request, chain.attempts, send, usages, finish_send = !chain.settled)
@@ -904,34 +927,38 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	chat_chain_release(chat)
 }
 
-// chat_chain_notice answers a chain that stopped while the model can still be reached with a
-// notice, so the turn continues with a new request instead of ending. A refusal is answered
-// once: the same refusal again means nothing the model adds will fix it, and the turn ends.
+// chat_failure_message is what the user is told about a request the chain stopped: what
+// failed and, where only the user can fix it, what would, followed by detail, the provider's
+// or the harness's own account. The text is allocated in the temporary allocator, so detail
+// may alias memory the caller is about to release.
 @(private)
-chat_chain_notice :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) {
-	chain := &chat.chain
-	notice := Chat_Notice.None
+chat_failure_message :: proc(reason: Request_Recovery_Reason, class: ai.Provider_Failure_Class, detail: string) -> string {
+	cause := ""
 	#partial switch reason {
-	// Completed, Harness_Failure, Storage_Failed, Cancelled, Context_Exhausted, and
-	// Transient_Failure are answered elsewhere or end the turn.
-	case .Ambiguous_Delivery:
-		notice = .Response_Lost
-	case .Output_Exposed:
-		if !chain.completion_accepted { notice = .Incomplete_Response }
+	case .Retries_Exhausted:
+		cause = "the provider kept failing after every scheduled retry"
 	case .Terminal_Failure:
-		class := chain.operation_error.failure_class
-		// The request was refused without its cache hints too, so they were not the cause and
-		// later requests carry them again.
-		if chain.cache_hints_omitted && class == .Invalid_Request { chat.cache_hints_refused = false }
-		if chat_failure_model_reachable(class) && class != chat.refused {
-			notice = .Provider_Refused
-			chat.refused = class
+		switch class {
+		case .Authentication:
+			cause = "the provider refused the credentials; check the API key"
+		case .Quota:
+			cause = "the provider account has no quota or credit left"
+		case .Not_Found:
+			cause = "the provider does not serve this model; choose another model"
+		case .Content_Policy:
+			cause = "the provider refused the content under its usage policy"
+		case .Untrusted_Connection:
+			cause = "the provider's identity could not be verified"
+		case .Invalid_Request:
+			cause = "the provider refused the request as invalid"
+		case .None, .Unknown, .Rate_Limited, .Context_Overflow, .Payload_Too_Large, .Provider_Unavailable, .Incomplete_Stream, .Invalid_Output:
 		}
 	}
-	if notice == .None { return }
-	chat_notice_set(chat, notice, chain.operation_error.detail)
-	// The failure is now the model's feedback, not the turn's end.
-	delete(chat.last_error, chat.allocator)
-	chat.last_error = ""
-	chat.active_failed = false
+	switch {
+	case cause == "":
+		return fmt.tprint(detail)
+	case detail == "":
+		return cause
+	}
+	return fmt.tprintf("%s: %s", cause, detail)
 }

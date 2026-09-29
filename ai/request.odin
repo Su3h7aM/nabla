@@ -639,8 +639,13 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 			}
 		}
 	}
-	if value, present := http.headers_get_unsafe(headers, "retry-after"); present {
-		state.response_head.retry_after = provider_retry_after(value)
+	if value, present := http.headers_get_unsafe(headers, "retry-after-ms"); present {
+		state.response_head.retry_after = provider_retry_after_milliseconds(value)
+	}
+	if state.response_head.retry_after == nil {
+		if value, present := http.headers_get_unsafe(headers, "retry-after"); present {
+			state.response_head.retry_after = provider_retry_after(value)
+		}
 	}
 	state.response_head.retry_directive = provider_retry_directive(state.api, headers)
 }
@@ -857,7 +862,7 @@ provider_emit_error :: proc(state: ^Provider_Request_Stream_State, kind: Provide
 	if state.failed { return }
 	state.failed = true
 	if state.failure_event == nil { state.failure_event = kind }
-	event, event_error := openai_error_event(kind, detail, "", state.allocator)
+	event, event_error := openai_error_event(kind, detail, allocator = state.allocator)
 	if event_error != nil {
 		// The wording could not be retained. The kind still names the failure, and the
 		// terminal error carries no detail rather than a fabricated one.
@@ -908,14 +913,17 @@ provider_accept_event :: proc(state: ^Provider_Request_Stream_State, event: Prov
 		// still reaches the caller with the provider's words.
 		if !provider_rejection_present(state.rejection) {
 			code, code_error := strings.clone(value.Provider_Code, state.allocator)
+			detail_code, detail_code_error := strings.clone(value.Provider_Detail_Code, state.allocator)
 			message, message_error := strings.clone(value.Message, state.allocator)
-			if code_error == nil && message_error == nil {
+			if code_error == nil && detail_code_error == nil && message_error == nil {
 				state.rejection = Provider_Rejection {
-					code    = code,
-					message = message,
+					code        = code,
+					detail_code = detail_code,
+					message     = message,
 				}
 			} else {
 				if code_error == nil && code != "" { delete(code, state.allocator) }
+				if detail_code_error == nil && detail_code != "" { delete(detail_code, state.allocator) }
 				if message_error == nil && message != "" { delete(message, state.allocator) }
 			}
 		}
