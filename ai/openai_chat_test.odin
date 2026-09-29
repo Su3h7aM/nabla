@@ -87,3 +87,29 @@ test_chat_tool_only_assistant_omits_content :: proc(t: ^testing.T) {
 	_, tool_calls_present := assistant["tool_calls"]
 	testing.expect(t, tool_calls_present)
 }
+
+@(test)
+test_chat_encode_keeps_prompt_cache_options_ttl :: proc(t: ^testing.T) {
+	request := Provider_Request {
+		API = .OpenAI_Chat_Completions,
+		Model_Present = true,
+		Model = "gpt-5.6",
+		Messages_Present = true,
+		Messages = []Provider_Message{{Role = .User, Content = "Hi."}},
+		Prompt_Cache_Options_Present = true,
+		Prompt_Cache_Options = Prompt_Cache_Options{Mode_Present = true, Mode = .Implicit, TTL_Present = true, TTL = "30m"},
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	if !testing.expect_value(t, parse_err, nil) { return }
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { return }
+	options, options_ok := object["prompt_cache_options"].(json.Object)
+	if !testing.expect(t, options_ok) { return }
+	ttl, ttl_present, ttl_ok := openai_value_string(options, "ttl")
+	testing.expect(t, ttl_ok && ttl_present && ttl == "30m")
+	_, retention_present := object["prompt_cache_retention"]
+	testing.expect(t, !retention_present)
+}

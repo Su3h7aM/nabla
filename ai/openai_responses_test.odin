@@ -82,6 +82,10 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 	testing.expect(t, options_ok)
 	mode, mode_present, mode_value_ok := openai_value_string(options, "mode")
 	testing.expect(t, mode_value_ok && mode_present && mode == "explicit")
+	ttl, ttl_present, ttl_value_ok := openai_value_string(options, "ttl")
+	testing.expect(t, ttl_value_ok && ttl_present && ttl == "30m")
+	_, retention_present := object["prompt_cache_retention"]
+	testing.expect(t, !retention_present)
 	input, input_ok := object["input"].(json.Array)
 	testing.expect(t, input_ok && len(input) == 2)
 	first, first_ok := input[0].(json.Object)

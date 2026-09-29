@@ -131,10 +131,6 @@ openai_chat_encode_request :: proc(
 		}
 		encode_write_raw(&cursor, body, "}")
 	}
-	if request.Prompt_Cache_Retention_Present {
-		encode_write_field(&cursor, body, &first, "prompt_cache_retention")
-		encode_write_text(&cursor, body, request.Prompt_Cache_Retention)
-	}
 	if request.Reasoning_Effort_Present {
 		encode_write_field(&cursor, body, &first, "reasoning_effort")
 		encode_write_text(&cursor, body, request.Reasoning_Effort)

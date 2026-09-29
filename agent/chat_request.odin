@@ -84,10 +84,7 @@ chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connectio
 chat_request_optional_features :: proc(request: ai.Provider_Request) -> Optional_Request_Features {
 	features: Optional_Request_Features
 	if request.Adaptive_Thinking { features += {.Adaptive_Thinking} }
-	if (request.Cache_Request_Present && request.Cache_Request) ||
-	   request.Prompt_Cache_Key_Present ||
-	   request.Prompt_Cache_Options_Present ||
-	   request.Prompt_Cache_Retention_Present {
+	if (request.Cache_Request_Present && request.Cache_Request) || request.Prompt_Cache_Key_Present || request.Prompt_Cache_Options_Present {
 		features += {.Cache_Hints}
 	}
 	return features
@@ -104,7 +101,6 @@ chat_request_omit_feature :: proc(request: ^ai.Provider_Request, feature: Option
 		request.Cache_Request = false
 		request.Prompt_Cache_Key_Present = false
 		request.Prompt_Cache_Options_Present = false
-		request.Prompt_Cache_Retention_Present = false
 	}
 }
 

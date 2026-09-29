@@ -202,10 +202,6 @@ openai_responses_encode_request_body :: proc(
 		}
 		encode_write_raw(&cursor, body, "}")
 	}
-	if request.Prompt_Cache_Retention_Present {
-		encode_write_field(&cursor, body, &first, "prompt_cache_retention")
-		encode_write_text(&cursor, body, request.Prompt_Cache_Retention)
-	}
 	if request.Reasoning_Effort_Present {
 		encode_write_field(&cursor, body, &first, "reasoning")
 		encode_write_raw(&cursor, body, "{")

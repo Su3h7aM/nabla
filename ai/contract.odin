@@ -105,59 +105,57 @@ Prompt_Cache_Options :: struct {
 }
 
 Provider_Request :: struct {
-	API:                            API_Kind,
-	Model_Present:                  bool,
-	Model:                          string,
+	API:                          API_Kind,
+	Model_Present:                bool,
+	Model:                        string,
 	// Instructions is the instruction content that precedes the conversation.
 	// It is not a message: a conversation never contains an instruction turn,
 	// and the prefix a later request reuses begins with it. Responses takes it
 	// as the top-level `instructions` field; Chat Completions has no such field
 	// and takes it as a leading system message.
-	Instructions_Present:           bool,
-	Instructions:                   string, // borrowed until operation retirement,
-	Messages_Present:               bool,
-	Messages:                       []Provider_Message,
-	Tools:                          []Provider_Tool_Def, // borrowed; frozen for the whole turn,
-	Max_Output_Tokens_Present:      bool,
-	Max_Output_Tokens:              int,
+	Instructions_Present:         bool,
+	Instructions:                 string, // borrowed until operation retirement,
+	Messages_Present:             bool,
+	Messages:                     []Provider_Message,
+	Tools:                        []Provider_Tool_Def, // borrowed; frozen for the whole turn,
+	Max_Output_Tokens_Present:    bool,
+	Max_Output_Tokens:            int,
 	// Reasoning effort is a verbatim level validated against the model's
 	// configured levels, never translated. Absent means provider default.
-	Reasoning_Effort_Present:       bool,
-	Reasoning_Effort:               string, // borrowed; valid only when present,
+	Reasoning_Effort_Present:     bool,
+	Reasoning_Effort:             string, // borrowed; valid only when present,
 	// Adaptive_Thinking asks the model to decide when and how much to think. It is
 	// optional: an endpoint that refuses it serves the same request without it. Only
 	// the Anthropic Messages API has the field; the other encoders leave it out.
-	Adaptive_Thinking:              bool,
-	Prompt_Cache_Key_Present:       bool,
-	Prompt_Cache_Key:               string, // borrowed; optional routing/accounting hint,
-	Prompt_Cache_Options_Present:   bool,
-	Prompt_Cache_Options:           Prompt_Cache_Options,
-	Prompt_Cache_Retention_Present: bool,
-	Prompt_Cache_Retention:         string, // borrowed; deprecated, use options TTL,
+	Adaptive_Thinking:            bool,
+	Prompt_Cache_Key_Present:     bool,
+	Prompt_Cache_Key:             string, // borrowed; optional routing/accounting hint,
+	Prompt_Cache_Options_Present: bool,
+	Prompt_Cache_Options:         Prompt_Cache_Options,
 	// Store_Response asks the endpoint to keep or discard its own copy of the
 	// response. The harness replays history itself, so it asks the endpoint not
 	// to keep a second copy; absent leaves the endpoint default. Both OpenAI
 	// APIs accept the field.
-	Store_Response_Present:         bool,
-	Store_Response:                 bool,
+	Store_Response_Present:       bool,
+	Store_Response:               bool,
 	// Cache_Request asks the provider to keep this request's prefix for reuse by
 	// later ones. It is false for content that recurs only when the turn does,
 	// such as a summarization, so paying a cache-write premium for it cannot
 	// displace the conversation's own entries. Absent means the provider decides.
-	Cache_Request_Present:          bool,
-	Cache_Request:                  bool,
+	Cache_Request_Present:        bool,
+	Cache_Request:                bool,
 	// User_Agent and Session_Id are the identities this client reports to the
 	// endpoint. Both are opaque here: the caller supplies its own names, because
 	// what identifies a client and a conversation is the caller's business. An
 	// endpoint that routes, throttles, or traces by client needs them, and one
 	// that has no use for them is sent no header.
-	User_Agent_Present:             bool,
-	User_Agent:                     string, // borrowed until operation retirement,
-	Session_Id_Present:             bool,
-	Session_Id:                     string, // borrowed until operation retirement,
+	User_Agent_Present:           bool,
+	User_Agent:                   string, // borrowed until operation retirement,
+	Session_Id_Present:           bool,
+	Session_Id:                   string, // borrowed until operation retirement,
 	// Parent_Session_Id names the conversation that started this one, such as the
 	// orchestrator of a subagent. "" sends no header. Borrowed until operation retirement.
-	Parent_Session_Id:              string,
+	Parent_Session_Id:            string,
 }
 
 Provider_Request_Error :: enum {
@@ -174,7 +172,6 @@ Provider_Request_Error :: enum {
 	Invalid_Reasoning_Effort,
 	Invalid_Prompt_Cache_Key,
 	Invalid_Prompt_Cache_Options,
-	Invalid_Prompt_Cache_Retention,
 	// Allocation means the local request body or cache could not be built.
 	Allocation,
 }
@@ -197,9 +194,6 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 		if request.Prompt_Cache_Options.Mode_Present && request.Prompt_Cache_Options.Mode == .Invalid { return .Invalid_Prompt_Cache_Options }
 		if request.Prompt_Cache_Options.TTL_Present && request.Prompt_Cache_Options.TTL != "30m" { return .Invalid_Prompt_Cache_Options }
 	}
-	if request.Prompt_Cache_Retention_Present &&
-	   request.Prompt_Cache_Retention != "in_memory" &&
-	   request.Prompt_Cache_Retention != "24h" { return .Invalid_Prompt_Cache_Retention }
 	for message in request.Messages {
 		// A native replay message has no role of its own. Responses items stand
 		// for the message; Anthropic thinking blocks are placed before the
