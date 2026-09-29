@@ -12,12 +12,6 @@ import "core:strings"
 // and a model that asked for more than the provider allows hears it from the provider that
 // refused it, not from this package guessing the bound.
 
-// TOOL_MAX_ARGS_DEPTH bounds nesting. It is checked before parsing because the
-// JSON parser recurses once per level, so a deeply nested document would reach
-// the stack before any later check could refuse it. It is the parser's bound, not
-// a bound on what the model may say.
-TOOL_MAX_ARGS_DEPTH :: 32
-
 // TOOL_EXACT_FLOAT_INTEGER is the largest magnitude at which every integer has its own f64,
 // so a whole float within it names exactly one integer and one beyond it may not.
 TOOL_EXACT_FLOAT_INTEGER :: 1 << 53
@@ -61,7 +55,6 @@ Tool_Argument_Error_Kind :: enum {
 	Wrong_Type,
 	Invalid_Value,
 	Too_Large,
-	Too_Deep,
 	Number_Out_Of_Range,
 	Out_Of_Memory,
 }
@@ -76,7 +69,6 @@ tool_argument_error_codes := [Tool_Argument_Error_Kind]string {
 	.Wrong_Type          = "wrong_type",
 	.Invalid_Value       = "invalid_value",
 	.Too_Large           = "too_large",
-	.Too_Deep            = "too_deep",
 	.Number_Out_Of_Range = "number_out_of_range",
 	.Out_Of_Memory       = "out_of_memory",
 }
@@ -166,8 +158,6 @@ tool_argument_error_sentence :: proc(err: Tool_Argument_Defect) -> string {
 	case .Too_Large:
 		if err.expected != "" { return fmt.tprintf("field %q must be %s", err.field, err.expected) }
 		return fmt.tprintf("field %q is too large", err.field)
-	case .Too_Deep:
-		return fmt.tprintf("the arguments nest more than %d levels deep", TOOL_MAX_ARGS_DEPTH)
 	case .Number_Out_Of_Range:
 		return "the arguments hold a number that no 64-bit integer or finite float can hold"
 	case .Out_Of_Memory:
@@ -354,20 +344,19 @@ tool_arguments_admit :: proc(raw: string, allocator: mem.Allocator) -> Tool_Argu
 }
 
 // tool_json_admit reports the first defect in a JSON document of any kind: one value alone
-// in its input, no repeated field name, no nesting past the argument bound, and no number
-// the parser cannot hold. A document it admits parses to exactly what it says. A repeated
-// field name is refused rather than resolved, because the harness will not choose which of
-// two values was meant. Every defect it reports carries the position of the token at fault.
+// in its input, no repeated field name, and no number the parser cannot hold. A document it
+// admits parses to exactly what it says. A repeated field name is refused rather than
+// resolved, because the harness will not choose which of two values was meant. Every defect
+// it reports carries the position of the token at fault.
 //
 // Admission walks the tokenizer instead of calling the parser because the parser accepts
-// trailing input, keeps one of two repeated fields, recurses before any depth check, and
-// leaks on some malformed documents.
+// trailing input, keeps one of two repeated fields, and leaks on some malformed documents.
 @(require_results)
 tool_json_admit :: proc(text: string, allocator: mem.Allocator) -> Tool_Argument_Error {
 	tokenizer := json.make_tokenizer(text, .JSON, true)
 	token, token_err := json.get_token(&tokenizer)
 	if tool_token_bad(token, token_err) { return tool_document_error(.Syntax, tokenizer.data, token) }
-	if value_error := tool_admit_value(&tokenizer, token, 1, allocator); value_error != nil { return value_error }
+	if value_error := tool_admit_value(&tokenizer, token, allocator); value_error != nil { return value_error }
 
 	token, token_err = json.get_token(&tokenizer)
 	if (token_err != nil && token_err != .EOF) || token.kind != .EOF { return tool_document_error(.Syntax, tokenizer.data, token) }
@@ -392,7 +381,7 @@ tool_token_bad :: proc(token: json.Token, err: json.Error) -> bool {
 }
 
 @(private, require_results)
-tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
+tool_admit_object :: proc(tokenizer: ^json.Tokenizer, allocator: mem.Allocator) -> Tool_Argument_Error {
 	seen := make(map[string]bool, context.temp_allocator)
 	defer delete(seen)
 
@@ -421,7 +410,7 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 		if tool_token_bad(colon, colon_err) || colon.kind != .Colon { return tool_document_error(.Syntax, tokenizer.data, colon) }
 		value, value_err := json.get_token(tokenizer)
 		if tool_token_bad(value, value_err) { return tool_document_error(.Syntax, tokenizer.data, value) }
-		if value_error := tool_admit_value(tokenizer, value, depth + 1, allocator); value_error != nil { return value_error }
+		if value_error := tool_admit_value(tokenizer, value, allocator); value_error != nil { return value_error }
 
 		separator, separator_err := json.get_token(tokenizer)
 		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
@@ -435,7 +424,7 @@ tool_admit_object :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem
 }
 
 @(private, require_results)
-tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
+tool_admit_array :: proc(tokenizer: ^json.Tokenizer, allocator: mem.Allocator) -> Tool_Argument_Error {
 	comma := false
 	for {
 		token, token_err := json.get_token(tokenizer)
@@ -444,7 +433,7 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 			if comma { return tool_document_error(.Syntax, tokenizer.data, token) }
 			return nil
 		}
-		if value_error := tool_admit_value(tokenizer, token, depth + 1, allocator); value_error != nil { return value_error }
+		if value_error := tool_admit_value(tokenizer, token, allocator); value_error != nil { return value_error }
 
 		separator, separator_err := json.get_token(tokenizer)
 		if tool_token_bad(separator, separator_err) { return tool_document_error(.Syntax, tokenizer.data, separator) }
@@ -464,12 +453,11 @@ tool_admit_array :: proc(tokenizer: ^json.Tokenizer, depth: int, allocator: mem.
 // integer past the 64-bit range and reads an enormous float as infinity, and either would
 // run the call with a number the model never sent.
 @(private, require_results)
-tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, depth: int, allocator: mem.Allocator) -> Tool_Argument_Error {
+tool_admit_value :: proc(tokenizer: ^json.Tokenizer, token: json.Token, allocator: mem.Allocator) -> Tool_Argument_Error {
 	#partial switch token.kind {
 	case .Open_Brace, .Open_Bracket:
-		if depth > TOOL_MAX_ARGS_DEPTH { return tool_document_error(.Too_Deep, tokenizer.data, token) }
-		if token.kind == .Open_Brace { return tool_admit_object(tokenizer, depth, allocator) }
-		return tool_admit_array(tokenizer, depth, allocator)
+		if token.kind == .Open_Brace { return tool_admit_object(tokenizer, allocator) }
+		return tool_admit_array(tokenizer, allocator)
 	case .Integer:
 		if _, fits := tool_decimal_integer(token.text); !fits { return tool_document_error(.Number_Out_Of_Range, tokenizer.data, token) }
 		return nil

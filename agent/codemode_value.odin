@@ -25,6 +25,9 @@ Codemode_Notation :: enum {
 	JSON,
 }
 
+// CODEMODE_MAX_VALUE_DEPTH is the maximum nesting accepted while converting Lua and JSON values.
+CODEMODE_MAX_VALUE_DEPTH :: 32
+
 // Codemode_Path_Step is one step the walk took: the field name it entered, or the array
 // position when index is positive.
 @(private)
@@ -43,8 +46,8 @@ Codemode_Walk :: struct {
 	state:         ^lua.State,
 	notation:      Codemode_Notation,
 	builder:       strings.Builder,
-	inside:        [TOOL_MAX_ARGS_DEPTH + 1]rawptr,
-	path:          [TOOL_MAX_ARGS_DEPTH + 1]Codemode_Path_Step,
+	inside:        [CODEMODE_MAX_VALUE_DEPTH + 1]rawptr,
+	path:          [CODEMODE_MAX_VALUE_DEPTH + 1]Codemode_Path_Step,
 	path_count:    int,
 	failure_count: int,
 	subject:       string,
@@ -55,7 +58,7 @@ Codemode_Walk :: struct {
 // codemode_lua_convert writes the value at index in notation. The text, or the message that
 // says what was refused and where, is owned by allocator; out_of_memory says the refusal
 // was a lack of memory rather than the value. A value of any size converts; a table nested
-// more than TOOL_MAX_ARGS_DEPTH deep, a cycle, and a value that is not data are refused.
+// more than CODEMODE_MAX_VALUE_DEPTH deep, a cycle, and a value that is not data are refused.
 @(require_results)
 codemode_lua_convert :: proc(
 	run: ^Lua_Run,
@@ -283,8 +286,8 @@ codemode_walk_quoted :: proc(walk: ^Codemode_Walk, text: string) -> bool {
 @(private, require_results)
 codemode_walk_table :: proc(walk: ^Codemode_Walk, table: c.int, depth: int) -> bool {
 	state := walk.state
-	// The problem is kept past this frame, so it is static text; the bound it names is TOOL_MAX_ARGS_DEPTH.
-	if depth > TOOL_MAX_ARGS_DEPTH { return codemode_walk_fail(walk, "table", "nests more than 32 levels deep") }
+	// The problem is kept past this frame, so it is static text; the bound it names is CODEMODE_MAX_VALUE_DEPTH.
+	if depth > CODEMODE_MAX_VALUE_DEPTH { return codemode_walk_fail(walk, "table", "nests more than 32 levels deep") }
 	identity := lua.topointer(state, table)
 	if slice.contains(walk.inside[:depth], identity) { return codemode_walk_fail(walk, "table", "contains itself") }
 	walk.inside[depth] = identity
@@ -465,7 +468,7 @@ codemode_lua_json_decode :: proc "c" (state: ^lua.State) -> c.int {
 	value, parse_error := json.parse_string(text, .JSON, true, context.temp_allocator)
 	if parse_error != nil { return codemode_lua_raise(state, "json.decode refused the text: it is not valid JSON", temp) }
 	if !codemode_json_push(run, state, value, 0) {
-		return codemode_lua_raise(state, fmt.tprintf("json.decode refused a document nested more than %d levels deep", TOOL_MAX_ARGS_DEPTH), temp)
+		return codemode_lua_raise(state, fmt.tprintf("json.decode refused a document nested more than %d levels deep", CODEMODE_MAX_VALUE_DEPTH), temp)
 	}
 	virtual.arena_temp_end(temp)
 	return 1
@@ -477,8 +480,6 @@ codemode_json_defect_text :: proc(defect: Tool_Argument_Defect) -> string {
 	#partial switch defect.kind {
 	case .Duplicate_Field:
 		return fmt.tprintf("field %q appears twice in one object", defect.field)
-	case .Too_Deep:
-		return fmt.tprintf("it nests more than %d levels deep", TOOL_MAX_ARGS_DEPTH)
 	case .Number_Out_Of_Range:
 		return "it holds a number that no 64-bit integer or finite float can hold"
 	}
@@ -489,7 +490,7 @@ codemode_json_defect_text :: proc(defect: Tool_Argument_Defect) -> string {
 // becomes json.null. It reports false, with nothing pushed, for a document nested too deeply.
 @(private, require_results)
 codemode_json_push :: proc(run: ^Lua_Run, state: ^lua.State, value: json.Value, depth: int) -> bool {
-	if depth > TOOL_MAX_ARGS_DEPTH { return false }
+	if depth > CODEMODE_MAX_VALUE_DEPTH { return false }
 	switch item in value {
 	case json.Null:
 		lua.pushlightuserdata(state, run)

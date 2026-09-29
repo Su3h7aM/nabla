@@ -314,8 +314,6 @@ tool_schema_valid :: proc(schema: string) -> string {
 	#partial switch defect.kind {
 	case .Not_Object:
 		return "the schema root must be a JSON object"
-	case .Too_Deep:
-		return "the schema nests too deeply"
 	case .Duplicate_Field:
 		return "the schema repeats a field name"
 	case .Number_Out_Of_Range:
