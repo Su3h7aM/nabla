@@ -216,8 +216,9 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 
 | Thread or process | Count | Blocks in (idle) | Owns |
 | --- | --- | --- | --- |
-| main (TUI, headless, or ACP writer) | 1 | `ppoll(tty or stdin, view eventfd)` | terminal or protocol stream, frontend state |
+| main (TUI, headless, or ACP) | 1 | `ppoll(tty or stdin, view eventfd)` | terminal or protocol stream, frontend state |
 | ACP reader | 1 in `nabla acp` | `read(stdin)` | frame decoding |
+| ACP writer | 1 per `acp.Writer` | `write(stdout)`, or its queue's condition when idle | the output stream |
 | owner | 1 per live session | `futex_wait(wake.seq)` | `Session_State`, journal writes for the session |
 | config watcher | 1 | `ppoll(inotify fd, shutdown eventfd)` | snapshot construction |
 | catalog refresh | 0 or 1, on demand, exits when done | network I/O | provider listing and models.dev fetch |
@@ -992,6 +993,7 @@ The `agent_spawn` description lists the configured names and descriptions, so th
 - TUI colors: Nabla has no theme. The terminal's theme is Nabla's theme, so a user who changes the terminal theme recolors Nabla with no Nabla setting. A theme reliably defines the default foreground and background and the 16 ANSI palette entries (0 to 7 normal, 8 to 15 bright); entries 16 to 255 are a fixed xterm cube and grayscale in most themes, and truecolor bypasses the theme entirely. The TUI therefore draws with the default colors, ANSI indices 1 to 6 for semantic accents (each meaning one fixed index, such as red for failure and cyan for code), and the attributes bold, dim, italic, underline, reverse, and strikethrough. It never emits RGB colors or indices above 15, and it avoids 0, 7, and 15 as foregrounds because their contrast against an unknown background is unknown. It does not query the terminal's colors (OSC 4, 10, 11), because replies add latency, support varies, and multiplexers can block them.
 - Headless (`nabla --prompt`): the main thread consumes view events, writes the final answer to stdout and everything else to stderr.
 - ACP server (`nabla acp`): the reader thread decodes frames into commands; the main thread turns view events into `session/update` frames. One owner per open ACP session, up to `ACP_MAX_SESSIONS`. `session/fork` maps to `Fork`, permission requests to `session/request_permission`, and `_nabla/rate` and `_nabla/branches` are extension methods. `acp` also implements the client role used by subagents.
+- ACP output: a sender encodes a whole frame and queues it under a lock that never spans the write; one writer thread writes the queue in order. The queue has no bound, since a harness limit would drop protocol frames. An update that reports a durable outcome (a message, a finished tool call) is queued only after the journal commit that records it, so the stream is a view of the journal: a client that stops reading loses nothing that `session/load` cannot replay. Shutdown drains the queue within `SHUTDOWN_JOIN_PATIENCE`; a writer still blocked in a write is abandoned and keeps what it can reach.
 
 ## 23. Context, capacity, compaction
 
