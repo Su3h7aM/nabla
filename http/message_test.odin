@@ -36,6 +36,29 @@ test_method_round_trips :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_repeated_set_cookie_fields_remain_separate :: proc(t: ^testing.T) {
+	headers: Headers
+	headers_init(&headers, context.temp_allocator)
+	defer headers_destroy(&headers)
+
+	_, first_ok := header_parse(&headers, "Set-Cookie: first=one; Expires=Wed, 21 Oct 2015 07:28:00 GMT")
+	testing.expect(t, first_ok)
+	_, second_ok := header_parse(&headers, "Set-Cookie: second=two; Expires=Thu, 22 Oct 2015 07:28:00 GMT")
+	testing.expect(t, second_ok)
+
+	values, found, values_err := headers_get_all(headers, "Set-Cookie", context.temp_allocator)
+	if testing.expect(t, values_err == nil && found && len(values) == 2) {
+		testing.expect_value(t, values[0], "first=one; Expires=Wed, 21 Oct 2015 07:28:00 GMT")
+		testing.expect_value(t, values[1], "second=two; Expires=Thu, 22 Oct 2015 07:28:00 GMT")
+	}
+
+	first, first_found, first_err := headers_get(headers, "Set-Cookie")
+	if testing.expect(t, first_err == nil && first_found) {
+		testing.expect_value(t, first, "first=one; Expires=Wed, 21 Oct 2015 07:28:00 GMT")
+	}
+}
+
+@(test)
 test_header_field_lines :: proc(t: ^testing.T) {
 	// RFC 9112 5.1 excludes only SP and HTAB from the field value, so another
 	// byte survives, except CR, LF, and NUL, which RFC 9110 5.5 lets a recipient

@@ -285,6 +285,11 @@ _response_write_heading :: proc(response: ^Response, content_length: int) {
 		_ = write_escaped_newlines(stream, value)
 		write_string(body_buffer, "\r\n")
 	}
+	for value in response.headers._set_cookie_values {
+		write_string(body_buffer, "set-cookie: ")
+		_ = write_escaped_newlines(stream, value)
+		write_string(body_buffer, "\r\n")
+	}
 
 	for cookie in response.cookies {
 		_ = cookie_write(stream, cookie)

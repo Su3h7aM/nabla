@@ -339,9 +339,9 @@ method_parse :: proc(text: string) -> (method: Method, ok: bool) {
 // The field name must be a token (RFC 9110 5.1). A CR, LF, or NUL in the value
 // is replaced with SP, as RFC 9110 5.5 lets a recipient do instead of rejecting
 // the message. A repeated field is combined into one comma-separated value
-// (RFC 9110 5.3), except Host, which may appear once (RFC 9112 3.2), and
-// Content-Length: RFC 9112 6.3 makes differing repeats an unrecoverable error,
-// and identical repeats stand for the first value.
+// (RFC 9110 5.3), except Set-Cookie (RFC 6265 3), Host, which may appear once
+// (RFC 9112 3.2), and Content-Length: RFC 9112 6.3 makes differing repeats an
+// unrecoverable error, and identical repeats stand for the first value.
 @(require_results)
 header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool) {
 	colon := strings.index_byte(line, ':')
@@ -380,6 +380,15 @@ header_parse :: proc(headers: ^Headers, line: string) -> (key: string, ok: bool)
 	if key_ptr^ == "content-length" {
 		return key_ptr^, content_length_values_equal(value_ptr^, value)
 	}
+	if key_ptr^ == "set-cookie" {
+		cloned, clone_err := field_value_clone(value, allocator)
+		if clone_err != nil { return "", false }
+		if _, append_err := append(&headers._set_cookie_values, cloned); append_err != nil {
+			delete(cloned, allocator)
+			return "", false
+		}
+		return key_ptr^, true
+	}
 	combined, concat_err := strings.concatenate({value_ptr^, ", ", value}, allocator)
 	if concat_err != nil { return }
 	field_value_sanitize(combined)
@@ -400,7 +409,11 @@ header_fold :: proc(headers: ^Headers, key, line: string) -> bool {
 	value := trim_ows(line)
 	if value == "" { return true }
 	previous, found := &headers._kv[key]
-	if !found { return false }
+	if key == "set-cookie" && len(headers._set_cookie_values) > 0 {
+		previous = &headers._set_cookie_values[len(headers._set_cookie_values) - 1]
+	} else if !found {
+		return false
+	}
 	allocator := headers._kv.allocator
 	continued, concat_err := strings.concatenate({previous^, " ", value}, allocator)
 	if concat_err != nil { return false }

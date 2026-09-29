@@ -22,8 +22,9 @@
 //
 // # Lifetime
 //
-// headers_init sets the allocator that owns a section's map and every name and value
-// header_parse copies into it; headers_destroy releases a section filled that way.
+// headers_init sets the allocator that owns a section's map and every name, value,
+// and additional Set-Cookie value header_parse copies into it; headers_destroy
+// releases them.
 // headers_set lowercases the name with that allocator and borrows the value it
 // stores. The server's request_init and response_init take the connection's arena and
 // are released with it. A body of unknown length is framed by response_writer_init
