@@ -402,6 +402,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 			input_tokens = 200,
 			output_tokens = 30,
 			cache_read_tokens = 150,
+			cost = 0.25,
 		},
 	)
 
@@ -549,6 +550,10 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	testing.expect_value(test, totals.cache_write, 5)
 	testing.expect_value(test, totals.paired_input, 300)
 	testing.expect_value(test, totals.paired_read, 190)
+	// Only the second response was priced, so the total is its cost alone and the
+	// priced count says the total covers one of the two.
+	testing.expect_value(test, totals.cost, 0.25)
+	testing.expect_value(test, totals.priced_requests, 1)
 	rate, rate_measured := cache_hit_rate(totals)
 	testing.expect(test, rate_measured, "the paired requests report a hit rate")
 	testing.expectf(test, math.abs(rate - 190.0 / 300.0) < 1e-9, "expected a hit rate of 190/300, got %v", rate)

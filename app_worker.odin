@@ -447,6 +447,8 @@ refresh_status :: proc(app: ^App) {
 		status.session_cache_present = false
 		status.session_hit_measured = false
 		status.session_hit_partial = false
+		status.cost_present = false
+		status.cost_partial = false
 	} else {
 		if totals.requests > 0 {
 			status.session_input = totals.input
@@ -460,6 +462,9 @@ refresh_status :: proc(app: ^App) {
 		} else {
 			status.session_cache_present = false
 		}
+		status.cost = totals.cost
+		status.cost_present = totals.priced_requests > 0
+		status.cost_partial = totals.priced_requests < totals.requests
 		rate, measured := journal.cache_hit_rate(totals)
 		status.session_hit_rate = rate
 		status.session_hit_measured = measured
@@ -787,9 +792,9 @@ observer_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usa
 		status.last_input = usage.Input_Tokens
 		status.last_input_present = true
 	}
-	// Cost accumulation lands here once the catalog carries pricing. Session
-	// totals are recomputed at work boundaries, not per stream event, so this
-	// only records the latest request's size for the footer beside them.
+	// Session totals, the priced cost among them, are recomputed at work
+	// boundaries, not per stream event, so this only records the latest request's
+	// size for the footer beside them.
 	_ = operation
 	app.run.snap.generation += 1
 }

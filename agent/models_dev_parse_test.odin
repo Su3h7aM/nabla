@@ -28,7 +28,7 @@ MODELS_DEV_FIXTURE :: `{
         ],
         "tool_call": true,
         "attachment": true,
-        "cost": {"input": 1.0, "output": 2.0},
+        "cost": {"input": 1.0, "output": 2.0, "cache_read": 0.1},
         "modalities": {"input": ["text", "image"], "output": ["text"]},
         "limit": {"context": 200000, "output": 64000}
       },
@@ -139,6 +139,13 @@ test_models_dev_parse_reads_providers_and_models :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(thinker.output_modalities), 1)
 	testing.expect_value(t, thinker.output_modalities[0], "text")
 
+	// Prices are floats and merge price by price.
+	testing.expect_value(t, thinker.cost.input, 1.0)
+	testing.expect_value(t, thinker.cost.output, 2.0)
+	testing.expect(t, thinker.cost.cache_read_present)
+	testing.expect_value(t, thinker.cost.cache_read, 0.1)
+	testing.expect(t, !thinker.cost.cache_write_present)
+
 	// Reasoning support and each control form it advertises.
 	testing.expect(t, thinker.thinking.present && thinker.thinking.supported)
 	testing.expect(t, thinker.thinking.toggle_present && thinker.thinking.toggle)
@@ -178,6 +185,11 @@ test_models_dev_parse_distinguishes_explicit_values_from_absent :: proc(t: ^test
 	plain := models_dev_fixture_model(t, acme, "acme/plain")
 	testing.expect(t, plain.tools_present)
 	testing.expect(t, !plain.tools)
+	// A model that states no cost leaves every price absent.
+	testing.expect(t, !plain.cost.input_present)
+	testing.expect(t, !plain.cost.output_present)
+	testing.expect(t, !plain.cost.cache_read_present)
+	testing.expect(t, !plain.cost.cache_write_present)
 
 	zeroed := models_dev_fixture_model(t, acme, "acme/zeroed")
 	testing.expect(t, zeroed.context_window_present)

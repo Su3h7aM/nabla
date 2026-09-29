@@ -4,6 +4,7 @@ package main
 
 import "core:fmt"
 import "core:io"
+import "core:math"
 import "core:mem"
 import "core:mem/virtual"
 import "core:net"
@@ -1026,6 +1027,18 @@ test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T
 	app.setup.session.provider_id = strings.clone("anthropic", app.setup.session.allocator)
 	app.setup.session.model_id = strings.clone("claude-sonnet-5", app.setup.session.allocator)
 	app_session_capacity(&app, 200_000, 1024)
+	// The price a resolved selection would carry, so the turn prices the usage it
+	// commits from the session's own copy.
+	app.setup.session.cost = agent.Catalog_Cost {
+		input_present       = true,
+		input               = 3,
+		output_present      = true,
+		output              = 15,
+		cache_read_present  = true,
+		cache_read          = 0.3,
+		cache_write_present = true,
+		cache_write         = 3.75,
+	}
 	app.run.connection = ai.Provider_Connection {
 		API        = .Anthropic_Messages,
 		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),
@@ -1062,6 +1075,11 @@ test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T
 	testing.expect_value(t, totals.requests, 1)
 	testing.expect_value(t, totals.input, i64(1050))
 	testing.expect_value(t, totals.cache_read, i64(900))
+	testing.expect_value(t, totals.priced_requests, 1)
+	// The input total is 100 uncached, 900 read, and 50 written tokens, and the
+	// response reported 3 output tokens: 100*3 + 900*0.3 + 50*3.75 + 3*15 dollars
+	// per million tokens.
+	testing.expectf(t, math.abs(totals.cost - 0.0008025) < 1e-12, "expected $0.0008025, got %v", totals.cost)
 }
 
 ANTHROPIC_COMPLETION_RESPONSE ::

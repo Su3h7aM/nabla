@@ -27,6 +27,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 					input_modalities = {"text"},
 					output_modalities = {"text"},
 					thinking = {supported = true, toggle = true, levels = {"low", "high"}},
+					cost = {input = 3, output = 15, cache_read = 0.3, cache_write = 3.75},
 				},
 				mini = {thinking = false, tools = false},
 				old = {disabled = true},
@@ -75,6 +76,12 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(chat^.thinking.levels), 2)
 	testing.expect_value(t, chat^.thinking.levels[0], "low")
 	testing.expect_value(t, chat^.thinking.levels[1], "high")
+	testing.expect_value(t, chat^.cost.input, 3.0)
+	testing.expect_value(t, chat^.cost.output, 15.0)
+	testing.expect(t, chat^.cost.cache_read_present)
+	testing.expect_value(t, chat^.cost.cache_read, 0.3)
+	testing.expect(t, chat^.cost.cache_write_present)
+	testing.expect_value(t, chat^.cost.cache_write, 3.75)
 	testing.expect(t, mini^.thinking.present && mini^.thinking.blocked)
 	testing.expect(t, old^.disabled_present && old^.disabled)
 
@@ -151,6 +158,7 @@ test_config_resolve_credential_reads_env_and_keeps_a_literal :: proc(t: ^testing
 @(test)
 test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 	cases := []string {
+		`return { providers = { acme = { models = { chat = { cost = { input = -1 } } } } } }`,
 		`return { providers = { acme = { models = { chat = { display_name = 42 } } } } }`,
 		`return { providers = { acme = { api_key = 42 } } }`,
 		`return { providers = { acme = { transport = "udp" } } }`,

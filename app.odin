@@ -74,6 +74,9 @@ Status :: struct {
 	last_input_present:    bool,
 	cost:                  f64,
 	cost_present:          bool,
+	// cost_partial says the total prices only part of the session's responses,
+	// because some committed responses named a model the catalog has no price for.
+	cost_partial:          bool,
 	session_input:         i64,
 	session_input_present: bool,
 	session_cache_read:    i64,

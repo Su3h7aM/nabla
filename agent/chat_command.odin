@@ -94,6 +94,18 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 			rate_text,
 		),
 	)
+
+	// A session whose responses were never priced says so rather than showing a
+	// total that silently ignores them, and one priced only in part names how many
+	// responses the total covers.
+	cost := "unknown: the model has no price in the catalog"
+	if totals.priced_requests > 0 {
+		cost = fmt.tprintf("$%.4f", totals.cost)
+		if totals.priced_requests < totals.requests {
+			cost = fmt.tprintf("%s over %d of %d responses", cost, totals.priced_requests, totals.requests)
+		}
+	}
+	chat_status_line(observer, "cost", cost)
 }
 
 @(private)

@@ -16,6 +16,7 @@ Model_Selection :: struct {
 	connection:    ai.Provider_Connection, // Endpoint and Credential owned
 	transport:     Provider_Transport,
 	capacity:      Model_Capacity,
+	cost:          Catalog_Cost,
 	tools:         bool,
 	effort_levels: []string, // lowest first, verbatim from the catalog
 }
@@ -80,6 +81,7 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 	}
 	built.transport = provider.transport
 	built.capacity = model.capacity
+	built.cost = model.cost
 	built.tools = model.tools_present && model.tools && chat_supports_tools(api)
 	clone_error: mem.Allocator_Error
 	built.provider_id, clone_error = strings.clone(provider_id, allocator)
@@ -204,6 +206,7 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 		}
 	}
 	chat.capacity = selection.capacity
+	chat.cost = selection.cost
 	chat.tools_enabled = selection.tools
 	chat.provider_transport = selection.transport
 	chat.websocket_fallback_http = false

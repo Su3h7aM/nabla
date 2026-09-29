@@ -271,6 +271,9 @@ Response_Committed :: struct {
 	output_tokens:      Maybe(i64),
 	cache_read_tokens:  Maybe(i64),
 	cache_write_tokens: Maybe(i64),
+	// cost is the response's price in US dollars, absent when the answering model
+	// has no price in the catalog.
+	cost:               Maybe(f64),
 }
 
 // Tool_Proposed carries the arguments exactly as the model sent them in the body.

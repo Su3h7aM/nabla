@@ -115,10 +115,16 @@ chat_send_rejection :: proc(result: Chat_Send_Result) -> journal.Response_Reject
 }
 
 // chat_send_usage is the usage the running send reported, as the response.committed
-// payload carries it. The send is the operation that performed it.
+// payload carries it, priced with the session's model when the catalog can price
+// it. The send is the operation that performed it.
 @(private)
 chat_send_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) -> journal.Response_Committed {
-	return chat_request_usage(usages, u64(chat.operation.id))
+	committed := chat_request_usage(usages, u64(chat.operation.id))
+	if dollars, ok := catalog_cost_of(chat.cost, committed.input_tokens, committed.output_tokens, committed.cache_read_tokens, committed.cache_write_tokens);
+	   ok {
+		committed.cost = dollars
+	}
+	return committed
 }
 
 // chat_request_usage totals one operation's usage. The provider's last word wins,

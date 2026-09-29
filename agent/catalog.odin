@@ -39,6 +39,41 @@ Catalog_Thinking_Source :: struct {
 	budget:            Catalog_Thinking_Budget,
 }
 
+// Catalog_Cost is a model's price in US dollars per million tokens. Each price has its own
+// presence and merges on its own, so a source that states only input and output still
+// leaves the cache prices open to enrichment.
+Catalog_Cost :: struct {
+	input_present:       bool,
+	input:               f64,
+	output_present:      bool,
+	output:              f64,
+	cache_read_present:  bool,
+	cache_read:          f64,
+	cache_write_present: bool,
+	cache_write:         f64,
+}
+
+CATALOG_COST_TOKENS_PER_UNIT :: 1_000_000
+
+// catalog_cost_of prices one response's usage. input counts every input token, cache reads
+// and cache writes included, which is how every API family's usage is normalized. A cache
+// price the model does not state is charged at its input price. It reports false when the
+// input or output price, or the input or output count, is missing, because any total built
+// without them would understate the cost.
+@(require_results)
+catalog_cost_of :: proc(cost: Catalog_Cost, input, output, cache_read, cache_write: Maybe(i64)) -> (dollars: f64, ok: bool) {
+	if !cost.input_present || !cost.output_present { return 0, false }
+	input_tokens := input.? or_return
+	output_tokens := output.? or_return
+	read := cache_read.? or_else 0
+	written := cache_write.? or_else 0
+	uncached := max(input_tokens - read - written, 0)
+	read_price := cost.cache_read if cost.cache_read_present else cost.input
+	write_price := cost.cache_write if cost.cache_write_present else cost.input
+	dollars = f64(uncached) * cost.input + f64(read) * read_price + f64(written) * write_price + f64(output_tokens) * cost.output
+	return dollars / CATALOG_COST_TOKENS_PER_UNIT, true
+}
+
 Catalog_Model_Source :: struct {
 	id:                        string,
 	disabled_present:          bool,
@@ -59,6 +94,7 @@ Catalog_Model_Source :: struct {
 	tools_present:             bool,
 	tools:                     bool,
 	thinking:                  Catalog_Thinking_Source,
+	cost:                      Catalog_Cost,
 }
 
 Provider_Transport :: enum {
@@ -122,6 +158,7 @@ Catalog_Model :: struct {
 	tools:                     bool,
 	tools_present:             bool,
 	thinking:                  Catalog_Thinking_Source,
+	cost:                      Catalog_Cost,
 }
 
 Catalog_Provider :: struct {
@@ -201,7 +238,11 @@ catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 		model.input_modalities_present ||
 		model.output_modalities_present ||
 		model.tools_present ||
-		model.thinking.present \
+		model.thinking.present ||
+		model.cost.input_present ||
+		model.cost.output_present ||
+		model.cost.cache_read_present ||
+		model.cost.cache_write_present \
 	)
 }
 
@@ -280,6 +321,28 @@ catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Think
 	return .None
 }
 
+// catalog_apply_cost enriches a cost record field by field. Each price merges on
+// its own, so a source that states only input and output still leaves the cache
+// prices open to a later source.
+catalog_apply_cost :: proc(dst: ^Catalog_Cost, src: Catalog_Cost) {
+	if !dst.input_present && src.input_present {
+		dst.input_present = true
+		dst.input = src.input
+	}
+	if !dst.output_present && src.output_present {
+		dst.output_present = true
+		dst.output = src.output
+	}
+	if !dst.cache_read_present && src.cache_read_present {
+		dst.cache_read_present = true
+		dst.cache_read = src.cache_read
+	}
+	if !dst.cache_write_present && src.cache_write_present {
+		dst.cache_write_present = true
+		dst.cache_write = src.cache_write
+	}
+}
+
 @(require_results)
 catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allocator: mem.Allocator) -> Catalog_Error {
 	if !dst.api_present && src.api_present {
@@ -319,6 +382,7 @@ catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allo
 		dst.tools = src.tools
 	}
 	catalog_apply_thinking(&dst.thinking, src.thinking, allocator) or_return
+	catalog_apply_cost(&dst.cost, src.cost)
 	return .None
 }
 

@@ -1,6 +1,7 @@
 package agent
 
 import c "core:c/libc"
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -76,6 +77,16 @@ lua_int :: proc(state: ^lua.State, idx: c.int) -> (int, bool) {
 	value := lua.tointeger(state, idx, &ok)
 	if !ok || value < 0 || value > lua.Integer(1 << 30) { return 0, false }
 	return int(value), true
+}
+
+// lua_number reads a number that must be a finite, non-negative price. A price is
+// a real value rather than a count, so it may be fractional.
+@(require_results)
+lua_number :: proc(state: ^lua.State, idx: c.int) -> (f64, bool) {
+	if lua.type(state, idx) != .NUMBER { return 0, false }
+	value := f64(lua.tonumber(state, idx))
+	if value < 0 || math.is_nan(value) || math.is_inf(value) { return 0, false }
+	return value, true
 }
 
 // lua_field pushes the named field, or nil when the value at idx is not a table.
@@ -264,6 +275,44 @@ load_model :: proc(state: ^lua.State, raw_idx: c.int, provider_id, model_id: str
 		} else {
 			return .Invalid
 		}
+	}
+	lua.settop(state, base)
+	lua_field(state, idx, "cost")
+	if lua.type(state, -1) != .NIL {
+		if !lua_plain_table(state, -1) { return .Invalid }
+		cost_base := lua.gettop(state)
+		lua_field(state, -1, "input")
+		if lua.type(state, -1) != .NIL {
+			value, ok := lua_number(state, -1)
+			if !ok { return .Invalid }
+			out^.cost.input = value
+			out^.cost.input_present = true
+		}
+		lua.settop(state, cost_base)
+		lua_field(state, -1, "output")
+		if lua.type(state, -1) != .NIL {
+			value, ok := lua_number(state, -1)
+			if !ok { return .Invalid }
+			out^.cost.output = value
+			out^.cost.output_present = true
+		}
+		lua.settop(state, cost_base)
+		lua_field(state, -1, "cache_read")
+		if lua.type(state, -1) != .NIL {
+			value, ok := lua_number(state, -1)
+			if !ok { return .Invalid }
+			out^.cost.cache_read = value
+			out^.cost.cache_read_present = true
+		}
+		lua.settop(state, cost_base)
+		lua_field(state, -1, "cache_write")
+		if lua.type(state, -1) != .NIL {
+			value, ok := lua_number(state, -1)
+			if !ok { return .Invalid }
+			out^.cost.cache_write = value
+			out^.cost.cache_write_present = true
+		}
+		lua.settop(state, cost_base)
 	}
 	failed = false
 	return .None

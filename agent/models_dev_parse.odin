@@ -1,6 +1,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:math"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -214,6 +215,26 @@ models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, o
 		out.tools_present = true
 		out.tools = tools
 	}
+	if cost_value, has_cost := object["cost"]; has_cost {
+		if cost, cost_is_object := cost_value.(json.Object); cost_is_object {
+			if input, input_present := models_dev_member_price(cost, "input"); input_present {
+				out.cost.input_present = true
+				out.cost.input = input
+			}
+			if output, output_present := models_dev_member_price(cost, "output"); output_present {
+				out.cost.output_present = true
+				out.cost.output = output
+			}
+			if cache_read, cache_read_present := models_dev_member_price(cost, "cache_read"); cache_read_present {
+				out.cost.cache_read_present = true
+				out.cost.cache_read = cache_read
+			}
+			if cache_write, cache_write_present := models_dev_member_price(cost, "cache_write"); cache_write_present {
+				out.cost.cache_write_present = true
+				out.cost.cache_write = cache_write
+			}
+		}
+	}
 	models_dev_thinking(object, allocator, &out.thinking) or_return
 	failed = false
 	return nil
@@ -325,6 +346,25 @@ models_dev_member_bool :: proc(object: json.Object, key: string) -> (value: bool
 	flag, is_bool := member.(json.Boolean)
 	if !is_bool { return false, false }
 	return bool(flag), true
+}
+
+// models_dev_member_price reads a member that must be a non-negative, finite price.
+// A price may be stated as an integer or a float, because the tokenizer reads a
+// trailing `.0` as a float. Anything else is absent rather than an error.
+@(require_results)
+models_dev_member_price :: proc(object: json.Object, key: string) -> (value: f64, present: bool) {
+	member, found := object[key]
+	if !found { return 0, false }
+	if integer, is_integer := member.(json.Integer); is_integer {
+		if integer < 0 { return 0, false }
+		return f64(integer), true
+	}
+	if number, is_number := member.(json.Float); is_number {
+		price := f64(number)
+		if price < 0 || math.is_nan(price) || math.is_inf(price) { return 0, false }
+		return price, true
+	}
+	return 0, false
 }
 
 // models_dev_member_integer reads a member that must be a non-negative integer. A

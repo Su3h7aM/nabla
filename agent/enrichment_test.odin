@@ -123,6 +123,45 @@ test_enrichment_later_sources_fill_only_what_is_missing :: proc(test: ^testing.T
 }
 
 @(test)
+test_enrichment_cost_merges_price_by_price :: proc(test: ^testing.T) {
+	// The user prices input and output, models.dev prices the cache. Each price is
+	// its own field, so the user's two prices stand while the cache is filled from
+	// a source that states no input price at all.
+	user := []Catalog_Provider_Source {
+		catalog_source("proxy", "gpt-4", Catalog_Model_Source{cost = Catalog_Cost{input_present = true, input = 3, output_present = true, output = 15}}),
+	}
+	models_dev := []Catalog_Provider_Source {
+		catalog_source(
+			"proxy",
+			"gpt-4",
+			Catalog_Model_Source {
+				cost = Catalog_Cost {
+					input_present = true,
+					input = 99,
+					cache_read_present = true,
+					cache_read = 0.3,
+					cache_write_present = true,
+					cache_write = 3.75,
+				},
+			},
+		),
+	}
+
+	resolved, error := resolve_catalog(user, {}, models_dev)
+	testing.expect_value(test, error, Catalog_Error.None)
+	defer catalog_destroy(&resolved)
+
+	model := catalog_test_find(resolved, "proxy", "gpt-4")
+	testing.expect(test, model != nil)
+	testing.expect_value(test, model.cost.input, 3)
+	testing.expect_value(test, model.cost.output, 15)
+	testing.expect(test, model.cost.cache_read_present)
+	testing.expect_value(test, model.cost.cache_read, 0.3)
+	testing.expect(test, model.cost.cache_write_present)
+	testing.expect_value(test, model.cost.cache_write, 3.75)
+}
+
+@(test)
 test_enrichment_a_models_api_family_outranks_its_providers :: proc(test: ^testing.T) {
 	// Routing is stated per model. The endpoint speaks chat completions, the user
 	// says one of its models is served through the Responses API, and models.dev

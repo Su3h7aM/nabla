@@ -1058,6 +1058,11 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		cost := "-"
 		if status.cost_present {
 			cost = fmt.tprintf("$%.2f", status.cost)
+			// A total under a cent would round to "$0.00", which reads as free.
+			if status.cost < 0.01 { cost = fmt.tprintf("$%.4f", status.cost) }
+			// A total that prices only some of the session is not the session's
+			// cost, and the footer is the only place a reader can see that.
+			if status.cost_partial { cost = fmt.tprintf("%s (partial)", cost) }
 		}
 		cache := "cache n/a"
 		if status.session_hit_measured {

@@ -57,6 +57,8 @@ Branch_Summary :: struct {
 // Usage_Totals sums what the session's committed responses reported. The
 // paired fields cover only the responses that reported both input and cache
 // read counts, the one population a cache hit rate may be measured over.
+// cost is the dollars the priced responses cost in total, and priced_requests
+// is how many of the requests could be priced.
 Usage_Totals :: struct {
 	requests:        int,
 	paired_requests: int,
@@ -66,6 +68,8 @@ Usage_Totals :: struct {
 	cache_write:     i64,
 	paired_input:    i64,
 	paired_read:     i64,
+	cost:            f64,
+	priced_requests: int,
 }
 
 // read_records returns the matching records with seq above after, oldest first,
@@ -252,6 +256,8 @@ usage_totals :: proc(journal: ^Journal, session: Session_Id) -> (totals: Usage_T
 	totals.cache_write = row_int(&row)
 	totals.paired_input = row_int(&row)
 	totals.paired_read = row_int(&row)
+	totals.cost = row_f64(&row)
+	totals.priced_requests = int(row_int(&row))
 	if row.error != nil { return {}, corrupt(journal, row.error, session, 0) }
 	return totals, nil
 }
@@ -447,12 +453,14 @@ USAGE_TOTALS_QUERY :: `WITH reported AS (SELECT
 	json_extract(data, '$.input_tokens') AS input,
 	json_extract(data, '$.output_tokens') AS output,
 	json_extract(data, '$.cache_read_tokens') AS cache_read,
-	json_extract(data, '$.cache_write_tokens') AS cache_write
+	json_extract(data, '$.cache_write_tokens') AS cache_write,
+	json_extract(data, '$.cost') AS cost
 	FROM records WHERE session = ? AND kind = 'response.committed'),
 paired AS (SELECT *, (input IS NOT NULL AND cache_read IS NOT NULL) AS both FROM reported)
 SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), COALESCE(SUM(cache_read), 0), COALESCE(SUM(cache_write), 0),
-	COALESCE(SUM(CASE WHEN both THEN input END), 0), COALESCE(SUM(CASE WHEN both THEN cache_read END), 0)
+	COALESCE(SUM(CASE WHEN both THEN input END), 0), COALESCE(SUM(CASE WHEN both THEN cache_read END), 0),
+	COALESCE(SUM(cost), 0), COUNT(cost)
 FROM paired`
 
 @(private, require_results)
@@ -624,6 +632,17 @@ row_int :: proc(row: ^Row) -> i64 {
 	if !ok { return {} }
 	if value == nil { return 0 }
 	number, error := db.as_i64(value)
+	if error != nil { row.error = Journal_Error.Corrupt }
+	return number
+}
+
+// row_f64 reads a real number; NULL is 0, the absent price.
+@(private)
+row_f64 :: proc(row: ^Row) -> f64 {
+	value, ok := row_next(row)
+	if !ok { return {} }
+	if value == nil { return 0 }
+	number, error := db.as_f64(value)
 	if error != nil { row.error = Journal_Error.Corrupt }
 	return number
 }

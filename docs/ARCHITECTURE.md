@@ -644,9 +644,11 @@ hit_rate     = paired_read / paired_input
 coverage     = paired_input / sum(all reported input)
 ```
 
+Cost is priced once, when `response.committed` is written, from the model's catalog price in US dollars per million tokens (section 12), and stored in the record as `cost`. Input counts include cache reads and writes in every API family, so the uncached share is `input - cache_read - cache_write`; a cache price the model does not state is charged at its input price. A response whose input or output count, or whose model's input or output price, is missing has no cost. Storing the price paid means a later price change never rewrites history. The session cost is the sum of the recorded costs, and a status that sums fewer responses than the session made says it is partial.
+
 ## 12. Model catalog
 
-- Sources in precedence order: user configuration, provider discovery (`GET /models`, disk-cached), models.dev (disk-cached). A present higher-precedence value is final; only absence is enriched. False, zero, and empty are present values. Lists replace, never merge. `disabled` is a tombstone.
+- Sources in precedence order: user configuration, provider discovery (`GET /models`, disk-cached), models.dev (disk-cached). A present higher-precedence value is final; only absence is enriched. False, zero, and empty are present values. Lists replace, never merge. `disabled` is a tombstone. Each price in `cost` is its own field, so a user who states only input and output prices still gets the cache prices from models.dev; in `config.lua` a model states `cost = { input = 3, output = 15, cache_read = 0.3, cache_write = 3.75 }`, any member optional.
 - Identity is `(provider_id, model_id)`. API-family behavior lives in `ai`; the catalog carries data only.
 - A difference between providers or models is expressed as data: a catalog fact the user can also set in configuration, or a classification of what the provider returned (status, error body, headers). Data takes effect on the next snapshot, with no rebuild and no new session. No code compares a model id, name, or name prefix.
 - Provider-specific code is allowed only for a wire difference that neither an API family nor a fact can express. It stays in `ai`, is keyed on a named provider behavior rather than on scattered id checks, and carries a comment naming the difference.
@@ -661,6 +663,7 @@ Model_Facts :: struct {
 	tools:          Maybe(bool),
 	input_modalities, output_modalities: bit_set[Modality],
 	reasoning:      Maybe(Reasoning_Facts),  // supported, toggle, valid effort levels
+	cost:           Cost,                    // USD per million tokens: input, output, cache_read, cache_write, each optional
 	flags:          bit_set[Model_Flag],
 	capacity:       Capacity,                // computed once, section 23
 }

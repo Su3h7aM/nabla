@@ -190,6 +190,10 @@ Chat_Session :: struct {
 	// the model was selected. It is the only thing that answers how much a request
 	// may send, because it is the only thing that was divided.
 	capacity:                     Model_Capacity,
+	// cost is the resolved model's price per million tokens, copied from the catalog
+	// when the model was selected. It prices the usage each committed response
+	// reports; a zero cost prices nothing.
+	cost:                         Catalog_Cost,
 	effort_levels:                [dynamic]string, // owned; allowed levels, verbatim
 	effort:                       string, // owned; "" means provider default
 
