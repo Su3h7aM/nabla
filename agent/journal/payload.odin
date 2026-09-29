@@ -327,10 +327,12 @@ Subagent_Message :: struct {
 	version: int,
 }
 
-// Response_Committed carries the endpoint's native output items in the body. A
-// token count the provider did not report is null, never zero.
+// Response_Committed carries the API family that produced the response and the
+// endpoint's native output items in the body. api uses the stable API names from
+// Request_Sent. A token count the provider did not report is null, never zero.
 Response_Committed :: struct {
 	version:            int,
+	api:                string,
 	model_resolved:     string,
 	finish:             string, // RESPONSE_FINISH_NAMES
 	input_tokens:       Maybe(i64),

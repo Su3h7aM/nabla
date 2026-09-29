@@ -47,9 +47,11 @@ Projected_Assistant :: struct {
 }
 
 // Projected_Response is the endpoint's native output items, exactly as returned,
-// and the provider and model that returned them: they replay only to that pair.
+// and the API, provider, and model that returned them: they replay only to that
+// combination.
 Projected_Response :: struct {
 	output:   string,
+	api:      string,
 	provider: string,
 	model:    string,
 }
@@ -191,8 +193,11 @@ projection_add_assistant :: proc(
 	}
 	for record in records {
 		if record.kind != .Response_Committed || len(record.body) == 0 { continue }
+		response: journal.Response_Committed
+		journal.payload_decode(record.data, &response, arena) or_return
 		item.payload = Projected_Response {
 			output   = string(record.body),
+			api      = response.api,
 			provider = record.provider,
 			model    = record.model,
 		}

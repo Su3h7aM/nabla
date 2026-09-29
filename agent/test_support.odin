@@ -184,7 +184,14 @@ _test_user :: proc(test: ^testing.T, chat: ^Chat_Session, text: string, origin :
 // _test_response commits an Assistant node for a response of request, with its native
 // output when one is given, as a completed response would, and makes it the node the
 // next calls belong to.
-_test_response :: proc(test: ^testing.T, chat: ^Chat_Session, request: journal.Request_Id, text: string, output := "") -> journal.Node_Id {
+_test_response :: proc(
+	test: ^testing.T,
+	chat: ^Chat_Session,
+	request: journal.Request_Id,
+	text: string,
+	output := "",
+	api: ai.API_Kind = .Invalid,
+) -> journal.Node_Id {
 	node := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
 	header := journal.Record {
 		kind     = .Response_Committed,
@@ -194,7 +201,7 @@ _test_response :: proc(test: ^testing.T, chat: ^Chat_Session, request: journal.R
 		provider = chat.provider_id,
 		model    = chat.model_id,
 	}
-	chat_record(chat, header, journal.Response_Committed{finish = journal.RESPONSE_FINISH_NAMES[.Stop]}, transmute([]u8)output)
+	chat_record(chat, header, journal.Response_Committed{api = chat_api_name(api), finish = journal.RESPONSE_FINISH_NAMES[.Stop]}, transmute([]u8)output)
 	_test_commit(test, chat)
 	chat.response_node = node
 	return node

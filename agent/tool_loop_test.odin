@@ -322,7 +322,7 @@ test_a_response_with_an_unparseable_call_is_not_replayed_verbatim :: proc(test: 
 	// response has to fall back to the projection, which can say it correctly.
 	request := journal.next_request(chat.store)
 	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"trying"}]},{"type":"function_call","id":"fc_1","call_id":"call_v","name":"shell","arguments":"{\"command\": not_a_number}"}]`
-	_test_response(test, chat, request, "trying", output)
+	_test_response(test, chat, request, "trying", output, .OpenAI_Responses)
 	call := _test_propose(test, chat, "call_v", `{"command": not_a_number}`, TOOL_SHELL_NAME, request)
 	content := `{"status":"invalid_arguments"}`
 	chat_record(
@@ -360,7 +360,7 @@ test_a_record_that_contradicts_the_call_it_holds_is_not_replayed :: proc(test: ^
 	// them is refused, and the projection is what the endpoint reads back.
 	request := journal.next_request(chat.store)
 	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"counting"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":""}]`
-	_test_response(test, chat, request, "counting", output)
+	_test_response(test, chat, request, "counting", output, .OpenAI_Responses)
 	request_test_call(test, chat, request, "call_1", "{}", .Success, "fc_1")
 
 	arena: virtual.Arena

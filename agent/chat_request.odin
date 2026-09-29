@@ -326,34 +326,37 @@ chat_append_projection :: proc(
 	// A response whose native output is not replayed is projected as text and calls. It is
 	// decided here, where the answer still decides what the whole request carries.
 	verbatim := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
-	if target.api == .OpenAI_Responses || target.api == .Anthropic_Messages {
-		unfaithful := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
-		if target.api == .OpenAI_Responses {
-			for item in items {
-				call, is_call := item.payload.(Projected_Call)
-				if !is_call { continue }
-				_, project, faithful := chat_replay_call(call)
-				if !project || !faithful { unfaithful[item.request] = true }
-			}
-		}
+	unfaithful := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
+	if target.api == .OpenAI_Responses {
 		for item in items {
-			response, is_response := item.payload.(Projected_Response)
-			if !is_response || item.request == 0 { continue }
-			if response.provider != target.provider || response.model != target.model { continue }
-			if target.api == .OpenAI_Responses {
-				// A record that cannot be read is not replayed either: the projection is the
-				// copy left.
-				calls, readable := ai.Provider_Replay_Read(response.output, context.temp_allocator)
-				if readable && !unfaithful[item.request] && chat_replay_record_agrees(calls, item.request, items) {
-					verbatim[item.request] = true
-				} else {
-					replay_refused += 1
-				}
-			} else if response.output != "" {
+			call, is_call := item.payload.(Projected_Call)
+			if !is_call { continue }
+			_, project, faithful := chat_replay_call(call)
+			if !project || !faithful { unfaithful[item.request] = true }
+		}
+	}
+	for item in items {
+		response, is_response := item.payload.(Projected_Response)
+		if !is_response || item.request == 0 { continue }
+		// Another endpoint's items mean nothing here; its response goes as text and calls.
+		if response.provider != target.provider || response.model != target.model || response.api != chat_api_name(target.api) { continue }
+		switch target.api {
+		case .OpenAI_Responses:
+			// A record that cannot be read is not replayed either: the projection is the
+			// copy left.
+			calls, readable := ai.Provider_Replay_Read(response.output, context.temp_allocator)
+			if readable && !unfaithful[item.request] && chat_replay_record_agrees(calls, item.request, items) {
 				verbatim[item.request] = true
 			} else {
 				replay_refused += 1
 			}
+		case .Anthropic_Messages:
+			if response.output != "" {
+				verbatim[item.request] = true
+			} else {
+				replay_refused += 1
+			}
+		case .OpenAI_Chat_Completions, .Invalid:
 		}
 	}
 

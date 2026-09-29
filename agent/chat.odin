@@ -181,6 +181,7 @@ chat_commit_response_nodes :: proc(
 	assistant := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
 	chat.response_node = assistant
 	committed := chat_send_usage(chat, usages)
+	committed.api = chat_api_name(chat.chain.connection.API)
 	committed.finish = chat_finish_reason_text(finish)
 	output: []u8
 	if chat.pending_response_present { output = transmute([]u8)chat.pending_response.output }

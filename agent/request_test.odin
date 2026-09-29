@@ -124,7 +124,7 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(test: ^test
 	_test_accept(test, chat, "run printf ok")
 	request := journal.next_request(chat.store)
 	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"printf tool-ok\"}"}]`
-	_test_response(test, chat, request, "Working.", output)
+	_test_response(test, chat, request, "Working.", output, .OpenAI_Responses)
 	request_test_call(test, chat, request, "call_1", `{"command":"printf tool-ok"}`, .Success, "fc_1")
 	connection := ai.Provider_Connection {
 		API = .OpenAI_Responses,
@@ -162,6 +162,58 @@ test_build_request_replays_verbatim_response_output_in_order :: proc(test: ^test
 }
 
 @(test)
+test_response_replay_requires_matching_api_family :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(test, chat, "run printf tool-ok")
+	request := journal.next_request(chat.store)
+	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"builtin_shell","arguments":"{\"command\":\"printf tool-ok\"}"}]`
+	_test_response(test, chat, request, "Working.", output, .OpenAI_Responses)
+	request_test_call(test, chat, request, "call_1", `{"command":"printf tool-ok"}`, .Success, "fc_1")
+
+	connection := ai.Provider_Connection {
+		API = .Anthropic_Messages,
+	}
+	chat.model_api = connection.API
+	anthropic_arena: virtual.Arena
+	anthropic := request_test_prepare(test, chat, connection, &anthropic_arena)
+	defer virtual.arena_destroy(&anthropic_arena)
+	// Another API's items are not this endpoint's to refuse: the response goes as text and calls.
+	testing.expect_value(test, anthropic.replay_refused, 0)
+	text_present := false
+	call_present := false
+	result_present := false
+	for message in anthropic.request.Messages {
+		text_present = text_present || message.Content == "Working."
+		result_present = result_present || (message.Role == .Tool && message.Tool_Call_ID == "call_1")
+		for call in message.Tool_Calls {
+			call_present = call_present || call.ID == "call_1"
+		}
+		testing.expect_value(test, message.Verbatim_Items, "")
+	}
+	testing.expect(test, text_present, "the neutral projection keeps the response text")
+	testing.expect(test, call_present, "the neutral projection keeps the tool call")
+	testing.expect(test, result_present, "the neutral projection keeps the tool result")
+	request_test_expect_encoded_order(test, anthropic.request, connection.API)
+
+	connection.API = .OpenAI_Responses
+	chat.model_api = connection.API
+	responses_arena: virtual.Arena
+	responses := request_test_prepare(test, chat, connection, &responses_arena)
+	defer virtual.arena_destroy(&responses_arena)
+	if !testing.expect_value(test, responses.replay_refused, 0) { return }
+	verbatim_present := false
+	for message in responses.request.Messages {
+		verbatim_present = verbatim_present || message.Verbatim_Items == output
+	}
+	testing.expect(test, verbatim_present, "the original API family replays its native response")
+	request_test_expect_encoded_order(test, responses.request, connection.API)
+}
+
+@(test)
 test_anthropic_request_replays_thinking_before_projected_content_and_calls :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
@@ -171,7 +223,7 @@ test_anthropic_request_replays_thinking_before_projected_content_and_calls :: pr
 	_test_accept(test, chat, "run printf ok")
 	request := journal.next_request(chat.store)
 	output := `[{"type":"thinking","thinking":"Check the command.","signature":"sig_1"}]`
-	_test_response(test, chat, request, "Working.", output)
+	_test_response(test, chat, request, "Working.", output, .Anthropic_Messages)
 	request_test_call(test, chat, request, "toolu_1", `{"command":"printf tool-ok"}`)
 	connection := ai.Provider_Connection {
 		API      = .Anthropic_Messages,
@@ -376,7 +428,7 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(test: ^testing.T) {
 		if connection.API == .Anthropic_Messages {
 			output = `[{"type":"thinking","thinking":"Checking the command.","signature":"sig_1"}]`
 		}
-		_test_response(test, chat, request, "Working.", output)
+		_test_response(test, chat, request, "Working.", output, connection.API)
 		request_test_call(test, chat, request, "call_1", `{"command":"ls"}`, .Success, "fc_1")
 		// A finished answer follows the result, so the next user line is a message of its own
 		// on every API rather than joining the result's user turn on Anthropic.
@@ -397,6 +449,102 @@ test_a_request_rebuilds_identically_and_only_appends :: proc(test: ^testing.T) {
 		delete(second)
 		delete(grown)
 		chat_test_end(test, &fixture)
+	}
+}
+
+@(test)
+test_request_encoding_survives_api_switches_during_a_tool_call :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 1024)
+	_test_accept(test, chat, "run printf api-cycle")
+
+	connections := [?]ai.Provider_Connection {
+		{API = .Anthropic_Messages},
+		{API = .OpenAI_Responses},
+		{API = .OpenAI_Chat_Completions},
+		{API = .Anthropic_Messages},
+	}
+	call_ids := [?]string{"toolu_1", "call_2", "call_3"}
+	call_item_ids := [?]string{"tu_1", "fc_2", ""}
+	response_texts := [?]string{"First answer.", "Second answer.", "Third answer."}
+	tool_arguments := `{"command":"printf api-cycle"}`
+	result_content := "completed api-cycle call"
+	for connection, index in connections {
+		chat.model_api = connection.API
+		request_test_encode_session(test, chat, connection)
+		if index == len(connections) - 1 { break }
+
+		request := journal.next_request(chat.store)
+		output := ""
+		if connection.API == .Anthropic_Messages {
+			output = `[{"type":"thinking","thinking":"Keep this thought.","signature":"sig_1"}]`
+		} else if connection.API == .OpenAI_Responses {
+			output = `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Second answer."}]}]`
+		}
+		_test_response(test, chat, request, response_texts[index], output, connection.API)
+		call := journal.next_call(chat.store)
+		chat_record(
+			chat,
+			{kind = .Tool_Proposed, node = chat.response_node, request = request, call = call},
+			journal.Tool_Proposed{provider_id = call_ids[index], item_id = call_item_ids[index], name = TOOL_SHELL_NAME},
+			transmute([]u8)tool_arguments,
+		)
+		chat_record(
+			chat,
+			{kind = .Tool_Admitted, node = chat.response_node, request = request, call = call},
+			journal.Tool_Admitted{tool = TOOL_SHELL_NAME},
+			transmute([]u8)tool_arguments,
+		)
+		_test_commit(test, chat)
+
+		// The first tool call remains in flight while the selected API changes.
+		if index == 0 { chat.model_api = connections[index + 1].API }
+		chat_record(
+			chat,
+			{kind = .Tool_Completed, node = chat.response_node, request = request, call = call},
+			journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+			transmute([]u8)result_content,
+		)
+		_test_commit(test, chat)
+		chat_node(chat, .Results, journal.Results{calls = []journal.Call_Id{call}})
+		_test_commit(test, chat)
+	}
+}
+
+@(private)
+request_test_encode_session :: proc(test: ^testing.T, chat: ^Chat_Session, connection: ai.Provider_Connection) {
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, connection, &arena)
+	defer virtual.arena_destroy(&arena)
+	request_test_expect_encoded_order(test, preparation.request, connection.API)
+}
+
+@(private)
+request_test_expect_encoded_order :: proc(test: ^testing.T, request: ai.Provider_Request, api: ai.API_Kind) {
+	body, encode_error := ai.Provider_Encode_Request(request)
+	if !testing.expect_value(test, encode_error, ai.Provider_Request_Error.None) { return }
+	defer delete(body)
+	for message, result_index in request.Messages {
+		if message.Role != .Tool { continue }
+		call_precedes_result := false
+		for prior_message in request.Messages[:result_index] {
+			for call in prior_message.Tool_Calls {
+				if call.ID == message.Tool_Call_ID { call_precedes_result = true }
+			}
+			if api == .OpenAI_Responses && prior_message.Verbatim_Items != "" {
+				calls, readable := ai.Provider_Replay_Read(prior_message.Verbatim_Items, context.temp_allocator)
+				if readable {
+					for call in calls {
+						if call.ID == message.Tool_Call_ID { call_precedes_result = true }
+					}
+				}
+			}
+		}
+		testing.expectf(test, call_precedes_result, "tool result %s follows its call", message.Tool_Call_ID)
 	}
 }
 
