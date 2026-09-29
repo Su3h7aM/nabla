@@ -87,3 +87,31 @@ nabla_owned_sources() {
 nabla_die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 nabla_step() { printf '\n==> %s\n' "$*"; }
+
+# nabla_contained runs a command so that no process it starts outlives it. The
+# command runs in a new PID namespace, and when it exits, whether it passed,
+# failed, or was killed, the kernel kills everything left inside, including
+# processes that started their own session or process group. PID 1 is a bash
+# that waits for the command, because the namespace's orphans are reparented to
+# PID 1 and bash reaps every child it gets; a PID 1 that did not would leave
+# them as zombies, which tests checking that a process ended still see. The
+# user namespace keeps the caller's uid, so the command runs with the caller's
+# permissions. Where unprivileged namespaces are unavailable the command runs
+# uncontained after a warning.
+nabla_contained() {
+	local isolate=(unshare --user --map-current-user --pid --fork --kill-child -- bash -c '"$@" & wait "$!"' nabla-init)
+	if [[ -z "${NABLA_CONTAINED_CHECKED:-}" ]]; then
+		NABLA_CONTAINED_CHECKED=1
+		NABLA_CONTAINED=false
+		if "${isolate[@]}" true 2>/dev/null; then
+			NABLA_CONTAINED=true
+		else
+			printf 'warning: unshare cannot create a PID namespace; processes a test leaves behind will keep running\n' >&2
+		fi
+	fi
+	if "$NABLA_CONTAINED"; then
+		"${isolate[@]}" "$@"
+	else
+		"$@"
+	fi
+}

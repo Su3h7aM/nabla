@@ -61,6 +61,8 @@ Use **mise** for everything: it installs Odin and runs the tasks `build`, `check
 
 Before committing a code change, run `mise run fmt`, `mise run check`, and the tests covering what you touched. `mise run test` is the full gate. Documentation-only changes need no run.
 
+Run tests only through `mise run test [package] [--debug-only | --release-only] [--sanitize <kind>]`, never through `odin test` directly. The task runs each suite in its own PID namespace, so every process a test starts ends with the suite, whether it passed, failed, or timed out.
+
 Read, search, and edit through the dedicated tools; use the shell for builds, tests, scripts, and pipelines.
 
 ## Version control
