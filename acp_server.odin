@@ -243,7 +243,10 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 	// A turn still running is stopped before the worker is joined, so it settles as
 	// cancelled and the record says the session was interrupted.
 	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
-	if server.work != {} { chan.close(&server.work) }
+	if server.work != {} {
+		chan.close(&server.work)
+		agent.owner_wake_signal()
+	}
 	if server.worker != nil {
 		if join_retiring(server.worker, "nabla-acp-worker") {
 			server.worker = nil
@@ -281,7 +284,9 @@ acp_server_destroy :: proc(server: ^Acp_Server) {
 // --- the worker --------------------------------------------------------------
 
 // acp_worker runs the requests the reader hands over and owns the session while it does.
-// It leaves when the queue is closed and drained.
+// While a V2 client has nothing queued, a background subagent's report starts a turn of its
+// own; a V1 client cannot receive a turn it did not ask for, so its reports wait in the
+// inbox for the next prompt's turn. It leaves when the queue is closed and drained.
 acp_worker :: proc(thread_handle: ^thread.Thread) {
 	server := cast(^Acp_Server)thread_handle.data
 	// A thread started without init_context gets the default context, so the run's
@@ -290,8 +295,25 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 	context.logger = agent.log_logger(&server.app.setup.log_binding)
 	context.allocator = server.alloc
 	for {
-		work, ok := chan.recv(server.work)
-		if !ok { break }
+		seen := agent.owner_wake_seen()
+		work, ok := chan.try_recv(server.work)
+		if !ok {
+			// A closed queue is shutdown, which starts no report turn.
+			if chan.is_closed(server.work) { break }
+			if acp_is_v2(server) && server.app.setup.store != nil {
+				if acp_report_turn(server) {
+					free_all(context.temp_allocator)
+					continue
+				}
+				// Reports arrive through the owner wake, which new requests signal too.
+				if agent.chat_agents_pending(&server.app.setup.session) {
+					agent.owner_wake_wait(seen, nil)
+					continue
+				}
+			}
+			work, ok = chan.recv(server.work)
+			if !ok { break }
+		}
 		acp_run_work(server, work)
 		acp_work_destroy(&work, server.alloc)
 		// Temp scratch belongs to one request: the worker is long-lived, so its pool is
@@ -836,48 +858,13 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	chat.catalog = app_catalog_ref(&server.app)
 	observer := acp_observer(server)
 	turn_completed := agent.chat_run_turn_steered(chat, server.app.run.connection, agent.chat_retry_policy_default(), observer, nil, &server.app.run.control)
-	// The prompt is answered once its work is done, so it waits for the subagents it started
-	// in the background and answers each report with a turn of its own.
-	for turn_completed && agent.chat_agents_wait(chat, &server.app.run.control.stop) {
-		report, had_message := agent.chat_session_accept_agent_message(chat, observer)
-		// The report the wait promised was taken elsewhere; there is nothing
-		// left to run a turn for.
-		if !had_message { break }
-		if report != .Accepted {
-			turn_completed = false
-			break
-		}
-		turn_completed = agent.chat_run_turn_steered(
-			chat,
-			server.app.run.connection,
-			agent.chat_retry_policy_default(),
-			observer,
-			nil,
-			&server.app.run.control,
-		)
+	if acp_is_v2(server) {
+		acp_v2_turn_end(server, turn_completed)
+		return
 	}
 
 	status := chat.terminal_status
 	if !turn_completed && status == .Completed { status = .Failed }
-
-	if acp_is_v2(server) {
-		switch status {
-		case .Completed:
-			_ = acp_send_state(server, "idle", acp.stop_reason_name(.End_Turn))
-		case .Cancelled:
-			_ = acp_send_state(server, "idle", acp.stop_reason_name(.Cancelled))
-		case .Failed, .None:
-			message := agent.chat_session_last_error(chat)
-			if message == "" { message = "the turn did not complete" }
-			message_id := acp_notice_message_id(server)
-			_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, message, message_id)
-			// A failed turn is not a refusal: the transcript carries the reason, and the
-			// state only says the agent is idle again.
-			_ = acp_send_state(server, "idle", "")
-		}
-		return
-	}
-
 	// A cancelled turn is an ordinary answer, not an error. A turn the harness could not
 	// finish is reported as the failure it is; the observer has already said why in the
 	// transcript.
@@ -891,6 +878,52 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 		if message == "" { message = "the turn did not complete" }
 		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, message)
 	}
+}
+
+// acp_v2_turn_end tells a V2 client how a turn ended and that the agent is idle again.
+@(private = "file")
+acp_v2_turn_end :: proc(server: ^Acp_Server, turn_completed: bool) {
+	chat := &server.app.setup.session
+	status := chat.terminal_status
+	if !turn_completed && status == .Completed { status = .Failed }
+	switch status {
+	case .Completed:
+		_ = acp_send_state(server, "idle", acp.stop_reason_name(.End_Turn))
+	case .Cancelled:
+		_ = acp_send_state(server, "idle", acp.stop_reason_name(.Cancelled))
+	case .Failed, .None:
+		message := agent.chat_session_last_error(chat)
+		if message == "" { message = "the turn did not complete" }
+		message_id := acp_notice_message_id(server)
+		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, message, message_id)
+		// A failed turn is not a refusal: the transcript carries the reason, and the
+		// state only says the agent is idle again.
+		_ = acp_send_state(server, "idle", "")
+	}
+}
+
+// acp_report_turn runs a turn for the oldest message a background subagent sent while no
+// request ran, and reports whether it ran one. The turn counts as work, so a cancel or a
+// shutdown stops it the way it stops a prompt's turn.
+@(private = "file", require_results)
+acp_report_turn :: proc(server: ^Acp_Server) -> bool {
+	chat := &server.app.setup.session
+	observer := acp_observer(server)
+	accepted, had_message := agent.chat_session_accept_agent_message(chat, observer)
+	if !had_message { return false }
+	if accepted != .Accepted {
+		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, agent.chat_session_last_error(chat), acp_notice_message_id(server))
+		return false
+	}
+	acp_queue_add(server)
+	defer acp_queue_remove(server)
+	defer agent.turn_control_clear(&server.app.run.control)
+	acp_clear_active_message_id(server)
+	_ = acp_send_state(server, "running", "")
+	chat.catalog = app_catalog_ref(&server.app)
+	turn_completed := agent.chat_run_turn_steered(chat, server.app.run.connection, agent.chat_retry_policy_default(), observer, nil, &server.app.run.control)
+	acp_v2_turn_end(server, turn_completed)
+	return true
 }
 
 @(require_results)

@@ -948,7 +948,10 @@ acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
 	// immediately cannot clear a flag that was never set. The count keeps that flag set
 	// while a v2 prompt waits behind the active turn.
 	acp_queue_add(server)
-	if chan.try_send(server.work, item) { return true }
+	if chan.try_send(server.work, item) {
+		agent.owner_wake_signal()
+		return true
+	}
 	acp_queue_remove(server)
 	acp_work_destroy(&item, server.alloc)
 	return false
