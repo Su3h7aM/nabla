@@ -230,7 +230,8 @@ Request_Sent :: struct {
 	purpose:         string, // REQUEST_PURPOSE_NAMES
 	api:             string,
 	model_requested: string,
-	// recovery is how the send came to be: initial, transient_retry, or checkpoint_repair.
+	// recovery is how the send came to be: initial, transient_retry, checkpoint_repair, or
+	// cache_hints_omitted.
 	recovery:        string,
 	body_digest:     string, // hex SHA-256 of the frozen body, "" when the body was not encoded
 	body_bytes:      int,

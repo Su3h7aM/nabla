@@ -207,6 +207,7 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 	}
 	chat.capacity = selection.capacity
 	chat.cost = selection.cost
+	chat.cache_hints_refused = false
 	chat.tools_enabled = selection.tools
 	chat.provider_transport = selection.transport
 	chat.websocket_fallback_http = false

@@ -67,6 +67,66 @@ chat_rebuild_prep :: proc(chat: ^Chat_Session, connection: ai.Provider_Connectio
 	return true
 }
 
+// chat_request_cache_hints reports whether request carries any of the cache hints the
+// harness adds. None of them changes what the model is asked, so each can be left out.
+@(private)
+chat_request_cache_hints :: proc(request: ai.Provider_Request) -> bool {
+	return(
+		(request.Cache_Request_Present && request.Cache_Request) ||
+		request.Prompt_Cache_Key_Present ||
+		request.Prompt_Cache_Options_Present ||
+		request.Prompt_Cache_Retention_Present \
+	)
+}
+
+// chat_request_omit_cache_hints removes the cache hints from request, for an endpoint that
+// refused a request carrying them.
+@(private)
+chat_request_omit_cache_hints :: proc(request: ^ai.Provider_Request) {
+	request.Cache_Request_Present = false
+	request.Cache_Request = false
+	request.Prompt_Cache_Key_Present = false
+	request.Prompt_Cache_Options_Present = false
+	request.Prompt_Cache_Retention_Present = false
+}
+
+// chat_request_freeze encodes prep's request into encoded, with the bytes copied into
+// allocator, which is the arena the attempt that sends them is retained with: it never
+// sends bytes a later encode has written over. False means the turn has already failed
+// with the reason.
+@(private, require_results)
+chat_request_freeze :: proc(
+	chat: ^Chat_Session,
+	prep: ^Chat_Request_Prep,
+	encoded: ^ai.Provider_Encoded_Request,
+	websocket_request: bool,
+	allocator: mem.Allocator,
+) -> bool {
+	frozen: ai.Provider_Encoded_Request
+	encode_err: ai.Provider_Operation_Error
+	if websocket_request {
+		frozen, encode_err = ai.Provider_Request_Freeze_WebSocket_Reusing(prep.request, &chat.encode_cache, chat.allocator)
+	} else {
+		frozen, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
+	}
+	if encode_err.kind != .None {
+		chat_session_fail_turn(chat, encode_err.detail)
+		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
+		return false
+	}
+	body, body_error := make([]u8, len(frozen.Body), allocator)
+	if body_error != nil {
+		chat_session_fail_turn(chat, "the rebuilt request body could not be kept for the attempt")
+		return false
+	}
+	copy(body, frozen.Body)
+	if !frozen.Body_Borrowed { delete(frozen.Body, chat.allocator) }
+	frozen.Body = body
+	frozen.Body_Borrowed = false
+	encoded^ = frozen
+	return true
+}
+
 // chat_build_request_into assembles a request from a span of projected items and the
 // summary that precedes them, in arena. directive, when not empty, is appended as the
 // final user message: that is how a compaction request asks for a summary while
@@ -153,6 +213,7 @@ chat_build_request_into :: proc(
 	prep.request.Prompt_Cache_Key_Present = true
 	prep.request.Prompt_Cache_Key = session_text
 	if parent := chat_parent_session(chat); parent != "" { prep.request.Prompt_Cache_Key = parent }
+	if chat.cache_hints_refused { chat_request_omit_cache_hints(&prep.request) }
 	if chat.effort != "" {
 		prep.request.Reasoning_Effort_Present = true
 		prep.request.Reasoning_Effort = chat.effort

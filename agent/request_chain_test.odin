@@ -165,8 +165,9 @@ test_a_stream_lost_after_acceptance_is_answered_with_a_notice :: proc(test: ^tes
 	testing.expect_value(test, answers, 1)
 }
 
-// A refused request is feedback once. The same refusal of the request that carried that
-// feedback means nothing the model adds will fix it, so the turn ends.
+// A refused request is first resent without its cache hints, and then it is feedback once.
+// The same refusal of the request that carried that feedback means nothing the model adds
+// will fix it, so the turn ends.
 @(test)
 test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -176,7 +177,8 @@ test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T)
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 	_test_accept(test, chat, "say something")
 	refusal := `{"error":{"message":"Unsupported parameter: frobnicate"}}`
-	responses := []string{agent_provider_refusal("400 Bad Request", refusal, ""), agent_provider_refusal("400 Bad Request", refusal, "")}
+	refused := agent_provider_refusal("400 Bad Request", refusal, "")
+	responses := []string{refused, refused, refused, refused}
 	provider: Agent_Provider
 	if !agent_provider_start(test, &provider, responses) { return }
 	defer agent_provider_stop(&provider)
@@ -186,10 +188,45 @@ test_a_repeated_refusal_ends_the_turn_after_one_notice :: proc(test: ^testing.T)
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 	testing.expect(test, !chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn ends on the repeated refusal")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 4) { return }
+	testing.expect(test, !strings.contains(agent_provider_request(&provider, 1), "prompt_cache_key"), "the first resend leaves the cache hints out")
+	noticed := agent_provider_request(&provider, 2)
+	testing.expect(test, strings.contains(noticed, chat_notice_text(.Provider_Refused)), "the request after the refusal carries the notice")
+	testing.expect(test, strings.contains(noticed, "Unsupported parameter: frobnicate"), "the notice carries the provider's words")
+	testing.expect(test, strings.contains(noticed, "prompt_cache_key"), "hints that were not the cause are sent again")
+}
+
+// A request refused while it carries the harness's optional cache hints is sent again
+// without them, and the turn goes on as if nothing happened: no notice reaches the model,
+// and later requests leave the hints out.
+@(test)
+test_a_refused_request_is_resent_without_its_cache_hints :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+	refusal := `{"error":{"message":"Unsupported parameter: prompt_cache_key"}}`
+	responses := []string{agent_provider_refusal("400 Bad Request", refusal, ""), agent_provider_reply("first answer"), agent_provider_reply("second answer")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completes")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
-	second := agent_provider_request(&provider, 1)
-	testing.expect(test, strings.contains(second, chat_notice_text(.Provider_Refused)), "the second request carries the notice")
-	testing.expect(test, strings.contains(second, "Unsupported parameter: frobnicate"), "the notice carries the provider's words")
+	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "prompt_cache_key"))
+	resent := agent_provider_request(&provider, 1)
+	testing.expect(test, !strings.contains(resent, "prompt_cache_key"), "the resend leaves the cache hints out")
+	testing.expect(test, !strings.contains(resent, chat_notice_text(.Provider_Refused)), "the model is not told about a refusal the harness repaired")
+	_test_accept(test, chat, "and again")
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the next turn completes")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 3) { return }
+	testing.expect(test, !strings.contains(agent_provider_request(&provider, 2), "prompt_cache_key"), "later requests leave the hints out")
 }
 
 @(test)

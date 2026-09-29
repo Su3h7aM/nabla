@@ -91,6 +91,9 @@ Chat_Request_Chain :: struct {
 	// repaired records that this chain has used its one context repair. It never resets,
 	// because the bound belongs to the chain rather than to the payload it sends.
 	repaired:            bool,
+	// cache_hints_omitted records that this chain resent its request without the cache
+	// hints after a refusal, which it does once.
+	cache_hints_omitted: bool,
 	// settled records that the last row was finished for a retry, so the response commit
 	// must not finish it twice.
 	settled:             bool,
@@ -722,6 +725,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 			error = chain.operation_error,
 			failed = chat.active_failed && chain.operation_error.kind == .None,
 			repaired = chain.repaired,
+			cache_hints_sent = chat_request_cache_hints(chain.prep.request),
 			storage_failed = chat_session_storage_failed(chat),
 			text_exposed = chain.text_exposed,
 			completion_accepted = chain.completion_accepted,
@@ -755,6 +759,17 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	if chain.decision.action == .Repair_Context {
 		chain.stage = .Repairing
 		return
+	}
+	if chain.decision.action == .Omit_Cache_Hints {
+		chat_request_omit_cache_hints(&chain.prep.request)
+		if !chat_request_freeze(chat, &chain.prep, &chain.encoded, chain.websocket_request, virtual.arena_allocator(&chain.scratch)) {
+			chat_chain_stop(chat, .Harness_Failure)
+			return
+		}
+		// Later requests leave the hints out too, unless the resend is refused as well.
+		chat.cache_hints_refused = true
+		chain.cache_hints_omitted = true
+		chain.recovery_kind = .Cache_Hints_Omitted
 	}
 	// Retry: the failed attempt's state is cleared now, so the turn stays cancellable while
 	// it waits and the next attempt starts from a clean runtime.
@@ -905,6 +920,9 @@ chat_chain_notice :: proc(chat: ^Chat_Session, reason: Request_Recovery_Reason) 
 		if !chain.completion_accepted { notice = .Incomplete_Response }
 	case .Terminal_Failure:
 		class := chain.operation_error.failure_class
+		// The request was refused without its cache hints too, so they were not the cause and
+		// later requests carry them again.
+		if chain.cache_hints_omitted && class == .Invalid_Request { chat.cache_hints_refused = false }
 		if chat_failure_model_reachable(class) && class != chat.refused {
 			notice = .Provider_Refused
 			chat.refused = class

@@ -189,7 +189,10 @@ retry_display_text :: proc(event: agent.Chat_Retry_Event) -> string {
 		reason = "the provider is unavailable"
 	case .Incomplete_Stream:
 		reason = "the response ended before it was complete"
-	case .None, .Unknown, .Authentication, .Quota, .Context_Overflow, .Payload_Too_Large, .Invalid_Request, .Content_Policy, .Invalid_Output:
+	case .Invalid_Request:
+		// The only invalid request that is sent again is one resent without its cache hints.
+		reason = "the endpoint refused the request's cache hints; sending it without them"
+	case .None, .Unknown, .Authentication, .Quota, .Context_Overflow, .Payload_Too_Large, .Content_Policy, .Invalid_Output:
 	}
 	return fmt.tprintf("%s; retrying in %s (attempt %d)", reason, display_duration(event.delay), event.next_attempt)
 }

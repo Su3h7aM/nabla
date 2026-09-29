@@ -194,6 +194,10 @@ Chat_Session :: struct {
 	// when the model was selected. It prices the usage each committed response
 	// reports; a zero cost prices nothing.
 	cost:                         Catalog_Cost,
+	// cache_hints_refused records that the endpoint refused a request carrying the cache
+	// hints and accepted it without them, so later requests leave them out. It holds for the
+	// model it was learned on and clears when another model is selected.
+	cache_hints_refused:          bool,
 	effort_levels:                [dynamic]string, // owned; allowed levels, verbatim
 	effort:                       string, // owned; "" means provider default
 

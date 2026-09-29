@@ -38,6 +38,10 @@ Request_Recovery_Action :: enum {
 	// Repair_Context makes room for a rebuilt request. The provider refused the payload
 	// itself as too large, so sending it again is pointless and waiting changes nothing.
 	Repair_Context,
+	// Omit_Cache_Hints sends the request again without the cache hints the harness added.
+	// They are optional, so a request refused while carrying them is resent without them
+	// before the refusal is treated as the request's own.
+	Omit_Cache_Hints,
 }
 
 // Request_Recovery_Reason names why the chain stopped or waited. A stop is always
@@ -72,6 +76,9 @@ Request_Recovery_Reason :: enum {
 	Terminal_Failure,
 	// Transient_Failure is a failure the chain retries after the reported delay.
 	Transient_Failure,
+	// Cache_Hints_Refused is a request refused as invalid while it carried the harness's
+	// optional cache hints, which the chain drops before sending it again.
+	Cache_Hints_Refused,
 }
 
 // request_recovery_reason_name is the stable spelling a record and a log line keep for a
@@ -96,6 +103,8 @@ request_recovery_reason_name :: proc(reason: Request_Recovery_Reason) -> string 
 		return "terminal_failure"
 	case .Transient_Failure:
 		return "transient_failure"
+	case .Cache_Hints_Refused:
+		return "cache_hints_refused"
 	}
 	return "unknown"
 }
@@ -115,6 +124,9 @@ Chat_Attempt_Facts :: struct {
 	// refusal is terminal even when another candidate appears, and the bound does not
 	// reset because the payload changed.
 	repaired:            bool,
+	// cache_hints_sent records that the refused request carried the harness's optional
+	// cache hints, which a resend can leave out.
+	cache_hints_sent:    bool,
 	storage_failed:      bool,
 	text_exposed:        bool,
 	completion_accepted: bool,
@@ -139,8 +151,9 @@ Chat_Recovery_Decision :: struct {
 //  2. A send whose operation finished and whose completion was accepted.
 //  3. Published output, because a retry could publish a second answer.
 //  4. Confirmed overflow, which ordinary backoff cannot fix.
-//  5. A failure class, or a provider directive, that says the same request cannot work.
-//  6. A transient class, after the backoff or the provider's own delay, whichever is longer.
+//  5. An invalid request that carried the harness's optional cache hints, resent without them.
+//  6. A failure class, or a provider directive, that says the same request cannot work.
+//  7. A transient class, after the backoff or the provider's own delay, whichever is longer.
 chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Facts, fraction: f64) -> Chat_Recovery_Decision {
 	if facts.cancelled || facts.error.kind == .Cancelled { return {action = .Stop, reason = .Cancelled} }
 	if facts.storage_failed { return {action = .Stop, reason = .Storage_Failed} }
@@ -157,6 +170,9 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 		// request, once, or the turn ends as context exhaustion.
 		if facts.repaired { return {action = .Stop, reason = .Context_Exhausted} }
 		return {action = .Repair_Context, reason = .Context_Exhausted}
+	}
+	if facts.error.failure_class == .Invalid_Request && facts.cache_hints_sent {
+		return {action = .Omit_Cache_Hints, reason = .Cache_Hints_Refused}
 	}
 	if facts.error.retry_directive == .Forbid { return {action = .Stop, reason = .Terminal_Failure} }
 	if !chat_failure_transient(facts.error.failure_class) {

@@ -1246,31 +1246,8 @@ chat_repair_context :: proc(
 		return .No_Reduction
 	}
 
-	rebuilt: ai.Provider_Encoded_Request
-	encode_err: ai.Provider_Operation_Error
-	if websocket_request {
-		rebuilt, encode_err = ai.Provider_Request_Freeze_WebSocket_Reusing(prep.request, &chat.encode_cache, chat.allocator)
-	} else {
-		rebuilt, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
-	}
-	if encode_err.kind != .None {
-		chat_session_fail_turn(chat, encode_err.detail)
-		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
-		return .Repair_Rejected
-	}
-	// The rebuilt bytes get the same treatment as the rejected ones: the attempt owns a copy in
-	// the arena it is retained with, so it never sends bytes a later encode has written over.
-	// The rejected bytes belong to that arena too, and the arena releases them with it.
-	body, body_error := make([]u8, len(rebuilt.Body), allocator)
-	if body_error != nil {
-		chat_session_fail_turn(chat, "the rebuilt request body could not be kept for the attempt")
-		return .Repair_Rejected
-	}
-	copy(body, rebuilt.Body)
-	if !rebuilt.Body_Borrowed { delete(rebuilt.Body, chat.allocator) }
-	rebuilt.Body = body
-	rebuilt.Body_Borrowed = false
-	encoded^ = rebuilt
+	// The rejected bytes belong to the same arena as the rebuilt ones, and it releases them.
+	if !chat_request_freeze(chat, prep, encoded, websocket_request, allocator) { return .Repair_Rejected }
 	return .None
 }
 
