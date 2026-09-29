@@ -83,9 +83,12 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 	// lifecycle_drain_slave reads from master until the child signals done on
 	// sync_fd, reading at most 64 bytes per 5ms tick so the pty output buffer
 	// stays full and the child's writes genuinely block (what makes the EINTR
-	// path real).
-	lifecycle_drain_slave :: proc(sync_fd: posix.FD, master: posix.FD) {
+	// path real). It also checks the close restoration bytes across read chunks.
+	lifecycle_drain_slave :: proc(sync_fd: posix.FD, master: posix.FD) -> bool {
 		done := false
+		restore_sequence := "\x1b[?25h\x1b[0m"
+		restore_matched := 0
+		restore_seen := false
 		for !done {
 			poll_descriptors := [2]posix.pollfd{{fd = sync_fd, events = {.IN}}, {fd = master, events = {.IN}}}
 			ready_count := posix.poll(raw_data(poll_descriptors[:]), 2, 5)
@@ -100,7 +103,22 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 			}
 			if .IN in poll_descriptors[1].revents {
 				buffer: [64]byte
-				posix.read(master, raw_data(buffer[:]), c.size_t(len(buffer)))
+				read_count := posix.read(master, raw_data(buffer[:]), c.size_t(len(buffer)))
+				if read_count > 0 {
+					for output_byte in buffer[:int(read_count)] {
+						if output_byte == restore_sequence[restore_matched] {
+							restore_matched += 1
+						} else if output_byte == restore_sequence[0] {
+							restore_matched = 1
+						} else {
+							restore_matched = 0
+						}
+						if restore_matched == len(restore_sequence) {
+							restore_seen = true
+							restore_matched = 0
+						}
+					}
+				}
 			}
 			if !done {
 				// Throttle: without this the master is constantly readable and
@@ -113,6 +131,7 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 				posix.nanosleep(&throttle, nil)
 			}
 		}
+		return restore_seen
 	}
 
 	// --- child scenarios ------------------------------------------------------
@@ -313,6 +332,14 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		posix.sigaction(posix.Signal(posix.SIGWINCH), nil, &restored)
 		lifecycle_check(restored.sa_handler == lifecycle_alarm_handler, "close must restore the caller's SIGWINCH handler")
 
+		// H: a terminal write may fail with EIO after SIGHUP; close still
+		// releases the descriptor and session after attempting every restore.
+		session, open_err = open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, mouse = true})
+		lifecycle_check(open_err == nil, "open must succeed")
+		Terminal_Test_Fail_Next_Write()
+		close_err := close(session)
+		lifecycle_check(close_err == nil, "close must tolerate a terminal write that fails with EIO")
+
 		return lifecycle_failures == 0 ? 0 : 1
 	}
 
@@ -363,7 +390,8 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		posix.write(parent_out[1], &go_byte, 1)
 
 		// Scenario E: drain the slave slowly until the child finishes.
-		lifecycle_drain_slave(child_out[0], master)
+		restore_seen := lifecycle_drain_slave(child_out[0], master)
+		testing.expect(t, restore_seen, "close must emit an SGR reset with its cursor restoration")
 
 		status: c.int
 		waited := posix.waitpid(pid, &status, {})

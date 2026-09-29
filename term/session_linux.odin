@@ -42,6 +42,7 @@ ALT_SCREEN_ENTER :: ansi.CSI + ansi.DECASB_ENTER + ansi.CSI + ansi.CUP
 ALT_SCREEN_LEAVE :: ansi.CSI + ansi.DECASB_EXIT
 CURSOR_HIDE :: ansi.CSI + ansi.DECTCEM_HIDE
 CURSOR_SHOW :: ansi.CSI + ansi.DECTCEM_SHOW
+SGR_RESET :: ansi.CSI + "0" + ansi.SGR
 // The session disables autowrap (DECAWM) for its lifetime: the frame path may
 // write the bottom-right cell, and with autowrap on that write can scroll the
 // viewport. Disabling it is what lets present write every cell, including a
@@ -362,12 +363,12 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 
 // _session_close tears down in reverse setup order, attempting every
 // applicable transition even after a failure. A transition flag is cleared
-// only when its compensation succeeded; on any failure the descriptor and
-// the un-compensated transitions are left in place so close can be retried,
-// and the first underlying cause is reported (the write path's own error,
-// or the Platform_Error/io.Error from the failed syscall). The descriptor
-// close itself is one-shot (core:os consumes the handle); a failure there
-// is reported and the fully-compensated session settles on the next close.
+// when its compensation succeeds or a terminal write reports EIO, which
+// means its modes are no longer reachable. Other failures leave the
+// descriptor and uncompensated transitions in place so close can be retried;
+// the first underlying cause is reported. The descriptor close itself is
+// one-shot (core:os consumes the handle); a failure there is reported and
+// the fully-compensated session settles on the next close.
 @(require_results)
 _session_close :: proc(session: ^Session) -> Error {
 	when #config(NABLA_TERM_TEST_HOOKS, false) {
@@ -385,7 +386,7 @@ _session_close :: proc(session: ^Session) -> Error {
 	// intent. The descriptor guard keeps a retry after the one-shot descriptor
 	// close from writing to a file the session no longer owns.
 	if impl.file != nil {
-		if err := _session_write(impl.file, CURSOR_SHOW); err != nil {
+		if err := _session_close_write(impl.file, CURSOR_SHOW + SGR_RESET); err != nil {
 			if first_error == nil {
 				first_error = err
 			}
@@ -394,7 +395,7 @@ _session_close :: proc(session: ^Session) -> Error {
 		}
 	}
 	if impl.bracketed_paste {
-		if err := _session_write(impl.file, BRACKETED_PASTE_OFF); err != nil {
+		if err := _session_close_write(impl.file, BRACKETED_PASTE_OFF); err != nil {
 			if first_error == nil {
 				first_error = err
 			}
@@ -403,7 +404,7 @@ _session_close :: proc(session: ^Session) -> Error {
 		}
 	}
 	if impl.mouse {
-		if err := _session_write(impl.file, MOUSE_OFF); err != nil {
+		if err := _session_close_write(impl.file, MOUSE_OFF); err != nil {
 			if first_error == nil {
 				first_error = err
 			}
@@ -412,7 +413,7 @@ _session_close :: proc(session: ^Session) -> Error {
 		}
 	}
 	if impl.autowrap_disabled {
-		if err := _session_write(impl.file, AUTOWRAP_ON); err != nil {
+		if err := _session_close_write(impl.file, AUTOWRAP_ON); err != nil {
 			if first_error == nil {
 				first_error = err
 			}
@@ -421,7 +422,7 @@ _session_close :: proc(session: ^Session) -> Error {
 		}
 	}
 	if impl.alt_screen_entered {
-		if err := _session_write(impl.file, ALT_SCREEN_LEAVE); err != nil {
+		if err := _session_close_write(impl.file, ALT_SCREEN_LEAVE); err != nil {
 			if first_error == nil {
 				first_error = err
 			}
@@ -513,6 +514,10 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 	offset := 0
 	for offset < len(bytes) {
 		when #config(NABLA_TERM_TEST_HOOKS, false) {
+			if _test_write_eio_once {
+				_test_write_eio_once = false
+				return offset, Platform_Error(.EIO)
+			}
 			if _test_zero_write_once {
 				_test_zero_write_once = false
 				return offset, General_Error.Partial_Write
@@ -592,6 +597,16 @@ _session_file :: proc(session: ^Session) -> (file: ^os.File, err: Error) {
 @(require_results)
 _session_write :: proc(file: ^os.File, text: string) -> Error {
 	_, err := _session_write_bytes(posix.FD(os.fd(file)), transmute([]byte)text)
+	return err
+}
+
+// _session_close_write treats a hung-up terminal as a completed best-effort restore.
+@(require_results)
+_session_close_write :: proc(file: ^os.File, text: string) -> Error {
+	err := _session_write(file, text)
+	if platform, ok := err.(Platform_Error); ok && platform == .EIO {
+		return nil
+	}
 	return err
 }
 

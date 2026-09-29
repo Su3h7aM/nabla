@@ -11,6 +11,7 @@ package term
 // they flip stays package-private for session_linux.odin to observe.
 when #config(NABLA_TERM_TEST_HOOKS, false) {
 	_test_fail_teardown_once: bool
+	_test_write_eio_once: bool
 	_test_zero_write_once: bool
 	_test_fail_close_once: bool
 
@@ -19,6 +20,12 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 	// intact so the retry exercises the full teardown.
 	Terminal_Test_Fail_Next_Teardown :: proc() {
 		_test_fail_teardown_once = true
+	}
+
+	// Terminal_Test_Fail_Next_Write makes the next terminal write report EIO,
+	// which a close must tolerate after the controlling terminal is hung up.
+	Terminal_Test_Fail_Next_Write :: proc() {
+		_test_write_eio_once = true
 	}
 
 	// Terminal_Test_Zero_Write_Next makes the next write loop report zero

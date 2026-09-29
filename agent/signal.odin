@@ -4,9 +4,9 @@ import "core:sys/posix"
 
 import "nabla:ai"
 
-// process_interrupt latches a SIGINT or SIGTERM: the process was asked to stop. A signal
-// handler may only write static storage, so this is the one process-wide stop; the owner
-// applies it to the turn it runs, and the root ends the process once no turn runs.
+// process_interrupt latches SIGINT, SIGTERM, or SIGHUP: the process was asked to stop. A
+// signal handler may only write static storage, so this is the one process-wide stop; the
+// owner applies it to the turn it runs, and the root ends the process once no turn runs.
 // Every turn's stop chains to it, so a wait blocked inside the turn sees it at once.
 @(private)
 process_interrupt: ai.Interrupt
@@ -45,11 +45,12 @@ chat_signal_disarm :: proc(previous: ^posix.sigaction_t) {
 Chat_Interactive_Signals :: struct {
 	previous_int:  posix.sigaction_t,
 	previous_term: posix.sigaction_t,
+	previous_hup:  posix.sigaction_t,
 }
 
 // chat_interactive_arm installs the handler for the whole interactive lifetime, so
-// SIGINT and SIGTERM end the process through the owner instead of killing it with the
-// terminal unrestored. Per-turn arming nests inside this and restores it afterwards.
+// SIGINT, SIGTERM, and SIGHUP end the process through the owner instead of killing it
+// with the terminal unrestored. Per-turn arming nests inside this and restores it afterwards.
 chat_interactive_arm :: proc(state: ^Chat_Interactive_Signals) {
 	action: posix.sigaction_t
 	action.sa_handler = chat_signal_interrupt
@@ -57,6 +58,9 @@ chat_interactive_arm :: proc(state: ^Chat_Interactive_Signals) {
 		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
 	}
 	if posix.sigaction(.SIGTERM, &action, &state.previous_term) != .OK {
+		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
+	}
+	if posix.sigaction(.SIGHUP, &action, &state.previous_hup) != .OK {
 		log_emit({level = .Error, category = .Runtime, event = "signal.arm_failed"})
 	}
 }
@@ -67,17 +71,19 @@ chat_interactive_disarm :: proc(state: ^Chat_Interactive_Signals) {
 	if state == nil { return }
 	_ = posix.sigaction(.SIGINT, &state.previous_int, nil)
 	_ = posix.sigaction(.SIGTERM, &state.previous_term, nil)
+	_ = posix.sigaction(.SIGHUP, &state.previous_hup, nil)
 }
 
-// chat_signal_block_watched blocks SIGINT and SIGTERM on the calling thread and returns
-// its previous mask. A thread inherits its creator's mask, so a worker that must never
-// run the handler is created between this and chat_signal_restore. A mask that cannot be
-// set leaves the thread exposed, which is what the diagnostic records.
+// chat_signal_block_watched blocks SIGINT, SIGTERM, and SIGHUP on the calling thread and
+// returns its previous mask. A thread inherits its creator's mask, so a worker that must
+// never run the handler is created between this and chat_signal_restore. A mask that
+// cannot be set leaves the thread exposed, which is what the diagnostic records.
 chat_signal_block_watched :: proc() -> (previous: posix.sigset_t) {
 	blocked: posix.sigset_t
 	posix.sigemptyset(&blocked)
 	posix.sigaddset(&blocked, .SIGINT)
 	posix.sigaddset(&blocked, .SIGTERM)
+	posix.sigaddset(&blocked, .SIGHUP)
 	if posix.pthread_sigmask(.BLOCK, &blocked, &previous) != .NONE {
 		log_emit({level = .Error, category = .Runtime, event = "signal.block_failed"})
 	}
