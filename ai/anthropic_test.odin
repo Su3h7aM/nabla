@@ -102,6 +102,9 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	if !testing.expect(t, block_ok) { return }
 	block_type, _, _ := openai_value_string(block, "type")
 	testing.expect_value(t, block_type, "tool_use")
+	call_id, call_id_present, call_id_ok := openai_value_string(block, "id")
+	testing.expect(t, call_id_ok && call_id_present)
+	testing.expect_value(t, call_id, "toolu_1")
 	_, call_cached := block["cache_control"]
 	testing.expect(t, !call_cached, "only the last block is a breakpoint")
 	name, _, _ := openai_value_string(block, "name")
@@ -138,6 +141,52 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	if !testing.expect(t, tool_ok) { return }
 	_, has_schema := tool["input_schema"]
 	testing.expect(t, has_schema, "a tool states its schema, not its parameters")
+}
+
+@(test)
+test_anthropic_encode_normalizes_tool_ids_consistently :: proc(t: ^testing.T) {
+	request := anthropic_test_request()
+	request.Messages[2].Tool_Calls[0].ID = "call_abc|fc_1"
+	request.Messages[3].Tool_Call_ID = "call_abc|fc_1"
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	value, parse_err := json.parse_string(body, .JSON, true, context.temp_allocator)
+	testing.expect_value(t, parse_err, nil)
+	defer json.destroy_value(value, context.temp_allocator)
+	object, object_ok := value.(json.Object)
+	if !testing.expect(t, object_ok) { return }
+	messages, messages_ok := object["messages"].(json.Array)
+	if !testing.expect(t, messages_ok && len(messages) == 3) { return }
+	assistant, assistant_ok := messages[1].(json.Object)
+	if !testing.expect(t, assistant_ok) { return }
+	blocks, blocks_ok := assistant["content"].(json.Array)
+	if !testing.expect(t, blocks_ok && len(blocks) == 2) { return }
+	tool_use, tool_use_ok := blocks[1].(json.Object)
+	if !testing.expect(t, tool_use_ok) { return }
+	call_id, call_id_present, call_id_ok := openai_value_string(tool_use, "id")
+	if !testing.expect(t, call_id_ok && call_id_present) { return }
+	result_turn, result_turn_ok := messages[2].(json.Object)
+	if !testing.expect(t, result_turn_ok) { return }
+	result_blocks, result_blocks_ok := result_turn["content"].(json.Array)
+	if !testing.expect(t, result_blocks_ok && len(result_blocks) == 1) { return }
+	tool_result, tool_result_ok := result_blocks[0].(json.Object)
+	if !testing.expect(t, tool_result_ok) { return }
+	result_id, result_id_present, result_id_ok := openai_value_string(tool_result, "tool_use_id")
+	if !testing.expect(t, result_id_ok && result_id_present) { return }
+	testing.expect_value(t, result_id, call_id)
+	testing.expect(t, call_id != "call_abc|fc_1")
+	hash_separator := len(call_id) - 17
+	if testing.expect(t, hash_separator >= 0) {
+		testing.expect_value(t, call_id[hash_separator], byte('_'))
+		for digit in transmute([]byte)call_id[hash_separator + 1:] {
+			valid_hex_digit := (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f')
+			testing.expect(t, valid_hex_digit, "the normalized id ends in 16 hexadecimal digits")
+		}
+	}
+	for value in transmute([]byte)call_id {
+		valid := (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '_' || value == '-'
+		testing.expect(t, valid, "the normalized tool id matches the Messages API pattern")
+	}
 }
 
 @(test)

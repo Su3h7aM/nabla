@@ -1,6 +1,7 @@
 package ai
 
 import "core:encoding/json"
+import "core:hash"
 import "core:mem"
 import "core:strings"
 
@@ -24,6 +25,7 @@ ANTHROPIC_BLOCK_TOOL_RESULT :: "tool_result"
 ANTHROPIC_BLOCK_THINKING :: "thinking"
 ANTHROPIC_BLOCK_REDACTED_THINKING :: "redacted_thinking"
 ANTHROPIC_BLOCK_FALLBACK :: "fallback"
+ANTHROPIC_TOOL_ID_HASH_HEX_DIGITS :: 16
 
 // --- encoding ----------------------------------------------------------------
 
@@ -369,6 +371,48 @@ anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builde
 	encode_write_raw(cursor, body, "}")
 }
 
+@(private)
+anthropic_tool_id_byte_valid :: proc "contextless" (value: byte) -> bool {
+	return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9') || value == '_' || value == '-'
+}
+
+@(private)
+anthropic_tool_id_valid :: proc "contextless" (id: string) -> bool {
+	for value in transmute([]byte)id {
+		if !anthropic_tool_id_byte_valid(value) { return false }
+	}
+	return true
+}
+
+// anthropic_write_tool_id leaves valid IDs unchanged in the cache's text path and appends a
+// deterministic 64-bit hash to invalid IDs without allocation, so collisions require both
+// equal sanitized prefixes and hashes or a valid ID equal to the normalized output.
+@(private)
+anthropic_write_tool_id :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, id: string) {
+	if anthropic_tool_id_valid(id) {
+		encode_write_text(cursor, body, id)
+		return
+	}
+
+	encode_write_byte(cursor, body, '"')
+	for value in transmute([]byte)id {
+		if anthropic_tool_id_byte_valid(value) {
+			encode_write_byte(cursor, body, value)
+		} else {
+			encode_write_byte(cursor, body, '_')
+		}
+	}
+	encode_write_byte(cursor, body, '_')
+	hash_value := hash.fnv64a(transmute([]byte)id)
+	hexadecimal_digits := "0123456789abcdef"
+	for index in 0 ..< ANTHROPIC_TOOL_ID_HASH_HEX_DIGITS {
+		shift := u32((ANTHROPIC_TOOL_ID_HASH_HEX_DIGITS - index - 1) * 4)
+		digit := int((hash_value >> shift) & 0xf)
+		encode_write_byte(cursor, body, hexadecimal_digits[digit])
+	}
+	encode_write_byte(cursor, body, '"')
+}
+
 // anthropic_write_tool_use writes a call as its content block. The arguments are a JSON
 // object on the wire, so a call whose arguments are not one is replayed with an empty
 // object: the id and name are preserved so the paired result still answers this call, and
@@ -386,7 +430,7 @@ anthropic_write_tool_use :: proc(
 	encode_write_raw(cursor, body, "{")
 	if marked { anthropic_write_cache_control(cursor, body, &field_first) }
 	encode_write_field(cursor, body, &field_first, "id")
-	encode_write_text(cursor, body, call.ID)
+	anthropic_write_tool_id(cursor, body, call.ID)
 	encode_write_field(cursor, body, &field_first, "input")
 	if !encode_write_object(cursor, body, call.Arguments, allocator) {
 		if cursor.error != .None { return cursor.error }
@@ -413,7 +457,7 @@ anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Build
 		encode_write_bool(cursor, body, true)
 	}
 	encode_write_field(cursor, body, &field_first, "tool_use_id")
-	encode_write_text(cursor, body, message.Tool_Call_ID)
+	anthropic_write_tool_id(cursor, body, message.Tool_Call_ID)
 	encode_write_field(cursor, body, &field_first, "type")
 	encode_write_literal_string(cursor, body, ANTHROPIC_BLOCK_TOOL_RESULT)
 	encode_write_raw(cursor, body, "}")

@@ -55,7 +55,10 @@ openai_chat_encode_request :: proc(
 		encode_write_item(&cursor, body, &item_first)
 		field_first := true
 		encode_write_raw(&cursor, body, "{")
-		if message.Cache_Breakpoint {
+		switch {
+		case message.Role == .Assistant && message.Content == "" && len(message.Tool_Calls) > 0:
+		// content is optional beside tool_calls, and compatible endpoints disagree on an empty one.
+		case message.Cache_Breakpoint:
 			encode_write_field(&cursor, body, &field_first, "content")
 			encode_write_raw(&cursor, body, "[{")
 			part_first := true
@@ -70,7 +73,7 @@ openai_chat_encode_request :: proc(
 			encode_write_field(&cursor, body, &part_first, "type")
 			encode_write_literal_string(&cursor, body, "text")
 			encode_write_raw(&cursor, body, "}]")
-		} else {
+		case:
 			encode_write_field(&cursor, body, &field_first, "content")
 			encode_write_text(&cursor, body, message.Content)
 		}
@@ -296,6 +299,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 	if len(choices) > 1 { return provider_stream_fail(state, .Invalid_Data, "multiple choices are unsupported") }
 	text_content := ""
 	text_present := false
+	refusal_text := ""
 	tools_present := false
 	reason := ""
 	reason_present := false
@@ -365,6 +369,9 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 			text_content = content
 			text_present = true
 		}
+		refusal, refusal_present, refusal_ok := openai_value_string(delta, "refusal")
+		if !refusal_ok { return provider_stream_fail(state, .Invalid_Data, "delta refusal is not text") }
+		if refusal_present && refusal != "" { refusal_text = refusal }
 		finish_text, finish_present, finish_ok := openai_value_string(choice, "finish_reason")
 		if !finish_ok { return provider_stream_fail(state, .Invalid_Data, "finish_reason is invalid") }
 		if finish_present && finish_text != "" {
@@ -372,12 +379,17 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 			reason_present = true
 		}
 	}
-	if state^.Phase == .Completed && (text_present || tools_present || reason_present) {
+	if state^.Phase == .Completed && (text_present || refusal_text != "" || tools_present || reason_present) {
 		return provider_stream_fail(state, .Invalid_Data, "data received after completion")
 	}
 	if text_present {
 		owned, clone_error := strings.clone(text_content, state.Allocator)
 		if clone_error != nil { return provider_stream_fail_allocation(state, "the response text could not be retained") }
+		provider_stream_push(state, Provider_Text_Event{Text = owned})
+	}
+	if refusal_text != "" {
+		owned, clone_error := strings.clone(refusal_text, state.Allocator)
+		if clone_error != nil { return provider_stream_fail_allocation(state, "the refusal text could not be retained") }
 		provider_stream_push(state, Provider_Text_Event{Text = owned})
 	}
 	if usage_present { provider_stream_push(state, Provider_Usage_Event(usage)) }
