@@ -74,6 +74,25 @@ test_markdown_preserves_strong_and_code_styles :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_markdown_link_segments_keep_safe_destination_through_wrap :: proc(t: ^testing.T) {
+	lines := rendered_lines(t, "[docs](https://example.com)", 8)
+	testing.expect(t, len(lines.line_ends) > 1)
+	for line_index in 0 ..< len(lines.line_ends) {
+		for segment in markdown_line(lines, line_index) {
+			testing.expect_value(t, segment.link, "https://example.com")
+		}
+	}
+	testing.expect_value(t, rendered_text(lines), "docs\n(https:/\n/example\n.com)")
+
+	unsafe := rendered_lines(t, "[bad](javascript:alert)", 80)
+	for line_index in 0 ..< len(unsafe.line_ends) {
+		for segment in markdown_line(unsafe, line_index) {
+			testing.expect_value(t, segment.link, "")
+		}
+	}
+}
+
+@(test)
 test_markdown_tight_nested_list_aligns_ordered_numbers :: proc(t: ^testing.T) {
 	lines := rendered_lines(t, "9. first\n10. second\n    - child\n    - next\n11. third", 40)
 	testing.expect_value(t, rendered_text(lines), " 9. first\n10. second\n    • child\n    • next\n11. third")

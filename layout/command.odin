@@ -207,6 +207,7 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 		data := Text_Cmd {
 			text     = record.text,
 			style    = input.text_style,
+			user     = input.desc.user,
 			line     = record.line,
 			baseline = record.baseline,
 		}

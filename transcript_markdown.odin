@@ -12,6 +12,7 @@ import "nabla:text"
 Styled_Segment :: struct {
 	text:  string,
 	style: term.Style,
+	link:  string,
 }
 
 // Markdown_Lines stores segments in reading order and the end index of each line.
@@ -121,18 +122,18 @@ renderer_flush_line :: proc(renderer: ^Renderer) -> mem.Allocator_Error {
 }
 
 @(private = "file", require_results)
-renderer_segment :: proc(renderer: ^Renderer, value: string, style: term.Style) -> mem.Allocator_Error {
+renderer_segment :: proc(renderer: ^Renderer, value: string, style: term.Style, link: string = "") -> mem.Allocator_Error {
 	if value == "" {
 		return nil
 	}
-	_, err := append(&renderer.current, Styled_Segment{text = value, style = style})
+	_, err := append(&renderer.current, Styled_Segment{text = value, style = style, link = link})
 	return err
 }
 
 @(private = "file", require_results)
 renderer_append_segments :: proc(renderer: ^Renderer, segments: []Styled_Segment) -> mem.Allocator_Error {
 	for segment in segments {
-		renderer_segment(renderer, segment.text, segment.style) or_return
+		renderer_segment(renderer, segment.text, segment.style, segment.link) or_return
 	}
 	return nil
 }
@@ -253,11 +254,12 @@ paragraph_render :: proc(renderer: ^Renderer, spans: []markdown.Span, width: int
 			continue
 		}
 		style := span_style(span.style, extra)
-		paragraph_add_text(renderer, span.text, style, width) or_return
+		link := span.url if .Link in span.style && safe_link_url(span.url) else ""
+		paragraph_add_text(renderer, span.text, style, width, link) or_return
 		if .Link in span.style && paragraph_link_group_end(spans, i) && !paragraph_link_text_is_url(spans, i) {
-			paragraph_add_text(renderer, MARKDOWN_LINK_URL_PREFIX, MARKDOWN_DIM_STYLE, width) or_return
-			paragraph_add_text(renderer, span.url, MARKDOWN_DIM_STYLE, width) or_return
-			paragraph_add_text(renderer, MARKDOWN_LINK_URL_SUFFIX, MARKDOWN_DIM_STYLE, width) or_return
+			paragraph_add_text(renderer, MARKDOWN_LINK_URL_PREFIX, MARKDOWN_DIM_STYLE, width, link) or_return
+			paragraph_add_text(renderer, span.url, MARKDOWN_DIM_STYLE, width, link) or_return
+			paragraph_add_text(renderer, MARKDOWN_LINK_URL_SUFFIX, MARKDOWN_DIM_STYLE, width, link) or_return
 		}
 	}
 	paragraph_place_word(renderer, width) or_return
@@ -269,7 +271,7 @@ paragraph_render :: proc(renderer: ^Renderer, spans: []markdown.Span, width: int
 }
 
 @(private = "file", require_results)
-paragraph_add_text :: proc(renderer: ^Renderer, value: string, style: term.Style, width: int) -> mem.Allocator_Error {
+paragraph_add_text :: proc(renderer: ^Renderer, value: string, style: term.Style, width: int, link: string = "") -> mem.Allocator_Error {
 	word_start := 0
 	offset := 0
 	for offset < len(value) {
@@ -279,14 +281,14 @@ paragraph_add_text :: proc(renderer: ^Renderer, value: string, style: term.Style
 		}
 		if value[offset:end] == " " {
 			if word_start < offset {
-				if _, err := append(&renderer.word, Styled_Segment{text = value[word_start:offset], style = style}); err != nil {
+				if _, err := append(&renderer.word, Styled_Segment{text = value[word_start:offset], style = style, link = link}); err != nil {
 					return err
 				}
 			}
 			if len(renderer.word) > 0 {
 				paragraph_place_word(renderer, width) or_return
 			}
-			if _, err := append(&renderer.spaces, Styled_Segment{text = value[offset:end], style = style}); err != nil {
+			if _, err := append(&renderer.spaces, Styled_Segment{text = value[offset:end], style = style, link = link}); err != nil {
 				return err
 			}
 			word_start = end
@@ -294,7 +296,7 @@ paragraph_add_text :: proc(renderer: ^Renderer, value: string, style: term.Style
 		offset = end
 	}
 	if word_start < len(value) {
-		if _, err := append(&renderer.word, Styled_Segment{text = value[word_start:], style = style}); err != nil {
+		if _, err := append(&renderer.word, Styled_Segment{text = value[word_start:], style = style, link = link}); err != nil {
 			return err
 		}
 	}
@@ -348,7 +350,7 @@ paragraph_split_word :: proc(renderer: ^Renderer, word: []Styled_Segment, width:
 			if column > 0 && column + grapheme_columns > width {
 				renderer_flush_line(renderer) or_return
 			}
-			renderer_segment(renderer, grapheme, segment.style) or_return
+			renderer_segment(renderer, grapheme, segment.style, segment.link) or_return
 			offset = end
 		}
 	}
@@ -665,4 +667,26 @@ rendered_cells_destroy :: proc(cells: ^[dynamic]Renderer) {
 	}
 	delete(cells^)
 	cells^ = {}
+}
+
+// LINK_SCHEMES are the destinations a click may open. Links come from model output, so
+// schemes that run or read something locally (file, javascript, custom handlers) stay text.
+@(private = "file")
+LINK_SCHEMES :: [?]string{"http", "https", "mailto"}
+
+// safe_link_url reports whether url may become a terminal hyperlink: an allowed scheme,
+// and only printable ASCII, so the URL cannot end the escape sequence carrying it.
+@(private = "file")
+safe_link_url :: proc(url: string) -> bool {
+	colon := strings.index_byte(url, ':')
+	if colon < 0 { return false }
+	allowed := false
+	for scheme in LINK_SCHEMES {
+		allowed ||= strings.equal_fold(url[:colon], scheme)
+	}
+	if !allowed { return false }
+	for character in transmute([]u8)url {
+		if character < '!' || character > '~' { return false }
+	}
+	return true
 }

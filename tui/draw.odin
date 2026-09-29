@@ -105,6 +105,23 @@ draw_text_rect :: proc(
 	return _draw_text_clipped(buffer, rect, Cell_Rect{width = buffer.columns, height = buffer.rows}, value, style, profile)
 }
 
+// draw_text_linked_rect writes text carrying the supplied terminal hyperlink id.
+@(require_results)
+draw_text_linked_rect :: proc(
+	buffer: ^term.Frame_Buffer,
+	rect: Cell_Rect,
+	value: string,
+	style: term.Style,
+	link: term.Link_Id,
+	profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE,
+) -> (
+	written: int,
+	ok: bool,
+) {
+	if buffer == nil { return 0, false }
+	return _draw_text_clipped(buffer, rect, Cell_Rect{width = buffer.columns, height = buffer.rows}, value, style, profile, link)
+}
+
 put :: proc {
 	put_cell,
 	put_context,
@@ -140,6 +157,7 @@ _draw_text_clipped :: proc(
 	value: string,
 	style: term.Style,
 	profile: text.Width_Profile,
+	link: term.Link_Id = 0,
 ) -> (
 	written: int,
 	ok: bool,
@@ -178,7 +196,7 @@ _draw_text_clipped :: proc(
 			break
 		}
 		if column >= visible.x && column + cluster.width <= _rect_end(visible.x, visible.width) {
-			if _write_cluster(buffer, column, visible.y, cluster.text, style, cluster.width) {
+			if _write_cluster(buffer, column, visible.y, cluster.text, style, cluster.width, link) {
 				written += cluster.width
 			}
 		}
@@ -190,7 +208,7 @@ _draw_text_clipped :: proc(
 // _write_cluster writes one cluster and resets every cell it overwrites,
 // including any wide-cluster partner, so no orphaned half survives.
 @(require_results)
-_write_cluster :: proc(buffer: ^term.Frame_Buffer, x, y: int, grapheme: string, style: term.Style, width: int) -> bool {
+_write_cluster :: proc(buffer: ^term.Frame_Buffer, x, y: int, grapheme: string, style: term.Style, width: int, link: term.Link_Id = 0) -> bool {
 	if x < 0 || x >= buffer.columns {
 		return false
 	}
@@ -205,12 +223,14 @@ _write_cluster :: proc(buffer: ^term.Frame_Buffer, x, y: int, grapheme: string, 
 		grapheme = grapheme,
 		style    = style,
 		width    = u8(width),
+		link     = link,
 	}
 	if width == 2 {
 		buffer.cells[row + x + 1] = term.Cell {
 			grapheme = "",
 			style    = style,
 			width    = 0,
+			link     = link,
 		}
 	}
 	return true

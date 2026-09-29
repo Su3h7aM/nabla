@@ -100,7 +100,7 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 		box.layout.sizing.height = fit()
 		box.id = id("box")
 		if element(&ctx, box) {
-			text(&ctx, {text = "aaa bbb ccc", style = {size = 10, color = {255, 255, 255, 255}, wrap = .Words}})
+			text(&ctx, {text = "aaa bbb ccc", user = User_Tag(37), style = {size = 10, color = {255, 255, 255, 255}, wrap = .Words}})
 		}
 	}
 	frame_result, err = result(&ctx)
@@ -114,6 +114,7 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 		}
 		testing.expect_value(t, data.text, expected_lines[line_index])
 		testing.expect_value(t, data.line, u16(line_index))
+		testing.expect_value(t, data.user, User_Tag(37))
 		line_index += 1
 	}
 	testing.expect_value(t, line_index, 3)

@@ -389,3 +389,40 @@ test_present_requires_an_open_session :: proc(t: ^testing.T) {
 	testing.expect_value(t, committed, 0)
 	testing.expect_value(t, required, 0)
 }
+
+@(test)
+test_encode_hyperlinks_close_before_wrapped_row_cursor_moves :: proc(t: ^testing.T) {
+	buffer := Frame_Buffer {
+		columns = 1,
+		rows    = 2,
+		cells   = []Cell{{grapheme = "a", width = 1, link = Link_Id(2)}, {grapheme = "b", width = 1, link = Link_Id(2)}},
+		links   = []string{"https://other.example", "https://example.com"},
+	}
+	scratch: [4096]byte
+	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
+	if !testing.expect(t, ok) { return }
+	open := "\x1b]8;id=2;https://example.com\x1b\\"
+	close := "\x1b]8;;\x1b\\"
+	first_open := strings.index(out, open)
+	first_close := strings.index(out, close)
+	second_open := strings.index(out[first_close + len(close):], open)
+	second_close := strings.index(out[first_close + len(close):], close)
+	row_move := strings.index(out, "\x1b[2;1H")
+	testing.expect(t, first_open >= 0 && first_close > first_open)
+	testing.expect(t, second_open >= 0 && second_close > second_open)
+	testing.expect(t, row_move > first_close && row_move < first_close + len(close) + 20)
+}
+
+@(test)
+test_encode_invalid_hyperlink_uri_without_osc8 :: proc(t: ^testing.T) {
+	buffer := Frame_Buffer {
+		columns = 1,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "x", width = 1, link = Link_Id(1)}},
+		links   = []string{"https://bad\x1b]8;;"},
+	}
+	scratch: [4096]byte
+	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
+	if !testing.expect(t, ok) { return }
+	testing.expect(t, strings.index(out, "\x1b]8;") < 0)
+}

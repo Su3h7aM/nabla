@@ -7,6 +7,10 @@ Frame_Buffer :: struct {
 	columns: int,
 	rows:    int,
 	cells:   []Cell,
+	// links are the hyperlink destinations cells refer to: Link_Id n is links[n - 1].
+	// They are borrowed for the call to present. A URI with a byte outside printable
+	// ASCII, or an id past the table, is written as plain cells without a hyperlink.
+	links:   []string,
 }
 
 // Cursor is the desired cursor state after a frame. Visibility and position

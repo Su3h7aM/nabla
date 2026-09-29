@@ -167,6 +167,9 @@ Frame_Storage :: struct {
 	output:     []byte,
 	alloc:      mem.Allocator,
 	markdown:   Markdown_Cache,
+	// links is this frame's hyperlink table (term.Frame_Buffer.links); the URIs are
+	// views into markdown's records, which live through the frame's present.
+	links:      [dynamic]string,
 	layout_ctx: layout.Context,
 	// capacities is what layout_ctx is currently sized for. The context owns its
 	// storage, so the budget is raised through layout.reserve as the transcript
@@ -180,6 +183,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage, storage_error := new(Frame_Storage, alloc)
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
+	storage.links = make([dynamic]string, alloc)
 	markdown_cache_init(&storage.markdown, alloc)
 	// Measurement and drawing share one width policy, so a tab or an
 	// emoji-presentation sequence measures the columns drawing produces.
@@ -208,6 +212,7 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
 	markdown_cache_destroy(&storage.markdown)
+	delete(storage.links)
 	layout.destroy(&storage.layout_ctx)
 	free(storage, storage.alloc)
 }
@@ -325,6 +330,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		cursor = drawn_cursor
 	}
 	draw_footer(app, storage, cwd_rect, status_rect)
+	storage.buffer.links = storage.links[:]
 	return cursor, .None
 }
 
@@ -399,6 +405,7 @@ conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.
 // when there is nothing to show, and one element per entry. The declarations live inside
 // the frame's own `if` block, because that block is what layout closes the frame on.
 declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) {
+	clear(&storage.links)
 	// Services bind for one frame only, so every solve re-binds them.
 	layout.set_services(
 		&storage.layout_ctx,
@@ -512,7 +519,8 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 			// the conversation's indent: the text keeps that indent as its padding.
 			tui.fill(&storage.buffer, {x = 0, y = line.y, width = storage.buffer.columns, height = 1}, " ", style)
 		}
-		_, _ = tui.draw_text(&storage.buffer, line, text_data.text, style)
+		// A text node's user tag is its link id; zero draws plain cells.
+		_, _ = tui.draw_text_linked_rect(&storage.buffer, line, text_data.text, style, term.Link_Id(text_data.user))
 	}
 	return true
 }
@@ -593,7 +601,7 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 	}
 	if entry.kind == .Assistant {
 		if lines, render_error := markdown_cache_lines(&storage.markdown, entry, width); render_error == nil {
-			declare_markdown_entry(ctx, lines)
+			declare_markdown_entry(ctx, storage, lines)
 			return
 		}
 	}
@@ -632,7 +640,7 @@ declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 // declare_markdown_entry adds an assistant message rendered from Markdown. The
 // lines arrive wrapped to the transcript width, so each is one row of unwrapped
 // segments, and an empty line still holds its row.
-declare_markdown_entry :: proc(ctx: ^layout.Context, lines: Markdown_Lines) {
+declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, lines: Markdown_Lines) {
 	entry_layout := layout.Layout_Style {
 		flow = .Column,
 		sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
@@ -647,11 +655,23 @@ declare_markdown_entry :: proc(ctx: ^layout.Context, lines: Markdown_Lines) {
 			}
 			if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
 				for segment in line {
-					layout.text(ctx, layout.Text_Desc{text = segment.text, style = layout_text_style(segment.style)})
+					link := frame_link_id(storage, segment.link)
+					layout.text(ctx, layout.Text_Desc{text = segment.text, style = layout_text_style(segment.style), user = layout.User_Tag(link)})
 				}
 			}
 		}
 	}
+}
+
+// frame_link_id returns the frame's link id for uri, adding it to the table the first
+// time. An empty uri, or one the table cannot hold, gets zero and is drawn unlinked.
+frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
+	if uri == "" { return 0 }
+	for link, index in storage.links {
+		if link == uri { return term.Link_Id(index + 1) }
+	}
+	if _, append_error := append(&storage.links, uri); append_error != nil { return 0 }
+	return term.Link_Id(len(storage.links))
 }
 
 // declare_tool_entry draws one tool call as a bordered box: the call's name on the top

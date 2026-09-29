@@ -52,6 +52,8 @@ Border_Cmd :: struct {
 Text_Cmd :: struct {
 	text:     string,
 	style:    Text_Style,
+	// user travels with each wrapped line emitted from its text node.
+	user:     User_Tag,
 	line:     u16,
 	baseline: Scalar,
 }

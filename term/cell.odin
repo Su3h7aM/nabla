@@ -18,4 +18,8 @@ Cell :: struct {
 	grapheme: string,
 	style:    Style,
 	width:    u8,
+	link:     Link_Id,
 }
+
+// Link_Id identifies a URI in the frame's hyperlink table. Zero means no link.
+Link_Id :: distinct u32

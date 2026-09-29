@@ -270,6 +270,10 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 	// unconditional SGR reset prevents stale attributes from a previous frame.
 	_encoder_write_text(encoder, ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
 	previous_style: Style
+	// previous_link is the last cell's id; link_open says a hyperlink for it is open,
+	// which is false for an id with no usable URI.
+	previous_link: Link_Id
+	link_open: bool
 
 	for y in 0 ..< buffer.rows {
 		// Per-row cursor positioning. CUP does not reset SGR attributes, so
@@ -281,8 +285,21 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 
 		for x in 0 ..< buffer.columns {
 			index := y * buffer.columns + x
-			_encoder_write_cell(encoder, buffer.cells[index], &previous_style, profile.color_depth)
+			cell := buffer.cells[index]
+			if cell.link != previous_link {
+				if link_open { _encoder_hyperlink_close(encoder) }
+				uri: string
+				uri, link_open = _hyperlink_uri(buffer, cell.link)
+				if link_open { _encoder_hyperlink_open(encoder, cell.link, uri) }
+				previous_link = cell.link
+			}
+			_encoder_write_cell(encoder, cell, &previous_style, profile.color_depth)
 		}
+		// A hyperlink never spans the next row's cursor move; the same id reopens
+		// it there, which is what joins the pieces of a wrapped link.
+		if link_open { _encoder_hyperlink_close(encoder) }
+		link_open = false
+		previous_link = 0
 	}
 
 	// Position first, then visibility: showing after the move keeps a
@@ -302,6 +319,33 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 
 	// Restore the base style at the end of the frame (baseline contract).
 	_encoder_write_text(encoder, ansi.CSI + ansi.SGR)
+}
+
+_hyperlink_uri :: proc(buffer: Frame_Buffer, id: Link_Id) -> (string, bool) {
+	if id == 0 || int(id) > len(buffer.links) { return "", false }
+	uri := buffer.links[id - 1]
+	return uri, _uri_safe(uri)
+}
+
+// _uri_safe keeps the URI from ending the OSC 8 sequence early: only printable ASCII.
+_uri_safe :: proc(uri: string) -> bool {
+	if len(uri) == 0 { return false }
+	for byte in transmute([]u8)uri {
+		if byte < 0x21 || byte > 0x7e { return false }
+	}
+	return true
+}
+
+_encoder_hyperlink_open :: proc(encoder: ^_Encoder, id: Link_Id, uri: string) {
+	_encoder_write_text(encoder, "\x1b]8;id=")
+	_encoder_write_uint(encoder, u64(id))
+	_encoder_write_byte(encoder, ';')
+	_encoder_write_text(encoder, uri)
+	_encoder_write_text(encoder, "\x1b\\")
+}
+
+_encoder_hyperlink_close :: proc(encoder: ^_Encoder) {
+	_encoder_write_text(encoder, "\x1b]8;;\x1b\\")
 }
 
 _encoder_write_cell :: proc(encoder: ^_Encoder, cell: Cell, previous: ^Style, depth: Color_Depth) {
