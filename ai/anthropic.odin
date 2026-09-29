@@ -84,6 +84,12 @@ anthropic_encode_request :: proc(
 		encode_write_field(&cursor, body, &first, "system")
 		encode_write_text(&cursor, body, request.Instructions)
 	}
+	if request.Adaptive_Thinking {
+		encode_write_field(&cursor, body, &first, "thinking")
+		encode_write_raw(&cursor, body, "{\"type\":")
+		encode_write_literal_string(&cursor, body, "adaptive")
+		encode_write_raw(&cursor, body, "}")
+	}
 	if len(request.Tools) > 0 {
 		encode_write_field(&cursor, body, &first, "tools")
 		encode_write_raw(&cursor, body, "[")

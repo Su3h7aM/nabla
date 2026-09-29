@@ -124,6 +124,10 @@ Provider_Request :: struct {
 	// configured levels, never translated. Absent means provider default.
 	Reasoning_Effort_Present:       bool,
 	Reasoning_Effort:               string, // borrowed; valid only when present,
+	// Adaptive_Thinking asks the model to decide when and how much to think. It is
+	// optional: an endpoint that refuses it serves the same request without it. Only
+	// the Anthropic Messages API has the field; the other encoders leave it out.
+	Adaptive_Thinking:              bool,
 	Prompt_Cache_Key_Present:       bool,
 	Prompt_Cache_Key:               string, // borrowed; optional routing/accounting hint,
 	Prompt_Cache_Options_Present:   bool,

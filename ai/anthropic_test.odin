@@ -158,6 +158,23 @@ test_anthropic_encode_omits_cache_when_not_requested :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_anthropic_encode_adaptive_thinking_beside_effort :: proc(t: ^testing.T) {
+	request := anthropic_test_request()
+	request.Reasoning_Effort_Present = true
+	request.Reasoning_Effort = "high"
+	request.Adaptive_Thinking = true
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	testing.expect(t, strings.contains(body, `"thinking":{"type":"adaptive"}`))
+	testing.expect(t, strings.contains(body, `"output_config":{"effort":"high"}`))
+
+	request.Adaptive_Thinking = false
+	body, err = Provider_Encode_Request(request, context.temp_allocator)
+	testing.expect_value(t, err, Provider_Request_Error.None)
+	testing.expect(t, !strings.contains(body, `"thinking"`), "a request without adaptive thinking leaves the model's default")
+}
+
+@(test)
 test_anthropic_encode_marks_a_single_text_turn :: proc(t: ^testing.T) {
 	request := anthropic_test_request()
 	request.Messages = request.Messages[:1]
