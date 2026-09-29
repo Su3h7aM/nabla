@@ -42,3 +42,20 @@ test_wrap_reports_invalid_text :: proc(t: ^testing.T) {
 	_, done := wrap_next(&iterator)
 	testing.expect_value(t, done, Wrap_Status.Done)
 }
+
+@(test)
+test_wrap_zero_width_keeps_each_grapheme :: proc(t: ^testing.T) {
+	iterator := wrap_iterator_make("a界b", 0)
+	first, first_status := wrap_next(&iterator)
+	second, second_status := wrap_next(&iterator)
+	third, third_status := wrap_next(&iterator)
+	_, done := wrap_next(&iterator)
+
+	testing.expect_value(t, first_status, Wrap_Status.OK)
+	testing.expect_value(t, first, "a")
+	testing.expect_value(t, second_status, Wrap_Status.OK)
+	testing.expect_value(t, second, "界")
+	testing.expect_value(t, third_status, Wrap_Status.OK)
+	testing.expect_value(t, third, "b")
+	testing.expect_value(t, done, Wrap_Status.Done)
+}

@@ -2,6 +2,7 @@ package input
 
 import "base:runtime"
 import "core:strings"
+import "core:unicode/utf8"
 
 Parser_State :: enum u8 {
 	Ground,
@@ -25,13 +26,15 @@ PASTE_END :: "\e[201~"
 Parser :: struct {
 	state:         Parser_State,
 	utf8_expected: int, // remaining UTF-8 continuation bytes
-	utf8_pending:  u32, // accumulated code point bits
+	utf8_bytes:    [4]u8,
+	utf8_length:   int,
 	// params holds the raw parameter bytes of one CSI/SS3 sequence. An SGR
 	// mouse report needs up to 14 bytes ('<' plus three decimal fields with
 	// separators), so the buffer is sized for that, not for key sequences.
 	params:        [16]u8,
 	param_count:   int,
 	intermediate:  u8,
+	osc_escape:    bool,
 	// paste is the scratch for a bracketed paste's raw bytes, allocated with
 	// the feed allocator and owned by the parser until parser_destroy. It grows
 	// with the paste it is collecting, however large that paste is.
@@ -99,9 +102,10 @@ parser_resolve_escape :: proc(parser: ^Parser, events: ^[dynamic]Event, allocato
 parser_reset :: proc(parser: ^Parser) {
 	parser.state = .Ground
 	parser.utf8_expected = 0
-	parser.utf8_pending = 0
+	parser.utf8_length = 0
 	parser.param_count = 0
 	parser.intermediate = 0
+	parser.osc_escape = false
 }
 
 @(require_results)
@@ -131,17 +135,16 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 		switch {
 		case input_byte >= 0xc2 && input_byte <= 0xdf:
 			expected = 1
-			parser.utf8_pending = u32(input_byte & 0x1f)
 		case input_byte >= 0xe0 && input_byte <= 0xef:
 			expected = 2
-			parser.utf8_pending = u32(input_byte & 0x0f)
 		case input_byte >= 0xf0 && input_byte <= 0xf4:
 			expected = 3
-			parser.utf8_pending = u32(input_byte & 0x07)
 		case:
 			err = parser_emit(parser, events, Unknown_Input{}, allocator)
 		}
 		if expected > 0 {
+			parser.utf8_bytes[0] = input_byte
+			parser.utf8_length = 1
 			parser.state = .Utf8
 			parser.utf8_expected = expected
 		}
@@ -154,14 +157,17 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 @(require_results)
 parser_utf8 :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	if input_byte >= 0x80 && input_byte <= 0xbf {
-		parser.utf8_pending = (parser.utf8_pending << 6) | u32(input_byte & 0x3f)
+		parser.utf8_bytes[parser.utf8_length] = input_byte
+		parser.utf8_length += 1
 		parser.utf8_expected -= 1
 		if parser.utf8_expected == 0 {
-			code_point := rune(parser.utf8_pending)
-			parser_reset(parser)
-			if (code_point >= 0xd800 && code_point <= 0xdfff) || code_point > 0x10ffff {
+			encoded := string(parser.utf8_bytes[:parser.utf8_length])
+			if !utf8.valid_string(encoded) {
+				parser_reset(parser)
 				return 1, parser_emit(parser, events, Unknown_Input{}, allocator)
 			}
+			code_point, _ := utf8.decode_rune(encoded)
+			parser_reset(parser)
 			return 1, parser_emit(parser, events, Key_Event{code = .Character, character = code_point}, allocator)
 		}
 		return 1, nil
@@ -461,8 +467,18 @@ parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, 
 // ESC terminator; the content is intentionally dropped, not surfaced.
 @(require_results)
 parser_osc :: proc(parser: ^Parser, input_byte: u8) -> (consumed: int, err: Error) {
-	if input_byte == 0x07 || input_byte == 0x1b {
+	if parser.osc_escape {
+		if input_byte == '\\' {
+			parser_reset(parser)
+			return 1, nil
+		}
 		parser_reset(parser)
+		return 0, nil
+	}
+	if input_byte == 0x07 {
+		parser_reset(parser)
+	} else if input_byte == 0x1b {
+		parser.osc_escape = true
 	}
 	return 1, nil
 }

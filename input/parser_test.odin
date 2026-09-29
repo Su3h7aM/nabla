@@ -88,6 +88,26 @@ test_malformed_input_emits_unknown_and_resyncs :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_overlong_utf8_emits_unknown_and_resyncs :: proc(t: ^testing.T) {
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
+	events: [dynamic]Event
+	defer events_destroy(&events)
+
+	data := []u8{0xe0, 0x80, 0xaf, 'q'}
+	testing.expect(t, feed(&parser, data, &events) == nil, "overlong input must not error")
+	testing.expect_value(t, len(events), 2)
+	testing.expect_value(t, events[0], Event(Unknown_Input{}))
+	testing.expect_value(t, events[1], Event(Key_Event{code = .Character, character = 'q'}))
+}
+
+@(test)
+test_osc_string_terminator_is_consumed :: proc(t: ^testing.T) {
+	_feed_events(t, "\e]0;title\e\\q", []Event{Key_Event{code = .Character, character = 'q'}})
+}
+
+@(test)
 test_bracketed_paste :: proc(t: ^testing.T) {
 	// The bytes between CSI 200 ~ and CSI 201 ~ become one Paste event with the
 	// exact content: newlines and escape bytes are not decoded into events.

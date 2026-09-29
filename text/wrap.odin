@@ -28,7 +28,7 @@ wrap_next :: proc(iterator: ^Wrap_Iterator) -> (line: string, status: Wrap_Statu
 	for len(iterator._rest) > 0 && iterator._rest[0] == ' ' {
 		iterator._rest = iterator._rest[1:]
 	}
-	if len(iterator._rest) == 0 || iterator._width <= 0 {
+	if len(iterator._rest) == 0 {
 		iterator._done = true
 		return "", .OK
 	}

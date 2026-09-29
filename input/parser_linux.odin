@@ -7,6 +7,7 @@ import "core:io"
 import "core:os"
 import "core:sys/linux"
 import "core:sys/posix"
+import "core:time"
 
 ESC_DEADLINE_MS :: 50
 
@@ -29,9 +30,21 @@ read_events :: proc(
 	start := len(events^)
 	fd := posix.FD(os.fd(file))
 
+	escape_deadline: time.Tick
+	has_escape_deadline := parser_escape_pending(parser)
+	if has_escape_deadline {
+		escape_deadline = time.tick_add(time.tick_now(), time.Duration(ESC_DEADLINE_MS) * time.Millisecond)
+	}
 	first_timeout := timeout_ms
-	if parser_escape_pending(parser) && (first_timeout < 0 || first_timeout > ESC_DEADLINE_MS) {
-		first_timeout = ESC_DEADLINE_MS
+	if has_escape_deadline {
+		remaining := time.tick_diff(time.tick_now(), escape_deadline)
+		remaining_timeout := i64(0)
+		if remaining > 0 {
+			remaining_timeout = i64((remaining + time.Millisecond - 1) / time.Millisecond)
+		}
+		if first_timeout < 0 || first_timeout > remaining_timeout {
+			first_timeout = remaining_timeout
+		}
 	}
 	ready, poll_err := input_poll(fd, c.int(first_timeout))
 	if poll_err != nil {
@@ -43,7 +56,16 @@ read_events :: proc(
 		}
 	}
 	if parser_escape_pending(parser) {
-		ready, poll_err = input_poll(fd, ESC_DEADLINE_MS)
+		if !has_escape_deadline {
+			escape_deadline = time.tick_add(time.tick_now(), time.Duration(ESC_DEADLINE_MS) * time.Millisecond)
+			has_escape_deadline = true
+		}
+		remaining := time.tick_diff(time.tick_now(), escape_deadline)
+		remaining_timeout := c.int(0)
+		if remaining > 0 {
+			remaining_timeout = c.int((remaining + time.Millisecond - 1) / time.Millisecond)
+		}
+		ready, poll_err = input_poll(fd, remaining_timeout)
 		if poll_err != nil {
 			return len(events^) - start, poll_err
 		}
@@ -62,12 +84,25 @@ read_events :: proc(
 
 @(require_results)
 input_poll :: proc(fd: posix.FD, timeout: c.int) -> (ready: int, err: Error) {
+	deadline: time.Tick
+	has_deadline := timeout > 0
+	if has_deadline {
+		deadline = time.tick_add(time.tick_now(), time.Duration(timeout) * time.Millisecond)
+	}
 	for {
+		poll_timeout := timeout
+		if has_deadline {
+			remaining := time.tick_diff(time.tick_now(), deadline)
+			poll_timeout = 0
+			if remaining > 0 {
+				poll_timeout = c.int((remaining + time.Millisecond - 1) / time.Millisecond)
+			}
+		}
 		poll_descriptor := posix.pollfd {
 			fd     = fd,
 			events = {.IN, .HUP, .ERR, .NVAL},
 		}
-		ready_count := posix.poll(&poll_descriptor, 1, timeout)
+		ready_count := posix.poll(&poll_descriptor, 1, poll_timeout)
 		if ready_count >= 0 {
 			return int(ready_count), nil
 		}
