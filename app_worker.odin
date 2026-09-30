@@ -210,8 +210,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 				detail := journal.error_text(record_error, context.temp_allocator)
 				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", detail))
 			} else if session_record_error := selection_applied_record(
-				app.setup.store,
-				app.setup.session.session,
+				&app.setup.session,
 				app.setup.api,
 				app.setup.provider_id,
 				app.setup.model_id,

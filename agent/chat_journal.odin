@@ -43,13 +43,22 @@ chat_commit :: proc(chat: ^Chat_Session, what: string) -> bool {
 }
 
 // chat_runtime_message buffers a process diagnostic of the running session for the
-// next commit. A journal that is not open for writing or does not hold the session yet
-// has nowhere to keep it, and the message is dropped. Owner only: worker threads never
-// write the journal.
+// next commit, and drops it when the journal cannot carry one. Owner only: worker threads
+// never write the journal.
 chat_runtime_message :: proc(chat: ^Chat_Session, level: journal.Runtime_Level, text: string) {
-	store := chat.store
-	if store == nil || !store.open || store.read_only || store.claimed != chat.session { return }
+	if !chat_journal_writable(chat) { return }
 	chat_record(chat, {kind = .Runtime_Message, request = chat.request}, journal.Runtime_Message{level = journal.RUNTIME_LEVEL_NAMES[level], text = text})
+}
+
+// chat_journal_writable reports whether the journal can carry a record for this chat. A
+// session nobody prompted is created by its first prompt, so it has no row to attach one to
+// yet, and a journal that is closed or read-only has nowhere to keep it either. A caller that
+// records before its session exists drops the record rather than appending it for a session
+// the journal does not hold.
+@(require_results)
+chat_journal_writable :: proc(chat: ^Chat_Session) -> bool {
+	store := chat.store
+	return store != nil && store.open && !store.read_only && store.claimed == chat.session
 }
 
 // chat_session_text is the session id as the 32 hexadecimal characters a provider,

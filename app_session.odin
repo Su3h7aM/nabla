@@ -545,13 +545,14 @@ selection_record :: proc(store: ^journal.Journal, provider, model, effort: strin
 }
 
 @(require_results)
-selection_applied_record :: proc(store: ^journal.Journal, session: journal.Session_Id, api: ai.API_Kind, provider, model, effort: string) -> journal.Error {
-	// A session nobody prompted is created by its first prompt, so there is nowhere to
-	// keep what it would say yet; its first turn records the selection instead.
-	if store == nil || store.claimed != session { return nil }
+selection_applied_record :: proc(chat: ^agent.Chat_Session, api: ai.API_Kind, provider, model, effort: string) -> journal.Error {
+	// A session nobody prompted is created by its first prompt, so there is nowhere to keep
+	// what it would say yet; its first turn records the selection instead.
+	if !agent.chat_journal_writable(chat) { return nil }
+	store := chat.store
 	journal.append_record(
 		store,
-		{session = session, kind = .Selection_Applied, provider = provider, model = model},
+		{session = chat.session, kind = .Selection_Applied, provider = provider, model = model},
 		journal.Selection_Applied{version = 1, api = agent.chat_api_name(api), provider = provider, model = model, effort = effort},
 	)
 	_, commit_error := journal.commit(store)
@@ -805,8 +806,7 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 	running.last_estimate = 0
 	running.last_input_measured = nil
 	if !applied { snap_append(app, .Warning, "the reasoning effort could not be applied") }
-	if record_error := selection_applied_record(app.setup.store, running.session, api, target.provider_id, target.model_id, running.effort);
-	   record_error != nil {
+	if record_error := selection_applied_record(running, api, target.provider_id, target.model_id, running.effort); record_error != nil {
 		running.storage_failed = true
 		selection_fail(app, "the selected model was installed but its session record could not be committed")
 		return false

@@ -153,9 +153,9 @@ chat_selection_check :: proc(
 	}
 	output, _ := chat_request_output_bound(target.capacity, prep.estimate)
 	recheck := transition.phase == .Needs_Recheck
-	// A session nobody prompted has no journal row to carry the decision: its first turn
-	// records the selection it starts with instead.
-	if chat.store != nil && chat.store.claimed == chat.session {
+	// A session nobody prompted has no row to carry the decision; its first turn records the
+	// selection it starts with instead.
+	if chat_journal_writable(chat) {
 		chat_record(
 			chat,
 			{kind = .Selection_Fit, provider = target.provider_id, model = target.model_id},

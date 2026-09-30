@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -100,6 +101,42 @@ test_model_selection_effort_preserves_supported_level_and_falls_back :: proc(tes
 	testing.expect_value(test, model_selection_effort(target, "unsupported"), "low")
 	target.effort_levels = nil
 	testing.expect_value(test, model_selection_effort(target, "unsupported"), "")
+}
+
+// A session nobody prompted is created by its first prompt, so the journal does not hold it
+// yet and has no row to attach a decision to. The check still answers, and it records nothing
+// rather than appending for a session the journal never claimed.
+@(test)
+test_selection_check_records_nothing_before_the_first_prompt :: proc(test: ^testing.T) {
+	directory, directory_error := os.make_directory_temp("", "nabla-agent-unclaimed-*", context.allocator)
+	if directory_error != nil { testing.fail_now(test, "the temporary directory could not be created") }
+	defer {
+		_ = os.remove_all(directory)
+		delete(directory, context.allocator)
+	}
+	store: journal.Journal
+	if open_error := journal.open(&store, directory, directory, journal.run_id_create(), .Read_Write, context.allocator); open_error != nil {
+		testing.fail_now(test, "the journal could not be opened")
+	}
+	defer _ = journal.close(&store)
+
+	// The session is named but never claimed, which is what an opened ACP session looks like
+	// before its first prompt.
+	session := journal.session_id_create()
+	chat, tool_error := chat_session_init(&store, session, journal.INITIAL_BRANCH, 0, tool_loop_workspace(test), context.allocator)
+	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
+	defer chat_session_destroy(&chat)
+	chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
+	chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
+	chat_test_capacity(&chat, 100_000)
+
+	target := selection_test_target(test, .OpenAI_Chat_Completions, 100_000)
+	defer model_selection_destroy(&target, context.allocator)
+	transition: Selection_Transition
+	status, _, error := chat_selection_check(&chat, target, &transition, false, {API = chat.model_api})
+	if error != nil { testing.fail_now(test, "selection projection failed") }
+	testing.expect_value(test, status, Selection_Status.Ready)
+	testing.expect_value(test, len(_test_records(test, &chat, {.Selection_Fit})), 0)
 }
 
 @(test)
