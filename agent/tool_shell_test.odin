@@ -2,10 +2,10 @@
 #+private file
 package agent
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "core:testing"
 
 import "nabla:agent/journal"
@@ -21,7 +21,8 @@ SHELL_TEST_PROBE_VARIABLE :: "NABLA_SHELL_TEST_INHERITED"
 // The tests below set SHELL for their own cases.
 @(init)
 shell_test_pin_interpreter :: proc "contextless" () {
-	_ = posix.setenv("SHELL", cstring(TOOL_SHELL_FALLBACK), true)
+	context = runtime.default_context()
+	_ = os.set_env("SHELL", TOOL_SHELL_FALLBACK)
 }
 
 // shell_test_scratch makes a directory for the fixtures below.

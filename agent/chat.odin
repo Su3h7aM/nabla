@@ -2,7 +2,6 @@ package agent
 
 import "base:runtime"
 import "core:fmt"
-import "core:sys/posix"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -380,7 +379,7 @@ chat_run_turn_steered :: proc(
 	steer: ^Steer_Context,
 	control: ^Turn_Control = nil,
 ) -> bool {
-	previous: posix.sigaction_t
+	previous: Signal_Action
 	chat_signal_arm(&previous)
 	defer chat_signal_disarm(&previous)
 	return chat_turn_drive(chat, connection, policy, observer, steer, control)

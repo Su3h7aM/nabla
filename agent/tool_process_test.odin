@@ -1,7 +1,6 @@
 package agent
 
 import "core:os"
-import "core:sys/posix"
 import "core:testing"
 
 @(test)
@@ -42,9 +41,7 @@ test_command_child_reads_its_input_pipe :: proc(t: ^testing.T) {
 	read_count, read_error := os.read(output_read, buffer[:])
 	testing.expect_value(t, read_error, nil)
 	testing.expect_value(t, string(buffer[:read_count]), message)
-	status: i32
-	waited := posix.waitpid(posix.pid_t(child.pid), &status, {})
-	testing.expect_value(t, int(waited), child.pid)
-	tool_child_record(&child, status)
-	testing.expect(t, child.exited && child.exit_code == 0)
+	exited, exit_code, waited := tool_child_reap(&child)
+	testing.expect(t, waited)
+	testing.expect(t, exited && exit_code == 0)
 }

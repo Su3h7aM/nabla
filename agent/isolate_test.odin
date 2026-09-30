@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:sys/posix"
 import "core:testing"
 
 // ISOLATED_CHILD_VARIABLE marks a child test-binary run that owns its process.
@@ -87,9 +86,7 @@ test_isolate_process :: proc(t: ^testing.T, procedure: string) -> bool {
 // thread the body creates. Threads created after this point inherit the cleared mask.
 @(private)
 test_isolate_clear_signal_mask :: proc() {
-	clear: posix.sigset_t
-	posix.sigemptyset(&clear)
-	_ = posix.pthread_sigmask(.SETMASK, &clear, nil)
+	signal_mask_set({})
 }
 
 // test_isolate_release frees what a parent spawned with. A failing check aborts the

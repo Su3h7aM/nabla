@@ -2,11 +2,9 @@
 package input
 
 import "base:runtime"
-import "core:c"
 import "core:io"
 import "core:os"
 import "core:sys/linux"
-import "core:sys/posix"
 import "core:time"
 
 ESC_DEADLINE_MS :: 50
@@ -28,7 +26,7 @@ read_events :: proc(
 	err: Error,
 ) {
 	start := len(events^)
-	fd := posix.FD(os.fd(file))
+	fd := linux.Fd(os.fd(file))
 
 	escape_deadline: time.Tick
 	has_escape_deadline := parser_escape_pending(parser)
@@ -46,7 +44,7 @@ read_events :: proc(
 			first_timeout = remaining_timeout
 		}
 	}
-	ready, poll_err := input_poll(fd, c.int(first_timeout))
+	ready, poll_err := input_poll(fd, i32(first_timeout))
 	if poll_err != nil {
 		return 0, poll_err
 	}
@@ -61,9 +59,9 @@ read_events :: proc(
 			has_escape_deadline = true
 		}
 		remaining := time.tick_diff(time.tick_now(), escape_deadline)
-		remaining_timeout := c.int(0)
+		remaining_timeout := i32(0)
 		if remaining > 0 {
-			remaining_timeout = c.int((remaining + time.Millisecond - 1) / time.Millisecond)
+			remaining_timeout = i32((remaining + time.Millisecond - 1) / time.Millisecond)
 		}
 		ready, poll_err = input_poll(fd, remaining_timeout)
 		if poll_err != nil {
@@ -83,7 +81,7 @@ read_events :: proc(
 }
 
 @(require_results)
-input_poll :: proc(fd: posix.FD, timeout: c.int) -> (ready: int, err: Error) {
+input_poll :: proc(fd: linux.Fd, timeout: i32) -> (ready: int, err: Error) {
 	deadline: time.Tick
 	has_deadline := timeout > 0
 	if has_deadline {
@@ -95,18 +93,15 @@ input_poll :: proc(fd: posix.FD, timeout: c.int) -> (ready: int, err: Error) {
 			remaining := time.tick_diff(time.tick_now(), deadline)
 			poll_timeout = 0
 			if remaining > 0 {
-				poll_timeout = c.int((remaining + time.Millisecond - 1) / time.Millisecond)
+				poll_timeout = i32((remaining + time.Millisecond - 1) / time.Millisecond)
 			}
 		}
-		poll_descriptor := posix.pollfd {
-			fd     = fd,
-			events = {.IN, .HUP, .ERR, .NVAL},
-		}
-		ready_count := posix.poll(&poll_descriptor, 1, poll_timeout)
-		if ready_count >= 0 {
+		poll_descriptors := [1]linux.Poll_Fd{{fd = fd, events = {.IN, .HUP, .ERR, .NVAL}}}
+		ready_count, errno := linux.poll(poll_descriptors[:], poll_timeout)
+		if errno == .NONE {
 			return int(ready_count), nil
 		}
-		if posix.get_errno() == .EINTR {
+		if errno == .EINTR {
 			continue
 		}
 		return 0, General_Error.Poll_Failed

@@ -153,6 +153,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 ### 3.7 Source
 
 - One subject per file, named for the subject; split a file when it holds a second subject, not when it grows. Platform code sits in `_linux.odin` (later `_darwin.odin`, `_bsd.odin`) files beside the portable file.
+- Prefer the `core:os` and other `core:` abstractions. Code that needs raw system calls lives only in a platform file behind a small platform-neutral procedure surface, with an `_unsupported.odin` stub beside it, so a new platform adds one file. Portable files import neither `core:sys/linux` nor `core:sys/posix`, and no package imports `system:c`-backed `core:sys/posix` or `core:c/libc`. Constants the toolchain lacks, such as termios requests, are defined locally in the platform file.
 - Every package has a `doc.odin` with the package overview. Naming and comment rules are in `AGENTS.md`.
 - `mise run check` builds with `-vet -strict-style -disallow-do -warnings-as-errors`; code and examples in this document follow the same rules.
 

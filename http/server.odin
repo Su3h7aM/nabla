@@ -11,7 +11,6 @@ import "core:net"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:sys/posix"
 import "core:thread"
 import "core:time"
 
@@ -263,16 +262,6 @@ _server_thread_shutdown :: proc(server: ^Server, loc := #caller_location) {
 }
 
 @(private)
-on_interrupt_write: posix.FD = -1
-
-@(private)
-on_interrupt_signal :: proc "c" (_: posix.Signal) {
-	// write is async-signal-safe; the byte only makes the pipe readable.
-	signaled := u8(1)
-	posix.write(on_interrupt_write, &signaled, 1)
-}
-
-@(private)
 on_interrupt :: proc(op: ^nbio.Operation, server: ^Server) {
 	current_thread.interrupt = nil
 	server_shutdown(server)
@@ -286,15 +275,7 @@ on_interrupt :: proc(op: ^nbio.Operation, server: ^Server) {
 server_shutdown_on_interrupt :: proc(server: ^Server) -> os.Error {
 	read, write := os.pipe() or_return
 	server.interrupt_read, server.interrupt_write = read, write
-	on_interrupt_write = posix.FD(os.fd(write))
-
-	action := posix.sigaction_t {
-		sa_handler = on_interrupt_signal,
-	}
-	posix.sigemptyset(&action.sa_mask)
-	if posix.sigaction(.SIGINT, &action, nil) != .OK {
-		return os.Platform_Error(posix.errno())
-	}
+	interrupt_notify_install(write) or_return
 	return nil
 }
 

@@ -3,10 +3,10 @@ package agent
 import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
+import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "core:time"
 
 import "nabla:acp"
@@ -119,7 +119,7 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 		}
 		return path, subagent_executable(path)
 	}
-	search := string(posix.getenv("PATH"))
+	search := os.get_env("PATH", context.temp_allocator)
 	for entry in strings.split_iterator(&search, ":") {
 		if entry == "" { continue }
 		path, join_error := strings.concatenate({entry, "/", command}, context.temp_allocator)
@@ -129,11 +129,31 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 	return "", false
 }
 
-@(private, require_results)
-subagent_executable :: proc(path: string) -> bool {
-	text, clone_error := strings.clone_to_cstring(path, context.temp_allocator)
-	if clone_error != nil { return false }
-	return posix.access(text, {.X_OK}) == .OK && !os.is_dir(path)
+// Acp_Input is the agent's stdin. Its descriptor pair comes from acp_input_open.
+@(private)
+Acp_Input :: struct {
+	ours:   Tool_Fd,
+	theirs: ^os.File, // for the child's stdin; closed once the child has it
+	open:   bool,
+}
+
+@(private)
+acp_input_writer :: proc(input: ^Acp_Input) -> io.Writer {
+	return io.Stream{procedure = acp_input_stream, data = input}
+}
+
+@(private = "file", require_results)
+acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+	input := cast(^Acp_Input)stream_data
+	#partial switch mode {
+	case .Write:
+		sent, ok := acp_input_send(input, p)
+		if !ok { return i64(sent), .Unexpected_EOF }
+		return i64(sent), nil
+	case .Query:
+		return io.query_utility({.Write, .Query})
+	}
+	return 0, .Unsupported
 }
 
 // Acp_Connection is one running agent program and the client state of its session.
@@ -731,35 +751,30 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	}
 	// The agent's exit is watched beside its output, because a descendant that inherited
 	// stdout can keep it open after the agent itself is gone.
-	fds: [5]posix.pollfd
+	fds: [5]Tool_Poll
 	fds[0] = {
-		fd     = tool_fd(connection.output),
-		events = {.IN},
+		fd = tool_fd(connection.output),
 	}
 	fds[1] = {
-		fd     = tool_exit_watch_fd(connection.child.exit),
-		events = {.IN},
+		fd = connection.child.exit.fd,
 	}
 	count := 2
 	errors_index := -1
 	if connection.errors != nil {
 		errors_index = count
 		fds[count] = {
-			fd     = tool_fd(connection.errors),
-			events = {.IN},
+			fd = tool_fd(connection.errors),
 		}
 		count += 1
 	}
 	if !connection.cancel_sent {
 		fds[count] = {
-			fd     = tool_fd(member.wake.read),
-			events = {.IN},
+			fd = tool_fd(member.wake.read),
 		}
 		count += 1
 		if member.parent_wake != nil {
 			fds[count] = {
-				fd     = tool_fd(member.parent_wake),
-				events = {.IN},
+				fd = tool_fd(member.parent_wake),
 			}
 			count += 1
 		}
@@ -771,12 +786,12 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 		return "the agent did not stop in time and was ended"
 	}
 	buffer: [SUBAGENT_ACP_READ_BYTES]u8
-	if errors_index >= 0 && fds[errors_index].revents != {} { acp_stderr_read(connection, buffer[:]) }
+	if errors_index >= 0 && fds[errors_index].ready { acp_stderr_read(connection, buffer[:]) }
 	// What the agent wrote before it exited is read first; its exit counts once nothing is
 	// waiting, whoever still holds its pipes.
-	if fds[0].revents == {} {
-		stderr_waiting := errors_index >= 0 && fds[errors_index].revents != {}
-		if fds[1].revents != {} && !stderr_waiting { return acp_ended(connection, "exited") }
+	if !fds[0].ready {
+		stderr_waiting := errors_index >= 0 && fds[errors_index].ready
+		if fds[1].ready && !stderr_waiting { return acp_ended(connection, "exited") }
 		return ""
 	}
 	read, status := tool_read(connection.output, buffer[:])
@@ -835,8 +850,8 @@ acp_ended :: proc(connection: ^Acp_Connection, what: string) -> string {
 	// ready is read, so a descendant that holds the pipe open cannot hold up the report.
 	buffer: [SUBAGENT_ACP_READ_BYTES]u8
 	for connection.errors != nil {
-		ready := [1]posix.pollfd{{fd = tool_fd(connection.errors), events = {.IN}}}
-		if posix.poll(raw_data(ready[:]), 1, 0) <= 0 || ready[0].revents == {} { break }
+		ready := [1]Tool_Poll{{fd = tool_fd(connection.errors)}}
+		if tool_poll(ready[:], time.tick_now(), true) != nil || !ready[0].ready { break }
 		if !acp_stderr_read(connection, buffer[:]) { break }
 	}
 	tail := strings.trim_space(string(connection.stderr_tail[:]))

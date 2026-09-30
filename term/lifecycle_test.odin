@@ -21,19 +21,20 @@ package term
 // (passed for this package by scripts/test), so without the define this file
 // contributes no tests.
 
-import "core:c"
+import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:sys/linux"
-import "core:sys/posix"
 import "core:testing"
 
 when #config(NABLA_TERM_TEST_HOOKS, false) {
 
-	// Linux ioctl requests not exposed by core:sys/linux.
+	// Linux ioctl requests not exposed by core:sys/linux (asm-generic/ioctls.h).
 	LIFECYCLE_TIOCSCTTY :: 0x540E
 	LIFECYCLE_TIOCSWINSZ :: 0x5414
+	LIFECYCLE_TIOCGPTN :: 0x80045430
+	LIFECYCLE_TIOCSPTLCK :: 0x40045431
 
 	// Lifecycle_Win_Size matches the kernel winsize structure for TIOCSWINSZ.
 	Lifecycle_Win_Size :: struct {
@@ -48,32 +49,30 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 
 	// --- pty plumbing ---------------------------------------------------------
 
-	lifecycle_pty_open :: proc(t: ^testing.T) -> (master: posix.FD, slave_path: string, ok: bool) {
-		master = posix.posix_openpt({.RDWR})
-		if master < 0 { return }
-		if posix.grantpt(master) != .OK || posix.unlockpt(master) != .OK {
-			posix.close(master)
-			master = -1
+	// lifecycle_pty_open opens /dev/ptmx, unlocks the slave (TIOCSPTLCK) and
+	// names it from its number (TIOCGPTN), the raw form of posix_openpt,
+	// unlockpt and ptsname. The path is temp-allocated.
+	lifecycle_pty_open :: proc(t: ^testing.T) -> (master: linux.Fd, slave_path: string, ok: bool) {
+		master_fd, open_errno := linux.open("/dev/ptmx", {.RDWR, .NOCTTY})
+		if open_errno != .NONE { return }
+		unlock: i32
+		number: u32
+		if _ioctl(master_fd, LIFECYCLE_TIOCSPTLCK, &unlock) != .NONE || _ioctl(master_fd, LIFECYCLE_TIOCGPTN, &number) != .NONE {
+			_ = linux.close(master_fd)
 			return
 		}
-		name := posix.ptsname(master)
-		if name == nil {
-			posix.close(master)
-			master = -1
-			return
-		}
-		return master, string(name), true
+		return master_fd, fmt.tprintf("/dev/pts/%d", number), true
 	}
 
 	// lifecycle_wait_for_byte blocks until the pipe yields the expected byte.
-	lifecycle_wait_for_byte :: proc(fd: posix.FD, expected: byte) -> bool {
-		got: byte
+	lifecycle_wait_for_byte :: proc(fd: linux.Fd, expected: byte) -> bool {
+		got: [1]byte
 		for {
-			read_count := posix.read(fd, &got, 1)
+			read_count, errno := linux.read(fd, got[:])
 			if read_count == 1 {
-				return got == expected
+				return got[0] == expected
 			}
-			if read_count < 0 && posix.get_errno() == .EINTR {
+			if errno == .EINTR {
 				continue
 			}
 			return false
@@ -84,26 +83,26 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 	// sync_fd, reading at most 64 bytes per 5ms tick so the pty output buffer
 	// stays full and the child's writes genuinely block (what makes the EINTR
 	// path real). It also checks the close restoration bytes across read chunks.
-	lifecycle_drain_slave :: proc(sync_fd: posix.FD, master: posix.FD) -> bool {
+	lifecycle_drain_slave :: proc(sync_fd: linux.Fd, master: linux.Fd) -> bool {
 		done := false
 		restore_sequence := "\x1b[?25h\x1b[0m"
 		restore_matched := 0
 		restore_seen := false
 		for !done {
-			poll_descriptors := [2]posix.pollfd{{fd = sync_fd, events = {.IN}}, {fd = master, events = {.IN}}}
-			ready_count := posix.poll(raw_data(poll_descriptors[:]), 2, 5)
-			if ready_count < 0 {
+			poll_descriptors := [2]linux.Poll_Fd{{fd = sync_fd, events = {.IN}}, {fd = master, events = {.IN}}}
+			_, poll_errno := linux.poll(poll_descriptors[:], 5)
+			if poll_errno != .NONE {
 				continue
 			}
 			if .IN in poll_descriptors[0].revents {
-				got: byte
-				if posix.read(sync_fd, &got, 1) == 1 && got == 'D' {
+				got: [1]byte
+				if count, _ := linux.read(sync_fd, got[:]); count == 1 && got[0] == 'D' {
 					done = true
 				}
 			}
 			if .IN in poll_descriptors[1].revents {
 				buffer: [64]byte
-				read_count := posix.read(master, raw_data(buffer[:]), c.size_t(len(buffer)))
+				read_count, _ := linux.read(master, buffer[:])
 				if read_count > 0 {
 					for output_byte in buffer[:int(read_count)] {
 						if output_byte == restore_sequence[restore_matched] {
@@ -124,11 +123,11 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 				// Throttle: without this the master is constantly readable and
 				// the whole buffer drains in microseconds, which would let the
 				// child's write complete before the SIGALRM lands.
-				throttle := posix.timespec {
-					tv_sec  = 0,
-					tv_nsec = 5_000_000,
+				throttle := linux.Time_Spec {
+					time_sec  = 0,
+					time_nsec = 5_000_000,
 				}
-				posix.nanosleep(&throttle, nil)
+				_ = linux.nanosleep(&throttle, nil)
 			}
 		}
 		return restore_seen
@@ -138,12 +137,19 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 
 	lifecycle_alarm_fired: int
 
-	lifecycle_alarm_handler :: proc "c" (sig: posix.Signal) {
+	lifecycle_alarm_handler :: proc "c" (sig: linux.Signal) {
 		// The handler must exist so the signal interrupts poll/write with EINTR
 		// instead of terminating the child. The counter proves the timer fired
 		// during the blocked write (single-threaded child; the increment is
 		// atomic in practice).
 		lifecycle_alarm_fired += 1
+	}
+
+	// lifecycle_setitimer arms ITIMER_REAL. core:sys/linux.setitimer issues
+	// SYS_getitimer, so the syscall is made directly.
+	lifecycle_setitimer :: proc(timer: ^linux.ITimer_Val) -> linux.Errno {
+		ret := intrinsics.syscall(linux.SYS_setitimer, uintptr(linux.ITimer_Which.REAL), uintptr(timer), 0)
+		return linux.Errno(-ret)
 	}
 
 	lifecycle_failures: int
@@ -155,13 +161,13 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		}
 	}
 
-	lifecycle_run_child :: proc(slave_path: string, sync_out_w: posix.FD, sync_in_r: posix.FD) -> int {
+	lifecycle_run_child :: proc(slave_path: string, sync_out_w: linux.Fd, sync_in_r: linux.Fd) -> int {
 		tracking: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&tracking, context.allocator)
 		context.allocator = mem.tracking_allocator(&tracking)
 
 		// Acquire a controlling terminal from the PTY.
-		if posix.setsid() < 0 {
+		if _, setsid_errno := linux.setsid(); setsid_errno != .NONE {
 			fmt.eprintln("child: setsid failed")
 			return 1
 		}
@@ -172,14 +178,14 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		}
 		copy(path_buf[:], slave_path)
 		slave_path_c := cstring(raw_data(path_buf[:]))
-		slave := posix.open(slave_path_c, {.RDWR, .NOCTTY})
-		if slave < 0 {
-			fmt.eprintln("child: slave open failed, errno", posix.get_errno())
+		slave, slave_errno := linux.open(slave_path_c, {.RDWR, .NOCTTY})
+		if slave_errno != .NONE {
+			fmt.eprintln("child: slave open failed, errno", slave_errno)
 			return 1
 		}
-		defer posix.close(slave)
-		if linux.ioctl(linux.Fd(slave), u32(LIFECYCLE_TIOCSCTTY), 0) != 0 {
-			fmt.eprintln("child: TIOCSCTTY failed, errno", posix.get_errno())
+		defer linux.close(slave)
+		if errno := _ioctl(slave, LIFECYCLE_TIOCSCTTY, nil); errno != .NONE {
+			fmt.eprintln("child: TIOCSCTTY failed, errno", errno)
 			return 1
 		}
 
@@ -210,8 +216,8 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		// C: resize — viewport polling reflects TIOCSWINSZ on the master.
 		session, open_err = open({})
 		lifecycle_check(open_err == nil, "open must succeed")
-		ready_byte := byte('R')
-		if posix.write(sync_out_w, &ready_byte, 1) != 1 {
+		ready_byte := [1]byte{'R'}
+		if written, _ := linux.write(sync_out_w, ready_byte[:]); written != 1 {
 			fmt.eprintln("child: resize-ready write failed")
 			return 1
 		}
@@ -253,7 +259,7 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		lifecycle_check(open_err == nil, "open must succeed")
 		file, file_err := session_file(session)
 		lifecycle_check(file_err == nil, "session_file must succeed")
-		fd := posix.FD(os.fd(file))
+		fd := linux.Fd(os.fd(file))
 
 		// Fill the pty output buffer so present's write genuinely blocks.
 		junk: [4096]byte
@@ -261,22 +267,22 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 			junk[i] = 'j'
 		}
 		for {
-			written := posix.write(fd, raw_data(junk[:]), c.size_t(len(junk)))
-			if written < 0 {
+			_, errno := linux.write(fd, junk[:])
+			if errno != .NONE {
 				break
 			}
 		}
-		fill_byte := byte('F')
-		posix.write(sync_out_w, &fill_byte, 1)
+		fill_byte := [1]byte{'F'}
+		_, _ = linux.write(sync_out_w, fill_byte[:])
 
-		action := posix.sigaction_t {
-			sa_handler = lifecycle_alarm_handler,
+		action := linux.Sig_Action {
+			handler = lifecycle_alarm_handler,
 		}
-		posix.sigaction(posix.Signal(posix.SIGALRM), &action, nil)
-		timer := posix.itimerval {
-			it_value = {tv_sec = 0, tv_usec = 20000},
+		lifecycle_check(linux.rt_sigaction(.SIGALRM, &action, nil) == .NONE, "SIGALRM handler must install")
+		timer := linux.ITimer_Val {
+			value = {seconds = 0, microseconds = 20000},
 		}
-		posix.setitimer(.REAL, &timer, nil)
+		lifecycle_check(lifecycle_setitimer(&timer) == .NONE, "timer must arm")
 
 		big := make([]Cell, 200 * 50)
 		defer delete(big)
@@ -298,9 +304,9 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		lifecycle_check(lifecycle_alarm_fired > 0, "the SIGALRM timer must have fired during the blocked write")
 
 		timer = {}
-		posix.setitimer(.REAL, &timer, nil)
-		done_byte := byte('D')
-		posix.write(sync_out_w, &done_byte, 1)
+		_ = lifecycle_setitimer(&timer)
+		done_byte := [1]byte{'D'}
+		_, _ = linux.write(sync_out_w, done_byte[:])
 		lifecycle_check(close(session) == nil, "close must succeed")
 
 		// F: descriptor-close failure — the cause is reported (not suppressed),
@@ -321,16 +327,21 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 
 		// G: SIGWINCH disposition — close restores the caller's previous
 		// handler, so a closed session never leaves the package handler armed.
-		sigwinch_action := posix.sigaction_t {
-			sa_handler = lifecycle_alarm_handler,
+		sigwinch_action := linux.Sig_Action {
+			handler = lifecycle_alarm_handler,
 		}
-		posix.sigaction(posix.Signal(posix.SIGWINCH), &sigwinch_action, nil)
+		lifecycle_check(linux.rt_sigaction(.SIGWINCH, &sigwinch_action, nil) == .NONE, "SIGWINCH handler must install")
 		session, open_err = open({})
 		lifecycle_check(open_err == nil, "open must succeed")
 		lifecycle_check(close(session) == nil, "close must succeed")
-		restored: posix.sigaction_t
-		posix.sigaction(posix.Signal(posix.SIGWINCH), nil, &restored)
-		lifecycle_check(restored.sa_handler == lifecycle_alarm_handler, "close must restore the caller's SIGWINCH handler")
+		restored: linux.Sig_Action
+		// rt_sigaction dereferences its action even for a pure query, so probe
+		// with the handler already installed.
+		probe := linux.Sig_Action {
+			handler = lifecycle_alarm_handler,
+		}
+		lifecycle_check(linux.rt_sigaction(.SIGWINCH, &probe, &restored) == .NONE, "SIGWINCH query must succeed")
+		lifecycle_check(restored.handler == lifecycle_alarm_handler, "close must restore the caller's SIGWINCH handler")
 
 		// H: a terminal write may fail with EIO after SIGHUP; close still
 		// releases the descriptor and session after attempting every restore.
@@ -348,33 +359,33 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 	lifecycle_run_parent :: proc(t: ^testing.T) {
 		master, slave_path, ok := lifecycle_pty_open(t)
 		if !testing.expect(t, ok, "pty must open") { return }
-		defer posix.close(master)
+		defer linux.close(master)
 		// slave_path borrows ptsname's static storage and is never freed.
 
-		child_out: [2]posix.FD
-		parent_out: [2]posix.FD
-		if posix.pipe(&child_out) != .OK || posix.pipe(&parent_out) != .OK {
+		child_out: [2]linux.Fd
+		parent_out: [2]linux.Fd
+		if linux.pipe2(&child_out, {}) != .NONE || linux.pipe2(&parent_out, {}) != .NONE {
 			testing.fail_now(t, "sync pipes must open")
 		}
 
-		pid := posix.fork()
-		if pid < 0 {
+		pid, fork_errno := linux.fork()
+		if fork_errno != .NONE {
 			testing.fail_now(t, "fork must succeed")
 		}
 		if pid == 0 {
-			posix.close(master)
-			posix.close(child_out[0])
-			posix.close(parent_out[1])
+			_ = linux.close(master)
+			_ = linux.close(child_out[0])
+			_ = linux.close(parent_out[1])
 			os.exit(lifecycle_run_child(slave_path, child_out[1], parent_out[0]))
 		}
 
-		posix.close(child_out[1])
-		posix.close(parent_out[0])
+		_ = linux.close(child_out[1])
+		_ = linux.close(parent_out[0])
 
 		// Scenario C: resize the master once the child's session is open.
 		if !lifecycle_wait_for_byte(child_out[0], 'R') {
-			probe: c.int
-			waited := posix.waitpid(pid, &probe, {.NOHANG})
+			probe: u32
+			waited, _ := linux.wait4(pid, &probe, {.WNOHANG}, nil)
 			if waited == pid {
 				testing.fail_now(t, "child died before 'R'")
 			} else {
@@ -385,16 +396,16 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 			rows    = 40,
 			columns = 100,
 		}
-		linux.ioctl(linux.Fd(master), u32(LIFECYCLE_TIOCSWINSZ), uintptr(rawptr(&size)))
-		go_byte := byte('G')
-		posix.write(parent_out[1], &go_byte, 1)
+		testing.expect_value(t, _ioctl(master, LIFECYCLE_TIOCSWINSZ, &size), linux.Errno.NONE)
+		go_byte := [1]byte{'G'}
+		_, _ = linux.write(parent_out[1], go_byte[:])
 
 		// Scenario E: drain the slave slowly until the child finishes.
 		restore_seen := lifecycle_drain_slave(child_out[0], master)
 		testing.expect(t, restore_seen, "close must emit an SGR reset with its cursor restoration")
 
-		status: c.int
-		waited := posix.waitpid(pid, &status, {})
+		status: u32
+		waited, _ := linux.wait4(pid, &status, {}, nil)
 		testing.expect(t, waited == pid, "waitpid must return the child pid")
 		exited := (status & 0x7f) == 0
 		code := (status >> 8) & 0xff

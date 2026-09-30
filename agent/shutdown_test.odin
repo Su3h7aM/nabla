@@ -9,7 +9,6 @@ import "core:os"
 import "core:strings"
 import "core:sync"
 import linux "core:sys/linux"
-import "core:sys/posix"
 import "core:testing"
 import "core:thread"
 import "core:time"
@@ -127,7 +126,7 @@ test_cancellation_is_not_inherited_by_next_turn :: proc(test: ^testing.T) {
 
 // keeping a saved disposition at a stable address is required by chat_signal_arm.
 sigaction_storage :: struct {
-	saved: posix.sigaction_t,
+	saved: Signal_Action,
 }
 
 // The handler references only static storage, so it remains valid while sessions

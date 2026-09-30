@@ -1,10 +1,10 @@
 package agent
 
 import "base:runtime"
+import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:sys/posix"
 import "core:time"
 import "core:unicode/utf8"
 
@@ -41,6 +41,54 @@ Tool_Spawn :: enum {
 	Started,
 	Exec_Failed,
 	Failed,
+}
+
+// Tool_Fd is an operating-system descriptor number, the neutral form of what os.fd reports.
+Tool_Fd :: distinct int
+
+// TOOL_FD_NONE names no descriptor.
+TOOL_FD_NONE :: Tool_Fd(-1)
+
+// Tool_Poll is one descriptor of a readiness wait. ready is set by tool_poll_wait when the
+// descriptor has data to read, reached its end, or failed, so a read on it will not block.
+Tool_Poll :: struct {
+	fd:    Tool_Fd,
+	ready: bool,
+}
+
+// Tool_Exit_Watch is a descriptor that becomes readable once a child exits, so a
+// wait for the child joins the same poll as its pipes. Its zero value watches
+// nothing.
+Tool_Exit_Watch :: struct {
+	fd:   Tool_Fd,
+	open: bool,
+}
+
+// Tool_Wait is what a wait on a child found. Running also covers a wait the system
+// refused, which leaves the child's state unknown.
+Tool_Wait :: enum {
+	Running,
+	Finished,
+	Gone,
+}
+
+// Tool_Group_Signal is the signal sent to a process group.
+Tool_Group_Signal :: enum {
+	Terminate,
+	Kill,
+}
+
+// Tool_Exec describes the command a forked child runs. argv and envp end in a nil entry.
+// report is the descriptor the child writes one errno byte to when exec fails.
+Tool_Exec :: struct {
+	argv:         []cstring,
+	envp:         []cstring,
+	directory:    cstring,
+	input:        Tool_Fd,
+	output:       Tool_Fd,
+	errors:       Tool_Fd,
+	report:       Tool_Fd,
+	parent_death: bool,
 }
 
 // TOOL_CHILD_SETUP_FAILED is the exit status of a forked child that could not
@@ -83,7 +131,7 @@ tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
 //
 // The harness may have other threads, so between fork and exec the child makes
 // only async-signal-safe calls: it allocates, locks, and logs nothing, and every
-// failure leaves through _exit, which runs no atexit handler and flushes no stdio.
+// failure leaves through exit_group, which runs no atexit handler and flushes no stdio.
 @(require_results)
 tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
 	arguments, arguments_error := make([dynamic]string, 0, 4, context.temp_allocator)
@@ -110,7 +158,7 @@ tool_spawn_command :: proc(
 	err: os.Error,
 ) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	if len(arguments) == 0 { return {}, .Failed, os.Platform_Error(posix.EINVAL) }
+	if len(arguments) == 0 { return {}, .Failed, os.General_Error.Invalid_Command }
 	argv, argv_error := make([]cstring, len(arguments) + 1, context.temp_allocator)
 	if argv_error != nil { return {}, .Failed, argv_error }
 	for argument, index in arguments {
@@ -121,11 +169,21 @@ tool_spawn_command :: proc(
 	work, directory_error := strings.clone_to_cstring(directory, context.temp_allocator)
 	if directory_error != nil { return {}, .Failed, directory_error }
 
-	// The command inherits the environment this process was started with: the
-	// user's own environment, as the shell that launched the harness exported it.
-	// Nothing is added, removed, or rewritten here, because a tool the user can
-	// run is a tool the command has to be able to run.
-	envp := posix.environ
+	// The command inherits this process's environment: the user's own, as the shell
+	// that launched the harness exported it. Nothing is added, removed, or rewritten
+	// here, because a tool the user can run is a tool the command has to be able to
+	// run. core:os keeps its cstring export private, so the list comes from
+	// os.environ and is converted here, before the fork, because the child may not
+	// allocate.
+	environment, environment_error := os.environ(context.temp_allocator)
+	if environment_error != nil { return {}, .Failed, environment_error }
+	envp, envp_error := make([]cstring, len(environment) + 1, context.temp_allocator)
+	if envp_error != nil { return {}, .Failed, envp_error }
+	for entry, index in environment {
+		entry_text, entry_error := strings.clone_to_cstring(entry, context.temp_allocator)
+		if entry_error != nil { return {}, .Failed, entry_error }
+		envp[index] = entry_text
+	}
 
 	// The exec status pipe carries one fact back to the parent: whether the shell
 	// started. Both ends close on exec, so a successful exec closes the child's
@@ -134,36 +192,27 @@ tool_spawn_command :: proc(
 	exec_read, exec_write, pipe_error := os.pipe()
 	if pipe_error != nil { return {}, .Failed, pipe_error }
 	defer _ = os.close(exec_read)
-	report_fd := tool_fd(exec_write)
-	child_stdout, child_stderr := tool_fd(stdout_write), tool_fd(stderr_write)
-	child_input := posix.FD(-1)
+	child_input := TOOL_FD_NONE
 	if input != nil { child_input = tool_fd(input) }
-	parent_pid := posix.getpid()
 
-	pid := posix.fork()
-	if pid == -1 {
+	pid, fork_error := tool_fork_exec(
+		{
+			argv = argv,
+			envp = envp,
+			directory = work,
+			input = child_input,
+			output = tool_fd(stdout_write),
+			errors = tool_fd(stderr_write),
+			report = tool_fd(exec_write),
+			parent_death = parent_death,
+		},
+	)
+	if fork_error != nil {
 		_ = os.close(exec_write)
-		return {}, .Failed, tool_errno()
-	}
-	if pid == 0 {
-		if posix.setpgid(0, 0) != .OK { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		if parent_death && !tool_child_bind_parent(parent_pid) { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		if child_input >= 0 {
-			if posix.dup2(child_input, 0) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		} else {
-			_ = posix.close(0)
-		}
-		if posix.dup2(child_stdout, 1) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		if posix.dup2(child_stderr, 2) == -1 { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		// Every pipe end closes on exec: os.pipe creates them that way.
-		if posix.chdir(work) != .OK { posix._exit(TOOL_CHILD_SETUP_FAILED) }
-		posix.execve(argv[0], &argv[0], envp)
-		reported := [1]u8{u8(posix.errno())}
-		_ = posix.write(report_fd, &reported[0], len(reported))
-		posix._exit(TOOL_CHILD_EXEC_FAILED)
+		return {}, .Failed, fork_error
 	}
 	_ = os.close(exec_write)
-	child.pid = int(pid)
+	child.pid = pid
 
 	// The watch is taken before the report is read: the child cannot be reaped
 	// before then, so the pid still names it.
@@ -206,49 +255,40 @@ Tool_Read :: enum {
 }
 
 @(private)
-tool_fd :: proc(file: ^os.File) -> posix.FD {
-	return posix.FD(os.fd(file))
-}
-
-// tool_errno is the calling thread's last POSIX error as an os.Error.
-@(private, require_results)
-tool_errno :: proc() -> os.Error {
-	return os.Platform_Error(i32(posix.errno()))
+tool_fd :: proc(file: ^os.File) -> Tool_Fd {
+	return Tool_Fd(os.fd(file))
 }
 
 // tool_read reads what one pipe end holds into buffer.
 tool_read :: proc(file: ^os.File, buffer: []u8) -> (count: int, status: Tool_Read) {
-	n := posix.read(tool_fd(file), raw_data(buffer), uint(len(buffer)))
-	if n >= 0 { return n, .Ok }
-	#partial switch posix.errno() {
-	case .EAGAIN, .EINTR:
-		return 0, .Again
-	}
+	n, err := os.read(file, buffer)
+	if err == nil || err == io.Error.EOF { return n, .Ok }
+	if tool_error_again(err) { return 0, .Again }
 	return 0, .Failed
 }
 
 // tool_poll blocks until one of fds is ready or the deadline passes, and never
 // wakes on its own otherwise. A signal restarts the wait with the time left.
 @(private, require_results)
-tool_poll :: proc(fds: []posix.pollfd, deadline: time.Tick, has_deadline: bool) -> os.Error {
+tool_poll :: proc(fds: []Tool_Poll, deadline: time.Tick, has_deadline: bool) -> os.Error {
 	for {
 		timeout: i32 = -1
 		if has_deadline {
 			remaining := time.tick_diff(time.tick_now(), deadline)
 			timeout = remaining <= 0 ? 0 : i32(min((remaining + time.Millisecond - 1) / time.Millisecond, time.Duration(max(i32))))
 		}
-		if posix.poll(raw_data(fds), posix.nfds_t(len(fds)), timeout) != -1 { return nil }
-		if posix.errno() != .EINTR { return tool_errno() }
+		interrupted, err := tool_poll_wait(fds, timeout)
+		if !interrupted { return err }
 	}
 }
 
 // tool_child_record keeps the exit state a wait reported.
 @(private)
-tool_child_record :: proc(child: ^Tool_Child, status: i32) {
+tool_child_record :: proc(child: ^Tool_Child, exited: bool, exit_code: int) {
 	child.reaped = true
 	child.status_known = true
-	child.exited = posix.WIFEXITED(status)
-	if child.exited { child.exit_code = int(posix.WEXITSTATUS(status)) }
+	child.exited = exited
+	if exited { child.exit_code = exit_code }
 }
 
 // tool_child_poll reports whether the child has finished, reaping it if it has.
@@ -256,14 +296,14 @@ tool_child_record :: proc(child: ^Tool_Child, status: i32) {
 @(require_results)
 tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 	if child.reaped { return true }
-	status: i32
-	reaped := posix.waitpid(posix.pid_t(child.pid), &status, {.NOHANG})
-	if int(reaped) == child.pid {
-		tool_child_record(child, status)
-		return true
+	switch wait, exited, exit_code := tool_child_wait(child.pid, false); wait {
+	case .Finished:
+		tool_child_record(child, exited, exit_code)
+	case .Gone:
+		// No child left to wait for: it was already reaped.
+		child.reaped = true
+	case .Running:
 	}
-	// No child left to wait for: it was already reaped.
-	if reaped == -1 && posix.errno() == .ECHILD { child.reaped = true }
 	return child.reaped
 }
 
@@ -272,18 +312,15 @@ tool_child_poll :: proc(child: ^Tool_Child) -> bool {
 @(require_results)
 tool_child_reap :: proc(child: ^Tool_Child) -> (exited: bool, exit_code: int, waited: bool) {
 	if child.reaped { return child.exited, child.exit_code, child.status_known }
-	status: i32
-	for {
-		if int(posix.waitpid(posix.pid_t(child.pid), &status, {})) == child.pid { break }
-		errno := posix.errno()
-		if errno == .ECHILD {
-			child.reaped = true
-			return false, 0, false
-		}
-		if errno != .EINTR { return false, 0, false }
+	switch wait, child_exited, child_exit_code := tool_child_wait(child.pid, true); wait {
+	case .Finished:
+		tool_child_record(child, child_exited, child_exit_code)
+		return child.exited, child.exit_code, true
+	case .Gone:
+		child.reaped = true
+	case .Running:
 	}
-	tool_child_record(child, status)
-	return child.exited, child.exit_code, true
+	return false, 0, false
 }
 
 // tool_child_await blocks until the child exits or deadline passes, and reaps it
@@ -292,7 +329,7 @@ tool_child_reap :: proc(child: ^Tool_Child) -> (exited: bool, exit_code: int, wa
 tool_child_await :: proc(child: ^Tool_Child, deadline: time.Tick) {
 	if !child.exit.open { return }
 	for !tool_child_poll(child) && time.tick_diff(time.tick_now(), deadline) > 0 {
-		fds := [1]posix.pollfd{{fd = tool_exit_watch_fd(child.exit), events = {.IN}}}
+		fds := [1]Tool_Poll{{fd = child.exit.fd}}
 		if tool_poll(fds[:], deadline, true) != nil { return }
 	}
 }
@@ -300,11 +337,10 @@ tool_child_await :: proc(child: ^Tool_Child, deadline: time.Tick) {
 // tool_control_fds appends the descriptors a stop wakes to fds: the call's wake,
 // when it has one.
 @(private)
-tool_control_fds :: proc(fds: []posix.pollfd, control: Tool_Control) -> int {
+tool_control_fds :: proc(fds: []Tool_Poll, control: Tool_Control) -> int {
 	if control.wake == nil { return 0 }
 	fds[0] = {
-		fd     = tool_fd(control.wake),
-		events = {.IN},
+		fd = tool_fd(control.wake),
 	}
 	return 1
 }
@@ -321,10 +357,9 @@ tool_retire_child :: proc(child: ^Tool_Child, start: time.Tick, budget: time.Dur
 			_ = tool_terminate_group(child)
 			return stop, nil, false
 		}
-		fds: [2]posix.pollfd
+		fds: [2]Tool_Poll
 		fds[0] = {
-			fd     = tool_exit_watch_fd(child.exit),
-			events = {.IN},
+			fd = child.exit.fd,
 		}
 		count := 1 + tool_control_fds(fds[1:], control)
 		if err := tool_poll(fds[:count], deadline, budget > 0); err != nil {
@@ -545,22 +580,20 @@ tool_drain_pipes :: proc(
 			if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
 			return stop_reason, nil, false
 		}
-		fds: [4]posix.pollfd
+		fds: [4]Tool_Poll
 		slots := [2]int{-1, -1}
 		count := 0
 		for stream, index in streams {
 			if !stream.open { continue }
 			slots[index] = count
 			fds[count] = {
-				fd     = tool_fd(stream.file),
-				events = {.IN},
+				fd = tool_fd(stream.file),
 			}
 			count += 1
 		}
 		exit_slot := count
 		fds[count] = {
-			fd     = tool_exit_watch_fd(child.exit),
-			events = {.IN},
+			fd = child.exit.fd,
 		}
 		count += 1
 		count += tool_control_fds(fds[count:], control)
@@ -572,7 +605,7 @@ tool_drain_pipes :: proc(
 
 		progress := false
 		for &stream, index in streams {
-			if slots[index] < 0 || fds[slots[index]].revents == {} { continue }
+			if slots[index] < 0 || !fds[slots[index]].ready { continue }
 			progress = true
 			n, status := tool_read(stream.file, scratch[:])
 			switch status {
@@ -599,7 +632,7 @@ tool_drain_pipes :: proc(
 		}
 		// An exited leader cannot write to a quiet pipe. Retire its group instead
 		// of waiting until a background process closes the pipe.
-		if !progress && fds[exit_slot].revents != {} { break }
+		if !progress && fds[exit_slot].ready { break }
 	}
 	if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil {
 		_ = tool_terminate_group(child)
@@ -613,18 +646,17 @@ tool_drain_pipes :: proc(
 // the child. It reports group members signalled after the direct child was reaped.
 tool_terminate_group :: proc(child: ^Tool_Child) -> bool {
 	if child.pid <= 0 { return false }
-	group := posix.pid_t(child.pid)
-	term_sent := posix.killpg(group, .SIGTERM) == .OK
+	term_sent := tool_group_signal(child.pid, .Terminate)
 	was_reaped := child.reaped
 	tool_child_await(child, time.tick_add(time.tick_now(), TOOL_KILL_GRACE))
 	if was_reaped && term_sent {
 		// A reaped leader cannot keep its group alive, so a successful group signal
 		// means a background member remains. Give it the same TERM grace as the child path.
-		no_fds: []posix.pollfd
+		no_fds: []Tool_Poll
 		_ = tool_poll(no_fds, time.tick_add(time.tick_now(), TOOL_KILL_GRACE), true)
 	}
-	_ = posix.killpg(group, .SIGKILL)
-	if !child.reaped { _ = posix.kill(group, .SIGKILL) }
+	_ = tool_group_signal(child.pid, .Kill)
+	if !child.reaped { _ = os.process_kill({pid = child.pid}) }
 	_, _, _ = tool_child_reap(child)
 	return was_reaped && term_sent
 }

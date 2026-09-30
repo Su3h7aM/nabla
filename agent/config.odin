@@ -1,6 +1,6 @@
 package agent
 
-import c "core:c/libc"
+import c "core:c"
 import "core:fmt"
 import "core:math"
 import "core:mem"

@@ -1,7 +1,5 @@
 package agent
 
-import "core:sys/posix"
-
 import "nabla:ai"
 
 // process_interrupt latches SIGINT, SIGTERM, or SIGHUP: the process was asked to stop. A
@@ -16,7 +14,16 @@ process_interrupted :: proc "contextless" () -> bool {
 	return ai.interrupt_requested(&process_interrupt)
 }
 
-chat_signal_interrupt :: proc "c" (signal: posix.Signal) {
+// Signal is a process signal the harness watches: the ones that ask it to stop.
+Signal :: enum {
+	Interrupt,
+	Terminate,
+	Hangup,
+}
+
+// signal_interrupt_latch is what an installed handler runs. It writes only static storage.
+@(private)
+signal_interrupt_latch :: proc "contextless" () {
 	ai.interrupt_request(&process_interrupt)
 	owner_wake_signal()
 }
@@ -26,64 +33,53 @@ chat_signal_interrupt :: proc "c" (signal: posix.Signal) {
 // SA_RESTART, so an interrupted wait returns and observes the stop. A disposition that
 // cannot be installed leaves the default in place, under which the signal ends the process
 // and journal recovery takes over.
-chat_signal_arm :: proc(previous: ^posix.sigaction_t) {
-	action: posix.sigaction_t
-	action.sa_handler = chat_signal_interrupt
-	_ = posix.sigaction(.SIGINT, &action, previous)
+chat_signal_arm :: proc(previous: ^Signal_Action) {
+	signal_action_install(.Interrupt, previous)
 }
 
 // chat_signal_disarm restores the previous disposition, which is teardown: a disposition
 // that cannot be restored changes nothing about a process that is finishing. The handler
 // references only static storage, so a signal that arrives while this runs either latches
 // the interrupt or terminates the process under the restored default.
-chat_signal_disarm :: proc(previous: ^posix.sigaction_t) {
+chat_signal_disarm :: proc(previous: ^Signal_Action) {
 	if previous == nil { return }
-	_ = posix.sigaction(.SIGINT, previous, nil)
+	signal_action_restore(.Interrupt, previous)
 }
 
 Chat_Interactive_Signals :: struct {
-	previous_int:  posix.sigaction_t,
-	previous_term: posix.sigaction_t,
-	previous_hup:  posix.sigaction_t,
+	previous_int:  Signal_Action,
+	previous_term: Signal_Action,
+	previous_hup:  Signal_Action,
 }
 
 // chat_interactive_arm installs the handler for the whole interactive lifetime, so
 // SIGINT, SIGTERM, and SIGHUP end the process through the owner instead of killing it
 // with the terminal unrestored. Per-turn arming nests inside this and restores it afterwards.
 chat_interactive_arm :: proc(state: ^Chat_Interactive_Signals) {
-	action: posix.sigaction_t
-	action.sa_handler = chat_signal_interrupt
-	_ = posix.sigaction(.SIGINT, &action, &state.previous_int)
-	_ = posix.sigaction(.SIGTERM, &action, &state.previous_term)
-	_ = posix.sigaction(.SIGHUP, &action, &state.previous_hup)
+	signal_action_install(.Interrupt, &state.previous_int)
+	signal_action_install(.Terminate, &state.previous_term)
+	signal_action_install(.Hangup, &state.previous_hup)
 }
 
 // chat_interactive_disarm restores both dispositions, which is teardown: the process is
 // going away and a disposition that cannot be restored changes nothing about that.
 chat_interactive_disarm :: proc(state: ^Chat_Interactive_Signals) {
 	if state == nil { return }
-	_ = posix.sigaction(.SIGINT, &state.previous_int, nil)
-	_ = posix.sigaction(.SIGTERM, &state.previous_term, nil)
-	_ = posix.sigaction(.SIGHUP, &state.previous_hup, nil)
+	signal_action_restore(.Interrupt, &state.previous_int)
+	signal_action_restore(.Terminate, &state.previous_term)
+	signal_action_restore(.Hangup, &state.previous_hup)
 }
 
 // chat_signal_block_watched blocks SIGINT, SIGTERM, and SIGHUP on the calling thread and
 // returns its previous mask. A thread inherits its creator's mask, so a worker that must
 // never run the handler is created between this and chat_signal_restore. A mask that
 // cannot be set leaves the thread exposed, and the handler only stores atomics.
-chat_signal_block_watched :: proc() -> (previous: posix.sigset_t) {
-	blocked: posix.sigset_t
-	posix.sigemptyset(&blocked)
-	posix.sigaddset(&blocked, .SIGINT)
-	posix.sigaddset(&blocked, .SIGTERM)
-	posix.sigaddset(&blocked, .SIGHUP)
-	_ = posix.pthread_sigmask(.BLOCK, &blocked, &previous)
-	return
+chat_signal_block_watched :: proc() -> Signal_Mask {
+	return signal_mask_block({.Interrupt, .Terminate, .Hangup})
 }
 
 // chat_signal_restore puts a thread's mask back, which is teardown for a thread that is
 // starting its work: a mask that cannot be restored changes nothing about the process.
-chat_signal_restore :: proc(previous: posix.sigset_t) {
-	mask := previous
-	_ = posix.pthread_sigmask(.SETMASK, &mask, nil)
+chat_signal_restore :: proc(previous: Signal_Mask) {
+	signal_mask_set(previous)
 }

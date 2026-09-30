@@ -88,9 +88,10 @@
 //   write path that retries EINTR, waits for POLLOUT on EAGAIN (the tty is
 //   O_NONBLOCK), and completes short writes, so a transient failure cannot
 //   leave a sequence half-applied.
-// - An atexit termios safety net is registered at open (raw mode only) as a
-//   best-effort fallback for abnormal exits. SIGKILL, power loss, and
-//   unhandled crashes are outside the guarantee.
+// - A termios safety net runs from a runtime fini hook (raw mode only) as a
+//   best-effort fallback when main returns without closing the session.
+//   os.exit, fatal signals, SIGKILL, power loss, and unhandled crashes are
+//   outside the guarantee.
 // - A failed present leaves terminal contents and cursor state unspecified
 //   until the next successful full frame: a hard write failure may occur
 //   after a prefix has reached the terminal, and bytes already consumed

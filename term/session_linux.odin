@@ -2,11 +2,9 @@
 #+private
 package term
 
-import "core:c"
 import "core:io"
 import "core:os"
 import "core:sys/linux"
-import "core:sys/posix"
 import "core:terminal/ansi"
 
 // Session_Impl is the Linux session state: the controlling-terminal
@@ -16,8 +14,8 @@ import "core:terminal/ansi"
 // session extension, equivalent to terminal_posix.odin for the copied base.
 Session_Impl :: struct {
 	file:                ^os.File,
-	original_termios:    posix.termios,
-	original_file_flags: c.int,
+	original_termios:    Termios,
+	original_file_flags: linux.Open_Flags,
 	file_flags_changed:  bool,
 	termios_saved:       bool,
 	mode_applied:        bool,
@@ -31,7 +29,7 @@ Session_Impl :: struct {
 	mouse:               bool,
 	cursor_hidden:       bool,
 	sigwinch_installed:  bool,
-	previous_sigaction:  posix.sigaction_t,
+	previous_sigaction:  linux.Sig_Action,
 }
 
 // Control sequences, composed from core:terminal/ansi constants rather than
@@ -72,15 +70,6 @@ Linux_Window_Size :: struct {
 	rows, columns, x_pixels, y_pixels: u16,
 }
 
-// _errno surfaces the current thread's errno as the package's Platform_Error
-// (linux.Errno). posix calls report failure through their return status; the
-// cause always lives in errno, and the error model preserves it instead of
-// collapsing into a stage name.
-@(require_results)
-_errno :: #force_inline proc "contextless" () -> Platform_Error {
-	return Platform_Error(linux.Errno(i32(c.int(posix.get_errno()))))
-}
-
 // session_active implements the one-active-session contract: a second open
 // fails with .Already_Open before touching the terminal.
 @(private = "file")
@@ -92,26 +81,19 @@ session_active: bool
 @(private = "file")
 sigwinch_pending: bool
 
-// atexit state: the exact saved termios plus the tty fd, restored on
-// abnormal exits as a best-effort safety net (raw_console pattern, the Odin
-// distribution's examples/console/raw_console/raw_posix.odin). POSIX atexit
-// cannot
-// unregister, so the callback is registered once per process; atexit_active
-// is true only while the session still owns its descriptor — it is disarmed
-// the moment the one-shot descriptor close consumes the handle, success or
-// failure, so a consumed (and possibly reused) fd never receives the saved
-// termios at exit.
+// fini state: the exact saved termios plus the tty fd, restored by the
+// @(fini) hook below. atexit_active is true only while the session still owns
+// its descriptor: it is disarmed the moment the one-shot descriptor close
+// consumes the handle, success or failure, so a consumed (and possibly
+// reused) fd never receives the saved termios at exit.
 @(private = "file")
-atexit_termios: posix.termios
+atexit_termios: Termios
 
 @(private = "file")
-atexit_fd: posix.FD
+atexit_fd: linux.Fd
 
 @(private = "file")
 atexit_active: bool
-
-@(private = "file")
-atexit_registered: bool
 
 @(require_results)
 _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
@@ -123,11 +105,16 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 	if open_err != nil {
 		// A missing /dev/tty is the semantic "no controlling terminal"
 		// state; any other open cause is preserved.
-		errno := linux.Errno(i32(c.int(posix.get_errno())))
-		if errno == .ENOENT || errno == .ENXIO {
+		if platform, ok := open_err.(os.Platform_Error); ok {
+			if platform == .ENOENT || platform == .ENXIO {
+				return General_Error.No_Controlling_Tty
+			}
+			return platform
+		}
+		if open_err == os.General_Error.Not_Exist {
 			return General_Error.No_Controlling_Tty
 		}
-		return Platform_Error(errno)
+		return io.Error.Unknown
 	}
 	impl.file = file
 	defer if !session_active {
@@ -144,50 +131,46 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 	if !os.is_tty(file) {
 		return General_Error.Not_A_Tty
 	}
-	fd := posix.FD(os.fd(file))
+	fd := linux.Fd(os.fd(file))
 
 	// Raw input mode is an explicit opt-in (.Raw): it saves and replaces the
 	// termios, sets the descriptor nonblocking for the drain-until-EAGAIN
-	// input path, and arms the atexit termios safety net. .Unchanged leaves
+	// input path, and arms the termios safety net. .Unchanged leaves
 	// the input configuration entirely alone.
 	if options.input_mode == .Raw {
-		if posix.tcgetattr(fd, &impl.original_termios) != .OK {
-			return _errno()
+		if errno := _tcgetattr(fd, &impl.original_termios); errno != .NONE {
+			return Platform_Error(errno)
 		}
 		impl.termios_saved = true
 
 		// Nonblocking mode: the input stage drains reads until EAGAIN. The
 		// original flags are saved and restored on teardown.
-		flags := posix.fcntl(fd, .GETFL)
-		if flags < 0 {
-			return _errno()
+		flags, flags_errno := linux.fcntl_getfl(fd, .GETFL)
+		if flags_errno != .NONE {
+			return Platform_Error(flags_errno)
 		}
 		impl.original_file_flags = flags
-		if posix.fcntl(fd, .SETFL, flags | c.int(posix.O_NONBLOCK)) < 0 {
-			return _errno()
+		if errno := linux.fcntl_setfl(fd, .SETFL, flags + {.NONBLOCK}); errno != .NONE {
+			return Platform_Error(errno)
 		}
 		impl.file_flags_changed = true
 
 		// Narrow TUI profile: clear echo/canonical/signals/extended, input and
 		// output postprocessing; retain all unrelated bits; VMIN=1 VTIME=0.
 		raw := impl.original_termios
-		raw.c_lflag -= {.ECHO, .ECHONL, .ICANON, .IEXTEN, .ISIG}
-		raw.c_iflag -= {.ICRNL, .INLCR, .IGNCR, .IXON}
-		raw.c_oflag -= {.OPOST}
-		raw.c_cc[.VMIN] = 1
-		raw.c_cc[.VTIME] = 0
-		if posix.tcsetattr(fd, .TCSAFLUSH, &raw) != .OK {
-			return _errno()
+		raw.c_lflag &~= ECHO | ECHONL | ICANON | IEXTEN | ISIG
+		raw.c_iflag &~= ICRNL | INLCR | IGNCR | IXON
+		raw.c_oflag &~= OPOST
+		raw.c_cc[VMIN] = 1
+		raw.c_cc[VTIME] = 0
+		if errno := _tcsetattr(fd, TCSAFLUSH, &raw); errno != .NONE {
+			return Platform_Error(errno)
 		}
 		impl.mode_applied = true
 
 		atexit_termios = impl.original_termios
 		atexit_fd = fd
 		atexit_active = true
-		if !atexit_registered {
-			posix.atexit(_session_atexit_restore)
-			atexit_registered = true
-		}
 	}
 
 	if options.alternate_screen {
@@ -322,9 +305,9 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 		}
 	}
 	if impl.mode_applied {
-		if posix.tcsetattr(posix.FD(os.fd(impl.file)), .TCSAFLUSH, &impl.original_termios) != .OK {
+		if errno := _tcsetattr(linux.Fd(os.fd(impl.file)), TCSAFLUSH, &impl.original_termios); errno != .NONE {
 			if first_error == nil {
-				first_error = _errno()
+				first_error = Platform_Error(errno)
 			}
 		} else {
 			impl.mode_applied = false
@@ -332,18 +315,18 @@ _session_rollback :: proc(impl: ^Session_Impl) -> Error {
 	}
 	impl.termios_saved = false
 	if impl.file_flags_changed {
-		if posix.fcntl(posix.FD(os.fd(impl.file)), .SETFL, impl.original_file_flags) < 0 {
+		if errno := linux.fcntl_setfl(linux.Fd(os.fd(impl.file)), .SETFL, impl.original_file_flags); errno != .NONE {
 			if first_error == nil {
-				first_error = _errno()
+				first_error = Platform_Error(errno)
 			}
 		} else {
 			impl.file_flags_changed = false
 		}
 	}
 	if impl.sigwinch_installed {
-		if posix.sigaction(posix.Signal(posix.SIGWINCH), &impl.previous_sigaction, nil) != .OK {
+		if errno := linux.rt_sigaction(.SIGWINCH, &impl.previous_sigaction, nil); errno != .NONE {
 			if first_error == nil {
-				first_error = _errno()
+				first_error = Platform_Error(errno)
 			}
 		} else {
 			impl.sigwinch_installed = false
@@ -379,7 +362,7 @@ _session_close :: proc(session: ^Session) -> Error {
 	}
 	impl := &session.impl
 	first_error: Error = nil
-	fd := posix.FD(os.fd(impl.file))
+	fd := linux.Fd(os.fd(impl.file))
 	// The cursor is part of the documented baseline: a presented frame may have
 	// hidden it and a partial write leaves that unspecified, so close shows it
 	// whenever the descriptor is still open, rather than tracking every frame's
@@ -431,27 +414,27 @@ _session_close :: proc(session: ^Session) -> Error {
 		}
 	}
 	if impl.mode_applied {
-		if posix.tcsetattr(fd, .TCSAFLUSH, &impl.original_termios) != .OK {
+		if errno := _tcsetattr(fd, TCSAFLUSH, &impl.original_termios); errno != .NONE {
 			if first_error == nil {
-				first_error = _errno()
+				first_error = Platform_Error(errno)
 			}
 		} else {
 			impl.mode_applied = false
 		}
 	}
 	if impl.file_flags_changed {
-		if posix.fcntl(fd, .SETFL, impl.original_file_flags) < 0 {
+		if errno := linux.fcntl_setfl(fd, .SETFL, impl.original_file_flags); errno != .NONE {
 			if first_error == nil {
-				first_error = _errno()
+				first_error = Platform_Error(errno)
 			}
 		} else {
 			impl.file_flags_changed = false
 		}
 	}
 	if impl.sigwinch_installed {
-		if posix.sigaction(posix.Signal(posix.SIGWINCH), &impl.previous_sigaction, nil) != .OK {
+		if errno := linux.rt_sigaction(.SIGWINCH, &impl.previous_sigaction, nil); errno != .NONE {
 			if first_error == nil {
-				first_error = _errno()
+				first_error = Platform_Error(errno)
 			}
 		} else {
 			impl.sigwinch_installed = false
@@ -489,7 +472,7 @@ _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, e
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}
-	return _session_write_bytes(posix.FD(os.fd(session.impl.file)), bytes)
+	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes)
 }
 
 // _session_clipboard writes a clipboard sequence through the same loop, so a
@@ -499,7 +482,7 @@ _session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int,
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}
-	return _session_write_bytes(posix.FD(os.fd(session.impl.file)), bytes)
+	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes)
 }
 
 // _session_write_bytes writes all of bytes to fd, retrying EINTR, waiting
@@ -510,7 +493,7 @@ _session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int,
 // returns zero while bytes remain is the one narrow Partial_Write case
 // (no errno exists to preserve).
 @(require_results)
-_session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, err: Error) {
+_session_write_bytes :: proc(fd: linux.Fd, bytes: []byte) -> (committed: int, err: Error) {
 	offset := 0
 	for offset < len(bytes) {
 		when #config(NABLA_TERM_TEST_HOOKS, false) {
@@ -523,10 +506,9 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 				return offset, General_Error.Partial_Write
 			}
 		}
-		remaining := len(bytes) - offset
-		written := posix.write(fd, raw_data(bytes[offset:]), c.size_t(remaining))
-		if written < 0 {
-			#partial switch posix.get_errno() {
+		written, errno := linux.write(fd, bytes[offset:])
+		if errno != .NONE {
+			#partial switch errno {
 			case .EINTR:
 				continue
 			case .EAGAIN:
@@ -536,7 +518,7 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 				}
 				continue
 			case:
-				return offset, _errno()
+				return offset, Platform_Error(errno)
 			}
 		}
 		if written == 0 {
@@ -553,20 +535,17 @@ _session_write_bytes :: proc(fd: posix.FD, bytes: []byte) -> (committed: int, er
 // is no separate public poll-error channel: the write path surfaces this
 // cause directly.
 @(require_results)
-_session_poll_out :: proc(fd: posix.FD) -> (ok: bool, err: Error) {
+_session_poll_out :: proc(fd: linux.Fd) -> (ok: bool, err: Error) {
 	for {
-		poll_descriptor := posix.pollfd {
-			fd     = fd,
-			events = {.OUT},
-		}
-		ready_count := posix.poll(&poll_descriptor, 1, -1)
-		if ready_count >= 0 {
+		poll_descriptors := [1]linux.Poll_Fd{{fd = fd, events = {.OUT}}}
+		_, errno := linux.poll(poll_descriptors[:], -1)
+		if errno == .NONE {
 			return true, nil
 		}
-		if posix.get_errno() == .EINTR {
+		if errno == .EINTR {
 			continue
 		}
-		return false, _errno()
+		return false, Platform_Error(errno)
 	}
 }
 
@@ -576,8 +555,8 @@ _session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
 		return {}, General_Error.Not_Open
 	}
 	size: Linux_Window_Size
-	if linux.ioctl(linux.Fd(os.fd(session.impl.file)), u32(linux.TIOCGWINSZ), uintptr(rawptr(&size))) != 0 {
-		return {}, _errno()
+	if errno := _ioctl(linux.Fd(os.fd(session.impl.file)), linux.TIOCGWINSZ, &size); errno != .NONE {
+		return {}, Platform_Error(errno)
 	}
 	if size.columns == 0 || size.rows == 0 {
 		// The tty reported no size: a semantic "no data" cause rather than
@@ -596,7 +575,7 @@ _session_file :: proc(session: ^Session) -> (file: ^os.File, err: Error) {
 
 @(require_results)
 _session_write :: proc(file: ^os.File, text: string) -> Error {
-	_, err := _session_write_bytes(posix.FD(os.fd(file)), transmute([]byte)text)
+	_, err := _session_write_bytes(linux.Fd(os.fd(file)), transmute([]byte)text)
 	return err
 }
 
@@ -610,24 +589,29 @@ _session_close_write :: proc(file: ^os.File, text: string) -> Error {
 	return err
 }
 
-_session_atexit_restore :: proc "c" () {
-	// No-op after a normal close: the termios is already restored and the
-	// saved fd may have been reused by an unrelated file. Best effort by
-	// contract: the process is exiting, so a failed restore changes nothing.
+// _session_restore_at_fini is the safety net for a process that returns from
+// main (or ends through runtime._cleanup_runtime) without closing its session:
+// it restores the saved termios. It does not run on os.exit (core:os documents
+// that @(fini) blocks are skipped), on a fatal signal, or on a panic, so those
+// exits still leave the terminal raw. After a normal close it is a no-op. The
+// restore is best effort: the process is ending, so a failure changes nothing.
+@(fini, private = "file")
+_session_restore_at_fini :: proc "contextless" () {
 	if atexit_active {
-		_ = posix.tcsetattr(atexit_fd, .TCSAFLUSH, &atexit_termios)
+		_ = _tcsetattr(atexit_fd, TCSAFLUSH, &atexit_termios)
 	}
 }
 
-_session_sigwinch_handler :: proc "c" (sig: posix.Signal) {
+_session_sigwinch_handler :: proc "c" (sig: linux.Signal) {
 	sigwinch_pending = true
 }
 
 _session_install_sigwinch :: proc(impl: ^Session_Impl) {
-	action := posix.sigaction_t {
-		sa_handler = _session_sigwinch_handler,
+	// rt_sigaction supplies the x86_64 restorer (SA_RESTORER + rt_sigreturn).
+	action := linux.Sig_Action {
+		handler = _session_sigwinch_handler,
 	}
-	if posix.sigaction(posix.Signal(posix.SIGWINCH), &action, &impl.previous_sigaction) == .OK {
+	if linux.rt_sigaction(.SIGWINCH, &action, &impl.previous_sigaction) == .NONE {
 		impl.sigwinch_installed = true
 	}
 }
