@@ -113,18 +113,25 @@ writer_failed :: proc(writer: ^Writer) -> bool {
 	return failed
 }
 
+// writer_submit_value serializes value and transfers its complete response frame to
+// the writer thread. True means queued, not written.
+@(private, require_results)
+writer_submit_value :: proc(writer: ^Writer, id: Jsonrpc_Id, key: string, value: $T) -> bool {
+	state := writer.state
+	if state == nil { return false }
+	body, marshal_error := json.marshal(value, allocator = context.temp_allocator)
+	if marshal_error != nil { return false }
+	defer delete(body, context.temp_allocator)
+	frame, encoded := writer_encode_frame(state, id, key, body)
+	if !encoded { return false }
+	return writer_submit_frame(state, frame, true)
+}
+
 // writer_write_response serializes a result before transferring its complete frame to
 // the writer thread. True means queued, not written.
 @(require_results)
 writer_write_response :: proc(writer: ^Writer, id: Jsonrpc_Id, result: $T) -> bool {
-	state := writer.state
-	if state == nil { return false }
-	body, marshal_error := json.marshal(result, allocator = context.temp_allocator)
-	if marshal_error != nil { return false }
-	defer delete(body, context.temp_allocator)
-	frame, encoded := writer_encode_frame(state, id, `"result":`, body)
-	if !encoded { return false }
-	return writer_submit_frame(state, frame, true)
+	return writer_submit_value(writer, id, `"result":`, result)
 }
 
 // Rpc_Error_Wire is the error document an error answer carries.
@@ -137,14 +144,7 @@ Rpc_Error_Wire :: struct {
 // writer thread. True means queued, not written.
 @(require_results)
 writer_write_error :: proc(writer: ^Writer, id: Jsonrpc_Id, code: i64, message: string) -> bool {
-	state := writer.state
-	if state == nil { return false }
-	body, marshal_error := json.marshal(Rpc_Error_Wire{code = code, message = message}, allocator = context.temp_allocator)
-	if marshal_error != nil { return false }
-	defer delete(body, context.temp_allocator)
-	frame, encoded := writer_encode_frame(state, id, `"error":`, body)
-	if !encoded { return false }
-	return writer_submit_frame(state, frame, true)
+	return writer_submit_value(writer, id, `"error":`, Rpc_Error_Wire{code = code, message = message})
 }
 
 // writer_write_notification serializes a notification before transferring its complete

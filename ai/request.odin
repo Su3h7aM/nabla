@@ -207,6 +207,26 @@ Provider_Encoded_Request :: struct {
 	User_Agent:         string,
 }
 
+// provider_encoded_request describes one frozen request around a body an API family
+// encoded. Every transport freezes the same fields from the same request, so the
+// ownership rule lives here rather than in each freeze path: a body encoded through
+// cache belongs to the cache, and one encoded without a cache is the caller's.
+@(private)
+provider_encoded_request :: proc(request: Provider_Request, body: string, cache: ^Provider_Encode_Cache) -> Provider_Encoded_Request {
+	return Provider_Encoded_Request {
+		API = request.API,
+		Body = transmute([]u8)body,
+		Body_Borrowed = cache != nil,
+		Model = request.Model,
+		Tools = len(request.Tools),
+		Session_Id_Present = request.Session_Id_Present,
+		Session_Id = request.Session_Id,
+		Parent_Session_Id = request.Parent_Session_Id,
+		User_Agent_Present = request.User_Agent_Present,
+		User_Agent = request.User_Agent,
+	}
+}
+
 // Provider_Operation_Options is the caller's interruption and trust policy for
 // one request. A zero value performs the request without cancellation, which is
 // what the synchronous prototype path wants.
@@ -412,18 +432,7 @@ Provider_Request_Freeze_Reusing :: proc(
 	if encode_err != .None {
 		return {}, provider_invalid_request(provider_request_error_text(encode_err), allocator)
 	}
-	return Provider_Encoded_Request {
-		API = request.API,
-		Body = transmute([]u8)body,
-		Body_Borrowed = cache != nil,
-		Model = request.Model,
-		Tools = len(request.Tools),
-		Session_Id_Present = request.Session_Id_Present,
-		Session_Id = request.Session_Id,
-		Parent_Session_Id = request.Parent_Session_Id,
-		User_Agent_Present = request.User_Agent_Present,
-		User_Agent = request.User_Agent,
-	}, {}
+	return provider_encoded_request(request, body, cache), {}
 }
 
 // Provider_Request_Operation_Encoded performs one request from a body that was
