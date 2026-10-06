@@ -21,7 +21,6 @@ import "nabla:tui/widgets"
 // terminal, and results cross through the runtime snapshot. The snapshot is a display
 // projection; the session keeps the real history, request context, effort, and usage.
 
-TUI_POLL_MS :: 50
 WORK_CAPACITY :: 16
 
 // Entry is one rendered conversation line group: a role or diagnostic plus
@@ -92,11 +91,9 @@ Status :: struct {
 	// working_since spans the complete execution of one accepted prompt, across
 	// every provider request and tool call, until the session returns to idle.
 	working_since:         time.Tick,
-	// The retry the turn is waiting for, while it waits for one. The due time is when the
-	// harness sends again: a front-end showing this clears it when the next send is prepared, and the
+	// Whether the turn is waiting to resend a failed request. The next send clears it, and the
 	// worker clears it whenever the session stops running.
 	retry_present:         bool,
-	retry_due:             time.Tick,
 }
 
 // TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps for
@@ -289,8 +286,17 @@ Pending_Target :: struct {
 Runtime :: struct {
 	mu:                       sync.Mutex, // guards snapshot and pending,
 	snap:                     Snapshot,
+	// wake is the eventfd the frame loop polls beside the terminal. Whatever changes
+	// what the frame shows signals it, so an idle loop sleeps until there is something
+	// to draw. It is set before the worker starts and cleared after the worker and the
+	// catalog refresh have stopped, so no thread reads it while it changes. Nil means
+	// there is no frame loop to wake.
+	wake:                     Maybe(int),
 	work:                     Work_Chan,
 	worker:                   ^thread.Thread,
+	// worker_done is signaled by the worker as its last action, which is what
+	// join_retiring waits on.
+	worker_done:              sync.One_Shot_Event,
 	connection:               ai.Provider_Connection,
 	// pending is the selection change waiting for a request boundary. It is written
 	// by the front-end and consumed by the worker, so it is guarded by mu like the
@@ -483,6 +489,16 @@ tui_run :: proc(
 	}
 	app.raw = raw
 
+	wake, wake_error := input.wake_make()
+	if wake_error != nil {
+		fmt.eprintln("nabla: cannot create the wake descriptor:", wake_error)
+		app_abandoned = app_teardown(app)
+		return false
+	}
+	app.run.wake = wake
+	term.set_resize_wake(wake)
+	agent.signal_set_wake(wake)
+
 	if !apply_startup_selection(app, flag_provider, flag_model) {
 		fmt.eprintln("nabla:", setup_error_text(app))
 		app_abandoned = app_teardown(app)
@@ -519,7 +535,10 @@ tui_run :: proc(
 
 	read_failed := false
 	for !app.quit {
-		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, TUI_POLL_MS)
+		// The drain comes before the loop reads any state a wake announces, so a
+		// signal that arrives after it leaves the descriptor readable for the next poll.
+		input.wake_drain(wake)
+		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, tui_wait_ms(app), wake)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
 			read_failed = true
@@ -561,6 +580,12 @@ tui_run :: proc(
 		if app.steer_active && !busy { restore_steering(app) }
 		app.steer_active = busy
 		advance_spinner := busy && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
+		// The lap restarts even when no frame can be drawn, because tui_wait_ms would
+		// otherwise return zero and spin until a size arrives.
+		if advance_spinner {
+			app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
+			app.spin_lap = now
+		}
 		// A startup chooser closes once its selection applies on the worker; a menu
 		// opened from the prompt closes on submit instead, so browsing it does not
 		// dismiss it.
@@ -578,10 +603,6 @@ tui_run :: proc(
 			app.menu.required = required
 		}
 		if sizable && (count > 0 || resized || recovered || generation_changed(app) || advance_spinner || catalog_updated) {
-			if advance_spinner {
-				app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
-				app.spin_lap = now
-			}
 			present_frame(app, app.storage)
 		}
 
@@ -600,6 +621,15 @@ tui_run :: proc(
 	if runtime_busy(app) { agent.turn_control_stop(&app.run.control) }
 	app_abandoned = app_teardown(app)
 	return !read_failed
+}
+
+// tui_wait_ms is how long the frame loop may sleep: forever while idle, because every
+// change that needs a frame signals the wake, and until the next spinner frame while a
+// turn runs, because the spinner animates without any change to signal.
+tui_wait_ms :: proc(app: ^App) -> i64 {
+	if !runtime_busy(app) { return -1 }
+	remaining := SPINNER_INTERVAL - time.tick_diff(app.spin_lap, time.tick_now())
+	return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
 }
 
 // report_viewport_unavailable says once per episode that the terminal reported no size to
@@ -624,7 +654,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 		agent.owner_wake_signal()
 	}
 	if app.run.worker != nil {
-		if join_retiring(app.run.worker, patience) {
+		if join_retiring(app.run.worker, &app.run.worker_done, patience) {
 			app.run.worker = nil
 		} else {
 			retired = false
@@ -635,6 +665,14 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 		// snapshot that the thread still reads. The process exits with that memory owned by
 		// the thread that is using it.
 		return true
+	}
+	// The worker and the catalog refresh are gone, so nothing signals the wake. The
+	// registrations clear first because a signal handler can still run on any thread.
+	if wake, armed := app.run.wake.?; armed {
+		term.set_resize_wake(-1)
+		agent.signal_set_wake(-1)
+		input.wake_destroy(wake)
+		app.run.wake = nil
 	}
 	// The worker frees what it had buffered on the way out; this covers commands
 	// that were queued after it stopped receiving, and a worker that never started.

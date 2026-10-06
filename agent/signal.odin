@@ -1,5 +1,6 @@
 package agent
 
+import "core:sync"
 import "nabla:ai"
 
 // process_interrupt latches SIGINT, SIGTERM, or SIGHUP: the process was asked to stop. A
@@ -21,11 +22,27 @@ Signal :: enum {
 	Hangup,
 }
 
+// signal_wake is the descriptor the latch writes to, or -1. A handler can run on any
+// thread, so the latch alone would not end a poll another thread is blocked in.
+@(private)
+signal_wake: i32 = -1
+
+// signal_set_wake registers a non-blocking eventfd that the latch writes a u64 1 to, so a
+// frontend polling it wakes at once. -1 clears the registration, which the caller does
+// before it closes the descriptor. The latch stays the source of truth: the write only
+// wakes the caller.
+signal_set_wake :: proc(fd: int) {
+	sync.atomic_store(&signal_wake, i32(fd))
+}
+
 // signal_interrupt_latch is what an installed handler runs. It writes only static storage.
 @(private)
 signal_interrupt_latch :: proc "contextless" () {
 	ai.interrupt_request(&process_interrupt)
 	owner_wake_signal()
+	if fd := sync.atomic_load(&signal_wake); fd >= 0 {
+		signal_wake_write(int(fd))
+	}
 }
 
 // chat_signal_arm installs the handler only while a turn is in flight, so a headless

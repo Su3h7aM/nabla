@@ -11,6 +11,9 @@ Signal_Mask :: struct {}
 signal_action_install :: proc(signal: Signal, previous: ^Signal_Action) {  }
 
 @(private)
+signal_wake_write :: proc "contextless" (fd: int) {  }
+
+@(private)
 signal_action_restore :: proc(signal: Signal, previous: ^Signal_Action) {  }
 
 @(private)

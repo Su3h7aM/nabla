@@ -12,11 +12,13 @@ import "core:time"
 import "nabla:agent"
 import "nabla:agent/journal"
 import "nabla:ai"
+import input "nabla:input"
 
 // --- worker ---------------------------------------------------------------
 
 run_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
+	defer sync.one_shot_event_signal(&app.run.worker_done)
 	// A thread started without init_context gets the default context, not the one
 	// the creating scope modified, so the run's allocator is installed here. Leaving
 	// init_context unset is what keeps the thread library managing this thread's
@@ -145,7 +147,7 @@ session_refresh_rows :: proc(app: ^App) {
 	// The running session is published with the list, so the menu can open on it
 	// without reading the running session from another thread.
 	app.run.snap.active_session = app.setup.session.session
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
@@ -433,7 +435,7 @@ snapshot_clear :: proc(app: ^App) {
 	clear(&app.run.snap.entries)
 	app.run.snap.entries_bytes = 0
 	app.run.snap.transcript_trimmed = false
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 // menu_begin publishes a freshly built list. Every open procedure builds its
@@ -497,7 +499,7 @@ refresh_status :: proc(app: ^App) {
 	snap_status_replace(app, &status.provider_id, app.setup.provider_id)
 	snap_status_replace(app, &status.model_id, app.setup.model_id)
 	snap_status_replace(app, &status.effort, running.effort)
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 // snap_status_replace replaces one owned status string with a copy of text, keeping
@@ -525,7 +527,7 @@ set_running :: proc(app: ^App, running: bool) {
 		status.working_since = time.tick_now()
 	}
 	status.running = running
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 @(require_results)
@@ -555,6 +557,22 @@ runtime_selection_provider :: proc(app: ^App) -> string {
 		snap_report_dropped(app)
 	}
 	return provider
+}
+
+// snap_publish_locked records that the snapshot changed and wakes the frame loop. The
+// caller holds the runtime mutex. The wake may be written under it because adding to
+// a non-blocking eventfd never waits.
+snap_publish_locked :: proc(app: ^App) {
+	app.run.snap.generation += 1
+	run_wake(app)
+}
+
+// run_wake makes the frame loop's next poll return. It does nothing without a frame
+// loop, as in a headless run.
+run_wake :: proc(app: ^App) {
+	if wake, armed := app.run.wake.?; armed {
+		input.wake_signal(wake)
+	}
 }
 
 generation_changed :: proc(app: ^App) -> bool {
@@ -632,7 +650,7 @@ snap_report_dropped :: proc(app: ^App) {
 snap_report_dropped_locked :: proc(app: ^App) {
 	if app.run.snap.display_incomplete { return }
 	app.run.snap.display_incomplete = true
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 snap_push_locked :: proc(app: ^App, entry: Entry) {
@@ -646,7 +664,7 @@ snap_push_locked :: proc(app: ^App, entry: Entry) {
 		snap_report_dropped_locked(app)
 		return
 	}
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 	snap_trim_locked(app)
 }
 
@@ -712,8 +730,7 @@ observer_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Even
 	defer sync.mutex_unlock(&app.run.mu)
 	status := &app.run.snap.status
 	status.retry_present = true
-	status.retry_due = time.tick_add(time.tick_now(), event.delay)
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 clear_retry :: proc(app: ^App) {
@@ -721,7 +738,7 @@ clear_retry :: proc(app: ^App) {
 	defer sync.mutex_unlock(&app.run.mu)
 	if !app.run.snap.status.retry_present { return }
 	app.run.snap.status.retry_present = false
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 observer_request_finished :: proc(user_data: rawptr) {
@@ -747,7 +764,7 @@ observer_assistant_text :: proc(user_data: rawptr, text: string) {
 			snap_entry_append_text(app, last, text)
 			app.run.snap.entries_bytes += last.bytes - before
 			snap_trim_locked(app)
-			app.run.snap.generation += 1
+			snap_publish_locked(app)
 			return
 		}
 	}
@@ -762,7 +779,7 @@ observer_assistant_end :: proc(user_data: rawptr) {
 	if count > 0 {
 		app.run.snap.entries[count - 1].complete = true
 	}
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 observer_user_text :: proc(user_data: rawptr, text: string) {
@@ -812,5 +829,5 @@ observer_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usa
 	// boundaries, not per stream event, so this only records the latest request's
 	// size for the footer beside them.
 	_ = operation
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }

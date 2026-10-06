@@ -450,6 +450,7 @@ Acp_Server :: struct {
 	writer:             acp.Writer,
 	work:               Acp_Work_Chan,
 	worker:             ^thread.Thread,
+	worker_done:        sync.One_Shot_Event, // signaled by the worker as its last action
 	// queue_mu guards pending_work.
 	queue_mu:           sync.Mutex,
 	pending_work:       int,
@@ -525,7 +526,7 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 		agent.owner_wake_signal()
 	}
 	if server.worker != nil {
-		if join_retiring(server.worker, patience) {
+		if join_retiring(server.worker, &server.worker_done, patience) {
 			server.worker = nil
 		} else {
 			// The worker still owns the session. Nothing below may run or be freed; the
@@ -587,6 +588,7 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 // inbox for the next prompt's turn. It leaves when the queue is closed and drained.
 acp_worker :: proc(thread_handle: ^thread.Thread) {
 	server := cast(^Acp_Server)thread_handle.data
+	defer sync.one_shot_event_signal(&server.worker_done)
 	// A thread started without init_context gets the default context, so the server's
 	// allocator, which the work it destroys was allocated with, is installed here.
 	context.allocator = server.alloc

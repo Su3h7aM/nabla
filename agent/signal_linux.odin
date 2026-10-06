@@ -27,6 +27,14 @@ signal_handler :: proc "c" (signal: linux.Signal) {
 	signal_interrupt_latch()
 }
 
+// signal_wake_write adds 1 to an eventfd. A full counter means the descriptor is already
+// readable, so a failed write loses nothing.
+@(private)
+signal_wake_write :: proc "contextless" (fd: int) {
+	one := u64(1)
+	_, _ = linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+}
+
 // signal_action_install routes signal to signal_interrupt_latch and saves the disposition it
 // replaces in previous. The handler is installed without SA_RESTART. A disposition that cannot
 // be installed leaves the default in place.

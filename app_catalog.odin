@@ -76,6 +76,7 @@ models_dev_read_due :: proc(app: ^App) -> bool {
 
 catalog_refresh_worker :: proc(thread_handle: ^thread.Thread) {
 	app := cast(^App)thread_handle.data
+	defer sync.one_shot_event_signal(&app.catalog_worker_done)
 	// The worker adopts the run's allocator, so what it allocates belongs to the run
 	// rather than to the process default a fresh thread context starts with.
 	context.allocator = app.setup.alloc
@@ -187,6 +188,7 @@ catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provid
 	// its endpoint. Nothing borrows a replaced catalog after this returns.
 	agent.catalog_destroy(&replaced)
 	sync.atomic_add(&app.catalog_revision, 1)
+	run_wake(app)
 }
 
 catalog_selection_refresh_request :: proc(app: ^App) {
@@ -228,7 +230,7 @@ catalog_selection_sync :: proc(app: ^App) {
 catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	if app.catalog_worker == nil { return true }
 	chan.close(&app.catalog_refresh)
-	if !join_retiring(app.catalog_worker, patience) { return false }
+	if !join_retiring(app.catalog_worker, &app.catalog_worker_done, patience) { return false }
 	app.catalog_worker = nil
 	chan.destroy(&app.catalog_refresh)
 	return true

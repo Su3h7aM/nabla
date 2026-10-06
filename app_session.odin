@@ -90,6 +90,7 @@ App :: struct {
 	models_dev_sources:         [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
 	catalog_refresh:            Catalog_Refresh_Chan,
 	catalog_worker:             ^thread.Thread,
+	catalog_worker_done:        sync.One_Shot_Event, // signaled by the catalog worker as its last action
 	catalog_revision:           u64,
 	catalog_seen:               u64,
 	terminal:                   ^term.Session,
@@ -903,7 +904,7 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, annou
 	app.run.snap.setup_error = ""
 	app.run.snap.setup_error_failed = false
 	if announce { snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id)) }
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }
 
 // apply_startup_selection chooses the model a launch runs with: the two flags if they are
@@ -960,5 +961,5 @@ selection_fail :: proc(app: ^App, message: string) {
 		app.run.snap.setup_error = cloned
 	}
 	snap_append_locked(app, .Warning, message)
-	app.run.snap.generation += 1
+	snap_publish_locked(app)
 }

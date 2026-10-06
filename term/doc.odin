@@ -62,8 +62,8 @@
 //   resize contract: the caller compares it with the previous value once per
 //   iteration, and a change invalidates width-dependent text measurements,
 //   supplies the new root extent to layout, and forces a complete redraw.
-//   There is no public resize-pending/signal API; a private SIGWINCH flag
-//   remains an implementation optimization only.
+//   set_resize_wake only wakes a caller blocked in poll on another
+//   descriptor; the private SIGWINCH flag behind viewport stays the truth.
 // - Viewport has no pixel field in the v1 surface.
 //
 // Terminal mode contract:

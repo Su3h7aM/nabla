@@ -4,6 +4,7 @@ package term
 
 import "core:io"
 import "core:os"
+import "core:sync"
 import "core:sys/linux"
 import "core:terminal/ansi"
 
@@ -80,6 +81,16 @@ session_active: bool
 // yet — it is the resize-notification seam.
 @(private = "file")
 sigwinch_pending: bool
+
+// sigwinch_wake is the descriptor the SIGWINCH handler writes to, or -1. The handler
+// can run on any thread, so without the write a resize would not end a poll that
+// another thread is blocked in.
+@(private = "file")
+sigwinch_wake: i32 = -1
+
+_session_set_resize_wake :: proc(fd: int) {
+	sync.atomic_store(&sigwinch_wake, i32(fd))
+}
 
 // fini state: the exact saved termios plus the tty fd, restored by the
 // @(fini) hook below. atexit_active is true only while the session still owns
@@ -604,6 +615,12 @@ _session_restore_at_fini :: proc "contextless" () {
 
 _session_sigwinch_handler :: proc "c" (sig: linux.Signal) {
 	sigwinch_pending = true
+	if fd := sync.atomic_load(&sigwinch_wake); fd >= 0 {
+		// A full counter means the descriptor is already readable, so a failed write
+		// loses nothing.
+		one := u64(1)
+		_, _ = linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+	}
 }
 
 _session_install_sigwinch :: proc(impl: ^Session_Impl) {

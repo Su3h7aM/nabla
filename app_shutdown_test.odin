@@ -22,6 +22,10 @@ Shutdown_Test_Thread :: struct {
 	cond:    sync.Cond,
 	started: bool,
 	stop:    bool,
+	// done is what the thread signals as its last action. It points at the event the code
+	// under test waits on, which is this state's own unless the test names another.
+	done:    ^sync.One_Shot_Event,
+	own:     sync.One_Shot_Event,
 }
 
 // shutdown_test_state gives one test the state its worker waits on. It comes from the
@@ -32,6 +36,7 @@ Shutdown_Test_Thread :: struct {
 shutdown_test_state :: proc() -> ^Shutdown_Test_Thread {
 	state := new(Shutdown_Test_Thread, os.heap_allocator())
 	state^ = {}
+	state.done = &state.own
 	return state
 }
 
@@ -40,6 +45,7 @@ shutdown_test_state :: proc() -> ^Shutdown_Test_Thread {
 // nothing, so a test releases it the same way whether or not it waited first.
 shutdown_test_loop :: proc(worker: ^thread.Thread) {
 	state := cast(^Shutdown_Test_Thread)worker.data
+	defer sync.one_shot_event_signal(state.done)
 	sync.mutex_lock(&state.mu)
 	state.started = true
 	sync.cond_broadcast(&state.cond)
@@ -67,7 +73,7 @@ shutdown_test_release :: proc(t: ^testing.T, state: ^Shutdown_Test_Thread, worke
 	state.stop = true
 	sync.cond_broadcast(&state.cond)
 	sync.mutex_unlock(&state.mu)
-	retired := join_retiring(worker, 2 * time.Second)
+	retired := join_retiring(worker, state.done, 2 * time.Second)
 	testing.expect(t, retired, "a released thread should retire")
 	if !retired { return }
 	free(state, os.heap_allocator())
@@ -79,7 +85,7 @@ test_join_retiring_gives_up_on_a_thread_that_never_returns :: proc(t: ^testing.T
 	worker := shutdown_test_start(t, state, "nabla-test-stuck")
 	// The wait is short because the point is giving up, not the five seconds a real
 	// shutdown grants a tool before it gives up on it.
-	testing.expect(t, !join_retiring(worker, 20 * time.Millisecond), "a thread that never returns must not be reported as retired")
+	testing.expect(t, !join_retiring(worker, state.done, 20 * time.Millisecond), "a thread that never returns must not be reported as retired")
 	// A thread that did not retire is left alone: thread.destroy would join it here.
 	testing.expect(t, !thread.is_done(worker), "the thread should still be running")
 
@@ -100,6 +106,7 @@ test_join_retiring_releases_a_thread_that_returns :: proc(t: ^testing.T) {
 test_app_teardown_abandons_its_release_path_for_a_stuck_worker :: proc(t: ^testing.T) {
 	app := App{}
 	state := shutdown_test_state()
+	state.done = &app.run.worker_done
 	app.run.worker = shutdown_test_start(t, state, "nabla-test-worker")
 	abandoned := app_teardown(&app, 20 * time.Millisecond)
 

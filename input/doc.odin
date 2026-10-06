@@ -10,6 +10,8 @@
 //   into the parser, and reports the produced events. The ESC ambiguity is
 //   resolved with a 50 ms deadline (capped poll), or immediately when more
 //   bytes are already buffered.
+//   A wake descriptor (wake_make, wake_signal, wake_drain) lets another thread or
+//   a signal handler end the wait early with zero events.
 // - io.Reader is not the interactive seam: readiness and timeouts cannot be
 //   expressed through core:io streams.
 //
