@@ -71,6 +71,58 @@ test_agent_status_reads_running_and_finished_children :: proc(test: ^testing.T) 
 	)
 }
 
+@(test)
+test_subagent_switch_at_finish_is_kept_on_resume :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	first, next: Agent_Provider
+	if !subagent_test_hold(test, &first, {agent_provider_reply("finished")}, 1) { return }
+	defer agent_provider_stop(&first)
+	if !agent_provider_start(test, &next, {agent_provider_reply("continued")}) { return }
+	defer agent_provider_stop(&next)
+	first_endpoint := agent_provider_endpoint(&first)
+	defer delete(first_endpoint)
+	next_endpoint := agent_provider_endpoint(&next)
+	defer delete(next_endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", first_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "next-provider", "next-model", next_endpoint, nil)
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
+	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = strings.clone("test-provider", chat.allocator)
+	delete(chat.model_id, chat.allocator)
+	chat.model_id = strings.clone("test-model", chat.allocator)
+	agent_team_note_parent(chat)
+	_test_accept(test, chat, "start one")
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"answer"}`), success)
+	child := subagent_test_wait_request(test, chat)
+	testing.expect_value(test, subagent_test_call(test, chat, "switch_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","model":"next-model"}`), success)
+	sync.sema_post(&first.release)
+	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	applied, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Selection_Applied}}, context.temp_allocator)
+	testing.expect_value(test, read_error, nil)
+	if !testing.expect(test, found) { return }
+	testing.expect_value(test, applied.model, "next-model")
+	testing.expect_value(test, applied.provider, "next-provider")
+	testing.expect_value(test, agent_provider_request_count(&first), 1)
+	testing.expect_value(test, agent_provider_request_count(&next), 0)
+	testing.expect_value(test, subagent_test_call(test, chat, "resume_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Continue."}`), success)
+	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)
+	for agent_team_running(chat.team) {
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(test, "the resumed child did not finish") }
+		time.sleep(time.Millisecond)
+	}
+	_ = agent_team_reap(chat.team, chat)
+	testing.expect_value(test, agent_provider_request_count(&next), 1)
+	testing.expect(test, strings.contains(agent_provider_request(&next, 0), `"model":"next-model"`))
+}
+
 // subagent_test_wait_request waits until the only child's newest journal record is a request
 // sent, which is a child held mid-request by the fixture, and returns its session.
 subagent_test_wait_request :: proc(test: ^testing.T, chat: ^Chat_Session) -> journal.Session_Id {
@@ -1256,7 +1308,11 @@ test_agent_send_compacts_a_running_subagent_without_stopping_it :: proc(test: ^t
 	_test_accept(test, chat, "start one")
 
 	success := journal.TOOL_OUTCOME_NAMES[.Success]
-	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, strings.concatenate({`{"prompt":"`, bulk, `"}`}, context.temp_allocator)), success)
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, strings.concatenate({`{"prompt":"`, bulk, `"}`}, context.temp_allocator)),
+		success,
+	)
 	testing.expect(test, strings.contains(subagent_test_report(test, chat), "done"), "the first turn ended")
 	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Once more."}`), success)
 	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)

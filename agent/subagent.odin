@@ -472,7 +472,7 @@ subagent_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string
 
 // Subagent_Resume says which finished child a start continues. name is its id, which is also
 // what tells a start from a continuation, and the instruction it was defined with goes in the
-// start's args. provider_id, model_id, and effort are what its last turn ran with, which a
+// start's args. provider_id, model_id, and effort are its newest selection, which a
 // continuation keeps unless the call names others; model_id is "" for a child that ran no
 // turn, which then starts from the orchestrator's selection as a new child does. The strings
 // are borrowed and valid until the start returns.
@@ -488,7 +488,7 @@ Subagent_Resume :: struct {
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
 // the model, the orchestrator's by default, and the effort, one level below the orchestrator's
 // by default. With resume it continues the child resume names in session instead, keeping the
-// selection its last turn used by default. problem, temp-allocated, says why nothing started.
+// newest selection by default. problem, temp-allocated, says why nothing started.
 // Worker thread or owner.
 @(require_results)
 subagent_start :: proc(
@@ -602,7 +602,7 @@ subagent_start :: proc(
 
 // Subagent_Defaults is what a selection falls back to for what its call leaves out. A new child
 // defaults to its orchestrator's model and, with step_down, to the level one below the
-// orchestrator's effort in effort_levels; a continued child keeps what its last turn ran with.
+// orchestrator's effort in effort_levels; a continued child keeps its newest selection.
 Subagent_Defaults :: struct {
 	provider_id:   string,
 	model_id:      string,
@@ -611,8 +611,8 @@ Subagent_Defaults :: struct {
 	step_down:     bool,
 }
 
-// subagent_defaults is what a start falls back to: the selection of a continued child's last
-// turn, else the orchestrator's with the effort stepped down.
+// subagent_defaults is what a start falls back to: a continued child's newest selection,
+// else the orchestrator's with the effort stepped down.
 @(private)
 subagent_defaults :: proc(parent: ^Agent_Parent, resume: Subagent_Resume) -> Subagent_Defaults {
 	if resume.model_id != "" { return {provider_id = resume.provider_id, model_id = resume.model_id, effort = resume.effort} }
@@ -1009,6 +1009,15 @@ subagent_run :: proc(member: ^Subagent) {
 			}
 			return
 		}
+		subagent_steer_service(&steer)
+		if chat.compact.state != .Idle {
+			subagent_compact_wait(member, &chat, steer.connection)
+			if chat_session_cancelled(&chat) {
+				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
+				return
+			}
+			subagent_steer_service(&steer)
+		}
 		// Steering answers every message taken before the turn settled. One that arrived
 		// after its last check starts the next turn, which delivers it. One that arrives
 		// after this read is found when the orchestrator reaps the child, which runs it again.
@@ -1163,7 +1172,7 @@ subagent_steer_apply :: proc(steer: ^Steer_Context) -> ai.Provider_Connection {
 // session's fit check as the main session does: a target that fits is installed, one that does
 // not waits for the compaction the check requests and is checked again after it installs, and
 // one the check refuses is reported to the orchestrator. It runs at each request boundary and
-// before the child accepts its next message.
+// between turns, including before the child finishes.
 @(private)
 subagent_steer_service :: proc(state: ^Subagent_Steer) {
 	if subagent_steer_take(state) { _ = chat_compact_request(state.chat, .User_Command) }
@@ -1311,7 +1320,7 @@ subagent_children :: proc(store: ^journal.Journal, session: journal.Session_Id) 
 
 // subagent_resume_plan finds the child send names among the delegations the orchestrator's
 // journal records, and fills send.resume with what continuing it needs: its instruction from
-// its newest start and the selection of its last turn. It returns the child's session, and
+// its newest start and its newest installed or turn selection. It returns the child's session, and
 // has checked that the selection the call names resolves, so a refused call records nothing.
 // problem, temp-allocated, says why the child cannot be continued; for a name the journal
 // does not know it lists the children it does, with how each ended. send.resume stays empty on
@@ -1349,7 +1358,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
 	}
 
-	latest, latest_found, latest_error := journal.read_latest(chat.store, {session = target.start.subagent, kinds = {.Turn_Started}}, context.temp_allocator)
+	latest, latest_found, latest_error := journal.read_latest(chat.store, {session = target.start.subagent, kinds = {.Turn_Started, .Selection_Applied}}, context.temp_allocator)
 	if latest_error != nil { return {}, fmt.tprintf("the last selection of %s could not be read", name) }
 	continued := Subagent_Resume {
 		name        = name,
@@ -1357,8 +1366,14 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 		compact     = send.compact,
 	}
 	if latest_found {
-		turn: journal.Turn_Started
-		if journal.payload_decode(latest.data, &turn, context.temp_allocator) == nil { continued.effort = turn.effort }
+		#partial switch latest.kind {
+		case .Turn_Started:
+			turn: journal.Turn_Started
+			if journal.payload_decode(latest.data, &turn, context.temp_allocator) == nil { continued.effort = turn.effort }
+		case .Selection_Applied:
+			selection: journal.Selection_Applied
+			if journal.payload_decode(latest.data, &selection, context.temp_allocator) == nil { continued.effort = selection.effort }
+		}
 		continued.provider_id, continued.model_id = latest.provider, latest.model
 	}
 	// The orchestrator is the only writer of team.parent, so reading it here needs no lock.
