@@ -17,14 +17,15 @@ import "nabla:agent"
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// The ACP agent front-end: one process, one session, one prompt turn at a time,
-// speaking the Agent Client Protocol on the streams it was given. The reader answers
-// what it can alone and hands session work to the worker, which owns the session. Both
-// threads enqueue output for the writer thread because a client cancels a turn by
-// sending another message on the same stream.
+// The ACP agent front-end: one connection, up to ACP_MAX_SESSIONS sessions, one prompt
+// turn at a time per session, speaking the Agent Client Protocol on the streams it was
+// given. The reader answers what it can alone and hands session work to the worker of the
+// session the request names, which owns that session. All threads enqueue output for the
+// writer thread because a client cancels a turn by sending another message on the same
+// stream.
 
-// ACP_WORK_CAPACITY bounds requests waiting for the worker. The reader admits one
-// session request at a time, so the queue holds the request being served and, briefly,
+// ACP_WORK_CAPACITY bounds requests waiting for one session's worker. The reader admits
+// one session request at a time, so the queue holds the request being served and, briefly,
 // nothing else.
 ACP_WORK_CAPACITY :: 4
 
@@ -42,92 +43,81 @@ Acp_Work_Kind :: enum {
 	Set_Model,
 	// Set_Config_Option applies the stable ACP model configuration method.
 	Set_Config_Option,
-	// List_Sessions answers the v2 session/list method.
-	List_Sessions,
 	// Close_Session releases the active v2 session.
 	Close_Session,
 }
 
 // Acp_Work is one request the reader handed to the worker. Every string is owned by the
-// server's allocator and released by acp_work_destroy.
+// session's allocator and released by acp_work_destroy.
 Acp_Work :: struct {
-	kind:               Acp_Work_Kind,
-	id:                 acp.Jsonrpc_Id, // the request to answer
+	kind:          Acp_Work_Kind,
+	id:            acp.Jsonrpc_Id, // the request to answer
 	// text is the prompt of a Prompt; workspace is where a new session runs;
 	// session_ref names a stored session for an Open_Session.
-	text:               string,
-	workspace:          string,
-	session_ref:        string,
-	model_id:           string,
-	config_id:          string,
-	config_value:       string,
-	list_cwd:           string,
-	list_cursor:        string,
-	mcp_servers:        [dynamic]agent.MCP_Server_Config,
-	system_prompt:      string,
-	session_title:      string,
-	replay:             bool,
+	text:          string,
+	workspace:     string,
+	session_ref:   string,
+	model_id:      string,
+	config_id:     string,
+	config_value:  string,
+	mcp_servers:   [dynamic]agent.MCP_Server_Config,
+	system_prompt: string,
+	session_title: string,
+	replay:        bool,
 	// start is the session an Open_Session opens. Its id aliases session_ref.
-	start:              Session_Start,
-	// session_generation is the open session the reader observed. A queued request
-	// must not mutate a session that has since been replaced or closed.
-	session_generation: u64,
+	start:         Session_Start,
 }
 
 Acp_Work_Chan :: chan.Chan(Acp_Work)
 
 // Acp_Model_Request is an ACP model-change intent handed from the reader to the
-// session owner. Its strings are server-allocator owned until settled.
+// session owner. Its strings are connection-allocator owned until settled.
 Acp_Model_Request :: struct {
-	active:             bool,
-	kind:               Acp_Work_Kind,
-	id:                 acp.Jsonrpc_Id,
-	model_id:           string,
-	session_generation: u64,
+	active:   bool,
+	kind:     Acp_Work_Kind,
+	id:       acp.Jsonrpc_Id,
+	model_id: string,
 }
 
 Acp_Model_Selection :: struct {
-	active:             bool,
-	kind:               Acp_Work_Kind,
-	id:                 acp.Jsonrpc_Id,
-	session_generation: u64,
-	target:             agent.Model_Selection,
-	transition:         agent.Selection_Transition,
+	active:     bool,
+	kind:       Acp_Work_Kind,
+	id:         acp.Jsonrpc_Id,
+	target:     agent.Model_Selection,
+	transition: agent.Selection_Transition,
 }
 
-// Acp_Server is the whole front-end: the harness runtime, the writer, the worker, and
-// the little of the protocol's own state that is not the harness's.
 Acp_Wire_Profile :: enum {
 	V1,
 	V2,
 }
 
 @(require_results)
-acp_is_v2 :: proc(server: ^Acp_Server) -> bool {
-	return server.profile == .V2
+acp_is_v2 :: proc(conn: ^Acp_Server) -> bool {
+	return conn.profile == .V2
 }
 
 @(require_results)
-acp_server_has_work :: proc(server: ^Acp_Server) -> bool {
-	sync.mutex_lock(&server.queue_mu)
-	pending := server.pending_work > 0
-	sync.mutex_unlock(&server.queue_mu)
+acp_session_has_work :: proc(session: ^Acp_Session) -> bool {
+	sync.mutex_lock(&session.queue_mu)
+	pending := session.pending_work > 0
+	sync.mutex_unlock(&session.queue_mu)
 	return pending
 }
 
-acp_queue_add :: proc(server: ^Acp_Server) {
-	sync.mutex_lock(&server.queue_mu)
-	server.pending_work += 1
-	sync.mutex_unlock(&server.queue_mu)
+acp_queue_add :: proc(session: ^Acp_Session) {
+	sync.mutex_lock(&session.queue_mu)
+	session.pending_work += 1
+	sync.mutex_unlock(&session.queue_mu)
 }
 
-acp_queue_remove :: proc(server: ^Acp_Server) {
-	sync.mutex_lock(&server.queue_mu)
-	server.pending_work -= 1
-	if server.pending_work <= 0 {
-		server.pending_work = 0
+acp_queue_remove :: proc(session: ^Acp_Session) {
+	sync.mutex_lock(&session.queue_mu)
+	session.pending_work -= 1
+	if session.pending_work <= 0 {
+		session.pending_work = 0
 	}
-	sync.mutex_unlock(&server.queue_mu)
+	sync.mutex_unlock(&session.queue_mu)
 }
 
 acp_model_request_destroy :: proc(request: ^Acp_Model_Request, allocator: mem.Allocator) {
@@ -142,111 +132,113 @@ acp_model_request_destroy :: proc(request: ^Acp_Model_Request, allocator: mem.Al
 
 // acp_model_request_submit replaces only a not-yet-claimed intent. The caller transfers
 // ownership whether it is superseded or accepted.
-acp_model_request_submit :: proc(server: ^Acp_Server, request: Acp_Model_Request) {
-	sync.mutex_lock(&server.model_mu)
-	previous := server.model_request
-	server.model_request = request
-	server.model_cancel = false
-	sync.mutex_unlock(&server.model_mu)
+acp_model_request_submit :: proc(session: ^Acp_Session, request: Acp_Model_Request) {
+	sync.mutex_lock(&session.model_mu)
+	previous := session.model_request
+	session.model_request = request
+	session.model_cancel = false
+	sync.mutex_unlock(&session.model_mu)
 	if previous.active {
-		_ = acp.writer_write_error(&server.writer, previous.id, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
-		acp_model_request_destroy(&previous, server.alloc)
+		_ = acp.writer_write_error(&session.conn.writer, previous.id, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
+		acp_model_request_destroy(&previous, session.conn.alloc)
 	}
 	agent.owner_wake_signal()
 }
 
 @(require_results)
-acp_model_request_take :: proc(server: ^Acp_Server) -> Acp_Model_Request {
-	sync.mutex_lock(&server.model_mu)
-	request := server.model_request
-	server.model_request = {}
-	sync.mutex_unlock(&server.model_mu)
+acp_model_request_take :: proc(session: ^Acp_Session) -> Acp_Model_Request {
+	sync.mutex_lock(&session.model_mu)
+	request := session.model_request
+	session.model_request = {}
+	sync.mutex_unlock(&session.model_mu)
 	return request
 }
 
 @(require_results)
-acp_model_request_pending :: proc(server: ^Acp_Server) -> bool {
-	sync.mutex_lock(&server.model_mu)
-	pending := server.model_request.active
-	sync.mutex_unlock(&server.model_mu)
+acp_model_request_pending :: proc(session: ^Acp_Session) -> bool {
+	sync.mutex_lock(&session.model_mu)
+	pending := session.model_request.active
+	sync.mutex_unlock(&session.model_mu)
 	return pending
 }
 
 @(require_results)
-acp_model_owner_work_pending :: proc(server: ^Acp_Server) -> bool {
-	sync.mutex_lock(&server.model_mu)
-	pending := server.model_request.active || server.model_cancel
-	sync.mutex_unlock(&server.model_mu)
+acp_model_owner_work_pending :: proc(session: ^Acp_Session) -> bool {
+	sync.mutex_lock(&session.model_mu)
+	pending := session.model_request.active || session.model_cancel
+	sync.mutex_unlock(&session.model_mu)
 	return pending
 }
 
-acp_model_cancel_signal :: proc(server: ^Acp_Server) {
-	sync.mutex_lock(&server.model_mu)
-	server.model_cancel = true
-	sync.mutex_unlock(&server.model_mu)
+acp_model_cancel_signal :: proc(session: ^Acp_Session) {
+	sync.mutex_lock(&session.model_mu)
+	session.model_cancel = true
+	sync.mutex_unlock(&session.model_mu)
 	agent.owner_wake_signal()
 }
 
 @(require_results)
-acp_model_cancel_take :: proc(server: ^Acp_Server) -> (bool, Acp_Model_Request) {
-	sync.mutex_lock(&server.model_mu)
-	cancel := server.model_cancel
-	server.model_cancel = false
+acp_model_cancel_take :: proc(session: ^Acp_Session) -> (bool, Acp_Model_Request) {
+	sync.mutex_lock(&session.model_mu)
+	cancel := session.model_cancel
+	session.model_cancel = false
 	request: Acp_Model_Request
 	if cancel {
-		request = server.model_request
-		server.model_request = {}
+		request = session.model_request
+		session.model_request = {}
 	}
-	sync.mutex_unlock(&server.model_mu)
+	sync.mutex_unlock(&session.model_mu)
 	return cancel, request
 }
 
-acp_model_selection_cancel :: proc(server: ^Acp_Server, request: Acp_Model_Request) {
+acp_model_selection_cancel :: proc(session: ^Acp_Session, request: Acp_Model_Request) {
 	owned_request := request
 	if owned_request.active {
-		_ = acp.writer_write_error(&server.writer, owned_request.id, acp.ERROR_INVALID_REQUEST, "the model selection was canceled before it could be applied")
-		acp_model_request_destroy(&owned_request, server.alloc)
+		_ = acp.writer_write_error(
+			&session.conn.writer,
+			owned_request.id,
+			acp.ERROR_INVALID_REQUEST,
+			"the model selection was canceled before it could be applied",
+		)
+		acp_model_request_destroy(&owned_request, session.conn.alloc)
 	}
-	if server.model_selection.active {
-		acp_model_selection_error(server, &server.model_selection, acp.ERROR_INVALID_REQUEST, "the model selection was canceled before it could be applied")
+	if session.model_selection.active {
+		acp_model_selection_error(session, &session.model_selection, acp.ERROR_INVALID_REQUEST, "the model selection was canceled before it could be applied")
 	}
 }
 
-acp_model_selection_destroy :: proc(server: ^Acp_Server, selection: ^Acp_Model_Selection) {
+acp_model_selection_destroy :: proc(session: ^Acp_Session, selection: ^Acp_Model_Selection) {
 	if selection.active {
 		switch id in selection.id {
 		case string:
-			delete(id, server.alloc)
+			delete(id, session.conn.alloc)
 		case i64, f64, acp.Jsonrpc_Null:
 		}
-		agent.model_selection_destroy(&selection.target, server.app.setup.alloc)
+		agent.model_selection_destroy(&selection.target, session.app.setup.alloc)
 	}
 	selection^ = {}
 }
 
-acp_model_selection_error :: proc(server: ^Acp_Server, selection: ^Acp_Model_Selection, code: i64, message: string) {
+acp_model_selection_error :: proc(session: ^Acp_Session, selection: ^Acp_Model_Selection, code: i64, message: string) {
 	if !selection.active { return }
-	_ = acp.writer_write_error(&server.writer, selection.id, code, message)
-	acp_model_selection_destroy(server, selection)
+	_ = acp.writer_write_error(&session.conn.writer, selection.id, code, message)
+	acp_model_selection_destroy(session, selection)
 }
 
 // acp_model_request_resolve takes the newest reader handoff and resolves it once on the
 // session owner. The target owns its catalog-derived strings through installation.
-acp_model_request_resolve :: proc(server: ^Acp_Server) {
-	request := acp_model_request_take(server)
+acp_model_request_resolve :: proc(session: ^Acp_Session) {
+	request := acp_model_request_take(session)
 	if !request.active { return }
-	if server.model_selection.active {
-		acp_model_selection_error(server, &server.model_selection, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
+	if session.model_selection.active {
+		acp_model_selection_error(session, &session.model_selection, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
 	}
-	sync.mutex_lock(&server.mu)
-	valid := request.session_generation == server.session_generation && server.session_id != "" && !server.closing
-	sync.mutex_unlock(&server.mu)
-	if !valid {
-		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could run")
-		acp_model_request_destroy(&request, server.alloc)
+	if !acp_session_live(session) {
+		_ = acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could run")
+		acp_model_request_destroy(&request, session.conn.alloc)
 		return
 	}
-	app := &server.app
+	app := &session.app
 	provider_id := ""
 	provider_error := false
 	sync.mutex_lock(&app.catalog_mu)
@@ -259,221 +251,155 @@ acp_model_request_resolve :: proc(server: ^Acp_Server) {
 	}
 	sync.mutex_unlock(&app.catalog_mu)
 	if provider_error {
-		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INTERNAL, "the provider id could not be allocated")
-		acp_model_request_destroy(&request, server.alloc)
+		_ = acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INTERNAL, "the provider id could not be allocated")
+		acp_model_request_destroy(&request, session.conn.alloc)
 		return
 	}
 	if provider_id == "" {
-		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the model %q is not available", request.model_id))
-		acp_model_request_destroy(&request, server.alloc)
+		_ = acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the model %q is not available", request.model_id))
+		acp_model_request_destroy(&request, session.conn.alloc)
 		return
 	}
 	defer delete(provider_id, app.setup.alloc)
 	target, problem := selection_target_resolve(app, provider_id, request.model_id, app.setup.alloc)
 	defer if problem != "" { delete(problem, context.temp_allocator) }
 	if target.provider_id == "" {
-		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, problem)
-		acp_model_request_destroy(&request, server.alloc)
+		_ = acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INVALID_PARAMS, problem)
+		acp_model_request_destroy(&request, session.conn.alloc)
 		return
 	}
 	request_id := request.id
 	request.id = ""
-	delete(request.model_id, server.alloc)
+	delete(request.model_id, session.conn.alloc)
 	request.model_id = ""
-	server.model_selection = Acp_Model_Selection {
-		active             = true,
-		kind               = request.kind,
-		id                 = request_id,
-		session_generation = request.session_generation,
-		target             = target,
+	session.model_selection = Acp_Model_Selection {
+		active = true,
+		kind   = request.kind,
+		id     = request_id,
+		target = target,
 	}
 	request = {}
 }
 
 // acp_model_selection_service checks a pending target at an owner boundary or while
 // idle. The transition is caller-owned state and remains with the target while pending.
-acp_model_selection_service :: proc(server: ^Acp_Server) -> ai.Provider_Connection {
-	cancel, request := acp_model_cancel_take(server)
+acp_model_selection_service :: proc(session: ^Acp_Session) -> ai.Provider_Connection {
+	cancel, request := acp_model_cancel_take(session)
 	if cancel {
-		acp_model_selection_cancel(server, request)
-		return server.app.run.connection
+		acp_model_selection_cancel(session, request)
+		return session.app.run.connection
 	}
-	if acp_model_request_pending(server) { acp_model_request_resolve(server) }
-	selection := &server.model_selection
-	if !selection.active { return server.app.run.connection }
-	sync.mutex_lock(&server.mu)
-	valid := selection.session_generation == server.session_generation && server.session_id != "" && !server.closing
-	sync.mutex_unlock(&server.mu)
-	if !valid {
-		acp_model_selection_error(server, selection, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
-		return server.app.run.connection
+	if acp_model_request_pending(session) { acp_model_request_resolve(session) }
+	selection := &session.model_selection
+	if !selection.active { return session.app.run.connection }
+	if !acp_session_live(session) {
+		acp_model_selection_error(session, selection, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
+		return session.app.run.connection
 	}
 	status, problem, selection_error := agent.chat_selection_check(
-		&server.app.setup.session,
+		&session.app.setup.session,
 		selection.target,
 		&selection.transition,
-		server.app.compact_on_switch,
-		server.app.run.connection,
+		session.app.compact_on_switch,
+		session.app.run.connection,
 	)
 	defer if problem != "" { delete(problem, context.temp_allocator) }
 	if selection_error != nil {
 		detail := journal.error_text(selection_error, context.temp_allocator)
-		server.app.setup.session.storage_failed = true
-		acp_model_selection_error(server, selection, acp.ERROR_INTERNAL, fmt.tprintf("the model switch could not be recorded: %s", detail))
-		return server.app.run.connection
+		session.app.setup.session.storage_failed = true
+		acp_model_selection_error(session, selection, acp.ERROR_INTERNAL, fmt.tprintf("the model switch could not be recorded: %s", detail))
+		return session.app.run.connection
 	}
 	switch status {
 	case .Pending:
-		return server.app.run.connection
+		return session.app.run.connection
 	case .Refused:
 		message := problem
 		if message == "" { message = "the model selection was refused" }
-		acp_model_selection_error(server, selection, acp.ERROR_INVALID_PARAMS, message)
+		acp_model_selection_error(session, selection, acp.ERROR_INVALID_PARAMS, message)
 	case .Ready:
-		cancel_before_install, request_before_install := acp_model_cancel_take(server)
+		cancel_before_install, request_before_install := acp_model_cancel_take(session)
 		if cancel_before_install {
-			acp_model_selection_cancel(server, request_before_install)
-			return server.app.run.connection
+			acp_model_selection_cancel(session, request_before_install)
+			return session.app.run.connection
 		}
-		if acp_model_request_pending(server) { return server.app.run.connection }
+		if acp_model_request_pending(session) { return session.app.run.connection }
 		model_id := selection.target.model_id
-		installed := selection_install(&server.app, selection.target, "", false)
+		installed := selection_install(&session.app, selection.target, "", false)
 		if !installed {
-			acp_model_selection_error(server, selection, acp.ERROR_INTERNAL, "the selected model could not be installed durably")
-			return server.app.run.connection
+			acp_model_selection_error(session, selection, acp.ERROR_INTERNAL, "the selected model could not be installed durably")
+			return session.app.run.connection
 		}
 		if selection.kind == .Set_Model {
-			_ = acp.writer_write_response(&server.writer, selection.id, acp.Session_Set_Model_Result{session_id = acp_session_id(server), model_id = model_id})
-		} else if acp_is_v2(server) {
-			v2_options, options_ok := acp_model_config_options_v2(server)
+			_ = acp.writer_write_response(
+				&session.conn.writer,
+				selection.id,
+				acp.Session_Set_Model_Result{session_id = acp_session_id(session), model_id = model_id},
+			)
+		} else if acp_is_v2(session.conn) {
+			v2_options, options_ok := acp_model_config_options_v2(session)
 			if !options_ok {
 				acp_model_selection_error(
-					server,
+					session,
 					selection,
 					acp.ERROR_INTERNAL,
 					"the model was installed but its configuration response could not be allocated",
 				)
-				return server.app.run.connection
+				return session.app.run.connection
 			}
-			_ = acp.writer_write_response(&server.writer, selection.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options})
+			_ = acp.writer_write_response(&session.conn.writer, selection.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options})
 		} else {
-			v1_options, options_ok := acp_model_config_options_v1(server)
+			v1_options, options_ok := acp_model_config_options_v1(session)
 			if !options_ok {
 				acp_model_selection_error(
-					server,
+					session,
 					selection,
 					acp.ERROR_INTERNAL,
 					"the model was installed but its configuration response could not be allocated",
 				)
-				return server.app.run.connection
+				return session.app.run.connection
 			}
-			_ = acp.writer_write_response(&server.writer, selection.id, acp.V1_Session_Set_Config_Option_Result{config_options = v1_options})
+			_ = acp.writer_write_response(&session.conn.writer, selection.id, acp.V1_Session_Set_Config_Option_Result{config_options = v1_options})
 		}
-		acp_model_selection_destroy(server, selection)
+		acp_model_selection_destroy(session, selection)
 	}
-	return server.app.run.connection
+	return session.app.run.connection
 }
 
 acp_model_selection_steer :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
-	server := cast(^Acp_Server)steer.apply_data
-	_ = acp_model_selection_service(server)
-	sync.mutex_lock(&server.app.run.mu)
-	defer sync.mutex_unlock(&server.app.run.mu)
-	return server.app.run.connection
+	session := cast(^Acp_Session)steer.apply_data
+	_ = acp_model_selection_service(session)
+	sync.mutex_lock(&session.app.run.mu)
+	defer sync.mutex_unlock(&session.app.run.mu)
+	return session.app.run.connection
 }
 
-acp_capture_session_generation :: proc(server: ^Acp_Server) -> u64 {
-	sync.mutex_lock(&server.mu)
-	generation := server.session_generation
-	sync.mutex_unlock(&server.mu)
-	return generation
-}
-
+// acp_session_live reports whether the session is open and not closing, which is what
+// decides whether a model selection still has a session to apply to.
 @(require_results)
-acp_work_session_valid :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
-	if work.kind == .List_Sessions { return true }
-	sync.mutex_lock(&server.mu)
-	valid := work.session_generation == server.session_generation
-	if valid && server.closing && work.kind != .Close_Session { valid = false }
-	if valid {
-		switch work.kind {
-		case .Open_Session:
-		case .Prompt, .Set_Model, .Set_Config_Option:
-			valid = server.session_id != ""
-		case .Close_Session:
-			valid = server.session_id != "" && server.session_id == work.session_ref
-		case .List_Sessions:
-		}
+acp_session_live :: proc(session: ^Acp_Session) -> bool {
+	sync.mutex_lock(&session.conn.table_mu)
+	defer sync.mutex_unlock(&session.conn.table_mu)
+	return session.id != "" && !session.closing
+}
+
+// acp_work_session_valid reports whether a queued request may still run. A session that
+// started closing refuses everything but its own close, and a request that needs an open
+// conversation waits for the open that makes one. Owner thread only.
+@(require_results)
+acp_work_session_valid :: proc(session: ^Acp_Session, work: Acp_Work) -> bool {
+	sync.mutex_lock(&session.conn.table_mu)
+	closing := session.closing
+	sync.mutex_unlock(&session.conn.table_mu)
+	switch work.kind {
+	case .Open_Session:
+		return !closing
+	case .Prompt, .Set_Model, .Set_Config_Option:
+		return !closing && session.app.setup.store != nil
+	case .Close_Session:
+		return session.app.setup.store != nil
 	}
-	sync.mutex_unlock(&server.mu)
-	return valid
-}
-
-acp_mark_session_closing :: proc(server: ^Acp_Server) {
-	sync.mutex_lock(&server.mu)
-	server.closing = true
-	sync.mutex_unlock(&server.mu)
-}
-
-acp_unmark_session_closing :: proc(server: ^Acp_Server, generation: u64) {
-	sync.mutex_lock(&server.mu)
-	if server.session_generation == generation { server.closing = false }
-	sync.mutex_unlock(&server.mu)
-}
-
-acp_invalidate_published_session :: proc(server: ^Acp_Server) {
-	sync.mutex_lock(&server.mu)
-	server.session_generation += 1
-	server.closing = false
-	delete(server.session_id, server.alloc)
-	server.session_id = ""
-	delete(server.session_title, server.alloc)
-	server.session_title = ""
-	sync.mutex_unlock(&server.mu)
-	delete(server.active_message_id, server.alloc)
-	server.active_message_id = ""
-	request := acp_model_request_take(server)
-	if request.active {
-		_ = acp.writer_write_error(&server.writer, request.id, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
-		acp_model_request_destroy(&request, server.alloc)
-	}
-	if server.model_selection.active {
-		acp_model_selection_error(server, &server.model_selection, acp.ERROR_INVALID_PARAMS, "the session changed before the model selection could be applied")
-	}
-}
-
-Acp_Server :: struct {
-	app:                App,
-	alloc:              mem.Allocator,
-	base_mcp_servers:   []agent.MCP_Server_Config, // borrowed from the launch config
-	mcp_servers_owned:  [dynamic]agent.MCP_Server_Config, // owned active list when a client supplied servers
-	writer:             acp.Writer,
-	work:               Acp_Work_Chan,
-	worker:             ^thread.Thread,
-	worker_done:        sync.One_Shot_Event, // signaled by the worker as its last action
-	// queue_mu guards pending_work.
-	queue_mu:           sync.Mutex,
-	pending_work:       int,
-	// initialized is set once initialize has been answered. Only the reader writes it.
-	initialized:        bool,
-	// profile is the wire surface agreed with the client.
-	profile:            Acp_Wire_Profile,
-	// mu guards session_id, which the reader matches a cancellation against and the
-	// worker replaces after opening a session.
-	mu:                 sync.Mutex,
-	session_id:         string, // owned
-	session_title:      string, // owned; the client-supplied title for the open session
-	session_generation: u64, // changes whenever the open session is replaced or closed
-	closing:            bool, // a close request has been admitted and invalidates queued work
-	// model_mu guards only the single pending reader-to-owner handoff.
-	model_mu:           sync.Mutex,
-	model_request:      Acp_Model_Request,
-	model_cancel:       bool, // owner should settle all current model-selection RPCs
-	model_selection:    Acp_Model_Selection, // owner only
-	// message_seq numbers process-local fallback messages. The v2 live assistant id
-	// is derived from the durable turn and request instead, so replay can reproduce it.
-	message_seq:        u64,
-	active_message_id:  string, // owned by server.alloc; the v2 answer being streamed
+	return false
 }
 
 // --- lifetime ----------------------------------------------------------------
@@ -491,8 +417,6 @@ acp_work_destroy :: proc(work: ^Acp_Work, allocator: mem.Allocator) {
 	delete(work.model_id, allocator)
 	delete(work.config_id, allocator)
 	delete(work.config_value, allocator)
-	delete(work.list_cwd, allocator)
-	delete(work.list_cursor, allocator)
 	agent.MCP_Server_Configs_Destroy(&work.mcp_servers, allocator)
 	delete(work.system_prompt, allocator)
 	delete(work.session_title, allocator)
@@ -515,71 +439,6 @@ acp_work_id :: proc(id: acp.Jsonrpc_Id, allocator: mem.Allocator) -> (acp.Jsonrp
 	return id, true
 }
 
-// acp_server_destroy releases everything the server owns after its worker retires. A
-// worker that ignores its stop still borrows the session, workspace, and tool backends.
-acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
-	// A turn still running is stopped before the worker is joined, so it settles as
-	// cancelled and the record says the session was interrupted.
-	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
-	if server.work != {} {
-		chan.close(&server.work)
-		agent.owner_wake_signal()
-	}
-	if server.worker != nil {
-		if join_retiring(server.worker, &server.worker_done, patience) {
-			server.worker = nil
-		} else {
-			// The worker still owns the session. Nothing below may run or be freed; the
-			// process exits with what that thread can reach.
-			fmt.eprintln("nabla: the ACP worker did not stop in time; the process exits without releasing what it still uses")
-			return false
-		}
-	}
-	for {
-		queued, ok := chan.recv(server.work)
-		if !ok { break }
-		acp_work_destroy(&queued, server.alloc)
-	}
-	if server.work != {} { chan.destroy(&server.work) }
-	request := acp_model_request_take(server)
-	if request.active {
-		_ = acp.writer_write_error(
-			&server.writer,
-			request.id,
-			acp.ERROR_INVALID_REQUEST,
-			"the ACP session is shutting down before the model selection could be applied",
-		)
-		acp_model_request_destroy(&request, server.alloc)
-	}
-	if server.model_selection.active {
-		acp_model_selection_error(
-			server,
-			&server.model_selection,
-			acp.ERROR_INVALID_REQUEST,
-			"the ACP session is shutting down before the model selection could be applied",
-		)
-	}
-	if !acp.writer_destroy(&server.writer, patience) {
-		fmt.eprintln("nabla: the ACP writer thread did not stop in time; the process leaves it running")
-	}
-	sync.mutex_lock(&server.mu)
-	delete(server.session_id, server.alloc)
-	server.session_id = ""
-	delete(server.session_title, server.alloc)
-	server.session_title = ""
-	sync.mutex_unlock(&server.mu)
-	delete(server.active_message_id, server.alloc)
-	server.active_message_id = ""
-	snapshot_destroy(&server.app)
-	if server.app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&server.app.setup.session) {
-		fmt.eprintln("nabla: a tool worker did not stop in time; the process exits without releasing what it still uses")
-		return false
-	}
-	run_setup_destroy(&server.app.setup)
-	agent.MCP_Server_Configs_Destroy(&server.mcp_servers_owned, server.alloc)
-	return true
-}
-
 // --- the worker --------------------------------------------------------------
 
 // acp_worker runs the requests the reader hands over and owns the session while it does.
@@ -587,113 +446,132 @@ acp_server_destroy :: proc(server: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIEN
 // own; a V1 client cannot receive a turn it did not ask for, so its reports wait in the
 // inbox for the next prompt's turn. It leaves when the queue is closed and drained.
 acp_worker :: proc(thread_handle: ^thread.Thread) {
-	server := cast(^Acp_Server)thread_handle.data
-	defer sync.one_shot_event_signal(&server.worker_done)
-	// A thread started without init_context gets the default context, so the server's
+	session := cast(^Acp_Session)thread_handle.data
+	defer sync.one_shot_event_signal(&session.worker_done)
+	// A thread started without init_context gets the default context, so the session's
 	// allocator, which the work it destroys was allocated with, is installed here.
-	context.allocator = server.alloc
+	context.allocator = session.conn.alloc
 	for {
 		seen := agent.owner_wake_seen()
-		work, ok := chan.try_recv(server.work)
+		work, ok := chan.try_recv(session.work)
 		if !ok {
 			// A closed queue is shutdown, which starts no report turn.
-			if chan.is_closed(server.work) { break }
-			if acp_is_v2(server) && server.app.setup.store != nil {
-				if acp_report_turn(server) {
+			if chan.is_closed(session.work) { break }
+			if !acp_owner_service_begin(session) {
+				agent.owner_wake_wait(seen, nil)
+				continue
+			}
+			if acp_is_v2(session.conn) && session.app.setup.store != nil {
+				if acp_report_turn(session) {
+					acp_owner_service_end(session)
 					free_all(context.temp_allocator)
 					continue
 				}
 				// Reports arrive through the owner wake, which new requests signal too.
-				if agent.chat_agents_pending(&server.app.setup.session) {
+				if agent.chat_agents_pending(&session.app.setup.session) {
+					acp_owner_service_end(session)
 					agent.owner_wake_wait(seen, nil)
 					continue
 				}
 			}
-			model_pending := acp_model_owner_work_pending(server) || server.model_selection.active
+			model_pending := acp_model_owner_work_pending(session) || session.model_selection.active
 			if model_pending {
-				_ = acp_model_selection_service(server)
+				_ = acp_model_selection_service(session)
 			}
-			compact_pending := server.app.setup.session.store != nil && server.app.setup.session.compact.state != agent.Compact_State.Idle
+			compact_pending := session.app.setup.session.store != nil && session.app.setup.session.compact.state != agent.Compact_State.Idle
 			if model_pending || compact_pending {
 				if compact_pending {
-					observer := acp_observer(server)
-					_ = agent.chat_compact_idle_service(&server.app.setup.session, observer, server.app.run.connection)
-					if server.model_selection.active {
-						_ = acp_model_selection_service(server)
-						if server.app.setup.session.compact.state != agent.Compact_State.Idle {
-							_ = agent.chat_compact_idle_service(&server.app.setup.session, observer, server.app.run.connection)
+					observer := acp_observer(session)
+					_ = agent.chat_compact_idle_service(&session.app.setup.session, observer, session.app.run.connection)
+					if session.model_selection.active {
+						_ = acp_model_selection_service(session)
+						if session.app.setup.session.compact.state != agent.Compact_State.Idle {
+							_ = agent.chat_compact_idle_service(&session.app.setup.session, observer, session.app.run.connection)
 						}
 					}
 				}
+				acp_owner_service_end(session)
 				free_all(context.temp_allocator)
-				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&server.app.setup.session))
+				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&session.app.setup.session))
 				continue
 			}
+			acp_owner_service_end(session)
 			free_all(context.temp_allocator)
 			agent.owner_wake_wait(seen, nil)
 			continue
 		}
-		acp_run_work(server, work)
-		acp_work_destroy(&work, server.alloc)
+		sync.mutex_lock(&session.conn.table_mu)
+		session.owner_active = true
+		sync.mutex_unlock(&session.conn.table_mu)
+		acp_run_work(session, work)
+		acp_owner_service_end(session)
+		retiring := work.kind == .Close_Session || (work.kind == .Open_Session && !session.opened)
+		acp_work_destroy(&work, session.conn.alloc)
 		// Temp scratch belongs to one request: the worker is long-lived, so its pool is
 		// recycled here rather than left to grow with the conversation.
 		free_all(context.temp_allocator)
+		if retiring {
+			// A closed session and a session whose first open failed have nothing left to
+			// serve. Closing the queue turns any later request into a refusal, and the
+			// reader, which alone frees sessions, reaps this one.
+			acp_session_retire(session)
+			break
+		}
 	}
 }
 
-acp_run_work :: proc(server: ^Acp_Server, work: Acp_Work) {
-	if !acp_work_session_valid(server, work) {
+acp_run_work :: proc(session: ^Acp_Session, work: Acp_Work) {
+	if !acp_work_session_valid(session, work) {
 		// A write error latches the writer, which the run reports as its failure, so
 		// every reply's own result is not acted on here or below.
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, "the session changed before the request could run")
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_PARAMS, "the session changed before the request could run")
 	} else {
 		switch work.kind {
 		case .Open_Session:
-			acp_work_open_session(server, work)
+			acp_work_open_session(session, work)
 		case .Prompt:
-			acp_work_prompt(server, work)
+			acp_work_prompt(session, work)
 		case .Set_Model:
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_REQUEST, "model selection must be handled by the session owner")
+			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_REQUEST, "model selection must be handled by the session owner")
 		case .Set_Config_Option:
-			acp_work_set_config_option(server, work)
-		case .List_Sessions:
-			acp_work_list_sessions(server, work)
+			acp_work_set_config_option(session, work)
 		case .Close_Session:
-			acp_work_close_session(server, work)
+			acp_work_close_session(session, work)
 		}
 	}
 	// The request is answered, so the next one may be admitted. The cancellation belongs
 	// to the turn that just ended; a client that cancels a finished turn is ignored.
-	agent.turn_control_clear(&server.app.run.control)
-	acp_queue_remove(server)
+	agent.turn_control_clear(&session.app.run.control)
+	acp_queue_remove(session)
 }
 
 // --- opening a session -------------------------------------------------------
 
-acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
-	// Invalidate the published reference before replacing the harness session. If opening
-	// the replacement fails, requests that were queued against the old session are then
-	// rejected instead of running against a session the client no longer owns.
-	acp_invalidate_published_session(server)
-
-	message, opened := acp_session_open(server, work.workspace, work.start)
-	if !opened {
-		if message == "" {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session could not be opened")
-		} else {
-			defer delete(message, server.app.setup.alloc)
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, message)
+acp_work_open_session :: proc(session: ^Acp_Session, work: Acp_Work) {
+	// A session that already holds its conversation is opened a second time by a load or
+	// resume of its own id: the conversation is the same, so it is announced again and
+	// nothing is claimed or selected. A refusal then leaves the session as it was.
+	reopen := session.opened
+	if !reopen {
+		message, opened := acp_session_open(session, work.workspace, work.start)
+		if !opened {
+			if message == "" {
+				_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the session could not be opened")
+			} else {
+				defer delete(message, session.app.setup.alloc)
+				_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_PARAMS, message)
+			}
+			return
 		}
+		delete(message, session.app.setup.alloc)
+		acp_session_select_model(session)
+	}
+	if !agent.chat_session_set_client_instructions(&session.app.setup.session, work.system_prompt) {
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the client system prompt could not be stored")
 		return
 	}
-	defer delete(message, server.app.setup.alloc)
-	acp_session_select_model(server)
-	if !agent.chat_session_set_client_instructions(&server.app.setup.session, work.system_prompt) {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the client system prompt could not be stored")
-		return
-	}
-	if !acp_server_apply_mcp(server, work.mcp_servers) {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session MCP configuration could not be installed")
+	if !acp_server_apply_mcp(session, work.mcp_servers) {
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the session MCP configuration could not be installed")
 		return
 	}
 
@@ -703,100 +581,114 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 	v1_options_ok: bool
 	v2_options: []acp.V2_Config_Option
 	v2_options_ok: bool
-	if acp_is_v2(server) {
-		v2_options, v2_options_ok = acp_model_config_options_v2(server)
+	if acp_is_v2(session.conn) {
+		v2_options, v2_options_ok = acp_model_config_options_v2(session)
 		if !v2_options_ok {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
+			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
 			return
 		}
 	} else if work.start.kind != .Resume_Id {
-		v1_options, v1_options_ok = acp_model_config_options_v1(server)
+		v1_options, v1_options_ok = acp_model_config_options_v1(session)
 		if !v1_options_ok {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
+			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
 			return
 		}
 	}
 	models: acp.Models_State
-	if work.start.kind != .Resume_Id && !acp_is_v2(server) {
+	if work.start.kind != .Resume_Id && !acp_is_v2(session.conn) {
 		models_ok: bool
-		models, models_ok = acp_models_state(server)
+		models, models_ok = acp_models_state(session)
 		if !models_ok {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model catalog could not be allocated")
+			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model catalog could not be allocated")
 			return
 		}
 	}
 
-	session_id := agent.chat_session_text(&server.app.setup.session)
-	owned_session_id, session_id_error := strings.clone(session_id, server.alloc)
+	session_id := agent.chat_session_text(&session.app.setup.session)
+	owned_session_id, session_id_error := strings.clone(session_id, session.conn.alloc)
 	if session_id_error != nil {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session reference could not be allocated")
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the session reference could not be allocated")
 		return
 	}
-	owned_title, title_error := strings.clone(work.session_title, server.alloc)
+	owned_title, title_error := strings.clone(work.session_title, session.conn.alloc)
 	if title_error != nil {
-		delete(owned_session_id, server.alloc)
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session title could not be allocated")
+		delete(owned_session_id, session.conn.alloc)
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the session title could not be allocated")
 		return
 	}
-	sync.mutex_lock(&server.mu)
-	delete(server.session_id, server.alloc)
-	server.session_id = owned_session_id
-	delete(server.session_title, server.alloc)
-	server.session_title = owned_title
-	sync.mutex_unlock(&server.mu)
-
-	if warning := app_tools_refresh(&server.app); warning != "" {
-		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, warning, acp_next_message_id(server))
+	owned_workspace, workspace_error := strings.clone(session.app.setup.workspace, session.conn.alloc)
+	if workspace_error != nil {
+		delete(owned_session_id, session.conn.alloc)
+		delete(owned_title, session.conn.alloc)
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the session directory could not be allocated")
+		return
 	}
-	if work.session_title != "" { _ = acp_send_session_info(server, work.session_title) }
+	sync.mutex_lock(&session.conn.table_mu)
+	delete(session.id, session.conn.alloc)
+	session.id = owned_session_id
+	delete(session.title, session.conn.alloc)
+	session.title = owned_title
+	delete(session.workspace, session.conn.alloc)
+	session.workspace = owned_workspace
+	sync.mutex_unlock(&session.conn.table_mu)
+	session.opened = true
+
+	if warning := app_tools_refresh(&session.app); warning != "" {
+		_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, warning, acp_next_message_id(session))
+	}
+	if work.session_title != "" { _ = acp_send_session_info(session, work.session_title) }
 	if work.replay {
-		acp_replay_session(server)
+		acp_replay_session(session)
 	}
 	if work.start.kind == .Resume_Id {
-		if acp_is_v2(server) {
-			_ = acp.writer_write_response(&server.writer, work.id, acp.Session_Resume_Result{config_options = v2_options})
+		if acp_is_v2(session.conn) {
+			_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Session_Resume_Result{config_options = v2_options})
 		} else {
-			_ = acp.writer_write_response(&server.writer, work.id, acp.Empty_Result{})
+			_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Empty_Result{})
 		}
-	} else if acp_is_v2(server) {
-		_ = acp.writer_write_response(&server.writer, work.id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options})
+	} else if acp_is_v2(session.conn) {
+		_ = acp.writer_write_response(&session.conn.writer, work.id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options})
 	} else {
-		_ = acp.writer_write_response(&server.writer, work.id, acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models})
+		_ = acp.writer_write_response(
+			&session.conn.writer,
+			work.id,
+			acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models},
+		)
 	}
 }
 
-acp_restore_base_runtime :: proc(server: ^Acp_Server) {
+acp_restore_base_runtime :: proc(session: ^Acp_Session) {
 	// A failed restore leaves the zero runtime: no MCP servers. The caller reports the
 	// failure that led here either way, so the restore failure is not answered twice.
-	restored, _ := mcp_runtime_make(server.base_mcp_servers, server.app.setup.alloc)
-	server.app.setup.mcp = restored
+	restored, _ := mcp_runtime_make(session.conn.base_mcp_servers, session.app.setup.alloc)
+	session.app.setup.mcp = restored
 }
 
 @(require_results)
-acp_server_apply_mcp :: proc(server: ^Acp_Server, requested: [dynamic]agent.MCP_Server_Config) -> bool {
-	setup := &server.app.setup
+acp_server_apply_mcp :: proc(session: ^Acp_Session, requested: [dynamic]agent.MCP_Server_Config) -> bool {
+	setup := &session.app.setup
 	// The old runtime owns processes and bindings that the newly opened session no
 	// longer borrows. Stop it before changing the configuration list.
 	mcp_runtime_destroy(&setup.mcp)
-	agent.MCP_Server_Configs_Destroy(&server.mcp_servers_owned, server.alloc)
-	setup.mcp_servers = server.base_mcp_servers
+	agent.MCP_Server_Configs_Destroy(&session.mcp_servers_owned, session.conn.alloc)
+	setup.mcp_servers = session.conn.base_mcp_servers
 	if len(requested) == 0 {
-		setup.mcp_servers = server.base_mcp_servers
+		setup.mcp_servers = session.conn.base_mcp_servers
 		built, ok := mcp_runtime_make(setup.mcp_servers, setup.alloc)
 		setup.mcp = built
 		return ok
 	}
-	combined, clone_error := agent.MCP_Server_Configs_Clone(server.base_mcp_servers, server.alloc)
+	combined, clone_error := agent.MCP_Server_Configs_Clone(session.conn.base_mcp_servers, session.conn.alloc)
 	if clone_error != .None {
-		acp_restore_base_runtime(server)
+		acp_restore_base_runtime(session)
 		return false
 	}
 	failed := true
-	defer if failed { agent.MCP_Server_Configs_Destroy(&combined, server.alloc) }
+	defer if failed { agent.MCP_Server_Configs_Destroy(&combined, session.conn.alloc) }
 	for existing in combined {
 		for wanted in requested {
 			if existing.id == wanted.id {
-				acp_restore_base_runtime(server)
+				acp_restore_base_runtime(session)
 				return false
 			}
 		}
@@ -805,20 +697,20 @@ acp_server_apply_mcp :: proc(server: ^Acp_Server, requested: [dynamic]agent.MCP_
 		appended := append(&combined, server_config)
 		if appended != 1 {
 			if appended == 0 {
-				agent.MCP_Server_Config_Destroy(&requested[index], server.alloc)
+				agent.MCP_Server_Config_Destroy(&requested[index], session.conn.alloc)
 				requested[index] = {}
 			}
-			acp_restore_base_runtime(server)
+			acp_restore_base_runtime(session)
 			return false
 		}
 		requested[index] = {}
 	}
 	built, runtime_ok := mcp_runtime_make(combined[:], setup.alloc)
 	if !runtime_ok {
-		acp_restore_base_runtime(server)
+		acp_restore_base_runtime(session)
 		return false
 	}
-	server.mcp_servers_owned = combined
+	session.mcp_servers_owned = combined
 	setup.mcp_servers = combined[:]
 	setup.mcp = built
 	failed = false
@@ -835,16 +727,15 @@ acp_open_message :: proc(text: string, allocator: mem.Allocator) -> string {
 	return message
 }
 
-// acp_session_open makes one session the running one: the client's working directory for
-// a new conversation, the stored session for a loaded one.
+// acp_session_open takes the conversation a client asked for into the session: the
+// client's working directory for a new one, the stored session for a loaded one. It is the
+// one place a session another process runs would be followed instead of refused; today
+// session_open refuses it because the session's setup does not share sessions.
 //
 // The message of a refusal is owned by the setup's allocator.
 @(require_results)
-acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_Start) -> (message: string, ok: bool) {
-	app := &server.app
-	// Loading the session this process already runs is not a switch: it is the same
-	// conversation, and the harness would refuse to claim it twice.
-	if start.kind == .Resume_Id && app.setup.store != nil && agent.chat_session_text(&app.setup.session) == start.id { return "", true }
+acp_session_open :: proc(session: ^Acp_Session, workspace: string, start: Session_Start) -> (message: string, ok: bool) {
+	app := &session.app
 	opened, open_message, opened_ok := session_open(&app.setup, start, workspace)
 	if !opened_ok { return open_message, false }
 	report_recovery(opened.recovery, opened.queued)
@@ -855,41 +746,27 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 }
 
 // acp_session_select_model gives a freshly opened session a model: the one its own record
-// names, otherwise the one this process chose at startup. A stale record falls back to the
-// process's selection, and a session with no selection at all still opens, because the
-// prompt is what refuses it.
-acp_session_select_model :: proc(server: ^Acp_Server) {
-	app := &server.app
+// names, otherwise the one this connection chose at startup. A stale record falls back to
+// the connection's selection, and a session with no selection at all still opens, because
+// the prompt is what refuses it.
+acp_session_select_model :: proc(session: ^Acp_Session) {
+	app := &session.app
+	chosen := &session.conn.app.setup
 	if app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
-		if acp_selection_install(server, app.setup.resumed_provider, app.setup.resumed_model, "") { return }
+		if acp_selection_install(session, app.setup.resumed_provider, app.setup.resumed_model, "") { return }
 	}
-	if app.setup.provider_id != "" && app.setup.model_id != "" {
-		if acp_selection_install(server, app.setup.provider_id, app.setup.model_id, "") { return }
+	if chosen.provider_id != "" && chosen.model_id != "" {
+		if acp_selection_install(session, chosen.provider_id, chosen.model_id, session.conn.default_effort) { return }
 	}
-	if app.setup.model_id == "" { _ = acp_select_first_model(server) }
+	if app.setup.model_id == "" { _ = acp_select_first_model(session) }
 }
 
-acp_selection_install :: proc(server: ^Acp_Server, provider_id, model_id, effort: string) -> bool {
-	target, problem := selection_target_resolve(&server.app, provider_id, model_id, server.app.setup.alloc)
+acp_selection_install :: proc(session: ^Acp_Session, provider_id, model_id, effort: string) -> bool {
+	target, problem := selection_target_resolve(&session.app, provider_id, model_id, session.app.setup.alloc)
 	defer if problem != "" { delete(problem, context.temp_allocator) }
 	if target.model_id == "" { return false }
-	defer agent.model_selection_destroy(&target, server.app.setup.alloc)
-	return selection_install(&server.app, target, effort, false)
-}
-
-// acp_select_startup_model chooses the model this process runs with: the user's own last
-// choice, otherwise the first model the configuration can actually serve. The fallback
-// exists because an editor session is often the first thing a person runs, and it must
-// not depend on having opened the interactive harness once.
-@(require_results)
-acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
-	app := &server.app
-	selection, found, load_err := selection_latest(app.setup.store, app.run.alloc)
-	defer selection_destroy(&selection, app.run.alloc)
-	if load_err == nil && found {
-		if acp_selection_install(server, selection.provider, selection.model, selection.effort) { return true }
-	}
-	return acp_select_first_model(server)
+	defer agent.model_selection_destroy(&target, session.app.setup.alloc)
+	return selection_install(&session.app, target, effort, false)
 }
 
 // acp_select_first_model picks the first configured provider that can serve a request and
@@ -898,13 +775,13 @@ acp_select_startup_model :: proc(server: ^Acp_Server) -> bool {
 // Every candidate is named before any of them is tried, because applying a selection takes
 // the catalog lock and a publication releases the catalog the names were read from.
 @(require_results)
-acp_select_first_model :: proc(server: ^Acp_Server) -> bool {
-	app := &server.app
+acp_select_first_model :: proc(session: ^Acp_Session) -> bool {
+	app := &session.app
 	candidates, candidates_ok := acp_servable_models(app, app.run.alloc)
 	if !candidates_ok { return false }
 	defer acp_candidates_destroy(candidates, app.run.alloc)
 	for candidate in candidates {
-		if acp_selection_install(server, candidate.provider_id, candidate.model_id, "") { return true }
+		if acp_selection_install(session, candidate.provider_id, candidate.model_id, "") { return true }
 	}
 	return false
 }
@@ -957,35 +834,35 @@ acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Mo
 
 // --- running a prompt --------------------------------------------------------
 
-acp_work_set_config_option :: proc(server: ^Acp_Server, work: Acp_Work) {
+acp_work_set_config_option :: proc(session: ^Acp_Session, work: Acp_Work) {
 	applied := false
 	if work.config_id == "effort" {
-		applied = agent.chat_session_set_effort(&server.app.setup.session, work.config_value)
+		applied = agent.chat_session_set_effort(&session.app.setup.session, work.config_value)
 	}
 	if !applied {
 		_ = acp.writer_write_error(
-			&server.writer,
+			&session.conn.writer,
 			work.id,
 			acp.ERROR_INVALID_PARAMS,
 			fmt.tprintf("the config option %q cannot be set to %q", work.config_id, work.config_value),
 		)
 		return
 	}
-	options, options_ok := acp_model_config_options_v1(server)
+	options, options_ok := acp_model_config_options_v1(session)
 	if !options_ok {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
 		return
 	}
-	if acp_is_v2(server) {
-		v2_options, v2_options_ok := acp_model_config_options_v2(server)
+	if acp_is_v2(session.conn) {
+		v2_options, v2_options_ok := acp_model_config_options_v2(session)
 		if !v2_options_ok {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
+			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
 			return
 		}
-		_ = acp.writer_write_response(&server.writer, work.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options})
+		_ = acp.writer_write_response(&session.conn.writer, work.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options})
 		return
 	}
-	_ = acp.writer_write_response(&server.writer, work.id, acp.V1_Session_Set_Config_Option_Result{config_options = options})
+	_ = acp.writer_write_response(&session.conn.writer, work.id, acp.V1_Session_Set_Config_Option_Result{config_options = options})
 }
 
 acp_session_timestamp :: proc(at_ms: i64) -> string {
@@ -1008,165 +885,52 @@ acp_session_cursor_encode :: proc(value: journal.Journal_Seq) -> string {
 
 ACP_SESSION_LIST_PAGE_SIZE :: 50
 
-acp_work_list_sessions :: proc(server: ^Acp_Server, work: Acp_Work) {
-	store := server.app.setup.store
-	// With no session open, the list is read through a journal of its own.
-	opened_store: ^journal.Journal
-	// The lookup's store is being abandoned; its close failure changes nothing.
-	defer _ = session_store_close(opened_store, server.app.setup.alloc)
-	if store == nil {
-		open_error: journal.Error
-		opened_store, open_error = session_store_open(&server.app.setup)
-		if open_error != nil {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session list could not be opened")
-			return
-		}
-		store = opened_store
-	}
-	options := journal.Session_Filter {
-		workspace = work.list_cwd,
-		role      = .Main,
-		limit     = ACP_SESSION_LIST_PAGE_SIZE,
-	}
-	if work.list_cursor != "" {
-		cursor, valid := acp_session_cursor_decode(work.list_cursor)
-		if !valid {
-			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, "the session list cursor is invalid")
-			return
-		}
-		options.before = cursor
-	}
-	sessions, list_error := journal.list_sessions(store, options, server.alloc)
-	if list_error != nil {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session list could not be read")
-		return
-	}
-	active_id := ""
-	sync.mutex_lock(&server.mu)
-	if server.app.setup.store != nil && server.session_id == agent.chat_session_text(&server.app.setup.session) {
-		active_id = agent.chat_session_text(&server.app.setup.session)
-	}
-	sync.mutex_unlock(&server.mu)
-	active_matches := active_id != "" && (work.list_cwd == "" || server.app.setup.workspace == work.list_cwd)
-	active_listed := false
-	for listed in sessions {
-		buffer: [journal.SESSION_ID_HEX_LENGTH]u8
-		if journal.session_id_to_hex(listed.id, buffer[:]) == active_id {
-			active_listed = true
-			break
-		}
-	}
-	extra := 1 if active_matches && !active_listed else 0
-	infos, infos_error := make([]acp.Session_Info, len(sessions) + extra, server.alloc)
-	if infos_error != nil {
-		journal.session_summaries_destroy(sessions, server.alloc)
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session list could not be allocated")
-		return
-	}
-	id_buffers, buffers_error := make([][journal.SESSION_ID_HEX_LENGTH]u8, len(sessions), context.temp_allocator)
-	if buffers_error != nil {
-		delete(infos, server.alloc)
-		journal.session_summaries_destroy(sessions, server.alloc)
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the session list could not be allocated")
-		return
-	}
-	for listed, index in sessions {
-		infos[index] = acp.Session_Info {
-			session_id = journal.session_id_to_hex(listed.id, id_buffers[index][:]),
-			cwd        = listed.workspace,
-			title      = listed.title,
-			updated_at = acp_session_timestamp(listed.updated_ms),
-		}
-	}
-	if extra == 1 {
-		sync.mutex_lock(&server.mu)
-		title := server.session_title
-		sync.mutex_unlock(&server.mu)
-		infos[len(sessions)] = acp.Session_Info {
-			session_id = active_id,
-			cwd        = server.app.setup.workspace,
-			title      = title,
-			updated_at = acp_session_timestamp(time.to_unix_nanoseconds(time.now()) / i64(time.Millisecond)),
-		}
-	}
-	next_cursor := ""
-	if len(sessions) == ACP_SESSION_LIST_PAGE_SIZE {
-		last := sessions[len(sessions) - 1]
-		next_cursor = acp_session_cursor_encode(last.last_seq)
-	}
-	_ = acp.writer_write_response(&server.writer, work.id, acp.Session_List_Result{sessions = infos, next_cursor = next_cursor})
-	delete(infos, server.alloc)
-	journal.session_summaries_destroy(sessions, server.alloc)
+// acp_work_close_session releases the session before it answers, so a client that loads the
+// session again as soon as it hears the close finds its claim dropped.
+acp_work_close_session :: proc(session: ^Acp_Session, work: Acp_Work) {
+	acp_session_release(session)
+	_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Empty_Result{})
 }
 
-acp_work_close_session :: proc(server: ^Acp_Server, work: Acp_Work) {
-	if !acp_closing_session_matches(server, work.session_ref) || server.app.setup.store == nil {
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
-		return
-	}
-	acp_invalidate_published_session(server)
-	agent.chat_session_destroy(&server.app.setup.session)
-	// A release failure is recorded rather than answered: the session is already
-	// destroyed, so the close stands either way. The journal is what failed to close, so
-	// the report goes to stderr.
-	if release_error := session_store_close(server.app.setup.store, server.app.setup.alloc); release_error != nil {
-		fmt.eprintln("nabla: the session database could not be closed cleanly:", journal.error_text(release_error, context.temp_allocator))
-	}
-	server.app.setup.store = nil
-	mcp_runtime_destroy(&server.app.setup.mcp)
-	agent.MCP_Server_Configs_Destroy(&server.mcp_servers_owned, server.alloc)
-	server.app.setup.mcp_servers = server.base_mcp_servers
-	acp_restore_base_runtime(server)
-	sync.mutex_lock(&server.mu)
-	delete(server.session_id, server.alloc)
-	server.session_id = ""
-	delete(server.session_title, server.alloc)
-	server.session_title = ""
-	sync.mutex_unlock(&server.mu)
-	delete(server.active_message_id, server.alloc)
-	server.active_message_id = ""
-	_ = acp.writer_write_response(&server.writer, work.id, acp.Empty_Result{})
-}
-
-acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
-	chat := &server.app.setup.session
-	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(server))
+acp_work_prompt :: proc(session: ^Acp_Session, work: Acp_Work) {
+	chat := &session.app.setup.session
+	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(session))
 	switch accepted {
 	case .Accepted:
 	case .Storage_Failed:
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, agent.chat_session_last_error(chat))
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, agent.chat_session_last_error(chat))
 		return
 	case .Busy:
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INVALID_REQUEST, "the session is already running a turn")
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_REQUEST, "the session is already running a turn")
 		return
 	}
-	if acp_is_v2(server) {
-		acp_clear_active_message_id(server)
-		message_id := acp_user_message_id(server)
-		_ = acp_send_user_message(server, message_id, work.text)
-		_ = acp.writer_write_response(&server.writer, work.id, acp.Prompt_Accepted_Result{message_id = message_id})
-		_ = acp_send_state(server, "running", "")
+	if acp_is_v2(session.conn) {
+		acp_clear_active_message_id(session)
+		message_id := acp_user_message_id(session)
+		_ = acp_send_user_message(session, message_id, work.text)
+		_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Prompt_Accepted_Result{message_id = message_id})
+		_ = acp_send_state(session, "running", "")
 	}
 
 	// The completion flag is read because the terminal status alone cannot report a
 	// turn the store could not record: the status still names what the model reached,
 	// so an unrecorded completion is corrected to a failure below.
-	chat.catalog = app_catalog_ref(&server.app)
-	observer := acp_observer(server)
+	chat.catalog = app_catalog_ref(&session.app)
+	observer := acp_observer(session)
 	steer := agent.Steer_Context {
 		apply      = acp_model_selection_steer,
-		apply_data = server,
+		apply_data = session,
 	}
 	turn_completed := agent.chat_run_turn_steered(
 		chat,
-		server.app.run.connection,
+		session.app.run.connection,
 		agent.chat_retry_policy_default(),
 		observer,
 		&steer,
-		&server.app.run.control,
+		&session.app.run.control,
 	)
-	if acp_is_v2(server) {
-		acp_v2_turn_end(server, turn_completed)
+	if acp_is_v2(session.conn) {
+		acp_v2_turn_end(session, turn_completed)
 		return
 	}
 
@@ -1177,35 +941,35 @@ acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	// transcript.
 	switch status {
 	case .Completed:
-		_ = acp.writer_write_response(&server.writer, work.id, acp.Prompt_Result{stop_reason = acp.stop_reason_name(.End_Turn)})
+		_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Prompt_Result{stop_reason = acp.stop_reason_name(.End_Turn)})
 	case .Cancelled:
-		_ = acp.writer_write_response(&server.writer, work.id, acp.Prompt_Result{stop_reason = acp.stop_reason_name(.Cancelled)})
+		_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Prompt_Result{stop_reason = acp.stop_reason_name(.Cancelled)})
 	case .Failed, .None:
 		message := agent.chat_session_last_error(chat)
 		if message == "" { message = "the turn did not complete" }
-		_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, message)
+		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, message)
 	}
 }
 
 // acp_v2_turn_end tells a V2 client how a turn ended and that the agent is idle again.
 @(private = "file")
-acp_v2_turn_end :: proc(server: ^Acp_Server, turn_completed: bool) {
-	chat := &server.app.setup.session
+acp_v2_turn_end :: proc(session: ^Acp_Session, turn_completed: bool) {
+	chat := &session.app.setup.session
 	status := chat.terminal_status
 	if !turn_completed && status == .Completed { status = .Failed }
 	switch status {
 	case .Completed:
-		_ = acp_send_state(server, "idle", acp.stop_reason_name(.End_Turn))
+		_ = acp_send_state(session, "idle", acp.stop_reason_name(.End_Turn))
 	case .Cancelled:
-		_ = acp_send_state(server, "idle", acp.stop_reason_name(.Cancelled))
+		_ = acp_send_state(session, "idle", acp.stop_reason_name(.Cancelled))
 	case .Failed, .None:
 		message := agent.chat_session_last_error(chat)
 		if message == "" { message = "the turn did not complete" }
-		message_id := acp_notice_message_id(server)
-		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, message, message_id)
+		message_id := acp_notice_message_id(session)
+		_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, message, message_id)
 		// A failed turn is not a refusal: the transcript carries the reason, and the
 		// state only says the agent is idle again.
-		_ = acp_send_state(server, "idle", "")
+		_ = acp_send_state(session, "idle", "")
 	}
 }
 
@@ -1213,45 +977,45 @@ acp_v2_turn_end :: proc(server: ^Acp_Server, turn_completed: bool) {
 // request ran, and reports whether it ran one. The turn counts as work, so a cancel or a
 // shutdown stops it the way it stops a prompt's turn.
 @(private = "file", require_results)
-acp_report_turn :: proc(server: ^Acp_Server) -> bool {
-	chat := &server.app.setup.session
-	observer := acp_observer(server)
+acp_report_turn :: proc(session: ^Acp_Session) -> bool {
+	chat := &session.app.setup.session
+	observer := acp_observer(session)
 	accepted, had_message := agent.chat_session_accept_agent_message(chat, observer)
 	if !had_message { return false }
 	if accepted != .Accepted {
-		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, agent.chat_session_last_error(chat), acp_notice_message_id(server))
+		_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, agent.chat_session_last_error(chat), acp_notice_message_id(session))
 		return false
 	}
-	acp_queue_add(server)
-	defer acp_queue_remove(server)
-	defer agent.turn_control_clear(&server.app.run.control)
-	acp_clear_active_message_id(server)
-	_ = acp_send_state(server, "running", "")
-	chat.catalog = app_catalog_ref(&server.app)
+	acp_queue_add(session)
+	defer acp_queue_remove(session)
+	defer agent.turn_control_clear(&session.app.run.control)
+	acp_clear_active_message_id(session)
+	_ = acp_send_state(session, "running", "")
+	chat.catalog = app_catalog_ref(&session.app)
 	steer := agent.Steer_Context {
 		apply      = acp_model_selection_steer,
-		apply_data = server,
+		apply_data = session,
 	}
 	turn_completed := agent.chat_run_turn_steered(
 		chat,
-		server.app.run.connection,
+		session.app.run.connection,
 		agent.chat_retry_policy_default(),
 		observer,
 		&steer,
-		&server.app.run.control,
+		&session.app.run.control,
 	)
-	acp_v2_turn_end(server, turn_completed)
+	acp_v2_turn_end(session, turn_completed)
 	return true
 }
 
 @(require_results)
-acp_models_state :: proc(server: ^Acp_Server) -> (acp.Models_State, bool) {
-	if len(server.app.setup.catalog.models) == 0 { return {}, true }
+acp_models_state :: proc(session: ^Acp_Session) -> (acp.Models_State, bool) {
+	if len(session.app.setup.catalog.models) == 0 { return {}, true }
 	result: acp.Models_State
-	result.current_model_id = server.app.setup.model_id
-	available, available_error := make([]acp.Model_Info, len(server.app.setup.catalog.models), context.temp_allocator)
+	result.current_model_id = session.app.setup.model_id
+	available, available_error := make([]acp.Model_Info, len(session.app.setup.catalog.models), context.temp_allocator)
 	if available_error != nil { return {}, false }
-	for model, index in server.app.setup.catalog.models {
+	for model, index in session.app.setup.catalog.models {
 		name := model.id
 		if model.display_name_present && model.display_name != "" { name = model.display_name }
 		available[index] = acp.Model_Info {
@@ -1264,10 +1028,10 @@ acp_models_state :: proc(server: ^Acp_Server) -> (acp.Models_State, bool) {
 }
 
 @(require_results)
-acp_model_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bool) {
-	values, values_error := make([]acp.Config_Value, len(server.app.setup.catalog.models), context.temp_allocator)
+acp_model_config_values :: proc(session: ^Acp_Session) -> ([]acp.Config_Value, bool) {
+	values, values_error := make([]acp.Config_Value, len(session.app.setup.catalog.models), context.temp_allocator)
 	if values_error != nil { return nil, false }
-	for model, index in server.app.setup.catalog.models {
+	for model, index in session.app.setup.catalog.models {
 		name := model.id
 		if model.display_name_present && model.display_name != "" { name = model.display_name }
 		values[index] = acp.Config_Value {
@@ -1282,8 +1046,8 @@ acp_model_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, boo
 // verbatim. An empty result means the model states none, and no effort option is
 // advertised for it.
 @(require_results)
-acp_effort_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bool) {
-	levels := server.app.setup.session.effort_levels[:]
+acp_effort_config_values :: proc(session: ^Acp_Session) -> ([]acp.Config_Value, bool) {
+	levels := session.app.setup.session.effort_levels[:]
 	values, values_error := make([]acp.Config_Value, len(levels), context.temp_allocator)
 	if values_error != nil { return nil, false }
 	for level, index in levels {
@@ -1296,36 +1060,36 @@ acp_effort_config_values :: proc(server: ^Acp_Server) -> ([]acp.Config_Value, bo
 }
 
 @(require_results)
-acp_model_config_options_v1 :: proc(server: ^Acp_Server) -> ([]acp.V1_Config_Option, bool) {
+acp_model_config_options_v1 :: proc(session: ^Acp_Session) -> ([]acp.V1_Config_Option, bool) {
 	model_count := 0
-	if len(server.app.setup.catalog.models) > 0 { model_count = 1 }
+	if len(session.app.setup.catalog.models) > 0 { model_count = 1 }
 	effort_count := 0
-	if len(server.app.setup.session.effort_levels) > 0 { effort_count = 1 }
+	if len(session.app.setup.session.effort_levels) > 0 { effort_count = 1 }
 	options, options_error := make([]acp.V1_Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
 	index := 0
 	if model_count == 1 {
-		values, values_ok := acp_model_config_values(server)
+		values, values_ok := acp_model_config_values(session)
 		if !values_ok { return nil, false }
 		options[index] = acp.V1_Config_Option {
 			id            = "model",
 			name          = "Model",
 			category      = "model",
 			type          = "select",
-			current_value = server.app.setup.model_id,
+			current_value = session.app.setup.model_id,
 			options       = values,
 		}
 		index += 1
 	}
 	if effort_count == 1 {
-		levels, levels_ok := acp_effort_config_values(server)
+		levels, levels_ok := acp_effort_config_values(session)
 		if !levels_ok { return nil, false }
 		options[index] = acp.V1_Config_Option {
 			id            = "effort",
 			name          = "Effort",
 			category      = "thought_level",
 			type          = "select",
-			current_value = server.app.setup.session.effort,
+			current_value = session.app.setup.session.effort,
 			options       = levels,
 		}
 	}
@@ -1333,36 +1097,36 @@ acp_model_config_options_v1 :: proc(server: ^Acp_Server) -> ([]acp.V1_Config_Opt
 }
 
 @(require_results)
-acp_model_config_options_v2 :: proc(server: ^Acp_Server) -> ([]acp.V2_Config_Option, bool) {
+acp_model_config_options_v2 :: proc(session: ^Acp_Session) -> ([]acp.V2_Config_Option, bool) {
 	model_count := 0
-	if len(server.app.setup.catalog.models) > 0 { model_count = 1 }
+	if len(session.app.setup.catalog.models) > 0 { model_count = 1 }
 	effort_count := 0
-	if len(server.app.setup.session.effort_levels) > 0 { effort_count = 1 }
+	if len(session.app.setup.session.effort_levels) > 0 { effort_count = 1 }
 	options, options_error := make([]acp.V2_Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
 	index := 0
 	if model_count == 1 {
-		values, values_ok := acp_model_config_values(server)
+		values, values_ok := acp_model_config_values(session)
 		if !values_ok { return nil, false }
 		options[index] = acp.V2_Config_Option {
 			config_id     = "model",
 			name          = "Model",
 			category      = "model",
 			type          = "select",
-			current_value = server.app.setup.model_id,
+			current_value = session.app.setup.model_id,
 			options       = values,
 		}
 		index += 1
 	}
 	if effort_count == 1 {
-		levels, levels_ok := acp_effort_config_values(server)
+		levels, levels_ok := acp_effort_config_values(session)
 		if !levels_ok { return nil, false }
 		options[index] = acp.V2_Config_Option {
 			config_id     = "effort",
 			name          = "Effort",
 			category      = "thought_level",
 			type          = "select",
-			current_value = server.app.setup.session.effort,
+			current_value = session.app.setup.session.effort,
 			options       = levels,
 		}
 	}
@@ -1372,17 +1136,17 @@ acp_model_config_options_v2 :: proc(server: ^Acp_Server) -> ([]acp.V2_Config_Opt
 // acp_notify sends one session/update notification carrying update. Every streamed
 // frame is built here, so the session id and the notification name are stated once.
 @(require_results)
-acp_notify :: proc(server: ^Acp_Server, update: $T) -> bool {
+acp_notify :: proc(session: ^Acp_Session, update: $T) -> bool {
 	params := acp.Session_Notification(T) {
-		session_id = acp_session_id(server),
+		session_id = acp_session_id(session),
 		update     = update,
 	}
-	return acp.writer_write_notification(&server.writer, acp.NOTIFICATION_SESSION_UPDATE, params)
+	return acp.writer_write_notification(&session.conn.writer, acp.NOTIFICATION_SESSION_UPDATE, params)
 }
 
 @(require_results)
-acp_send_session_info :: proc(server: ^Acp_Server, title: string) -> bool {
-	return acp_notify(server, acp.Session_Info_Update{session_update = acp.UPDATE_SESSION_INFO, title = title})
+acp_send_session_info :: proc(session: ^Acp_Session, title: string) -> bool {
+	return acp_notify(session, acp.Session_Info_Update{session_update = acp.UPDATE_SESSION_INFO, title = title})
 }
 
 // --- streaming what happens --------------------------------------------------
@@ -1390,49 +1154,49 @@ acp_send_session_info :: proc(server: ^Acp_Server, title: string) -> bool {
 // acp_send_message writes one streamed message fragment. Chunks that share an id are one
 // message in the client, which is what keeps a notice from reading as part of the answer.
 @(require_results)
-acp_send_user_message :: proc(server: ^Acp_Server, message_id, text: string) -> bool {
-	if !acp_is_v2(server) { return false }
+acp_send_user_message :: proc(session: ^Acp_Session, message_id, text: string) -> bool {
+	if !acp_is_v2(session.conn) { return false }
 	content, content_error := make([]acp.Text_Content, 1, context.temp_allocator)
 	if content_error != nil { return false }
 	content[0] = {
 		type = acp.CONTENT_TEXT,
 		text = text,
 	}
-	return acp_notify(server, acp.Message_Update{session_update = acp.UPDATE_USER_MESSAGE, message_id = message_id, content = content})
+	return acp_notify(session, acp.Message_Update{session_update = acp.UPDATE_USER_MESSAGE, message_id = message_id, content = content})
 }
 
 @(require_results)
-acp_send_state :: proc(server: ^Acp_Server, state, stop_reason: string) -> bool {
-	if !acp_is_v2(server) { return false }
-	return acp_notify(server, acp.State_Update{session_update = acp.UPDATE_STATE, state = state, stop_reason = stop_reason})
+acp_send_state :: proc(session: ^Acp_Session, state, stop_reason: string) -> bool {
+	if !acp_is_v2(session.conn) { return false }
+	return acp_notify(session, acp.State_Update{session_update = acp.UPDATE_STATE, state = state, stop_reason = stop_reason})
 }
 
 @(require_results)
-acp_send_message_full :: proc(server: ^Acp_Server, kind, message_id, text: string) -> bool {
-	if !acp_is_v2(server) { return acp_send_message(server, kind, text, message_id) }
+acp_send_message_full :: proc(session: ^Acp_Session, kind, message_id, text: string) -> bool {
+	if !acp_is_v2(session.conn) { return acp_send_message(session, kind, text, message_id) }
 	content, content_error := make([]acp.Text_Content, 1, context.temp_allocator)
 	if content_error != nil { return false }
 	content[0] = {
 		type = acp.CONTENT_TEXT,
 		text = text,
 	}
-	return acp_notify(server, acp.Message_Update{session_update = kind, message_id = message_id, content = content})
+	return acp_notify(session, acp.Message_Update{session_update = kind, message_id = message_id, content = content})
 }
 
 @(require_results)
-acp_send_message :: proc(server: ^Acp_Server, kind: string, text, message_id: string) -> bool {
+acp_send_message :: proc(session: ^Acp_Session, kind: string, text, message_id: string) -> bool {
 	resolved_message_id := message_id
-	if acp_is_v2(server) && resolved_message_id == "" {
-		resolved_message_id = acp_next_message_id(server)
+	if acp_is_v2(session.conn) && resolved_message_id == "" {
+		resolved_message_id = acp_next_message_id(session)
 	}
-	return acp_notify(server, acp.Message_Chunk{session_update = kind, content = {type = acp.CONTENT_TEXT, text = text}, message_id = resolved_message_id})
+	return acp_notify(session, acp.Message_Chunk{session_update = kind, content = {type = acp.CONTENT_TEXT, text = text}, message_id = resolved_message_id})
 }
 
 // acp_send_tool_call announces one call with the state it is in when it is announced: a
 // call about to run is pending, and a call replayed from the record already has its
 // output.
 @(require_results)
-acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string, status: acp.Tool_Status, output: string) -> bool {
+acp_send_tool_call :: proc(session: ^Acp_Session, call_id, name, arguments: string, status: acp.Tool_Status, output: string) -> bool {
 	// The arguments are parsed for the client's benefit and released after the frame is
 	// written, not when this block ends: the value the update carries must outlive it.
 	raw, parse_err := json.parse_string(arguments, .JSON, true, context.temp_allocator)
@@ -1444,15 +1208,15 @@ acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string
 		made[0] = acp_tool_content(output)
 		content = made
 	}
-	if acp_is_v2(server) {
+	if acp_is_v2(session.conn) {
 		return acp_notify(
-			server,
+			session,
 			acp.Tool_Call_Update_V2 {
 				session_update = acp.UPDATE_TOOL_CALL_UPDATE,
 				tool_call_id = call_id,
 				name = name,
 				title = acp_tool_title(name, arguments),
-				kind = acp.tool_kind_name(acp_tool_kind(&server.app.setup.session, name)),
+				kind = acp.tool_kind_name(acp_tool_kind(&session.app.setup.session, name)),
 				status = acp.tool_status_name(status),
 				content = content,
 				raw_input = raw if parse_err == nil else nil,
@@ -1460,12 +1224,12 @@ acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string
 		)
 	}
 	return acp_notify(
-		server,
+		session,
 		acp.Tool_Call {
 			session_update = acp.UPDATE_TOOL_CALL,
 			tool_call_id = call_id,
 			title = acp_tool_title(name, arguments),
-			kind = acp.tool_kind_name(acp_tool_kind(&server.app.setup.session, name)),
+			kind = acp.tool_kind_name(acp_tool_kind(&session.app.setup.session, name)),
 			status = acp.tool_status_name(status),
 			content = content,
 			raw_input = raw if parse_err == nil else nil,
@@ -1475,13 +1239,13 @@ acp_send_tool_call :: proc(server: ^Acp_Server, call_id, name, arguments: string
 
 // acp_send_tool_result settles a call that was already announced, by its id.
 @(require_results)
-acp_send_tool_result :: proc(server: ^Acp_Server, call_id: string, status: acp.Tool_Status, output: string) -> bool {
+acp_send_tool_result :: proc(session: ^Acp_Session, call_id: string, status: acp.Tool_Status, output: string) -> bool {
 	content, content_error := make([]acp.Tool_Call_Content, 1, context.temp_allocator)
 	if content_error != nil { return false }
 	content[0] = acp_tool_content(output)
-	if acp_is_v2(server) {
+	if acp_is_v2(session.conn) {
 		return acp_notify(
-			server,
+			session,
 			acp.Tool_Call_Update_V2 {
 				session_update = acp.UPDATE_TOOL_CALL_UPDATE,
 				tool_call_id = call_id,
@@ -1491,7 +1255,7 @@ acp_send_tool_result :: proc(server: ^Acp_Server, call_id: string, status: acp.T
 		)
 	}
 	return acp_notify(
-		server,
+		session,
 		acp.Tool_Call_Update{session_update = acp.UPDATE_TOOL_CALL_UPDATE, tool_call_id = call_id, status = acp.tool_status_name(status), content = content},
 	)
 }
@@ -1504,38 +1268,38 @@ acp_tool_content :: proc(text: string) -> acp.Tool_Call_Content {
 // acp_send_usage reports how full the context is: the size the provider measured, or the
 // harness's own count when the provider reported none, against the model's window.
 @(require_results)
-acp_send_usage :: proc(server: ^Acp_Server, used, size: i64) -> bool {
-	return acp_notify(server, acp.Usage_Update{session_update = acp.UPDATE_USAGE, used = used, size = size})
+acp_send_usage :: proc(session: ^Acp_Session, used, size: i64) -> bool {
+	return acp_notify(session, acp.Usage_Update{session_update = acp.UPDATE_USAGE, used = used, size = size})
 }
 
 // acp_session_id is the id a session update names. The worker owns the session, so the
 // string is borrowed for the write and no longer.
-acp_session_id :: proc(server: ^Acp_Server) -> string {
-	return agent.chat_session_text(&server.app.setup.session)
+acp_session_id :: proc(session: ^Acp_Session) -> string {
+	return agent.chat_session_text(&session.app.setup.session)
 }
 
-acp_user_message_id :: proc(server: ^Acp_Server) -> string {
-	if turn := server.app.setup.session.turn; turn != 0 { return fmt.tprintf("msg-user-%d-1", i64(turn)) }
-	return acp_next_message_id(server)
+acp_user_message_id :: proc(session: ^Acp_Session) -> string {
+	if turn := session.app.setup.session.turn; turn != 0 { return fmt.tprintf("msg-user-%d-1", i64(turn)) }
+	return acp_next_message_id(session)
 }
 
-acp_assistant_message_id :: proc(server: ^Acp_Server) -> string {
-	turn := server.app.setup.session.turn
-	request := server.app.setup.session.request
+acp_assistant_message_id :: proc(session: ^Acp_Session) -> string {
+	turn := session.app.setup.session.turn
+	request := session.app.setup.session.request
 	if turn != 0 && request != 0 {
 		return fmt.tprintf("msg-assistant-%d-%d", i64(turn), i64(request))
 	}
 	if turn != 0 { return fmt.tprintf("msg-assistant-%d", i64(turn)) }
-	return acp_next_message_id(server)
+	return acp_next_message_id(session)
 }
 
-acp_notice_message_id :: proc(server: ^Acp_Server) -> string {
-	turn := server.app.setup.session.turn
-	request := server.app.setup.session.request
+acp_notice_message_id :: proc(session: ^Acp_Session) -> string {
+	turn := session.app.setup.session.turn
+	request := session.app.setup.session.request
 	if turn != 0 && request != 0 {
 		return fmt.tprintf("msg-notice-%d-%d", i64(turn), i64(request))
 	}
-	return acp_next_message_id(server)
+	return acp_next_message_id(session)
 }
 
 acp_replay_notice_id :: proc(item: agent.Projection_Item) -> string {
@@ -1554,50 +1318,50 @@ acp_replay_assistant_message_id :: proc(item: agent.Projection_Item) -> string {
 }
 
 // acp_set_active_message_id names the v2 answer being streamed. The id is owned by
-// the server so it outlives the scratch memory the streamed chunks borrow. A copy
+// the session so it outlives the scratch memory the streamed chunks borrow. A copy
 // that fails is recorded as a runtime message and leaves the previous id in place, so the stream
 // continues under the id it already had rather than under none.
-acp_set_active_message_id :: proc(server: ^Acp_Server, message_id: string) {
-	owned, clone_error := strings.clone(message_id, server.alloc)
+acp_set_active_message_id :: proc(session: ^Acp_Session, message_id: string) {
+	owned, clone_error := strings.clone(message_id, session.conn.alloc)
 	if clone_error != nil {
-		agent.chat_runtime_message(&server.app.setup.session, .Warning, "the answer's message id could not be copied; the stream keeps its previous id")
+		agent.chat_runtime_message(&session.app.setup.session, .Warning, "the answer's message id could not be copied; the stream keeps its previous id")
 		return
 	}
-	delete(server.active_message_id, server.alloc)
-	server.active_message_id = owned
+	delete(session.active_message_id, session.conn.alloc)
+	session.active_message_id = owned
 }
 
-acp_clear_active_message_id :: proc(server: ^Acp_Server) {
-	delete(server.active_message_id, server.alloc)
-	server.active_message_id = ""
+acp_clear_active_message_id :: proc(session: ^Acp_Session) {
+	delete(session.active_message_id, session.conn.alloc)
+	session.active_message_id = ""
 }
 
 // acp_tool_status maps a harness outcome to the wire status. v2 names cancellation;
 // v1 has no cancelled state, so a cancelled call reads as failed there.
-acp_tool_status :: proc(server: ^Acp_Server, outcome: journal.Tool_Outcome) -> acp.Tool_Status {
+acp_tool_status :: proc(session: ^Acp_Session, outcome: journal.Tool_Outcome) -> acp.Tool_Status {
 	if outcome == .Success { return .Completed }
-	if outcome == .Cancelled && acp_is_v2(server) { return .Cancelled }
+	if outcome == .Cancelled && acp_is_v2(session.conn) { return .Cancelled }
 	return .Failed
 }
 
-acp_next_message_id :: proc(server: ^Acp_Server) -> string {
-	server.message_seq += 1
-	return fmt.tprintf("msg-%d", server.message_seq)
+acp_next_message_id :: proc(session: ^Acp_Session) -> string {
+	session.message_seq += 1
+	return fmt.tprintf("msg-%d", session.message_seq)
 }
 
 @(private)
-acp_current_message_id :: proc(server: ^Acp_Server) -> string {
-	if acp_is_v2(server) && server.active_message_id != "" {
-		return server.active_message_id
+acp_current_message_id :: proc(session: ^Acp_Session) -> string {
+	if acp_is_v2(session.conn) && session.active_message_id != "" {
+		return session.active_message_id
 	}
-	return fmt.tprintf("msg-%d", server.message_seq)
+	return fmt.tprintf("msg-%d", session.message_seq)
 }
 
 // --- the observer ------------------------------------------------------------
 
-acp_observer :: proc(server: ^Acp_Server) -> agent.Chat_Observer {
+acp_observer :: proc(session: ^Acp_Session) -> agent.Chat_Observer {
 	return {
-		user_data = server,
+		user_data = session,
 		assistant_begin = acp_obs_assistant_begin,
 		assistant_text = acp_obs_assistant_text,
 		tool_call = acp_obs_tool_call,
@@ -1609,17 +1373,17 @@ acp_observer :: proc(server: ^Acp_Server) -> agent.Chat_Observer {
 }
 
 acp_obs_assistant_begin :: proc(user_data: rawptr) {
-	server := cast(^Acp_Server)user_data
-	if acp_is_v2(server) {
-		acp_set_active_message_id(server, acp_assistant_message_id(server))
+	session := cast(^Acp_Session)user_data
+	if acp_is_v2(session.conn) {
+		acp_set_active_message_id(session, acp_assistant_message_id(session))
 	} else {
-		_ = acp_next_message_id(server)
+		_ = acp_next_message_id(session)
 	}
 }
 
 acp_obs_assistant_text :: proc(user_data: rawptr, text: string) {
-	server := cast(^Acp_Server)user_data
-	_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, text, acp_current_message_id(server))
+	session := cast(^Acp_Session)user_data
+	_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, text, acp_current_message_id(session))
 }
 
 // acp_obs_message reports the harness's own lines. They are the only place a client
@@ -1627,39 +1391,39 @@ acp_obs_assistant_text :: proc(user_data: rawptr, text: string) {
 // the transcript is the protocol's only channel, so they are sent as a message of their
 // own rather than folded into the model's answer.
 acp_obs_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
-	server := cast(^Acp_Server)user_data
-	message_id := acp_next_message_id(server)
-	if acp_is_v2(server) { message_id = acp_notice_message_id(server) }
-	_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, text, message_id)
+	session := cast(^Acp_Session)user_data
+	message_id := acp_next_message_id(session)
+	if acp_is_v2(session.conn) { message_id = acp_notice_message_id(session) }
+	_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, text, message_id)
 }
 
 acp_obs_tool_call :: proc(user_data: rawptr, event: agent.Chat_Tool_Event) {
-	server := cast(^Acp_Server)user_data
-	_ = acp_send_tool_call(server, event.call_id, event.name, event.arguments, .Pending, "")
+	session := cast(^Acp_Session)user_data
+	_ = acp_send_tool_call(session, event.call_id, event.name, event.arguments, .Pending, "")
 }
 
 acp_obs_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
-	server := cast(^Acp_Server)user_data
+	session := cast(^Acp_Session)user_data
 	text := tool_display_preview(result.content)
 	if text == "" { text = tool_display_summary(result) }
-	_ = acp_send_tool_result(server, result.call_id, acp_tool_status(server, result.outcome), text)
+	_ = acp_send_tool_result(session, result.call_id, acp_tool_status(session, result.outcome), text)
 }
 
 acp_obs_request_finished :: proc(user_data: rawptr) {
-	server := cast(^Acp_Server)user_data
-	chat := &server.app.setup.session
+	session := cast(^Acp_Session)user_data
+	chat := &session.app.setup.session
 	size := i64(chat.capacity.window)
 	if size <= 0 { return }
 	used := i64(chat.last_estimate)
 	if measured, reported := chat.last_input_measured.?; reported { used = measured }
-	_ = acp_send_usage(server, used, size)
+	_ = acp_send_usage(session, used, size)
 }
 
 acp_obs_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
-	server := cast(^Acp_Server)user_data
-	message_id := acp_next_message_id(server)
-	if acp_is_v2(server) { message_id = acp_notice_message_id(server) }
-	_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, retry_display_text(event), message_id)
+	session := cast(^Acp_Session)user_data
+	message_id := acp_next_message_id(session)
+	if acp_is_v2(session.conn) { message_id = acp_notice_message_id(session) }
+	_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, retry_display_text(event), message_id)
 }
 
 // --- replaying a loaded conversation -----------------------------------------
@@ -1668,17 +1432,17 @@ acp_obs_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event
 // harness keeps becomes the update that carries it: the user's own lines, the model's
 // answers, and each stored call with the result it produced. A client that asked to load
 // a session shows the conversation it asked for rather than an empty one.
-acp_replay_session :: proc(server: ^Acp_Server) {
-	chat := &server.app.setup.session
+acp_replay_session :: proc(session: ^Acp_Session) {
+	chat := &session.app.setup.session
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena) != nil {
-		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, "the session's history could not be allocated", acp_next_message_id(server))
+		_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, "the session's history could not be allocated", acp_next_message_id(session))
 		return
 	}
 	defer virtual.arena_destroy(&arena)
 	replayed, load_err := agent.projection_load(chat.store, chat.session, chat.head, virtual.arena_allocator(&arena))
 	if load_err != nil {
-		_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, "the session's history could not be read", acp_next_message_id(server))
+		_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, "the session's history could not be read", acp_next_message_id(session))
 		return
 	}
 	calls := make(map[journal.Call_Id]agent.Projected_Call, len(replayed.items), context.temp_allocator)
@@ -1699,17 +1463,17 @@ acp_replay_session :: proc(server: ^Acp_Server) {
 				user_occurrences[item.turn] += 1
 				message_id = acp_replay_user_message_id(item, user_occurrences[item.turn])
 			}
-			if acp_is_v2(server) {
-				_ = acp_send_message_full(server, message_kind, message_id, payload.text)
+			if acp_is_v2(session.conn) {
+				_ = acp_send_message_full(session, message_kind, message_id, payload.text)
 			} else {
-				_ = acp_send_message(server, kind, payload.text, message_id)
+				_ = acp_send_message(session, kind, payload.text, message_id)
 			}
 		case agent.Projected_Assistant:
 			message_id := acp_replay_assistant_message_id(item)
-			if acp_is_v2(server) {
-				_ = acp_send_message_full(server, acp.UPDATE_AGENT_MESSAGE, message_id, payload.text)
+			if acp_is_v2(session.conn) {
+				_ = acp_send_message_full(session, acp.UPDATE_AGENT_MESSAGE, message_id, payload.text)
 			} else {
-				_ = acp_send_message(server, acp.UPDATE_AGENT_MESSAGE_CHUNK, payload.text, message_id)
+				_ = acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, payload.text, message_id)
 			}
 		case agent.Projected_Call:
 			calls[payload.call] = payload
@@ -1718,7 +1482,7 @@ acp_replay_session :: proc(server: ^Acp_Server) {
 			if !known { continue }
 			text := tool_display_preview(payload.content)
 			if text == "" { text = journal.TOOL_OUTCOME_NAMES[payload.outcome] }
-			_ = acp_send_tool_call(server, call.provider_id, call.name, call.proposed, acp_tool_status(server, payload.outcome), text)
+			_ = acp_send_tool_call(session, call.provider_id, call.name, call.proposed, acp_tool_status(session, payload.outcome), text)
 		}
 	}
 }
@@ -1728,7 +1492,7 @@ acp_replay_session :: proc(server: ^Acp_Server) {
 // acp_tool_kind tells a client what a call does, so it can render the card the call
 // deserves. The harness's own hints answer for a definition that states them; what is
 // left is the tools this harness ships, named here, and Other is the honest answer for
-// anything else, including a tool an MCP server contributed without saying.
+// anything else, including a tool an MCP session contributed without saying.
 acp_tool_kind :: proc(chat: ^agent.Chat_Session, name: string) -> acp.Tool_Kind {
 	if definition, present := agent.tool_registry_find(&chat.tools, name); present {
 		if definition.hints.read_only == .Yes { return .Read }

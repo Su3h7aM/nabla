@@ -37,16 +37,16 @@ ACP_TEST_BOUND :: 10 * time.Second
 
 @(test)
 test_acp_model_selection_does_not_mark_foreground_work_busy :: proc(t: ^testing.T) {
-	server: Acp_Server
-	server.model_request.active = true
-	testing.expect(t, !acp_server_has_work(&server), "a pending model RPC is not foreground work")
-	server.model_request = {}
-	server.model_selection.active = true
-	testing.expect(t, !acp_server_has_work(&server), "a model switch waiting for compaction is not foreground work")
-	server.model_selection = {}
-	acp_queue_add(&server)
-	testing.expect(t, acp_server_has_work(&server), "queued foreground work remains busy")
-	acp_queue_remove(&server)
+	session: Acp_Session
+	session.model_request.active = true
+	testing.expect(t, !acp_session_has_work(&session), "a pending model RPC is not foreground work")
+	session.model_request = {}
+	session.model_selection.active = true
+	testing.expect(t, !acp_session_has_work(&session), "a model switch waiting for compaction is not foreground work")
+	session.model_selection = {}
+	acp_queue_add(&session)
+	testing.expect(t, acp_session_has_work(&session), "queued foreground work remains busy")
+	acp_queue_remove(&session)
 }
 
 @(test)
@@ -157,6 +157,8 @@ acp_test_provider_start :: proc(t: ^testing.T, provider: ^Acp_Test_Provider, rep
 }
 
 acp_test_provider_stop :: proc(t: ^testing.T, provider: ^Acp_Test_Provider) {
+	// Closing a listener in another thread does not wake a blocked Linux accept.
+	_ = net.shutdown(provider.listener, .Both)
 	net.close(provider.listener)
 	if provider.thread != nil {
 		thread.join(provider.thread)
@@ -283,6 +285,147 @@ acp_test_writer_cleanup :: proc(writer: ^acp.Writer) {
 	_ = acp.writer_destroy(writer, time.Second)
 }
 
+acp_test_server_init :: proc(t: ^testing.T, server: ^Acp_Server) -> bool {
+	server.alloc = context.allocator
+	server.app.setup.alloc = server.alloc
+	writer, writer_error := acp.writer_init({}, server.alloc)
+	if writer_error != nil { return testing.expect(t, false, "the ACP test writer could not be created") }
+	server.writer = writer
+	return true
+}
+
+Acp_Test_Retained_Worker :: struct {
+	session: ^Acp_Session,
+	release: sync.One_Shot_Event,
+}
+
+acp_test_retained_worker :: proc(worker: ^thread.Thread) {
+	state := cast(^Acp_Test_Retained_Worker)worker.data
+	sync.one_shot_event_wait(&state.release)
+	sync.one_shot_event_signal(&state.session.worker_done)
+}
+
+@(test)
+test_acp_shutdown_settles_joined_sessions_and_retains_a_stuck_connection :: proc(t: ^testing.T) {
+	server: Acp_Server
+	client: Acp_Test_Client
+	defer delete(client.output)
+	server.alloc = context.allocator
+	server.app.setup.alloc = server.alloc
+	writer, writer_error := acp.writer_init(acp_test_client_output(&client), server.alloc)
+	if !testing.expect(t, writer_error == nil, "the shared writer could not be created") { return }
+	server.writer = writer
+	joined, reason := acp_session_create(&server, "joined")
+	if !testing.expectf(t, joined != nil, "the joined session could not be created: %s", reason) {
+		_ = acp_server_destroy(&server)
+		return
+	}
+	retained, made := acp_session_make(&server, "retained")
+	if !testing.expect(t, made, "the retained session could not be created") {
+		_ = acp_server_destroy(&server)
+		return
+	}
+	state := Acp_Test_Retained_Worker {
+		session = retained,
+	}
+	worker := thread.create(acp_test_retained_worker)
+	if !testing.expect(t, worker != nil, "the retained worker could not be created") {
+		acp_session_free(retained)
+		_ = acp_server_destroy(&server)
+		return
+	}
+	worker.data = &state
+	retained.worker = worker
+	server.sessions[1] = retained
+	thread.start(worker)
+	complete := acp_server_destroy(&server, time.Millisecond)
+	testing.expect(t, !complete, "shutdown reported success while a worker still borrowed the connection")
+	testing.expect(t, server.sessions[0] == nil, "the joined session was not released after another worker timed out")
+	testing.expect(t, server.sessions[1] == retained, "the unjoined session was freed")
+	testing.expect(
+		t,
+		acp.writer_write_response(&server.writer, i64(1), acp.Empty_Result{}),
+		"the shared writer was destroyed while a worker could still enqueue",
+	)
+	sync.one_shot_event_signal(&state.release)
+	if join_retiring(worker, &retained.worker_done) {
+		retained.worker = nil
+		server.worker_stuck = false
+	}
+	testing.expect(t, acp_server_destroy(&server), "the retained connection did not shut down after its worker retired")
+}
+
+@(test)
+test_acp_cancellation_routes_to_the_named_session :: proc(t: ^testing.T) {
+	server: Acp_Server
+	first: Acp_Session
+	second: Acp_Session
+	first.conn = &server
+	first.id = "session-first"
+	first.pending_work = 1
+	second.conn = &server
+	second.id = "session-second"
+	second.pending_work = 1
+	server.sessions[0] = &first
+	server.sessions[1] = &second
+	params, parse_error := json.parse_string(`{"sessionId":"session-second"}`, .JSON, true, context.allocator)
+	if parse_error != nil { testing.fail_now(t, "the cancellation parameters could not be parsed") }
+	defer json.destroy_value(params, context.allocator)
+	envelope := acp.Envelope {
+		kind   = .Request,
+		id     = i64(1),
+		params = params,
+	}
+	acp_request_cancel(&server, &envelope)
+	testing.expect(t, !agent.turn_control_stop_requested(&first.app.run.control), "cancellation stopped the wrong session")
+	testing.expect(t, agent.turn_control_stop_requested(&second.app.run.control), "cancellation did not stop the named session")
+}
+
+@(test)
+test_acp_busy_sessions_refuse_a_ninth_open :: proc(t: ^testing.T) {
+	server: Acp_Server
+	if !acp_test_server_init(t, &server) { return }
+	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
+	for i in 0 ..< ACP_MAX_SESSIONS {
+		session, reason := acp_session_create(&server, fmt.tprintf("session-%d", i))
+		if !testing.expectf(t, session != nil, "session %d could not be created: %s", i, reason) { return }
+		sync.mutex_lock(&session.queue_mu)
+		session.pending_work = 1
+		sync.mutex_unlock(&session.queue_mu)
+	}
+	refused, reason := acp_session_create(&server, "session-ninth")
+	testing.expect(t, refused == nil, "a ninth session was admitted while all sessions were busy")
+	testing.expect(t, strings.contains(reason, "all of them are busy"), "the full-table error did not explain that all sessions are busy")
+	for i in 0 ..< ACP_MAX_SESSIONS {
+		testing.expect(t, acp_session_find(&server, fmt.tprintf("session-%d", i)) != nil, "a busy session was lost when the ninth was refused")
+	}
+	for session in server.sessions {
+		if session == nil { continue }
+		sync.mutex_lock(&session.queue_mu)
+		session.pending_work = 0
+		sync.mutex_unlock(&session.queue_mu)
+	}
+}
+
+@(test)
+test_acp_idle_sessions_are_evicted_by_lru_and_can_be_loaded_again :: proc(t: ^testing.T) {
+	server: Acp_Server
+	if !acp_test_server_init(t, &server) { return }
+	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
+	for i in 0 ..< ACP_MAX_SESSIONS {
+		session, reason := acp_session_create(&server, fmt.tprintf("session-%d", i))
+		if !testing.expectf(t, session != nil, "session %d could not be created: %s", i, reason) { return }
+	}
+	acp_session_touch(acp_session_find(&server, "session-0"))
+	opened, reason := acp_session_create(&server, "session-ninth")
+	if !testing.expectf(t, opened != nil, "the idle session did not make room: %s", reason) { return }
+	testing.expect(t, acp_session_find(&server, "session-1") == nil, "the least recently used idle session was not evicted")
+	testing.expect(t, acp_session_find(&server, "session-0") != nil, "the recently used idle session was evicted")
+	reloaded, reload_reason := acp_session_create(&server, "session-1")
+	testing.expectf(t, reloaded != nil, "the evicted session could not be opened again: %s", reload_reason)
+	testing.expect(t, acp_session_find(&server, "session-1") != nil, "the reloaded session was not published")
+}
+
 acp_test_stalled_output_wait :: proc(t: ^testing.T, state: ^Acp_Test_Stalled_Output) {
 	sync.mutex_lock(&state.mutex)
 	deadline := time.tick_add(time.tick_now(), time.Second)
@@ -323,8 +466,11 @@ test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 	defer delete(state.output)
 	server: Acp_Server
 	server.alloc = context.allocator
-	server.session_id = "session-stalled"
-	server.pending_work = 1
+	session: Acp_Session
+	session.conn = &server
+	session.id = "session-stalled"
+	session.pending_work = 1
+	server.sessions[0] = &session
 	writer, writer_error := acp.writer_init(acp_test_stalled_output(&state), server.alloc)
 	if writer_error != nil { testing.fail_now(t, "the writer could not be created") }
 	server.writer = writer
@@ -377,7 +523,7 @@ test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 	thread.join(cancel_thread)
 	thread.destroy(cancel_thread)
 	testing.expect(t, completed_while_stalled, "the cancellation handler waited for stdout")
-	testing.expect(t, agent.turn_control_stop_requested(&server.app.run.control), "the cancellation did not stop the turn")
+	testing.expect(t, agent.turn_control_stop_requested(&session.app.run.control), "the cancellation did not stop the turn")
 	testing.expect(t, acp.writer_destroy(&server.writer, time.Second), "the released writer should retire")
 }
 
@@ -554,6 +700,28 @@ acp_test_run_thread :: proc(thread_handle: ^thread.Thread) {
 @(test)
 test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
+	acp_test_session_protocol(t, .Independent)
+}
+
+@(test)
+test_acp_refused_claim_keeps_an_existing_session_usable :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	acp_test_session_protocol(t, .Refused_Claim)
+}
+
+@(test)
+test_acp_evicted_persisted_session_replays_and_accepts_another_prompt :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	acp_test_session_protocol(t, .Persisted_Eviction)
+}
+
+Acp_Test_Session_Scenario :: enum {
+	Independent,
+	Refused_Claim,
+	Persisted_Eviction,
+}
+
+acp_test_session_protocol :: proc(t: ^testing.T, scenario: Acp_Test_Session_Scenario) {
 	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-workspace-*", context.allocator)
 	if workspace_err != nil {
 		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
@@ -615,6 +783,14 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 		acp_test_stream_reply(
 			acp_test_sse_body(
 				{`{"choices":[{"delta":{"content":"the note says so"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+			),
+		),
+		acp_test_stream_reply(
+			acp_test_sse_body(
+				{
+					`{"choices":[{"delta":{"content":"the second session answered"},"finish_reason":null}]}`,
+					`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+				},
 			),
 		),
 	}
@@ -739,6 +915,83 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 	acp_test_load_session_message(&missing, 5, "00000000000000000000000000000000", workspace)
 	acp_test_client_send(&client, strings.to_string(missing))
 	if acp_test_client_expect(t, &client, `"code":-32602`, "loading an unknown session was not refused") == "" { return }
+
+	if scenario == .Refused_Claim {
+		directory, directory_error := agent.xdg_directory(.State, context.allocator)
+		if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
+		defer delete(directory, context.allocator)
+		locks, _, locks_error := agent.session_lock_directory(context.allocator)
+		if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
+		defer delete(locks, context.allocator)
+		other: journal.Journal
+		if !testing.expect_value(t, journal.open(&other, directory, locks, journal.run_id_create(), .Read_Write, context.allocator), nil) { return }
+		defer _ = journal.close(&other)
+		target, create_error := journal.create_session(&other, {workspace = workspace})
+		if !testing.expect_value(t, create_error, nil) { return }
+		_, commit_error := journal.commit(&other)
+		if !testing.expect_value(t, commit_error, nil) { return }
+		refused := strings.builder_make(context.temp_allocator)
+		target_text: [32]u8
+		acp_test_load_session_message(&refused, 20, journal.session_id_to_hex(target, target_text[:]), workspace)
+		acp_test_client_send(&client, strings.to_string(refused))
+		refusal := acp_test_client_expect(t, &client, `"id":20,"error":`, "loading a claimed session was not refused")
+		if refusal == "" { return }
+		if !testing.expect(t, strings.contains(refusal, `"code":-32602`), "the claim refusal did not use invalid parameters") { return }
+	}
+	if scenario == .Persisted_Eviction {
+		for i in 0 ..< ACP_MAX_SESSIONS {
+			opening_idle := strings.builder_make(context.temp_allocator)
+			acp_test_new_session_message(&opening_idle, 10 + i, workspace)
+			acp_test_client_send(&client, strings.to_string(opening_idle))
+			if acp_test_client_expect(t, &client, fmt.tprintf(`"id":%d,"result":`, 10 + i), "an idle session did not open") == "" { return }
+		}
+		unknown := strings.builder_make(context.temp_allocator)
+		acp_test_prompt_message(&unknown, 20, session_id, "the evicted id must be unknown")
+		acp_test_client_send(&client, strings.to_string(unknown))
+		if acp_test_client_expect(t, &client, `"id":20,"error":`, "the evicted session id was still routed") == "" { return }
+		reload_evicted := strings.builder_make(context.temp_allocator)
+		acp_test_load_session_message(&reload_evicted, 21, session_id, workspace)
+		acp_test_client_send(&client, strings.to_string(reload_evicted))
+		replayed := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message_chunk"`, "the evicted session did not replay its history")
+		if !acp_test_client_carries(t, replayed, {session_id, "read the note"}, "the evicted session replay") { return }
+		if acp_test_client_expect(t, &client, `"sessionUpdate":"tool_call"`, "the evicted session did not replay its completed call") == "" { return }
+		if acp_test_client_expect(t, &client, "the note says so", "the evicted session did not replay its answer") == "" { return }
+		if acp_test_client_expect(t, &client, `"id":21,"result":{}`, "the evicted session did not finish loading") == "" { return }
+	}
+	if scenario != .Independent {
+		still_usable := strings.builder_make(context.temp_allocator)
+		acp_test_prompt_message(&still_usable, 22, session_id, "answer after the session lifecycle change")
+		acp_test_client_send(&client, strings.to_string(still_usable))
+		answer := acp_test_client_expect(t, &client, "the second session answered", "the earlier session could not answer another prompt")
+		if !acp_test_client_carries(t, answer, {session_id}, "the surviving session answer") { return }
+		if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the surviving session did not report usage") == "" { return }
+		if acp_test_client_expect(t, &client, `"id":22,"result":`, "the surviving session prompt was not answered") == "" { return }
+		return
+	}
+
+	second_opening := strings.builder_make(context.temp_allocator)
+	acp_test_new_session_message(&second_opening, 7, workspace)
+	acp_test_client_send(&client, strings.to_string(second_opening))
+	second_opened := acp_test_client_expect(t, &client, `"sessionId"`, "the second session was not opened")
+	if second_opened == "" { return }
+	second_session_id := acp_test_client_session_id_from_frame(t, second_opened)
+	if second_session_id == "" { return }
+	defer delete(second_session_id, context.allocator)
+	if !testing.expect(t, second_session_id != session_id, "independent opens returned the same session id") { return }
+
+	second_prompt := strings.builder_make(context.temp_allocator)
+	acp_test_prompt_message(&second_prompt, 8, second_session_id, "answer from the second session")
+	acp_test_client_send(&client, strings.to_string(second_prompt))
+	second_answer := acp_test_client_expect(t, &client, "the second session answered", "the second session prompt was routed incorrectly")
+	if second_answer == "" { return }
+	if !strings.contains(second_answer, second_session_id) {
+		testing.expectf(t, false, "the second session answer named the wrong session: %s", second_answer)
+		return
+	}
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the second session did not report usage") == "" { return }
+	second_result := acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the second session prompt was not answered")
+	if second_result == "" { return }
+	testing.expectf(t, strings.contains(second_result, `"id":8`), "the second session prompt response used the wrong request id: %s", second_result)
 }
 
 @(test)
@@ -1343,4 +1596,33 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 	acp_test_end(&unknown_option)
 	acp_test_client_send(&client, strings.to_string(unknown_option))
 	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown config option was not refused") == "" { return }
+}
+@(test)
+test_acp_owner_activity_prevents_eviction_until_idle :: proc(t: ^testing.T) {
+	server: Acp_Server
+	if !acp_test_server_init(t, &server) { return }
+	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
+	for i in 0 ..< ACP_MAX_SESSIONS {
+		session, made := acp_session_make(&server, fmt.tprintf("session-%d", i))
+		if !testing.expect(t, made, "the fixture session could not be allocated") { return }
+		server.sessions[i] = session
+		acp_session_touch(session)
+		testing.expect(t, acp_owner_service_begin(session), "the owner could not reserve background servicing")
+	}
+	first := server.sessions[0]
+	first.model_selection.active = true
+	acp_owner_service_end(first)
+	refused, reason := acp_session_create(&server, "session-ninth")
+	testing.expect(t, refused == nil, "owner activity or a pending model selection allowed eviction")
+	testing.expect(t, strings.contains(reason, "all of them are busy"), "the refusal did not report busy sessions")
+	first.model_selection.active = false
+	acp_owner_service_end(first)
+	opened, open_reason := acp_session_create(&server, "session-ninth")
+	testing.expectf(t, opened != nil, "restored idle did not allow eviction: %s", open_reason)
+	testing.expect(t, acp_session_find(&server, "session-0") == nil, "the restored idle session was not evicted")
+	closing := server.sessions[1]
+	sync.mutex_lock(&server.table_mu)
+	closing.closing = true
+	sync.mutex_unlock(&server.table_mu)
+	testing.expect(t, !acp_owner_service_begin(closing), "background servicing began after closing")
 }

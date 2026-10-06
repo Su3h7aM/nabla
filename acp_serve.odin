@@ -9,7 +9,6 @@ import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
-import "core:thread"
 
 import "nabla:acp"
 import "nabla:agent"
@@ -56,6 +55,8 @@ acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 				_ = acp.writer_write_error(&server.writer, nil, acp.ERROR_PARSE, acp.frame_error_text(frame_err))
 			}
 			for frame in frames {
+				// A session whose worker retired gives its slot back before the next request.
+				acp_sessions_reap(server)
 				acp_handle_frame(server, frame)
 				delete(frame, server.alloc)
 				// Temp scratch belongs to one message: a request is decoded into it and
@@ -71,10 +72,11 @@ acp_serve :: proc(server: ^Acp_Server, input: io.Reader) -> bool {
 			break
 		}
 	}
-	// A turn still running is stopped before the worker is joined: it settles as
+	// A turn still running is stopped before the workers are joined: it settles as
 	// cancelled, so the record says the session was interrupted rather than guessing.
-	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
-	acp_model_cancel_signal(server)
+	for session in server.sessions {
+		if session != nil { acp_cancel_session(session) }
+	}
 	return !read_failed && !acp.writer_failed(&server.writer)
 }
 
@@ -164,7 +166,8 @@ acp_handle_single_frame :: proc(server: ^Acp_Server, frame: string) {
 }
 
 // acp_handle_request answers one request. A request that opens a session or runs a turn
-// is handed to the worker, which owns the session; everything else is answered here.
+// is handed to the worker of the session it names, which owns that session; everything
+// else is answered here.
 acp_handle_request :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	switch envelope.method {
 	case acp.METHOD_INITIALIZE:
@@ -205,7 +208,7 @@ acp_request_cancel :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/cancel needs a session id")
 		return
 	}
-	acp_cancel_session(server, params.session_id)
+	if session := acp_session_find(server, params.session_id); session != nil { acp_cancel_session(session) }
 	_ = acp.writer_write_response(&server.writer, envelope.id, acp.Empty_Result{})
 }
 
@@ -214,7 +217,7 @@ acp_handle_notification :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	case acp.SESSION_CANCEL:
 		params: acp.Session_Cancel_Params
 		if acp.params_decode(envelope.params, &params, context.temp_allocator) != .None { return }
-		acp_cancel_session(server, params.session_id)
+		if session := acp_session_find(server, params.session_id); session != nil { acp_cancel_session(session) }
 	case:
 	// A notification is an announcement, not a request: an unknown one is ignored, so a
 	// client that speaks a newer version of the protocol is not disconnected by it.
@@ -321,10 +324,6 @@ acp_request_session_new :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a session is opened")
 		return
 	}
-	if acp_server_has_work(server) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
-		return
-	}
 	params: acp.Session_New_Params
 	if !acp_request_params_decode(server, envelope, &params, "session/new needs a working directory") { return }
 	if reason := acp_session_params_reason(params.mcp_servers, params.additional_directories, acp_is_v2(server)); reason != "" {
@@ -359,10 +358,6 @@ acp_request_session_new :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	if !server.initialized {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a session is opened")
-		return
-	}
-	if acp_server_has_work(server) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
 		return
 	}
 	params: acp.Session_Load_Params
@@ -408,10 +403,6 @@ acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope)
 	}
 	if !server.initialized {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a session is opened")
-		return
-	}
-	if acp_server_has_work(server) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
 		return
 	}
 	params: acp.Session_Resume_Params
@@ -469,34 +460,117 @@ acp_request_session_list :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the session/list working directory must be absolute")
 		return
 	}
-	cwd, cwd_error := strings.clone(params.cwd, server.alloc)
-	if cwd_error != nil {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list filter could not be allocated")
+	before: journal.Journal_Seq
+	if params.cursor != "" {
+		decoded, valid := acp_session_cursor_decode(params.cursor)
+		if !valid {
+			acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the session/list cursor is invalid")
+			return
+		}
+		before = decoded
+	}
+	acp_session_list(server, envelope, params.cwd, before)
+}
+
+// acp_session_list reads persisted sessions through a read-only journal and adds sessions
+// that have been opened on this connection but have not committed their first record.
+// Session strings copied from the table use temp memory so no table lock spans the writer.
+acp_session_list :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, cwd: string, before: journal.Journal_Seq) {
+	store: journal.Journal
+	if open_error := journal.open(&store, server.app.setup.journal_directory, "", server.app.setup.run, .Read_Only, context.temp_allocator);
+	   open_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session database could not be opened")
 		return
 	}
-	cursor, cursor_error := strings.clone(params.cursor, server.alloc)
-	if cursor_error != nil {
-		delete(cwd, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list cursor could not be allocated")
+	defer _ = journal.close(&store)
+	filter := journal.Session_Filter {
+		workspace = cwd,
+		limit     = ACP_SESSION_LIST_PAGE_SIZE + 1,
+		before    = before,
+	}
+	stored, list_error := journal.list_sessions(&store, filter, context.temp_allocator)
+	if list_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be read")
 		return
 	}
-	id, id_ok := acp_work_id(envelope.id, server.alloc)
-	if !id_ok {
-		delete(cwd, server.alloc)
-		delete(cursor, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
+	defer journal.session_summaries_destroy(stored, context.temp_allocator)
+
+	infos, infos_error := make([dynamic]acp.Session_Info, 0, len(stored) + ACP_MAX_SESSIONS, context.temp_allocator)
+	if infos_error != nil {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be allocated")
 		return
 	}
-	work := Acp_Work {
-		kind        = .List_Sessions,
-		id          = id,
-		list_cwd    = cwd,
-		list_cursor = cursor,
+	stored_count := min(len(stored), ACP_SESSION_LIST_PAGE_SIZE)
+	for summary in stored[:stored_count] {
+		id_buffer: [journal.SESSION_ID_HEX_LENGTH]u8
+		id, id_error := strings.clone(journal.session_id_to_hex(summary.id, id_buffer[:]), context.temp_allocator)
+		if id_error != nil {
+			acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be allocated")
+			return
+		}
+		info := acp.Session_Info {
+			session_id = id,
+			cwd        = summary.workspace,
+			title      = summary.title,
+			updated_at = acp_session_timestamp(summary.updated_ms),
+		}
+		appended, append_error := append(&infos, info)
+		if append_error != nil || appended != 1 {
+			acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be allocated")
+			return
+		}
 	}
-	work.session_generation = acp_capture_session_generation(server)
-	if !acp_enqueue(server, work) {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
+
+	live_infos: [ACP_MAX_SESSIONS]acp.Session_Info
+	live_count := 0
+	live_copy_failed := false
+	sync.mutex_lock(&server.table_mu)
+	for session in server.sessions {
+		if session == nil || session.closing || session.id == "" || (cwd != "" && session.workspace != cwd) { continue }
+		id, id_error := strings.clone(session.id, context.temp_allocator)
+		workspace, workspace_error := strings.clone(session.workspace, context.temp_allocator)
+		title, title_error := strings.clone(session.title, context.temp_allocator)
+		if id_error != nil || workspace_error != nil || title_error != nil {
+			delete(id)
+			delete(workspace)
+			delete(title)
+			live_copy_failed = true
+			break
+		}
+		live_infos[live_count] = acp.Session_Info {
+			session_id = id,
+			cwd        = workspace,
+			title      = title,
+		}
+		live_count += 1
 	}
+	sync.mutex_unlock(&server.table_mu)
+	if live_copy_failed {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be allocated")
+		return
+	}
+	for info in live_infos[:live_count] {
+		parsed_id, valid := journal.session_id_parse(info.session_id)
+		if !valid { continue }
+		matching, matching_error := journal.list_sessions(&store, journal.Session_Filter{session = parsed_id, limit = 1}, context.temp_allocator)
+		if matching_error != nil {
+			acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be read")
+			return
+		}
+		is_stored := len(matching) > 0
+		journal.session_summaries_destroy(matching, context.temp_allocator)
+		if is_stored { continue }
+		appended, append_error := append(&infos, info)
+		if append_error != nil || appended != 1 {
+			acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be allocated")
+			return
+		}
+	}
+	next_cursor := ""
+	if len(stored) > ACP_SESSION_LIST_PAGE_SIZE {
+		next_cursor = acp_session_cursor_encode(stored[stored_count - 1].last_seq)
+	}
+	_ = acp.writer_write_response(&server.writer, envelope.id, acp.Session_List_Result{sessions = infos[:], next_cursor = next_cursor})
 }
 
 acp_request_session_close :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
@@ -512,31 +586,30 @@ acp_request_session_close :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) 
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/close needs a session id")
 		return
 	}
-	if !acp_session_matches(server, params.session_id) {
+	session := acp_session_find(server, params.session_id)
+	if session == nil {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
-		return
-	}
-	acp_cancel_session(server, params.session_id)
-	reference, reference_error := strings.clone(params.session_id, server.alloc)
-	if reference_error != nil {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session reference could not be allocated")
 		return
 	}
 	id, id_ok := acp_work_id(envelope.id, server.alloc)
 	if !id_ok {
-		delete(reference, server.alloc)
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
 	work := Acp_Work {
-		kind        = .Close_Session,
-		id          = id,
-		session_ref = reference,
+		kind = .Close_Session,
+		id   = id,
 	}
-	acp_mark_session_closing(server)
-	work.session_generation = acp_capture_session_generation(server)
-	if !acp_enqueue(server, work) {
-		acp_unmark_session_closing(server, work.session_generation)
+	acp_cancel_session(session)
+	// Marking the session closing refuses every later request for it, and the worker runs
+	// the close after what is already queued.
+	sync.mutex_lock(&server.table_mu)
+	session.closing = true
+	sync.mutex_unlock(&server.table_mu)
+	if !acp_enqueue(session, work) {
+		sync.mutex_lock(&server.table_mu)
+		session.closing = false
+		sync.mutex_unlock(&server.table_mu)
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}
 }
@@ -554,12 +627,13 @@ acp_request_set_config_option :: proc(server: ^Acp_Server, envelope: ^acp.Envelo
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/set_config_option needs a session, config id, and value")
 		return
 	}
-	if !acp_session_matches(server, params.session_id) {
+	session := acp_session_find(server, params.session_id)
+	if session == nil {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
 		return
 	}
 	if params.config_id == "model" {
-		acp_request_model_change(server, envelope, .Set_Config_Option, params.session_id, params.value)
+		acp_request_model_change(server, envelope, session, .Set_Config_Option, params.value)
 		return
 	}
 	config_id, config_id_error := strings.clone(params.config_id, server.alloc)
@@ -586,8 +660,7 @@ acp_request_set_config_option :: proc(server: ^Acp_Server, envelope: ^acp.Envelo
 		config_id    = config_id,
 		config_value = value,
 	}
-	work.session_generation = acp_capture_session_generation(server)
-	if !acp_enqueue(server, work) {
+	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}
 }
@@ -724,11 +797,35 @@ acp_enqueue_open_session :: proc(
 		start         = start,
 		replay        = replay,
 	}
-	work.session_generation = acp_capture_session_generation(server)
-	if !acp_enqueue(server, work) {
+	// A stored session this connection already runs is opened again by its own worker, so
+	// it is never claimed twice. Anything else gets a session of its own, which a full
+	// table makes room for or refuses; a refusal changes no session that is running.
+	created := false
+	session: ^Acp_Session
+	if kind == .Resume_Id { session = acp_session_find(server, session_id) }
+	if session == nil {
+		reason: string
+		session, reason = acp_session_create(server, session_id)
+		if session == nil {
+			acp_work_destroy(&work, server.alloc)
+			acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, reason)
+			return
+		}
+		created = true
+	}
+	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
+		if created {
+			sync.mutex_lock(&server.table_mu)
+			for entry, index in server.sessions {
+				if entry == session { server.sessions[index] = nil }
+			}
+			sync.mutex_unlock(&server.table_mu)
+			acp_session_drop(server, session)
+		}
 	}
 }
+
 // acp_session_meta_system_prompt reads the two systemPrompt forms used by ACP
 // clients. The object form appends to the agent's own instructions instead of
 // replacing them.
@@ -825,18 +922,19 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a prompt")
 		return
 	}
-	if acp_server_has_work(server) && !acp_is_v2(server) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
-		return
-	}
 	params: acp.Session_Prompt_Params
 	params_error := acp.session_prompt_params_decode(envelope.params, &params, context.temp_allocator)
 	if !acp_request_params_result(server, envelope, params_error, "session/prompt needs a prompt") { return }
-	// The prompt names the session it belongs to. A request for a session this process is
-	// not running is refused here: the process holds a session of its own from startup,
-	// and only the client's own session/new may replace it.
-	if !acp_session_matches(server, params.session_id) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id; call session/new first")
+	// The prompt names the session it belongs to. A request for a session this connection
+	// is not running, including one it closed to make room, is refused here; the client
+	// can load it again.
+	session := acp_session_find(server, params.session_id)
+	if session == nil {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id; call session/new or session/load first")
+		return
+	}
+	if acp_session_has_work(session) && !acp_is_v2(server) {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
 		return
 	}
 	text, reason, ok := acp_prompt_text(params.prompt, context.temp_allocator)
@@ -848,7 +946,7 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the prompt is empty")
 		return
 	}
-	if server.app.setup.model_id == "" {
+	if session.app.setup.model_id == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "no model is selected; configure a provider in nabla's config.lua")
 		return
 	}
@@ -868,8 +966,7 @@ acp_request_prompt :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		id   = id,
 		text = prompt_text,
 	}
-	work.session_generation = acp_capture_session_generation(server)
-	if !acp_enqueue(server, work) {
+	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}
 }
@@ -891,24 +988,17 @@ acp_request_set_model :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/set_model needs a session id and model id")
 		return
 	}
-	if !acp_session_matches(server, params.session_id) {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id; call session/new first")
+	session := acp_session_find(server, params.session_id)
+	if session == nil {
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id; call session/new or session/load first")
 		return
 	}
-	acp_request_model_change(server, envelope, .Set_Model, params.session_id, params.model_id)
+	acp_request_model_change(server, envelope, session, .Set_Model, params.model_id)
 }
 
-// acp_request_model_change hands a copied raw model id to the owner; catalog
+// acp_request_model_change hands a copied raw model id to the owner of session; catalog
 // resolution stays on that owner and does not hold the reader in session work.
-acp_request_model_change :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, kind: Acp_Work_Kind, session_id, model_id: string) {
-	sync.mutex_lock(&server.mu)
-	valid_session := !server.closing && server.session_id != "" && server.session_id == session_id
-	generation := server.session_generation
-	sync.mutex_unlock(&server.mu)
-	if !valid_session {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "no session is open for that id")
-		return
-	}
+acp_request_model_change :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session: ^Acp_Session, kind: Acp_Work_Kind, model_id: string) {
 	owned_model_id, model_error := strings.clone(model_id, server.alloc)
 	if model_error != nil {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the model id could not be allocated")
@@ -921,57 +1011,40 @@ acp_request_model_change :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, k
 		return
 	}
 	request := Acp_Model_Request {
-		active             = true,
-		kind               = kind,
-		id                 = id,
-		model_id           = owned_model_id,
-		session_generation = generation,
+		active   = true,
+		kind     = kind,
+		id       = id,
+		model_id = owned_model_id,
 	}
-	acp_model_request_submit(server, request)
+	acp_session_touch(session)
+	acp_model_request_submit(session, request)
 }
 
-// acp_session_matches reports whether the id names the session this process runs. A
-// request is matched against it before it is handed to the worker, so a request for a
-// session the client never opened cannot reach the session the process started with.
+// acp_cancel_session asks the running turn of session to stop. A cancellation for a
+// session that is idle is ignored, which is what the protocol expects: a turn that
+// already ended has nothing to cancel.
+acp_cancel_session :: proc(session: ^Acp_Session) {
+	acp_model_cancel_signal(session)
+	if acp_session_has_work(session) { agent.turn_control_stop(&session.app.run.control) }
+}
+
+// acp_enqueue hands one request to the worker of session. It owns work on both paths: on
+// success the worker releases it, and on failure it is released here, so the caller must
+// not free it again.
 @(require_results)
-acp_session_matches :: proc(server: ^Acp_Server, session_id: string) -> bool {
-	sync.mutex_lock(&server.mu)
-	defer sync.mutex_unlock(&server.mu)
-	return !server.closing && server.session_id != "" && server.session_id == session_id
-}
-
-@(require_results)
-acp_closing_session_matches :: proc(server: ^Acp_Server, session_id: string) -> bool {
-	sync.mutex_lock(&server.mu)
-	defer sync.mutex_unlock(&server.mu)
-	return server.closing && server.session_id != "" && server.session_id == session_id
-}
-
-// acp_cancel_session asks the running turn to stop. A cancellation for a session that is
-// not running is ignored, which is what the protocol expects: a turn that already ended
-// has nothing to cancel.
-acp_cancel_session :: proc(server: ^Acp_Server, session_id: string) {
-	if !acp_session_matches(server, session_id) { return }
-	acp_model_cancel_signal(server)
-	if acp_server_has_work(server) { agent.turn_control_stop(&server.app.run.control) }
-}
-
-// acp_enqueue hands one request to the worker. It owns work on both paths: on success the
-// worker releases it, and on failure it is released here, so the caller must not free it
-// again.
-@(require_results)
-acp_enqueue :: proc(server: ^Acp_Server, work: Acp_Work) -> bool {
+acp_enqueue :: proc(session: ^Acp_Session, work: Acp_Work) -> bool {
 	item := work
+	acp_session_touch(session)
 	// The request is marked in flight before it is queued, so a worker that finishes it
 	// immediately cannot clear a flag that was never set. The count keeps that flag set
 	// while a v2 prompt waits behind the active turn.
-	acp_queue_add(server)
-	if chan.try_send(server.work, item) {
+	acp_queue_add(session)
+	if chan.try_send(session.work, item) {
 		agent.owner_wake_signal()
 		return true
 	}
-	acp_queue_remove(server)
-	acp_work_destroy(&item, server.alloc)
+	acp_queue_remove(session)
+	acp_work_destroy(&item, session.conn.alloc)
 	return false
 }
 
@@ -1073,10 +1146,12 @@ acp_usage :: proc() {
 	fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
 }
 
-// acp_run opens the front-end, serves one conversation on the given streams, and releases
+// acp_run opens the front-end, serves conversations on the given streams, and releases
 // everything it owns. It is the whole front-end except its configuration and the process
 // lifetime around it, which is what lets a test drive a real conversation without a
 // process. False means the run could not be opened or the stream failed before it ended.
+// When retained is provided, it reports whether shutdown left workers borrowing the
+// configuration or output. Those borrows must then remain valid until process exit.
 @(require_results)
 acp_run :: proc(
 	sources: []agent.Catalog_Provider_Source,
@@ -1084,25 +1159,32 @@ acp_run :: proc(
 	mcp_servers: []agent.MCP_Server_Config,
 	input: io.Reader,
 	output: io.Writer,
+	retained: ^bool = nil,
 ) -> bool {
+	if retained != nil { retained^ = false }
 	server, server_error := new(Acp_Server)
 	if server_error != nil { return false }
 	server.alloc = context.allocator
 	server_cleanup_managed := false
 	defer if !server_cleanup_managed { free(server, server.alloc) }
 	server.app.run.alloc = server.alloc
-	server.app.setup.alloc = server.alloc
 	server.app.setup.harness_options = harness_options
 	server.app.compact_on_switch = harness_options.compact_on_switch
 	server.base_mcp_servers = mcp_servers
 	// The model this run picks belongs to the conversation, not to the user: an editor
 	// session neither publishes a selection nor remembers one.
 	server.app.setup.owns_selection = false
-	if !run_catalog(sources, mcp_servers, &server.app.setup, Session_Start{kind = .New}) { return false }
+	if !acp_connection_open(server, sources) { return false }
 	server_cleanup_managed = true
 	defer {
 		// An unretired worker can still reach server, so its owner memory stays alive.
-		if acp_server_destroy(server) { free(server, server.alloc) }
+		if acp_server_destroy(server) {
+			snapshot_destroy(&server.app)
+			catalog_run_destroy(&server.app)
+			free(server, server.alloc)
+		} else if retained != nil {
+			retained^ = true
+		}
 	}
 
 	writer, writer_err := acp.writer_init(output, server.alloc)
@@ -1111,24 +1193,6 @@ acp_run :: proc(
 		return false
 	}
 	server.writer = writer
-	channel, channel_err := chan.create_buffered(Acp_Work_Chan, ACP_WORK_CAPACITY, server.alloc)
-	if channel_err != nil {
-		fmt.eprintln("nabla: cannot create the request queue")
-		return false
-	}
-	server.work = channel
-	worker := thread.create(acp_worker, name = "nabla-acp-worker")
-	if worker == nil {
-		fmt.eprintln("nabla: cannot start the ACP worker thread")
-		return false
-	}
-	worker.data = server
-	server.worker = worker
-	thread.start(worker)
-
-	if !acp_select_startup_model(server) {
-		fmt.eprintln("nabla: no model could be selected; configure a provider in nabla's config.lua")
-	}
 	return acp_serve(server, input)
 }
 
@@ -1178,8 +1242,11 @@ acp_main :: proc(args: []string) -> int {
 		fmt.eprintln(config_error_display_text(config_path, config_err, config_detail))
 		return 1
 	}
-	defer agent.catalog_sources_destroy(&sources)
-	defer agent.mcp_servers_destroy(&mcp_servers)
+	retained := false
+	defer if !retained {
+		agent.catalog_sources_destroy(&sources)
+		agent.mcp_servers_destroy(&mcp_servers)
+	}
 
 	// Signals end the run the way a client closing the stream does, so a killed editor
 	// leaves a session that says it was interrupted. This is the process's own lifetime,
@@ -1188,7 +1255,7 @@ acp_main :: proc(args: []string) -> int {
 	agent.chat_interactive_arm(&signals)
 	defer agent.chat_interactive_disarm(&signals)
 
-	served := acp_run(sources[:], harness_options, mcp_servers[:], io.to_reader(os.to_stream(os.stdin)), io.to_writer(os.to_stream(os.stdout)))
+	served := acp_run(sources[:], harness_options, mcp_servers[:], io.to_reader(os.to_stream(os.stdin)), io.to_writer(os.to_stream(os.stdout)), &retained)
 	// A signal ends the run the way a client closing the stream does, and stopping for it
 	// is not a stream failure.
 	if served || agent.process_interrupted() { return 0 }
