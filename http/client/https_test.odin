@@ -19,20 +19,20 @@ import "core:time"
 HTTPS_STARTUP_TIMEOUT :: 10 * time.Second
 HTTPS_ATTEMPTS :: 3
 
-// Https_Body gathers the response body of one request. It is per test: the
+// HTTPS_Body gathers the response body of one request. It is per test: the
 // callback appends to it while the request runs.
-Https_Body :: struct {
+HTTPS_Body :: struct {
 	buffer: [dynamic]u8,
 }
 
-// Https_Server owns one `openssl s_server` child. Stopping kills what is left
+// HTTPS_Server owns one `openssl s_server` child. Stopping kills what is left
 // and reaps it, so a failed request cannot leak a server into the next attempt.
-Https_Server :: struct {
+HTTPS_Server :: struct {
 	process: os.Process,
 	running: bool,
 }
 
-https_server_stop :: proc(t: ^testing.T, server: ^Https_Server) {
+https_server_stop :: proc(t: ^testing.T, server: ^HTTPS_Server) {
 	if !server.running { return }
 	server.running = false
 	_ = os.process_kill(server.process)
@@ -68,7 +68,7 @@ https_run_request :: proc(t: ^testing.T, directory: string) -> bool {
 	port, port_ok := https_free_port()
 	if !port_ok { return false }
 
-	server := Https_Server{}
+	server := HTTPS_Server{}
 	if !https_start_server(&server, directory, port) { return false }
 	defer https_server_stop(t, &server)
 
@@ -93,7 +93,7 @@ https_run_request :: proc(t: ^testing.T, directory: string) -> bool {
 	}
 	defer delete(request.url)
 
-	body := Https_Body {
+	body := HTTPS_Body {
 		buffer = make([dynamic]u8, 0, 64 * 1024, context.allocator),
 	}
 	defer delete(body.buffer)
@@ -131,7 +131,7 @@ https_keep_going :: proc(_: rawptr) -> Wait_Status {
 }
 
 https_collect :: proc(user_data: rawptr, chunk: []u8) {
-	body := cast(^Https_Body)user_data
+	body := cast(^HTTPS_Body)user_data
 	room := cap(body.buffer) - len(body.buffer)
 	if room <= 0 { return }
 	count := min(room, len(chunk))
@@ -178,7 +178,7 @@ https_generate_certificate :: proc(t: ^testing.T, directory: string) -> bool {
 	return true
 }
 
-https_start_server :: proc(server: ^Https_Server, directory: string, port: int) -> bool {
+https_start_server :: proc(server: ^HTTPS_Server, directory: string, port: int) -> bool {
 	process, err := os.process_start(
 		{
 			working_dir = directory,

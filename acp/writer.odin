@@ -116,7 +116,7 @@ writer_failed :: proc(writer: ^Writer) -> bool {
 // writer_submit_value serializes value and transfers its complete response frame to
 // the writer thread. True means queued, not written.
 @(private, require_results)
-writer_submit_value :: proc(writer: ^Writer, id: Jsonrpc_Id, key: string, value: $T) -> bool {
+writer_submit_value :: proc(writer: ^Writer, id: JSONRPC_Id, key: string, value: $T) -> bool {
 	state := writer.state
 	if state == nil { return false }
 	body, marshal_error := json.marshal(value, allocator = context.temp_allocator)
@@ -130,12 +130,12 @@ writer_submit_value :: proc(writer: ^Writer, id: Jsonrpc_Id, key: string, value:
 // writer_write_response serializes a result before transferring its complete frame to
 // the writer thread. True means queued, not written.
 @(require_results)
-writer_write_response :: proc(writer: ^Writer, id: Jsonrpc_Id, result: $T) -> bool {
+writer_write_response :: proc(writer: ^Writer, id: JSONRPC_Id, result: $T) -> bool {
 	return writer_submit_value(writer, id, `"result":`, result)
 }
 
-// Rpc_Error_Wire is the error document an error answer carries.
-Rpc_Error_Wire :: struct {
+// RPC_Error_Wire is the error document an error answer carries.
+RPC_Error_Wire :: struct {
 	code:    i64 `json:"code"`,
 	message: string `json:"message"`,
 }
@@ -143,8 +143,8 @@ Rpc_Error_Wire :: struct {
 // writer_write_error serializes an error before transferring its complete frame to the
 // writer thread. True means queued, not written.
 @(require_results)
-writer_write_error :: proc(writer: ^Writer, id: Jsonrpc_Id, code: i64, message: string) -> bool {
-	return writer_submit_value(writer, id, `"error":`, Rpc_Error_Wire{code = code, message = message})
+writer_write_error :: proc(writer: ^Writer, id: JSONRPC_Id, code: i64, message: string) -> bool {
+	return writer_submit_value(writer, id, `"error":`, RPC_Error_Wire{code = code, message = message})
 }
 
 // writer_write_notification serializes a notification before transferring its complete
@@ -176,7 +176,7 @@ writer_write_request :: proc(writer: ^Writer, id: i64, method: string, params: $
 }
 
 @(private, require_results)
-writer_encode_frame :: proc(state: ^Writer_State, id: Jsonrpc_Id, key: string, body: []byte) -> (string, bool) {
+writer_encode_frame :: proc(state: ^Writer_State, id: JSONRPC_Id, key: string, body: []byte) -> (string, bool) {
 	builder, builder_error := strings.builder_make(state.allocator)
 	if builder_error != nil { return "", false }
 	if !writer_builder_string(&builder, `{"jsonrpc":"2.0","id":`) ||
@@ -211,7 +211,7 @@ writer_encode_request :: proc(state: ^Writer_State, id: i64, method: string, bod
 	builder, builder_error := strings.builder_make(state.allocator)
 	if builder_error != nil { return "", false }
 	if !writer_builder_string(&builder, `{"jsonrpc":"2.0","id":`) ||
-	   !writer_write_id(&builder, Jsonrpc_Id(id)) ||
+	   !writer_write_id(&builder, JSONRPC_Id(id)) ||
 	   !writer_builder_string(&builder, `,"method":`) ||
 	   !writer_write_quoted(&builder, method) ||
 	   !writer_builder_string(&builder, `,"params":`) ||
@@ -401,7 +401,7 @@ writer_builder_byte :: proc(builder: ^strings.Builder, value: byte) -> bool {
 }
 
 @(private, require_results)
-writer_write_id :: proc(builder: ^strings.Builder, id: Jsonrpc_Id) -> bool {
+writer_write_id :: proc(builder: ^strings.Builder, id: JSONRPC_Id) -> bool {
 	switch value in id {
 	case i64, f64:
 		body, err := json.marshal(value, allocator = context.temp_allocator)
@@ -410,7 +410,7 @@ writer_write_id :: proc(builder: ^strings.Builder, id: Jsonrpc_Id) -> bool {
 		return writer_builder_bytes(builder, body)
 	case string:
 		return writer_write_quoted(builder, value)
-	case Jsonrpc_Null:
+	case JSONRPC_Null:
 		return writer_builder_string(builder, "null")
 	case:
 		// An id the envelope parser would have refused cannot name a request, so a

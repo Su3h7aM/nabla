@@ -82,7 +82,15 @@ subagent_program :: proc(args: Agent_Spawn_Args, parent: ^Agent_Parent, allocato
 }
 
 @(private, require_results)
-subagent_program_clone :: proc(config: ACP_Agent_Config, path, model: string, parent: ^Agent_Parent, allocator: mem.Allocator) -> (result_value: Subagent_Program, error: mem.Allocator_Error) {
+subagent_program_clone :: proc(
+	config: ACP_Agent_Config,
+	path, model: string,
+	parent: ^Agent_Parent,
+	allocator: mem.Allocator,
+) -> (
+	result_value: Subagent_Program,
+	error: mem.Allocator_Error,
+) {
 	built: Subagent_Program
 	complete := false
 	defer if !complete { subagent_program_destroy(&built, allocator) }
@@ -126,22 +134,22 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 	return "", false
 }
 
-// Acp_Input is the agent's stdin. Its descriptor pair comes from acp_input_open.
+// ACP_Input is the agent's stdin. Its descriptor pair comes from acp_input_open.
 @(private)
-Acp_Input :: struct {
+ACP_Input :: struct {
 	ours:   Tool_Fd,
 	theirs: ^os.File, // for the child's stdin; closed once the child has it
 	open:   bool,
 }
 
 @(private)
-acp_input_writer :: proc(input: ^Acp_Input) -> io.Writer {
+acp_input_writer :: proc(input: ^ACP_Input) -> io.Writer {
 	return io.Stream{procedure = acp_input_stream, data = input}
 }
 
 @(private = "file", require_results)
 acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-	input := cast(^Acp_Input)stream_data
+	input := cast(^ACP_Input)stream_data
 	#partial switch mode {
 	case .Write:
 		sent, ok := acp_input_send(input, p)
@@ -153,13 +161,13 @@ acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, o
 	return 0, .Unsupported
 }
 
-// Acp_Connection is one running agent program and the client state of its session.
+// ACP_Connection is one running agent program and the client state of its session.
 @(private)
-Acp_Connection :: struct {
+ACP_Connection :: struct {
 	member:        ^Subagent,
 	child:         Tool_Child,
 	started:       bool,
-	input:         ^Acp_Input,
+	input:         ^ACP_Input,
 	output:        ^os.File, // read end of the agent's stdout
 	errors:        ^os.File, // read end of the agent's stderr; nil once it ends
 	writer:        acp.Writer,
@@ -183,7 +191,7 @@ Acp_Connection :: struct {
 @(private)
 subagent_acp_run :: proc(member: ^Subagent) {
 	allocator := member.allocator
-	connection := Acp_Connection {
+	connection := ACP_Connection {
 		member = member,
 	}
 	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
@@ -276,7 +284,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 // with the prompt's answer; version 2 acknowledges the prompt and reports the end as an idle
 // state update. stop_reason is the agent's, temp-allocated.
 @(private, require_results)
-acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: string, problem: string) {
+acp_prompt :: proc(connection: ^ACP_Connection, text: string) -> (stop_reason: string, problem: string) {
 	Text_Block :: struct {
 		type: string `json:"type"`,
 		text: string `json:"text"`,
@@ -324,11 +332,11 @@ acp_prompt :: proc(connection: ^Acp_Connection, text: string) -> (stop_reason: s
 
 // acp_connection_open starts the agent program with its three standard streams piped here.
 @(private, require_results)
-acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
+acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
 	opened_input, input_ok := acp_input_open()
 	if !input_ok { return "the agent's input could not be created; nothing ran" }
-	input, input_error := new(Acp_Input, member.allocator)
+	input, input_error := new(ACP_Input, member.allocator)
 	if input_error != nil {
 		acp_input_close(&opened_input)
 		return "the agent's input could not be held; nothing ran"
@@ -374,7 +382,7 @@ acp_connection_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 // acp_connection_close stops the child before draining the writer, so a blocked send sees its
 // peer close. The agent keeps its own session; nothing here waits for it to save.
 @(private)
-acp_connection_close :: proc(connection: ^Acp_Connection, patience: time.Duration) {
+acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duration) {
 	if connection.started {
 		tool_terminate_group(&connection.child)
 		tool_child_close(&connection.child)
@@ -405,7 +413,7 @@ acp_connection_close :: proc(connection: ^Acp_Connection, patience: time.Duratio
 // acp_session_open agrees on the protocol, preferring version 2, opens a session in the workspace,
 // and chooses the model and effort among what the agent offers.
 @(private, require_results)
-acp_session_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
+acp_session_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
 	// Version 2 names the client in info; a version 1 agent answers with its own version and
 	// reads the missing clientCapabilities as no file system and no terminal.
@@ -434,9 +442,9 @@ acp_session_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 
 	New_Session :: struct {
 		cwd:         string `json:"cwd"`,
-		mcp_servers: []acp.Mcp_Server `json:"mcpServers"`,
+		mcp_servers: []acp.MCP_Server `json:"mcpServers"`,
 	}
-	opened: Acp_Session_Opened
+	opened: ACP_Session_Opened
 	if problem = acp_call(connection, acp.METHOD_SESSION_NEW, New_Session{cwd = member.workspace}, &opened); problem != "" { return }
 	if opened.session_id == "" { return "the agent opened a session without an id" }
 	connection.session_id = strings.clone(opened.session_id, member.allocator)
@@ -473,10 +481,10 @@ acp_session_open :: proc(connection: ^Acp_Connection) -> (problem: string) {
 	return ""
 }
 
-// Acp_Config_Option is a session config option of either version: version 1 names it by id and
+// ACP_Config_Option is a session config option of either version: version 1 names it by id and
 // version 2 by configId.
 @(private)
-Acp_Config_Option :: struct {
+ACP_Config_Option :: struct {
 	id:            string `json:"id"`,
 	config_id:     string `json:"configId"`,
 	category:      string `json:"category"`,
@@ -484,17 +492,17 @@ Acp_Config_Option :: struct {
 	options:       []acp.Config_Value `json:"options"`,
 }
 
-// Acp_Session_Opened is what session/new answers in either version. models is the
+// ACP_Session_Opened is what session/new answers in either version. models is the
 // pre-standard model list some version 1 agents send.
 @(private)
-Acp_Session_Opened :: struct {
+ACP_Session_Opened :: struct {
 	session_id:     string `json:"sessionId"`,
-	config_options: []Acp_Config_Option `json:"configOptions"`,
+	config_options: []ACP_Config_Option `json:"configOptions"`,
 	models:         acp.Models_State `json:"models"`,
 }
 
 @(private, require_results)
-acp_set_option :: proc(connection: ^Acp_Connection, option: Acp_Config_Option, value: string) -> (problem: string) {
+acp_set_option :: proc(connection: ^ACP_Connection, option: ACP_Config_Option, value: string) -> (problem: string) {
 	// Version 2 requires the value's type; version 1 reads a missing type as an id.
 	Set_Option :: struct {
 		session_id: string `json:"sessionId"`,
@@ -513,7 +521,7 @@ acp_set_option :: proc(connection: ^Acp_Connection, option: Acp_Config_Option, v
 }
 
 @(private, require_results)
-acp_option :: proc(options: []Acp_Config_Option, category: string) -> (Acp_Config_Option, bool) {
+acp_option :: proc(options: []ACP_Config_Option, category: string) -> (ACP_Config_Option, bool) {
 	for option in options {
 		if option.category == category { return option, true }
 	}
@@ -522,7 +530,7 @@ acp_option :: proc(options: []Acp_Config_Option, category: string) -> (Acp_Confi
 
 // acp_option_value is the value of the choice named wanted, by value or display name, or "".
 @(private)
-acp_option_value :: proc(option: Acp_Config_Option, wanted: string) -> string {
+acp_option_value :: proc(option: ACP_Config_Option, wanted: string) -> string {
 	if wanted == "" { return "" }
 	for choice in option.options {
 		if choice.value == wanted || choice.name == wanted { return choice.value }
@@ -541,7 +549,7 @@ acp_model_offered :: proc(models: acp.Models_State, model: string) -> bool {
 // acp_models_text lists the models a session offers, temp-allocated. A list that cannot be
 // held says so rather than reading as an agent that offers no model.
 @(private)
-acp_models_text :: proc(opened: Acp_Session_Opened) -> string {
+acp_models_text :: proc(opened: ACP_Session_Opened) -> string {
 	names, names_error := make([dynamic]string, context.temp_allocator)
 	if names_error != nil { return "the model list could not be held" }
 	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_MODEL); found {
@@ -557,7 +565,7 @@ acp_models_text :: proc(opened: Acp_Session_Opened) -> string {
 // acp_call sends one request and reads until its answer, which it decodes into result with
 // the temp allocator. problem, temp-allocated, says why there is no answer.
 @(private, require_results)
-acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result: ^$R) -> (problem: string) {
+acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result: ^$R) -> (problem: string) {
 	id := connection.next_id
 	connection.next_id += 1
 	if !acp.writer_write_request(&connection.writer, id, method, params) { return acp_ended(connection, "stopped reading its input") }
@@ -591,7 +599,7 @@ acp_call :: proc(connection: ^Acp_Connection, method: string, params: $P, result
 // what the message carries could not be held, which ends the connection rather than letting
 // the answer or the stop reason go missing.
 @(private, require_results)
-acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
+acp_handle :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
 	// What a message is decoded into is released with it, so a long turn holds no scratch.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	#partial switch envelope.kind {
@@ -607,7 +615,7 @@ acp_handle :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool 
 // Text before a tool call is narration, so a tool call starts the answer over, and so does a
 // message with a new id. It reports false when what it followed could not be held.
 @(private, require_results)
-acp_notification :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
+acp_notification :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
 	if envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
 	kind: acp.Session_Notification(acp.Update_Kind)
 	switch acp.params_decode(envelope.params, &kind, context.temp_allocator) {
@@ -682,7 +690,7 @@ acp_update_has :: proc(params: json.Value, key: string) -> bool {
 // acp_message_begin starts the answer over when the agent begins a message with a new id. It
 // reports false when the id could not be held.
 @(private, require_results)
-acp_message_begin :: proc(connection: ^Acp_Connection, message_id: string) -> bool {
+acp_message_begin :: proc(connection: ^ACP_Connection, message_id: string) -> bool {
 	if message_id == "" || message_id == connection.message_id { return true }
 	clear(&connection.answer)
 	return acp_replace(&connection.message_id, message_id, connection.member.allocator)
@@ -704,7 +712,7 @@ acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) -> 
 // acp_answer answers a request the agent sent. A permission request is granted once, as a
 // native subagent's tools run without asking; nothing else is offered.
 @(private, require_results)
-acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool {
+acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
 	// A write to the agent that fails ends the exchange: the next read reports it.
 	if envelope.method != acp.METHOD_SESSION_REQUEST_PERMISSION {
 		_ = acp.writer_write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method")
@@ -744,7 +752,7 @@ acp_answer :: proc(connection: ^Acp_Connection, envelope: acp.Envelope) -> bool 
 // and waiting as needed. A stop sends the agent session/cancel and waits the stop patience
 // for its answer; problem says the agent ended, went silent past that, or could not be read.
 @(private, require_results)
-acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, problem: string) {
+acp_next :: proc(connection: ^ACP_Connection) -> (envelope: acp.Envelope, problem: string) {
 	for {
 		for connection.next_frame < len(connection.frames) {
 			frame := connection.frames[connection.next_frame]
@@ -762,7 +770,7 @@ acp_next :: proc(connection: ^Acp_Connection) -> (envelope: acp.Envelope, proble
 
 // acp_wait blocks until the agent wrote something or a stop arrived, and reads what came.
 @(private, require_results)
-acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
+acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
 	if ai.interrupt_requested(&member.stop) && !connection.cancel_sent {
 		connection.cancel_sent = true
@@ -838,7 +846,7 @@ acp_wait :: proc(connection: ^Acp_Connection) -> (problem: string) {
 // acp_stderr_read reads one chunk of the agent's stderr into the tail, and closes the pipe at
 // its end. It returns false when nothing more is ready.
 @(private)
-acp_stderr_read :: proc(connection: ^Acp_Connection, buffer: []u8) -> bool {
+acp_stderr_read :: proc(connection: ^ACP_Connection, buffer: []u8) -> bool {
 	taken, status := tool_read(connection.errors, buffer)
 	if status == .Failed || (status == .Ok && taken == 0) {
 		_ = os.close(connection.errors)
@@ -867,7 +875,7 @@ acp_stderr_retain :: proc(tail: ^[dynamic]u8, data: []u8) {
 
 // acp_ended says the agent went away, with the end of what it wrote to stderr.
 @(private)
-acp_ended :: proc(connection: ^Acp_Connection, what: string) -> string {
+acp_ended :: proc(connection: ^ACP_Connection, what: string) -> string {
 	// What the agent wrote to stderr before it went away can still be in the pipe. Only what is
 	// ready is read, so a descendant that holds the pipe open cannot hold up the report.
 	buffer: [SUBAGENT_ACP_READ_BYTES]u8
@@ -882,6 +890,6 @@ acp_ended :: proc(connection: ^Acp_Connection, what: string) -> string {
 }
 
 @(private, require_results)
-acp_stopped :: proc(connection: ^Acp_Connection) -> bool {
+acp_stopped :: proc(connection: ^ACP_Connection) -> bool {
 	return connection.cancel_sent || ai.interrupt_requested(&connection.member.stop)
 }

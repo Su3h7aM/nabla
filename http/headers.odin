@@ -182,7 +182,7 @@ headers_set_content_type_string :: #force_inline proc(headers: ^Headers, content
 	headers_set_unsafe(headers, "content-type", content_type)
 }
 
-headers_set_content_type_mime :: #force_inline proc(headers: ^Headers, content_type: Mime_Type) {
+headers_set_content_type_mime :: #force_inline proc(headers: ^Headers, content_type: MIME_Type) {
 	headers_set_unsafe(headers, "content-type", mime_to_content_type(content_type))
 }
 

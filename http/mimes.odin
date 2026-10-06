@@ -2,7 +2,7 @@ package http
 
 import "core:path/filepath"
 
-Mime_Type :: enum {
+MIME_Type :: enum {
 	Plain,
 	Css,
 	Csv,
@@ -20,7 +20,7 @@ Mime_Type :: enum {
 	Wasm,
 }
 
-mime_from_extension :: proc(path: string) -> Mime_Type {
+mime_from_extension :: proc(path: string) -> MIME_Type {
 	//odinfmt:disable
 	switch filepath.ext(path) {
 	case ".html": return .Html
@@ -42,7 +42,7 @@ mime_from_extension :: proc(path: string) -> Mime_Type {
 }
 
 @(private = "file")
-_mime_to_content_type := [Mime_Type]string {
+_mime_to_content_type := [MIME_Type]string {
 	.Plain       = "text/plain",
 	.Css         = "text/css",
 	.Csv         = "text/csv",
@@ -60,6 +60,6 @@ _mime_to_content_type := [Mime_Type]string {
 	.Wasm        = "application/wasm",
 }
 
-mime_to_content_type :: proc(mime: Mime_Type) -> string {
+mime_to_content_type :: proc(mime: MIME_Type) -> string {
 	return _mime_to_content_type[mime]
 }

@@ -231,20 +231,20 @@ V2_Initialize_Result :: struct {
 	auth_methods:     []json.Value `json:"authMethods"`,
 }
 
-Mcp_Environment :: struct {
+MCP_Environment :: struct {
 	name:  string `json:"name"`,
 	value: string `json:"value"`,
 }
 
-// Mcp_Server is the stdio MCP server configuration carried by ACP. The optional
+// MCP_Server is the stdio MCP server configuration carried by ACP. The optional
 // type is accepted for v1 clients and is required by v2 clients, but only stdio is
 // implemented by this agent.
-Mcp_Server :: struct {
+MCP_Server :: struct {
 	name:    string `json:"name"`,
 	type:    string `json:"type,omitempty"`,
 	command: string `json:"command"`,
 	args:    []string `json:"args"`,
-	env:     []Mcp_Environment `json:"env"`,
+	env:     []MCP_Environment `json:"env"`,
 }
 
 Session_Meta :: struct {
@@ -255,7 +255,7 @@ Session_Meta :: struct {
 Session_New_Params :: struct {
 	cwd:                    string `json:"cwd"`,
 	additional_directories: []string `json:"additionalDirectories"`,
-	mcp_servers:            []Mcp_Server `json:"mcpServers"`,
+	mcp_servers:            []MCP_Server `json:"mcpServers"`,
 	system_prompt:          string `json:"systemPrompt"`,
 	meta:                   Session_Meta `json:"_meta"`,
 }
@@ -263,7 +263,7 @@ Session_New_Params :: struct {
 Session_Load_Params :: struct {
 	session_id:    string `json:"sessionId"`,
 	cwd:           string `json:"cwd"`,
-	mcp_servers:   []Mcp_Server `json:"mcpServers"`,
+	mcp_servers:   []MCP_Server `json:"mcpServers"`,
 	system_prompt: string `json:"systemPrompt"`,
 	meta:          Session_Meta `json:"_meta"`,
 }
@@ -275,7 +275,7 @@ Replay_From :: struct {
 Session_Resume_Params :: struct {
 	session_id:             string `json:"sessionId"`,
 	cwd:                    string `json:"cwd"`,
-	mcp_servers:            []Mcp_Server `json:"mcpServers"`,
+	mcp_servers:            []MCP_Server `json:"mcpServers"`,
 	additional_directories: []string `json:"additionalDirectories"`,
 	system_prompt:          string `json:"systemPrompt"`,
 	meta:                   Session_Meta `json:"_meta"`,
@@ -401,7 +401,7 @@ Prompt_Capabilities :: struct {
 	embedded_context: bool `json:"embeddedContext"`,
 }
 
-Mcp_Capabilities :: struct {
+MCP_Capabilities :: struct {
 	http: bool `json:"http"`,
 	sse:  bool `json:"sse"`,
 }
@@ -410,7 +410,7 @@ Agent_Capabilities :: struct {
 	load_session:         bool `json:"loadSession"`,
 	session_capabilities: V1_Session_List_Capabilities `json:"sessionCapabilities"`,
 	prompt_capabilities:  Prompt_Capabilities `json:"promptCapabilities"`,
-	mcp_capabilities:     Mcp_Capabilities `json:"mcpCapabilities"`,
+	mcp_capabilities:     MCP_Capabilities `json:"mcpCapabilities"`,
 }
 
 Initialize_Result :: struct {

@@ -3,14 +3,14 @@ package acp
 import "core:encoding/json"
 import "core:strings"
 
-Jsonrpc_Null :: struct {}
-Jsonrpc_Id :: union {
+JSONRPC_Null :: struct {}
+JSONRPC_Id :: union {
 	i64,
 	f64,
 	string,
-	Jsonrpc_Null,
+	JSONRPC_Null,
 }
-Rpc_Error :: struct {
+RPC_Error :: struct {
 	code:         i64,
 	message:      string,
 	data:         json.Value,
@@ -24,14 +24,14 @@ Envelope_Kind :: enum {
 }
 Envelope :: struct {
 	kind:           Envelope_Kind,
-	id:             Jsonrpc_Id,
+	id:             JSONRPC_Id,
 	id_present:     bool,
 	method:         string,
 	params:         json.Value,
 	params_present: bool,
 	result:         json.Value,
 	result_present: bool,
-	rpc_error:      Rpc_Error,
+	rpc_error:      RPC_Error,
 	error_present:  bool,
 }
 Envelope_Error :: enum {
@@ -221,7 +221,7 @@ object_string_present :: proc(object: json.Object, key: string) -> (string, bool
 	return string(text), true, true
 }
 @(require_results)
-object_id :: proc(object: json.Object, key: string, allocator := context.allocator) -> (id: Jsonrpc_Id, present: bool, err: Envelope_Error) {
+object_id :: proc(object: json.Object, key: string, allocator := context.allocator) -> (id: JSONRPC_Id, present: bool, err: Envelope_Error) {
 	value, has_value := object[key]
 	if !has_value { return nil, false, .None }
 	#partial switch id_value in value {
@@ -234,12 +234,12 @@ object_id :: proc(object: json.Object, key: string, allocator := context.allocat
 		if clone_error != nil { return nil, true, .Allocation }
 		return text, true, .None
 	case json.Null:
-		return Jsonrpc_Null{}, true, .None
+		return JSONRPC_Null{}, true, .None
 	}
 	return nil, true, .Invalid_ID
 }
 @(require_results)
-parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (Rpc_Error, Envelope_Error) {
+parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (RPC_Error, Envelope_Error) {
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, .Invalid_Error }
 	code_value, code_present := object["code"]
@@ -249,7 +249,7 @@ parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (R
 	if !code_present || !message_present || !code_is_integer || !message_is_string { return {}, .Invalid_Error }
 	message, message_error := strings.clone(string(message_text), allocator)
 	if message_error != nil { return {}, .Allocation }
-	result := Rpc_Error {
+	result := RPC_Error {
 		code    = i64(code),
 		message = message,
 	}

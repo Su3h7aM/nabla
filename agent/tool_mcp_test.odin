@@ -87,14 +87,14 @@ test_mcp_integer_fields_are_repaired_from_the_schema :: proc(test: ^testing.T) {
 
 // The only question that decides an outcome is whether the call can have happened.
 @(private)
-Mcp_Failure_Case :: struct {
+MCP_Failure_Case :: struct {
 	failure: mcp.Error,
 	outcome: journal.Tool_Outcome,
 }
 
 @(test)
 test_mcp_failures_map_by_delivery :: proc(test: ^testing.T) {
-	cases := []Mcp_Failure_Case {
+	cases := []MCP_Failure_Case {
 		{{kind = .Cancelled}, .Cancelled},
 		{{kind = .Timed_Out}, .Timed_Out},
 		{{kind = .Spawn_Failed}, .Unavailable},

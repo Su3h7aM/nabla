@@ -14,7 +14,7 @@ import "nabla:agent"
 import "nabla:agent/journal"
 
 // The ACP connection holds what every session of it shares, and a table of the sessions
-// themselves. Each Acp_Session has exactly one owner, its worker thread: the worker holds
+// themselves. Each ACP_Session has exactly one owner, its worker thread: the worker holds
 // the session's journal, chat, queue, Turn_Control and MCP runtime, and nothing else touches
 // them while it runs. The reader thread alone creates, finds, and frees sessions, so a
 // session it found stays valid for the request it is handling.
@@ -23,7 +23,7 @@ import "nabla:agent/journal"
 // closes the least recently used idle session, and is refused when all are busy.
 ACP_MAX_SESSIONS :: 8
 
-// Acp_Session is one conversation of a connection.
+// ACP_Session is one conversation of a connection.
 //
 // Its App is a view over the connection's: app.setup shares the following fields by
 // shallow copy, borrows them from the connection's own setup, and never frees them:
@@ -35,8 +35,8 @@ ACP_MAX_SESSIONS :: 8
 // Everything else in app.setup is the session's own: store, session, workspace, the
 // resumed_* strings, provider_id, model_id, api, credential, mcp, and mcp_servers.
 // acp_session_make is the one place the shared fields are copied.
-Acp_Session :: struct {
-	conn:              ^Acp_Server,
+ACP_Session :: struct {
+	conn:              ^ACP_Server,
 	app:               App,
 	// id, title, workspace, closing, owner_active, and last_used are guarded by conn.table_mu: the
 	// reader finds a session by its id and the owner publishes them after an open. A
@@ -56,7 +56,7 @@ Acp_Session :: struct {
 	// knows to reap the session.
 	retired:           bool,
 	mcp_servers_owned: [dynamic]agent.MCP_Server_Config, // owned active list when a client supplied servers
-	work:              Acp_Work_Chan,
+	work:              ACP_Work_Chan,
 	worker:            ^thread.Thread,
 	worker_done:       sync.One_Shot_Event, // signaled by the worker as its last action
 	// queue_mu guards pending_work.
@@ -64,18 +64,18 @@ Acp_Session :: struct {
 	pending_work:      int,
 	// model_mu guards only the single pending reader-to-owner handoff.
 	model_mu:          sync.Mutex,
-	model_request:     Acp_Model_Request,
+	model_request:     ACP_Model_Request,
 	model_cancel:      bool, // owner should settle all current model-selection RPCs
-	model_selection:   Acp_Model_Selection, // owner only
+	model_selection:   ACP_Model_Selection, // owner only
 	// message_seq numbers process-local fallback messages. The v2 live assistant id
 	// is derived from the durable turn and request instead, so replay can reproduce it.
 	message_seq:       u64,
 	active_message_id: string, // owned by conn.alloc; the v2 answer being streamed
 }
 
-// Acp_Server is the connection: the writer, the wire profile, the setup every session
+// ACP_Server is the connection: the writer, the wire profile, the setup every session
 // shares, and the session table. The table's slots are written by the reader thread only.
-Acp_Server :: struct {
+ACP_Server :: struct {
 	// app.setup carries the shared catalog, configuration, directories, and run id, and
 	// the connection's own default selection in provider_id and model_id. It holds no
 	// session.
@@ -87,10 +87,10 @@ Acp_Server :: struct {
 	// initialized is set once initialize has been answered. Only the reader writes it.
 	initialized:      bool,
 	// profile is the wire surface agreed with the client.
-	profile:          Acp_Wire_Profile,
+	profile:          ACP_Wire_Profile,
 	// table_mu guards use_clock and the fields of every session that its comment names.
 	table_mu:         sync.Mutex,
-	sessions:         [ACP_MAX_SESSIONS]^Acp_Session,
+	sessions:         [ACP_MAX_SESSIONS]^ACP_Session,
 	use_clock:        u64,
 	// worker_stuck and memory_leaked say a session could not be released: a worker thread
 	// that did not stop, or a tool worker that still borrows the session. Reader only.
@@ -105,7 +105,7 @@ Acp_Server :: struct {
 // user's last choice, otherwise the first model the configuration can serve. It opens no
 // session. Errors print to stderr; false means the caller should exit.
 @(require_results)
-acp_connection_open :: proc(conn: ^Acp_Server, sources: []agent.Catalog_Provider_Source) -> bool {
+acp_connection_open :: proc(conn: ^ACP_Server, sources: []agent.Catalog_Provider_Source) -> bool {
 	setup := &conn.app.setup
 	setup.alloc = conn.alloc
 	ok := false
@@ -161,7 +161,7 @@ acp_connection_open :: proc(conn: ^Acp_Server, sources: []agent.Catalog_Provider
 // names none. Nothing is persisted: a model chosen for an editor conversation is not the
 // user's own last choice. An empty default is not fatal, because the prompt is what
 // refuses a session with no model.
-acp_default_selection :: proc(conn: ^Acp_Server, selection: journal.Selection_Changed, found: bool) {
+acp_default_selection :: proc(conn: ^ACP_Server, selection: journal.Selection_Changed, found: bool) {
 	if found && acp_default_install(conn, selection.provider, selection.model, selection.effort) { return }
 	candidates, candidates_ok := acp_servable_models(&conn.app, conn.alloc)
 	if !candidates_ok { return }
@@ -172,7 +172,7 @@ acp_default_selection :: proc(conn: ^Acp_Server, selection: journal.Selection_Ch
 }
 
 @(require_results)
-acp_default_install :: proc(conn: ^Acp_Server, provider_id, model_id, effort: string) -> bool {
+acp_default_install :: proc(conn: ^ACP_Server, provider_id, model_id, effort: string) -> bool {
 	setup := &conn.app.setup
 	target, problem := selection_target_resolve(&conn.app, provider_id, model_id, setup.alloc)
 	defer if problem != "" { delete(problem, context.temp_allocator) }
@@ -196,7 +196,7 @@ acp_default_install :: proc(conn: ^Acp_Server, provider_id, model_id, effort: st
 // acp_server_destroy stops and joins every session before draining the writer. False
 // means a worker or abandoned child still borrows the connection: the caller must retain
 // conn, its writer, and all shared setup allocations until process exit.
-acp_server_destroy :: proc(conn: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
+acp_server_destroy :: proc(conn: ^ACP_Server, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	for session in conn.sessions {
 		if session == nil { continue }
 		acp_cancel_session(session)
@@ -244,15 +244,15 @@ acp_server_destroy :: proc(conn: ^Acp_Server, patience := SHUTDOWN_JOIN_PATIENCE
 // by, or empty for a new one. It is the only place a session copies the connection's
 // shared fields, and so the only place that changes if the setup is ever split.
 @(require_results)
-acp_session_make :: proc(conn: ^Acp_Server, preset_id: string) -> (session: ^Acp_Session, ok: bool) {
-	made, new_error := new(Acp_Session, conn.alloc)
+acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP_Session, ok: bool) {
+	made, new_error := new(ACP_Session, conn.alloc)
 	if new_error != nil { return nil, false }
 	id, id_error := strings.clone(preset_id, conn.alloc)
 	if id_error != nil {
 		free(made, conn.alloc)
 		return nil, false
 	}
-	channel, channel_error := chan.create_buffered(Acp_Work_Chan, ACP_WORK_CAPACITY, conn.alloc)
+	channel, channel_error := chan.create_buffered(ACP_Work_Chan, ACP_WORK_CAPACITY, conn.alloc)
 	if channel_error != nil {
 		delete(id, conn.alloc)
 		free(made, conn.alloc)
@@ -281,7 +281,7 @@ acp_session_make :: proc(conn: ^Acp_Server, preset_id: string) -> (session: ^Acp
 
 // acp_session_free releases a session that is released and has no worker. Its queue must
 // be empty.
-acp_session_free :: proc(session: ^Acp_Session) {
+acp_session_free :: proc(session: ^ACP_Session) {
 	alloc := session.conn.alloc
 	if session.work != {} { chan.destroy(&session.work) }
 	delete(session.id, alloc)
@@ -295,13 +295,13 @@ acp_session_free :: proc(session: ^Acp_Session) {
 // closes the least recently used idle session to make room; with none idle the reason says
 // so. A session created from a stored id carries that id at once. Reader thread only.
 @(require_results)
-acp_session_create :: proc(conn: ^Acp_Server, preset_id: string) -> (session: ^Acp_Session, reason: string) {
+acp_session_create :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP_Session, reason: string) {
 	acp_sessions_reap(conn)
 	made, made_ok := acp_session_make(conn, preset_id)
 	if !made_ok { return nil, "the session could not be allocated" }
 
 	slot := -1
-	victim: ^Acp_Session
+	victim: ^ACP_Session
 	sync.mutex_lock(&conn.table_mu)
 	for entry, index in conn.sessions {
 		if entry == nil {
@@ -347,7 +347,7 @@ acp_session_create :: proc(conn: ^Acp_Server, preset_id: string) -> (session: ^A
 // acp_session_find returns the open session a request names, or nil for an id the
 // connection does not run, or runs no longer. Reader thread only.
 @(require_results)
-acp_session_find :: proc(conn: ^Acp_Server, id: string) -> ^Acp_Session {
+acp_session_find :: proc(conn: ^ACP_Server, id: string) -> ^ACP_Session {
 	if id == "" { return nil }
 	sync.mutex_lock(&conn.table_mu)
 	defer sync.mutex_unlock(&conn.table_mu)
@@ -358,7 +358,7 @@ acp_session_find :: proc(conn: ^Acp_Server, id: string) -> ^Acp_Session {
 }
 
 // acp_session_touch records a use, which is what eviction orders by.
-acp_session_touch :: proc(session: ^Acp_Session) {
+acp_session_touch :: proc(session: ^ACP_Session) {
 	sync.mutex_lock(&session.conn.table_mu)
 	session.conn.use_clock += 1
 	session.last_used = session.conn.use_clock
@@ -368,13 +368,13 @@ acp_session_touch :: proc(session: ^Acp_Session) {
 // acp_session_idle reports whether a session has no turn running and no request queued.
 // Called with table_mu held.
 @(require_results)
-acp_session_idle :: proc(session: ^Acp_Session) -> bool {
+acp_session_idle :: proc(session: ^ACP_Session) -> bool {
 	return !session.owner_active && !acp_session_has_work(session) && !acp_model_owner_work_pending(session)
 }
 
 // acp_owner_service_begin reserves background servicing against reader eviction.
 @(require_results)
-acp_owner_service_begin :: proc(session: ^Acp_Session) -> bool {
+acp_owner_service_begin :: proc(session: ^ACP_Session) -> bool {
 	sync.mutex_guard(&session.conn.table_mu)
 	if session.closing { return false }
 	session.owner_active = true
@@ -382,7 +382,7 @@ acp_owner_service_begin :: proc(session: ^Acp_Session) -> bool {
 }
 
 // acp_owner_service_end keeps unfinished owner-only service protected across waits.
-acp_owner_service_end :: proc(session: ^Acp_Session) {
+acp_owner_service_end :: proc(session: ^ACP_Session) {
 	active := session.model_selection.active || (session.app.setup.session.store != nil && session.app.setup.session.compact.state != agent.Compact_State.Idle)
 	sync.mutex_guard(&session.conn.table_mu)
 	session.owner_active = active
@@ -390,7 +390,7 @@ acp_owner_service_end :: proc(session: ^Acp_Session) {
 
 // acp_session_retire is the worker's last decision: the session has nothing left to serve.
 // Closing the queue turns a request that raced the retirement into a refusal.
-acp_session_retire :: proc(session: ^Acp_Session) {
+acp_session_retire :: proc(session: ^ACP_Session) {
 	sync.mutex_lock(&session.conn.table_mu)
 	session.closing = true
 	sync.mutex_unlock(&session.conn.table_mu)
@@ -400,7 +400,7 @@ acp_session_retire :: proc(session: ^Acp_Session) {
 
 // acp_sessions_reap frees every session whose worker retired, which frees its slot.
 // Reader thread only.
-acp_sessions_reap :: proc(conn: ^Acp_Server) {
+acp_sessions_reap :: proc(conn: ^ACP_Server) {
 	for session, index in conn.sessions {
 		if session == nil || !sync.atomic_load(&session.retired) { continue }
 		conn.sessions[index] = nil
@@ -411,7 +411,7 @@ acp_sessions_reap :: proc(conn: ^Acp_Server) {
 // acp_session_drop stops a session that is no longer in the table, joins its worker, and
 // frees it. A worker that does not stop, or a tool worker that still borrows the session,
 // leaves the session unfreed and is reported at teardown. Reader thread only.
-acp_session_drop :: proc(conn: ^Acp_Server, session: ^Acp_Session) {
+acp_session_drop :: proc(conn: ^ACP_Server, session: ^ACP_Session) {
 	acp_cancel_session(session)
 	chan.close(&session.work)
 	agent.owner_wake_signal()
@@ -431,7 +431,7 @@ acp_session_drop :: proc(conn: ^Acp_Server, session: ^Acp_Session) {
 
 // acp_session_shutdown answers what a session never ran: requests still queued, and a
 // model selection still pending. The worker has retired.
-acp_session_shutdown :: proc(session: ^Acp_Session) {
+acp_session_shutdown :: proc(session: ^ACP_Session) {
 	alloc := session.conn.alloc
 	for {
 		queued, ok := chan.try_recv(session.work)
@@ -463,7 +463,7 @@ acp_session_shutdown :: proc(session: ^Acp_Session) {
 // journal and claim, the MCP runtime, and the model's strings. It may run twice, once by a
 // close on the worker and once by whoever frees the session. The tool registry borrowed the
 // runtime's bindings, so the chat goes first and the MCP clients second.
-acp_session_release :: proc(session: ^Acp_Session) {
+acp_session_release :: proc(session: ^ACP_Session) {
 	if session.released { return }
 	session.released = true
 	setup := &session.app.setup

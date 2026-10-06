@@ -8,7 +8,7 @@ import "core:strings"
 import "nabla:agent"
 import "nabla:agent/journal"
 
-Cli_Parse_Error :: enum {
+CLI_Parse_Error :: enum {
 	None,
 	Unknown_Option,
 	Missing_Value,
@@ -32,7 +32,7 @@ chat_cli_options :: struct {
 }
 
 @(require_results)
-chat_cli_parse :: proc(args: []string) -> (chat_cli_options, Cli_Parse_Error) {
+chat_cli_parse :: proc(args: []string) -> (chat_cli_options, CLI_Parse_Error) {
 	result: chat_cli_options
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]

@@ -732,7 +732,7 @@ test_acp_next_reports_a_malformed_json_rpc_frame :: proc(test: ^testing.T) {
 		delete(frames)
 		testing.fail_now(test, "could not create the ACP frame")
 	}
-	connection := Acp_Connection {
+	connection := ACP_Connection {
 		member = &member,
 		frames = frames,
 	}

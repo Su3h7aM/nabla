@@ -25,11 +25,6 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 
 - Process spawning is written three times: `mcp/stdio_process*`, `agent/tool_process*`, and `agent/subagent_acp_linux.odin`. A small `process` library package would remove about 350 lines. Needs a decision because it adds a package.
 
-## Naming
-
-- Acronyms in type names: `Acp_Server`, `Mcp_Server`, `Mcp_Environment` beside `ACP_Agent_Config`, `MCP_Runtime`. Use the uppercase form, as `core:net` does with `TCP_Socket`.
-- `acp_serve.odin` and `acp_server.odin` differ by one letter; name them for their subjects.
-
 ## Architecture document drift
 
 - §14.1 lists tool kinds, placements, `Tool_Definition` fields, and tool names that no longer match `agent/tool_args.odin` and `agent/tool.odin` (`agent_send`, `agent_stop`, `builtin_list_skills`, `builtin_load_skill`; no `Task_Run`).

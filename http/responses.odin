@@ -11,7 +11,7 @@ import "core:strings"
 // Sets the response to one that sends the given HTML.
 respond_html :: proc(response: ^Response, html: string, status: Status = .OK, loc := #caller_location) {
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(Mime_Type.Html))
+	headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Html))
 	body_set(response, html, loc)
 	respond(response, loc)
 }
@@ -19,7 +19,7 @@ respond_html :: proc(response: ^Response, html: string, status: Status = .OK, lo
 // Sets the response to one that sends the given plain text.
 respond_plain :: proc(response: ^Response, text: string, status: Status = .OK, loc := #caller_location) {
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(Mime_Type.Plain))
+	headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Plain))
 	body_set(response, text, loc)
 	respond(response, loc)
 }
@@ -35,7 +35,7 @@ The content type is taken from the path, optionally overwritten using the parame
 If the file doesn't exist, a 404 response is sent.
 If any other error occurs, a 500 is sent and the error is logged.
 */
-respond_file :: proc(response: ^Response, path: string, content_type: Maybe(Mime_Type) = nil, loc := #caller_location) {
+respond_file :: proc(response: ^Response, path: string, content_type: Maybe(MIME_Type) = nil, loc := #caller_location) {
 	// PERF: we are still putting the content into the body buffer, we could stream it.
 
 	assert_on_server_thread(loc)
@@ -152,7 +152,7 @@ respond_json :: proc(
 	options := options
 
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(Mime_Type.Json))
+	headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Json))
 
 	// Going to write a MINIMUM of 128 bytes at a time.
 	writer: Response_Writer

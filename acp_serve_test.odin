@@ -37,7 +37,7 @@ ACP_TEST_BOUND :: 10 * time.Second
 
 @(test)
 test_acp_model_selection_does_not_mark_foreground_work_busy :: proc(t: ^testing.T) {
-	session: Acp_Session
+	session: ACP_Session
 	session.model_request.active = true
 	testing.expect(t, !acp_session_has_work(&session), "a pending model RPC is not foreground work")
 	session.model_request = {}
@@ -128,10 +128,10 @@ acp_test_stream_reply :: proc(body: string, allocator := context.allocator) -> s
 
 // --- a scripted provider -----------------------------------------------------
 
-// Acp_Test_Provider answers one canned HTTP response per connection, in order. It stands
+// ACP_Test_Provider answers one canned HTTP response per connection, in order. It stands
 // in for a provider endpoint, so a turn runs for real: the harness sends requests, reads
 // streams, and records results exactly as it would against a server.
-Acp_Test_Provider :: struct {
+ACP_Test_Provider :: struct {
 	listener: net.TCP_Socket,
 	port:     int,
 	replies:  []string,
@@ -141,7 +141,7 @@ Acp_Test_Provider :: struct {
 	thread:   ^thread.Thread,
 }
 
-acp_test_provider_start :: proc(t: ^testing.T, provider: ^Acp_Test_Provider, replies: []string) -> bool {
+acp_test_provider_start :: proc(t: ^testing.T, provider: ^ACP_Test_Provider, replies: []string) -> bool {
 	provider.replies = replies
 	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Address{127, 0, 0, 1}, port = 0})
 	if listen_err != nil { return testing.expectf(t, false, "the provider socket could not be opened: %v", listen_err) }
@@ -156,7 +156,7 @@ acp_test_provider_start :: proc(t: ^testing.T, provider: ^Acp_Test_Provider, rep
 	return true
 }
 
-acp_test_provider_stop :: proc(t: ^testing.T, provider: ^Acp_Test_Provider) {
+acp_test_provider_stop :: proc(t: ^testing.T, provider: ^ACP_Test_Provider) {
 	// Closing a listener in another thread does not wake a blocked Linux accept.
 	_ = net.shutdown(provider.listener, .Both)
 	net.close(provider.listener)
@@ -173,7 +173,7 @@ acp_test_provider_stop :: proc(t: ^testing.T, provider: ^Acp_Test_Provider) {
 }
 
 acp_test_provider_serve :: proc(thread_handle: ^thread.Thread) {
-	provider := cast(^Acp_Test_Provider)thread_handle.data
+	provider := cast(^ACP_Test_Provider)thread_handle.data
 	for index in 0 ..< len(provider.replies) {
 		client, _, accept_err := net.accept_tcp(provider.listener)
 		if accept_err != nil { return }
@@ -183,7 +183,7 @@ acp_test_provider_serve :: proc(thread_handle: ^thread.Thread) {
 
 // acp_test_provider_answer reads one whole request before answering it, so the harness is
 // never still writing when the connection closes.
-acp_test_provider_answer :: proc(provider: ^Acp_Test_Provider, client: net.TCP_Socket, reply: string) {
+acp_test_provider_answer :: proc(provider: ^ACP_Test_Provider, client: net.TCP_Socket, reply: string) {
 	defer net.close(client)
 	_ = net.set_option(client, .Receive_Timeout, ACP_TEST_BOUND)
 
@@ -224,10 +224,10 @@ acp_test_provider_answer :: proc(provider: ^Acp_Test_Provider, client: net.TCP_S
 
 // --- the client --------------------------------------------------------------
 
-// Acp_Test_Client is a client with two ends: the messages it writes to the agent, and the
+// ACP_Test_Client is a client with two ends: the messages it writes to the agent, and the
 // frames it has read back. Both are guarded, because the run reads and writes on its own
 // threads while the test does the same.
-Acp_Test_Client :: struct {
+ACP_Test_Client :: struct {
 	mu:            sync.Mutex,
 	cond:          sync.Cond,
 	input:         [dynamic]u8,
@@ -239,15 +239,15 @@ Acp_Test_Client :: struct {
 	read_at:       int,
 }
 
-acp_test_client_input :: proc(client: ^Acp_Test_Client) -> io.Reader {
+acp_test_client_input :: proc(client: ^ACP_Test_Client) -> io.Reader {
 	return io.Reader{data = client, procedure = acp_test_client_stream}
 }
 
-acp_test_client_output :: proc(client: ^Acp_Test_Client) -> io.Writer {
+acp_test_client_output :: proc(client: ^ACP_Test_Client) -> io.Writer {
 	return io.Writer{data = client, procedure = acp_test_client_stream}
 }
 
-Acp_Test_Stalled_Output :: struct {
+ACP_Test_Stalled_Output :: struct {
 	mutex:   sync.Mutex,
 	cond:    sync.Cond,
 	entered: bool,
@@ -255,11 +255,11 @@ Acp_Test_Stalled_Output :: struct {
 	output:  [dynamic]u8,
 }
 
-acp_test_stalled_output :: proc(state: ^Acp_Test_Stalled_Output) -> io.Writer {
+acp_test_stalled_output :: proc(state: ^ACP_Test_Stalled_Output) -> io.Writer {
 	return io.Writer {
 		data = state,
 		procedure = proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-			state := cast(^Acp_Test_Stalled_Output)data
+			state := cast(^ACP_Test_Stalled_Output)data
 			switch mode {
 			case .Write:
 				sync.mutex_lock(&state.mutex)
@@ -285,7 +285,7 @@ acp_test_writer_cleanup :: proc(writer: ^acp.Writer) {
 	_ = acp.writer_destroy(writer, time.Second)
 }
 
-acp_test_server_init :: proc(t: ^testing.T, server: ^Acp_Server) -> bool {
+acp_test_server_init :: proc(t: ^testing.T, server: ^ACP_Server) -> bool {
 	server.alloc = context.allocator
 	server.app.setup.alloc = server.alloc
 	writer, writer_error := acp.writer_init({}, server.alloc)
@@ -294,21 +294,21 @@ acp_test_server_init :: proc(t: ^testing.T, server: ^Acp_Server) -> bool {
 	return true
 }
 
-Acp_Test_Retained_Worker :: struct {
-	session: ^Acp_Session,
+ACP_Test_Retained_Worker :: struct {
+	session: ^ACP_Session,
 	release: sync.One_Shot_Event,
 }
 
 acp_test_retained_worker :: proc(worker: ^thread.Thread) {
-	state := cast(^Acp_Test_Retained_Worker)worker.data
+	state := cast(^ACP_Test_Retained_Worker)worker.data
 	sync.one_shot_event_wait(&state.release)
 	sync.one_shot_event_signal(&state.session.worker_done)
 }
 
 @(test)
 test_acp_shutdown_settles_joined_sessions_and_retains_a_stuck_connection :: proc(t: ^testing.T) {
-	server: Acp_Server
-	client: Acp_Test_Client
+	server: ACP_Server
+	client: ACP_Test_Client
 	defer delete(client.output)
 	server.alloc = context.allocator
 	server.app.setup.alloc = server.alloc
@@ -325,7 +325,7 @@ test_acp_shutdown_settles_joined_sessions_and_retains_a_stuck_connection :: proc
 		_ = acp_server_destroy(&server)
 		return
 	}
-	state := Acp_Test_Retained_Worker {
+	state := ACP_Test_Retained_Worker {
 		session = retained,
 	}
 	worker := thread.create(acp_test_retained_worker)
@@ -357,9 +357,9 @@ test_acp_shutdown_settles_joined_sessions_and_retains_a_stuck_connection :: proc
 
 @(test)
 test_acp_cancellation_routes_to_the_named_session :: proc(t: ^testing.T) {
-	server: Acp_Server
-	first: Acp_Session
-	second: Acp_Session
+	server: ACP_Server
+	first: ACP_Session
+	second: ACP_Session
 	first.conn = &server
 	first.id = "session-first"
 	first.pending_work = 1
@@ -383,7 +383,7 @@ test_acp_cancellation_routes_to_the_named_session :: proc(t: ^testing.T) {
 
 @(test)
 test_acp_busy_sessions_refuse_a_ninth_open :: proc(t: ^testing.T) {
-	server: Acp_Server
+	server: ACP_Server
 	if !acp_test_server_init(t, &server) { return }
 	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
 	for i in 0 ..< ACP_MAX_SESSIONS {
@@ -409,7 +409,7 @@ test_acp_busy_sessions_refuse_a_ninth_open :: proc(t: ^testing.T) {
 
 @(test)
 test_acp_idle_sessions_are_evicted_by_lru_and_can_be_loaded_again :: proc(t: ^testing.T) {
-	server: Acp_Server
+	server: ACP_Server
 	if !acp_test_server_init(t, &server) { return }
 	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
 	for i in 0 ..< ACP_MAX_SESSIONS {
@@ -426,7 +426,7 @@ test_acp_idle_sessions_are_evicted_by_lru_and_can_be_loaded_again :: proc(t: ^te
 	testing.expect(t, acp_session_find(&server, "session-1") != nil, "the reloaded session was not published")
 }
 
-acp_test_stalled_output_wait :: proc(t: ^testing.T, state: ^Acp_Test_Stalled_Output) {
+acp_test_stalled_output_wait :: proc(t: ^testing.T, state: ^ACP_Test_Stalled_Output) {
 	sync.mutex_lock(&state.mutex)
 	deadline := time.tick_add(time.tick_now(), time.Second)
 	for !state.entered {
@@ -439,8 +439,8 @@ acp_test_stalled_output_wait :: proc(t: ^testing.T, state: ^Acp_Test_Stalled_Out
 	testing.expect(t, entered, "the writer did not enter its blocked output call")
 }
 
-Acp_Test_Cancel_Run :: struct {
-	server:   ^Acp_Server,
+ACP_Test_Cancel_Run :: struct {
+	server:   ^ACP_Server,
 	envelope: acp.Envelope,
 	mutex:    sync.Mutex,
 	cond:     sync.Cond,
@@ -448,7 +448,7 @@ Acp_Test_Cancel_Run :: struct {
 }
 
 acp_test_cancel_request :: proc(thread_handle: ^thread.Thread) {
-	run := cast(^Acp_Test_Cancel_Run)thread_handle.data
+	run := cast(^ACP_Test_Cancel_Run)thread_handle.data
 	acp_request_cancel(run.server, &run.envelope)
 	sync.mutex_lock(&run.mutex)
 	run.done = true
@@ -459,14 +459,14 @@ acp_test_cancel_request :: proc(thread_handle: ^thread.Thread) {
 @(test)
 test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
-	state: Acp_Test_Stalled_Output
+	state: ACP_Test_Stalled_Output
 	output, output_error := make([dynamic]u8, 0, 0, context.allocator)
 	if output_error != nil { testing.fail_now(t, "the test output buffer could not be created") }
 	state.output = output
 	defer delete(state.output)
-	server: Acp_Server
+	server: ACP_Server
 	server.alloc = context.allocator
-	session: Acp_Session
+	session: ACP_Session
 	session.conn = &server
 	session.id = "session-stalled"
 	session.pending_work = 1
@@ -498,7 +498,7 @@ test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 	params, parse_error := json.parse_string(`{"sessionId":"session-stalled"}`, .JSON, true, context.allocator)
 	if parse_error != nil { testing.fail_now(t, "the cancellation parameters could not be parsed") }
 	defer json.destroy_value(params, context.allocator)
-	run := Acp_Test_Cancel_Run {
+	run := ACP_Test_Cancel_Run {
 		server = &server,
 		envelope = acp.Envelope{kind = .Request, id = i64(1), params = params},
 	}
@@ -530,7 +530,7 @@ test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 // acp_test_client_stream serves both ends of the client: a read takes the next message the
 // test wrote, and a write appends what the run produced.
 acp_test_client_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-	client := cast(^Acp_Test_Client)data
+	client := cast(^ACP_Test_Client)data
 	switch mode {
 	case .Read:
 		sync.mutex_lock(&client.mu)
@@ -564,7 +564,7 @@ acp_test_client_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, of
 	return 0, .Unsupported
 }
 
-acp_test_client_destroy :: proc(client: ^Acp_Test_Client) {
+acp_test_client_destroy :: proc(client: ^ACP_Test_Client) {
 	sync.mutex_lock(&client.mu)
 	defer sync.mutex_unlock(&client.mu)
 	delete(client.input)
@@ -575,7 +575,7 @@ acp_test_client_destroy :: proc(client: ^Acp_Test_Client) {
 }
 
 // acp_test_client_send writes one whole message, including the newline that ends it.
-acp_test_client_send :: proc(client: ^Acp_Test_Client, message: string) {
+acp_test_client_send :: proc(client: ^ACP_Test_Client, message: string) {
 	sync.mutex_lock(&client.mu)
 	defer sync.mutex_unlock(&client.mu)
 	append(&client.input, ..transmute([]u8)message)
@@ -584,7 +584,7 @@ acp_test_client_send :: proc(client: ^Acp_Test_Client, message: string) {
 
 // acp_test_client_hang_up ends the client's side of the stream, which is what a client
 // that quits does.
-acp_test_client_hang_up :: proc(client: ^Acp_Test_Client) {
+acp_test_client_hang_up :: proc(client: ^ACP_Test_Client) {
 	sync.mutex_lock(&client.mu)
 	defer sync.mutex_unlock(&client.mu)
 	client.input_closed = true
@@ -594,7 +594,7 @@ acp_test_client_hang_up :: proc(client: ^Acp_Test_Client) {
 // acp_test_client_receive reads one whole message. It returns "" when the run stopped
 // writing or did not answer within the bound, so a failure is reported by the expectation
 // that wanted the message rather than by aborting the test.
-acp_test_client_receive :: proc(client: ^Acp_Test_Client, allocator := context.temp_allocator) -> string {
+acp_test_client_receive :: proc(client: ^ACP_Test_Client, allocator := context.temp_allocator) -> string {
 	sync.mutex_lock(&client.mu)
 	defer sync.mutex_unlock(&client.mu)
 	for {
@@ -613,7 +613,7 @@ acp_test_client_receive :: proc(client: ^Acp_Test_Client, allocator := context.t
 // frame comes back so the rest of what one answer says can be checked with it; it is
 // scratch, and it lives until the test's own free_all. An empty result means the
 // expectation failed and the caller should stop reading.
-acp_test_client_expect :: proc(t: ^testing.T, client: ^Acp_Test_Client, needle, what: string) -> string {
+acp_test_client_expect :: proc(t: ^testing.T, client: ^ACP_Test_Client, needle, what: string) -> string {
 	frame := acp_test_client_receive(client)
 	if frame == "" {
 		testing.expectf(t, false, "%s: the run did not answer", what)
@@ -652,7 +652,7 @@ acp_test_client_session_id_from_frame :: proc(t: ^testing.T, frame: string, allo
 	return answer.result.session_id
 }
 
-acp_test_client_session_id :: proc(t: ^testing.T, client: ^Acp_Test_Client, allocator := context.allocator) -> string {
+acp_test_client_session_id :: proc(t: ^testing.T, client: ^ACP_Test_Client, allocator := context.allocator) -> string {
 	frame := acp_test_client_receive(client)
 	if frame == "" {
 		testing.expectf(t, false, "session/new: the run did not answer")
@@ -685,15 +685,15 @@ acp_test_env_restore :: proc(variable, previous: string, had_previous: bool) {
 
 // --- the conversation --------------------------------------------------------
 
-// Acp_Test_Run is one frontend living on its own thread while the test plays the client.
-Acp_Test_Run :: struct {
-	client:  ^Acp_Test_Client,
+// ACP_Test_Run is one frontend living on its own thread while the test plays the client.
+ACP_Test_Run :: struct {
+	client:  ^ACP_Test_Client,
 	sources: []agent.Catalog_Provider_Source,
 	served:  bool,
 }
 
 acp_test_run_thread :: proc(thread_handle: ^thread.Thread) {
-	run := cast(^Acp_Test_Run)thread_handle.data
+	run := cast(^ACP_Test_Run)thread_handle.data
 	run.served = acp_run(run.sources, {}, {}, acp_test_client_input(run.client), acp_test_client_output(run.client))
 }
 
@@ -715,13 +715,13 @@ test_acp_evicted_persisted_session_replays_and_accepts_another_prompt :: proc(t:
 	acp_test_session_protocol(t, .Persisted_Eviction)
 }
 
-Acp_Test_Session_Scenario :: enum {
+ACP_Test_Session_Scenario :: enum {
 	Independent,
 	Refused_Claim,
 	Persisted_Eviction,
 }
 
-acp_test_session_protocol :: proc(t: ^testing.T, scenario: Acp_Test_Session_Scenario) {
+acp_test_session_protocol :: proc(t: ^testing.T, scenario: ACP_Test_Session_Scenario) {
 	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-workspace-*", context.allocator)
 	if workspace_err != nil {
 		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
@@ -796,7 +796,7 @@ acp_test_session_protocol :: proc(t: ^testing.T, scenario: Acp_Test_Session_Scen
 	}
 	defer for reply in replies { delete(reply, context.allocator) }
 
-	provider: Acp_Test_Provider
+	provider: ACP_Test_Provider
 	if !acp_test_provider_start(t, &provider, replies) { return }
 	defer acp_test_provider_stop(t, &provider)
 
@@ -825,9 +825,9 @@ acp_test_session_protocol :: proc(t: ^testing.T, scenario: Acp_Test_Session_Scen
 	}
 	defer delete(sources[0].base_url, context.allocator)
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client  = &client,
 		sources = sources,
 	}
@@ -1022,9 +1022,9 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client = &client,
 	}
 	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-test-run")
@@ -1131,7 +1131,7 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 		),
 	}
 	defer for reply in replies { delete(reply, context.allocator) }
-	provider: Acp_Test_Provider
+	provider: ACP_Test_Provider
 	if !acp_test_provider_start(t, &provider, replies) { return }
 	defer acp_test_provider_stop(t, &provider)
 
@@ -1160,9 +1160,9 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	}
 	defer delete(sources[0].base_url, context.allocator)
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client  = &client,
 		sources = sources,
 	}
@@ -1275,9 +1275,9 @@ test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client = &client,
 	}
 	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-batch-run")
@@ -1325,9 +1325,9 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client = &client,
 	}
 	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-buzz-run")
@@ -1413,9 +1413,9 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 		models           = models,
 	}
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client  = &client,
 		sources = sources,
 	}
@@ -1531,9 +1531,9 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 		models           = models,
 	}
 
-	client: Acp_Test_Client
+	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
-	run := Acp_Test_Run {
+	run := ACP_Test_Run {
 		client  = &client,
 		sources = sources,
 	}
@@ -1599,7 +1599,7 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 }
 @(test)
 test_acp_owner_activity_prevents_eviction_until_idle :: proc(t: ^testing.T) {
-	server: Acp_Server
+	server: ACP_Server
 	if !acp_test_server_init(t, &server) { return }
 	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
 	for i in 0 ..< ACP_MAX_SESSIONS {
