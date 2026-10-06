@@ -603,7 +603,9 @@ chat_session_accept_message :: proc(
 	if !chat_session_recover_pending(chat) { return .Storage_Failed }
 
 	// A new session is created by its first prompt, so a session nobody prompted is
-	// never recorded.
+	// never recorded. A follower holds no claim either, and creating a session it only
+	// shows would write over the runner's, so it never gets here.
+	assert(chat.store.followed == {}, "a follower never runs a turn")
 	if chat.store.claimed == {} {
 		_, create_error := journal.create_session(chat.store, {id = chat.session, workspace = chat.workspace, role = .Main})
 		if create_error != nil {

@@ -997,12 +997,12 @@ chat_agents_wait :: proc(chat: ^Chat_Session, stop: ^ai.Interrupt) -> bool {
 	}
 }
 
-// chat_session_accept_agent_message opens a turn that delivers what the agents sent while no
-// turn ran, and anything else the session accepted and has not delivered, before it. It
-// reports had_message false when no agent's report or message waits. Input the store
-// refused stays pending in the journal.
+// chat_session_accept_agent_message opens a turn that delivers what the agents sent and
+// what other processes sent while no turn ran, and anything else the session accepted and
+// has not delivered, before it. It reports had_message false when nothing of that kind
+// waits. Input the store refused stays pending in the journal.
 @(require_results)
 chat_session_accept_agent_message :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> (accepted: Chat_Accept, had_message: bool) {
-	if chat.team == nil || !chat_inbox_reports_pending(chat) { return .Accepted, false }
+	if !chat_inbox_reports_pending(chat) { return .Accepted, false }
 	return chat_session_accept_message(chat, "", .Agent, observer), true
 }

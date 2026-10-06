@@ -485,7 +485,10 @@ SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(cost), 0), COUNT(cost)
 FROM paired`
 
-@(private, require_results)
+// read_node returns node id of session. A node that does not exist returns Corrupt,
+// because callers name only nodes that a record or the tree promised. The result is owned
+// by allocator; release it with node_destroy.
+@(require_results)
 read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator: mem.Allocator) -> (node: Node, error: Error) {
 	session := session
 	rows: db.Rows

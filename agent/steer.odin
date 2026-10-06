@@ -240,17 +240,20 @@ chat_inbox_deliver :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int 
 	return len(texts)
 }
 
-// chat_inbox_reports_pending reports whether an agent's report or message is waiting that
-// was committed after this process claimed the session. Lines the user accepted do not
-// count, since only a prompt starts a turn for them, and neither does anything older than
-// the claim: that waits for the next prompt.
+// chat_inbox_reports_pending reports whether something is waiting that was committed after
+// this process claimed the session and starts a turn of its own: an agent's report or
+// message, or a line another process sent (section 8.6 of the architecture). A line this
+// process accepted does not count, since its own prompt or turn already holds it, and
+// neither does anything older than the claim: that waits for the next prompt. The lines
+// this process wrote as a follower, before it took the session over, are the takeover's
+// to deliver.
 chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
 	if chat.storage_failed || !chat_journal_writable(chat) { return false }
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	records, read_error := journal.read_inbox(chat.store, chat.session, max(chat.delivered, chat.claimed_at), context.temp_allocator)
 	if read_error != nil { return false }
 	for record in records {
-		if record.kind != .User_Input { return true }
+		if record.kind != .User_Input || record.run != chat.store.run { return true }
 	}
 	return false
 }

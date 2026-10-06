@@ -52,6 +52,22 @@ Run_Setup :: struct {
 	// remembered for the next launch. A headless or child run does not, because it
 	// selects a model for one job and must not change what the user starts with.
 	owns_selection:    bool,
+	// shared_sessions says this front-end shows a session another process runs as a
+	// follower instead of refusing it, and watches the lock file of the session it shows
+	// so that other processes' commits and a dropped claim wake the worker. Headless runs
+	// and the ACP server leave it false and refuse a running session.
+	shared_sessions:   bool,
+	// follow is where the follower's reading of the journal stands. It is meaningful only
+	// while the running store follows.
+	follow:            agent.Follow,
+	// takeover_failed stops a follower from claiming again after a claim it won could not
+	// be used, so every later wake does not repeat the failure.
+	takeover_failed:   bool,
+	// watch wakes the worker for changes of the shown session's lock file. watched is the
+	// session whose lock file it watches, and watch_id the kernel's name for it.
+	watch:             agent.Session_Watch,
+	watched:           journal.Session_Id,
+	watch_id:          agent.Session_Watch_Id,
 	// mcp_servers is borrowed from the launch's configuration, which outlives the
 	// setup. mcp owns the running MCP clients and the bindings a tool definition may
 	// borrow, so it is released after the session that holds the registry.
@@ -294,19 +310,26 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 // Opened_Session is a session resolved and taken in its own journal, not yet
 // running. It owns store and its strings until session_install takes them.
 Opened_Session :: struct {
-	store:     ^journal.Journal,
-	id:        journal.Session_Id,
-	workspace: string,
-	branch:    journal.Branch_Id,
-	head:      journal.Node_Id,
+	store:      ^journal.Journal,
+	id:         journal.Session_Id,
+	workspace:  string,
+	branch:     journal.Branch_Id,
+	head:       journal.Node_Id,
 	// provider and model are what the session's last turn ran with, "" for a new session.
-	provider:  string,
-	model:     string,
-	effort:    string,
-	recovery:  journal.Recovery,
+	provider:   string,
+	model:      string,
+	effort:     string,
+	recovery:   journal.Recovery,
 	// queued is how many lines the session accepted and never delivered, which go with the
 	// next prompt.
-	queued:    int,
+	queued:     int,
+	// own_queued counts the queued lines this process wrote as a follower, which a takeover
+	// delivers.
+	own_queued: int,
+	// following says store follows the session another process claimed. follow is where its
+	// reading of the journal starts.
+	following:  bool,
+	follow:     agent.Follow,
 }
 
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
@@ -377,27 +400,79 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	}
 
 	opened.id = summary.id
+	// The session this process already shows cannot be opened a second time: its own claim
+	// would make it a follower of itself.
+	if setup.store != nil && (setup.store.claimed == summary.id || setup.store.followed == summary.id) {
+		return opened, fmt.aprintf("the session is already open here", allocator = allocator), false
+	}
 	if _, claim_error := journal.claim(opened.store, summary.id); claim_error != nil {
-		return opened, session_error_message("cannot take the session", claim_error, allocator), false
+		if claim_error != journal.Journal_Error.Claimed {
+			return opened, session_error_message("cannot take the session", claim_error, allocator), false
+		}
+		if !setup.shared_sessions {
+			return opened,
+				fmt.aprintf("cannot take the session: another process runs it, and this mode cannot follow a running session", allocator = allocator),
+				false
+		}
+		if follow_message, followed := session_follow(setup, &opened); !followed { return opened, follow_message, false }
 	}
-	recover_error: journal.Error
-	opened.recovery, recover_error = journal.recover(opened.store)
-	if recover_error != nil { return opened, session_error_message("cannot settle the session", recover_error, allocator), false }
+	if settle_message, settled := session_settle(&opened, summary.workspace, allocator); !settled { return opened, settle_message, false }
+	return opened, "", true
+}
+
+// session_follow makes opened follow the session another process runs: it opens the
+// session's lock file without the claim, arms the watch on it, and only then positions the
+// follow, so a commit after the first read raises a wake. A failure leaves the watch on
+// the target; the caller that keeps the running session restores it with app_watch_sync.
+@(require_results)
+session_follow :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (message: string, ok: bool) {
+	allocator := setup.alloc
+	if follow_error := journal.follow(opened.store, opened.id); follow_error != nil {
+		return session_error_message("cannot follow the session", follow_error, allocator), false
+	}
+	if watch_error := app_watch_session(setup, opened.id); watch_error != nil {
+		return fmt.aprintf("cannot watch the session: %v", watch_error, allocator = allocator), false
+	}
+	follow_error: journal.Error
+	opened.follow, follow_error = agent.follow_start(opened.store, opened.id)
+	if follow_error != nil { return session_error_message("cannot read the session", follow_error, allocator), false }
+	opened.following = true
+	return "", true
+}
+
+// session_settle completes an opened session whose store holds the claim or follows it.
+// A claimed session first settles what an earlier run left open and counts the lines it
+// accepted and never delivered; either way it reads the session's head and the selection
+// it last ran with. workspace is copied into opened. The message is owned by allocator.
+@(require_results)
+session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: mem.Allocator) -> (message: string, ok: bool) {
+	store := opened.store
+	id := opened.id
+	claimed := store.claimed != {}
+	if claimed {
+		recover_error: journal.Error
+		opened.recovery, recover_error = journal.recover(store)
+		if recover_error != nil { return session_error_message("cannot settle the session", recover_error, allocator), false }
+	}
 	head_error: journal.Error
-	opened.branch, opened.head, head_error = journal.session_head(opened.store, summary.id)
-	if head_error != nil { return opened, session_error_message("cannot read the session", head_error, allocator), false }
+	opened.branch, opened.head, head_error = journal.session_head(store, id)
+	if head_error != nil { return session_error_message("cannot read the session", head_error, allocator), false }
 
-	delivered, delivered_error := journal.last_delivered_message(opened.store, summary.id)
-	if delivered_error != nil { return opened, session_error_message("cannot read the session", delivered_error, allocator), false }
-	waiting, waiting_error := journal.read_inbox(opened.store, summary.id, delivered, allocator)
-	if waiting_error != nil { return opened, session_error_message("cannot read the session", waiting_error, allocator), false }
-	for record in waiting {
-		if record.kind == .User_Input { opened.queued += 1 }
+	if claimed {
+		delivered, delivered_error := journal.last_delivered_message(store, id)
+		if delivered_error != nil { return session_error_message("cannot read the session", delivered_error, allocator), false }
+		waiting, waiting_error := journal.read_inbox(store, id, delivered, allocator)
+		if waiting_error != nil { return session_error_message("cannot read the session", waiting_error, allocator), false }
+		for record in waiting {
+			if record.kind != .User_Input { continue }
+			opened.queued += 1
+			if record.run == store.run { opened.own_queued += 1 }
+		}
+		journal.records_destroy(waiting, allocator)
 	}
-	journal.records_destroy(waiting, allocator)
 
-	selection_record, selection_found, read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Selection_Applied}}, allocator)
-	if read_error != nil { return opened, session_error_message("cannot read the session selection", read_error, allocator), false }
+	selection_record, selection_found, read_error := journal.read_latest(store, {session = id, kinds = {.Selection_Applied}}, allocator)
+	if read_error != nil { return session_error_message("cannot read the session selection", read_error, allocator), false }
 	if selection_found {
 		defer journal.record_destroy(&selection_record, allocator)
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -410,7 +485,7 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 			session = selection_record.session,
 			seq = selection_record.seq,
 		); decode_error != nil {
-			return opened, session_error_message("cannot read the session selection", decode_error, allocator), false
+			return session_error_message("cannot read the session selection", decode_error, allocator), false
 		}
 		provider, provider_error := strings.clone(selection.provider, allocator)
 		model, model_error := strings.clone(selection.model, allocator)
@@ -419,14 +494,14 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 			delete(provider, allocator)
 			delete(model, allocator)
 			delete(effort, allocator)
-			return opened, fmt.aprintf("the session's model could not be stored", allocator = allocator), false
+			return fmt.aprintf("the session's model could not be stored", allocator = allocator), false
 		}
 		opened.provider = provider
 		opened.model = model
 		opened.effort = effort
 	} else {
-		latest, found, turn_read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Turn_Started}}, allocator)
-		if turn_read_error != nil { return opened, session_error_message("cannot read the session", turn_read_error, allocator), false }
+		latest, found, turn_read_error := journal.read_latest(opened.store, {session = id, kinds = {.Turn_Started}}, allocator)
+		if turn_read_error != nil { return session_error_message("cannot read the session", turn_read_error, allocator), false }
 		defer journal.record_destroy(&latest, allocator)
 		if found {
 			provider, provider_error := strings.clone(latest.provider, allocator)
@@ -434,27 +509,29 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 			if provider_error != nil || model_error != nil {
 				delete(provider, allocator)
 				delete(model, allocator)
-				return opened, fmt.aprintf("the session's model could not be stored", allocator = allocator), false
+				return fmt.aprintf("the session's model could not be stored", allocator = allocator), false
 			}
 			opened.provider = provider
 			opened.model = model
 		}
 	}
-	workspace, workspace_error := strings.clone(summary.workspace, allocator)
+	owned_workspace, workspace_error := strings.clone(workspace, allocator)
 	if workspace_error != nil {
-		return opened, fmt.aprintf("the session's directory could not be stored", allocator = allocator), false
+		return fmt.aprintf("the session's directory could not be stored", allocator = allocator), false
 	}
-	opened.workspace = workspace
-	return opened, "", true
+	opened.workspace = owned_workspace
+	return "", true
 }
 
 // session_install makes opened the running session in place of the one running,
 // whose chat and journal it releases after the target chat initializes. It takes
 // everything opened owns and leaves it zero. False leaves the running session intact.
+// An opened session that carries the running store, as a takeover does, keeps it open.
 @(require_results)
 session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	new_session, tool_error := agent.chat_session_init(opened.store, opened.id, opened.branch, opened.head, opened.workspace, setup.alloc)
 	if tool_error.kind != .None {
+		if opened.store == setup.store { opened.store = nil }
 		opened_session_destroy(opened, setup.alloc)
 		return false
 	}
@@ -464,7 +541,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 		setup.workers_abandoned = setup.workers_abandoned || setup.session.workers_retained
 	}
 	// The session being replaced is released; its close failure changes nothing here.
-	_ = session_store_close(setup.store, setup.alloc)
+	if setup.store != opened.store { _ = session_store_close(setup.store, setup.alloc) }
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
@@ -475,12 +552,56 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	setup.resumed_provider = opened.provider
 	setup.resumed_model = opened.model
 	setup.resumed_effort = opened.effort
+	setup.follow = opened.follow
+	setup.takeover_failed = false
 	opened^ = {}
 	setup.session = new_session
 	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
 		agent.chat_runtime_message(&setup.session, .Error, "the subagent tool descriptions could not be applied to the session")
 	}
+	if watch_error := app_watch_sync(setup); watch_error != nil {
+		agent.chat_runtime_message(&setup.session, .Warning, "the session cannot be watched, so lines other processes send it wait for the next prompt")
+	}
 	return true
+}
+
+// app_following reports whether the running session is one another process runs. Owner
+// thread only: the front-end reads Status.following instead.
+@(require_results)
+app_following :: proc(app: ^App) -> bool {
+	store := app.setup.store
+	return store != nil && store.followed != {}
+}
+
+// app_watch_session makes the watch cover the lock file of session, or nothing for the
+// zero session, and removes the watch on the one it covered. The watch is armed when this
+// returns, so a caller that reads the session after it misses no commit. A failure leaves
+// session recorded as watched, so a worker that syncs again does not repeat the failure; a
+// caller that needs the watch reports it.
+@(require_results)
+app_watch_session :: proc(setup: ^Run_Setup, session: journal.Session_Id) -> os.Error {
+	if setup.watched == session { return nil }
+	if setup.watched != {} { agent.session_watch_remove(&setup.watch, setup.watch_id) }
+	setup.watched = session
+	setup.watch_id = 0
+	if session == {} { return nil }
+	path := agent.session_lock_path(setup.lock_directory, session, context.temp_allocator) or_return
+	setup.watch_id = agent.session_watch_add(&setup.watch, path) or_return
+	return nil
+}
+
+// app_watch_sync points the watch at the running session's lock file, which exists once
+// the session is claimed or followed, so a session nobody has prompted yet has none. It
+// does nothing for a front-end that does not share sessions.
+@(require_results)
+app_watch_sync :: proc(setup: ^Run_Setup) -> os.Error {
+	if !setup.shared_sessions { return nil }
+	wanted: journal.Session_Id
+	if setup.store != nil {
+		wanted = setup.store.claimed
+		if wanted == {} { wanted = setup.store.followed }
+	}
+	return app_watch_session(setup, wanted)
 }
 
 // session_store_open opens a journal of this run on the launch's state directory,
@@ -637,6 +758,10 @@ selection_intent_clear :: proc(app: ^App) {
 // for whichever boundary comes first.
 selection_request :: proc(app: ^App, provider_id, model_id: string) {
 	if runtime_stopping(app) { return }
+	if runtime_following(app) {
+		follower_refuse(app, "changing the model")
+		return
+	}
 	provider, provider_error := strings.clone(provider_id, app.run.alloc)
 	model, model_error := strings.clone(model_id, app.run.alloc)
 	if provider_error != nil || model_error != nil {
@@ -859,7 +984,9 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 	delete(app.setup.model_id, app.setup.alloc)
 	app.setup.model_id = setup_model
 	sync.mutex_unlock(&app.run.mu)
-	if app.setup.owns_selection && announce {
+	// A follower never records a selection: it would rewrite the user's default model
+	// for a session whose model it does not choose.
+	if app.setup.owns_selection && announce && !app_following(app) {
 		if record_error := selection_record(app.setup.store, target.provider_id, target.model_id, running.effort); record_error != nil {
 			running.storage_failed = true
 			selection_fail(app, "the selected model was installed but its default could not be committed")

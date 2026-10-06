@@ -45,3 +45,10 @@ Each report has a dated heading with a short name, then four parts:
 - Attempt: none; the earlier Python helper was reused out of habit.
 - Gap: the same as the first report. Code Mode could do it with `string.find(text, old, 1, true)` and splicing, but there is no literal replace with an expected count, so each replacement takes several lines of Lua.
 - Workaround: the Python `rep(old, new)` script through the shell.
+
+## 2026-10-06 Reading a tool result inside Code Mode
+
+- Goal: read one line of a document in Code Mode, splice a replacement, and pass it to the patch tool.
+- Attempt: `tools.builtin_read(...)` followed by `r.output:match(...)`.
+- Gap: the shape of `output` is not documented in the Code Mode tool description; it was not a string, so the script failed with "attempt to call a nil value (method 'match')". Each tool's result fields need a stated Lua shape, or a helper that returns a file's text.
+- Workaround: the line was read with `sed -n` through the shell and the patch tool was called directly.

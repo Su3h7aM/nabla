@@ -1121,6 +1121,10 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 			right = fmt.tprintf("%s | %s", right, effort_text)
 		}
 	}
+	// A follower says so, since its model is not the one the session runs.
+	if status.following {
+		right = fmt.tprintf("following | %s", right) if right != "" else "following"
+	}
 	// The session disables autowrap, so the whole width is usable: the
 	// bottom-right cell is written like any other, and a wide cluster may span
 	// the final two columns. Widths are cells, not bytes.

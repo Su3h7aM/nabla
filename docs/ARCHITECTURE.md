@@ -1135,7 +1135,7 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | Current | Target |
 | --- | --- |
 | one live ACP session per connection: opening another replaces it, and requests for any other session are refused | one owner per open ACP session, up to `ACP_MAX_SESSIONS` (section 22) |
-| a session another process has claimed cannot be opened | runner and followers over `user.input` records, with an inotify wake (sections 6.5 and 8.6) |
+| headless and the ACP server refuse a session another process runs; the TUI follows it | headless follows, sends its line, and prints the turn that delivered it; ACP connections follow by the same rule (section 8.6) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
 | tool jobs scheduled by placement and lane, with no access classes | access classes when a measured gain justifies them (sections 7.3 and 26) |
 | `agent/skills` with skill list and load tools | `agent/material` (sections 18, 19) |

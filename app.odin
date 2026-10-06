@@ -88,6 +88,9 @@ Status :: struct {
 	// because some finished requests reported no cache usage.
 	session_hit_partial:   bool,
 	running:               bool,
+	// following says the session runs in another process: this front-end shows it and
+	// sends lines to it, and running then reports that process's turn.
+	following:             bool,
 	// working_since spans the complete execution of one accepted prompt, across
 	// every provider request and tool call, until the session returns to idle.
 	working_since:         time.Tick,
@@ -361,6 +364,8 @@ Session_Start :: struct {
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.chat_session_destroy(&setup.session)
+	// The watch only wakes owners, so it stops once the session it woke is gone.
+	agent.session_watch_stop(&setup.watch)
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)
@@ -408,6 +413,9 @@ tui_run :: proc(
 	// This run is the user's own, so its model choice is published to the frame and
 	// remembered for the next launch.
 	app.setup.owns_selection = true
+	// The TUI shows a session another process runs as a follower, and watches the
+	// sessions it shows.
+	app.setup.shared_sessions = true
 	// The setup is filled in place: a store owns a live connection, and copying
 	// one would leave two owners of it.
 	app.setup.harness_options = harness_options
