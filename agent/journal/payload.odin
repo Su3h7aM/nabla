@@ -112,6 +112,7 @@ Response_Finish :: enum u8 {
 	Unknown,
 	Stop,
 	Length,
+	Context_Window,
 	Content_Filter,
 	Tool_Call,
 }
@@ -120,6 +121,7 @@ RESPONSE_FINISH_NAMES := [Response_Finish]string {
 	.Unknown        = "unknown",
 	.Stop           = "stop",
 	.Length         = "length",
+	.Context_Window = "context_window",
 	.Content_Filter = "content_filter",
 	.Tool_Call      = "tool_call",
 }

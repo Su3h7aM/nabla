@@ -241,7 +241,12 @@ Provider_Arguments_Object :: proc(raw: string, allocator := context.allocator) -
 Provider_Finish_Reason :: enum {
 	Unknown,
 	Stop,
+	// Length is a response the provider stopped at its output limit.
 	Length,
+	// Context_Window is a response that filled the model's context window before it
+	// finished. The provider reports it as a success, and the response is truncated:
+	// resending the same context fills the window again.
+	Context_Window,
 	Content_Filter,
 	Tool_Call,
 }

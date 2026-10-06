@@ -485,8 +485,10 @@ anthropic_stop_reason :: proc(reason: string) -> Provider_Finish_Reason {
 	switch reason {
 	case "end_turn", "stop_sequence":
 		return .Stop
-	case "max_tokens", "model_context_window_exceeded":
+	case "max_tokens":
 		return .Length
+	case "model_context_window_exceeded":
+		return .Context_Window
 	case "tool_use":
 		return .Tool_Call
 	case "refusal":

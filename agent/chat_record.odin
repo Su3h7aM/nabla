@@ -70,6 +70,8 @@ chat_finish_reason_text :: proc(reason: ai.Provider_Finish_Reason) -> string {
 		return journal.RESPONSE_FINISH_NAMES[.Stop]
 	case .Length:
 		return journal.RESPONSE_FINISH_NAMES[.Length]
+	case .Context_Window:
+		return journal.RESPONSE_FINISH_NAMES[.Context_Window]
 	case .Content_Filter:
 		return journal.RESPONSE_FINISH_NAMES[.Content_Filter]
 	case .Tool_Call:

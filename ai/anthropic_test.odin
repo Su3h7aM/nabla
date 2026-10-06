@@ -286,6 +286,27 @@ test_anthropic_stream_text_and_usage :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Provider_Stream_Error.None)
 }
 
+// A response that filled the context window is a different stop from one that reached the
+// output limit: the first is cured by making room, the second by asking for less.
+@(test)
+test_anthropic_stream_stop_reasons_distinguish_the_context_window :: proc(t: ^testing.T) {
+	Stop :: struct {
+		wire:   string,
+		reason: Provider_Finish_Reason,
+	}
+	stops := [?]Stop{{"max_tokens", .Length}, {"model_context_window_exceeded", .Context_Window}}
+	for stop in stops {
+		state := Provider_Stream_Start(.Anthropic_Messages, context.temp_allocator)
+		defer Provider_Stream_Destroy(&state)
+		data := strings.concatenate({`{"type":"message_delta","delta":{"stop_reason":"`, stop.wire, `"}}`}, context.temp_allocator)
+		events := consume(t, data, &state, 1)
+		completed := expect_event(t, events[0], Provider_Completed_Event)
+		testing.expect_value(t, completed.Reason, stop.reason)
+		testing.expect_value(t, completed.Reason_Text, stop.wire)
+		destroy_events(events)
+	}
+}
+
 @(test)
 test_anthropic_stream_tool_use_arguments :: proc(t: ^testing.T) {
 	state := Provider_Stream_Start(.Anthropic_Messages, context.temp_allocator)

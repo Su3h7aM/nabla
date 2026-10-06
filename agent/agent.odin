@@ -375,6 +375,7 @@ Chat_Notice :: enum {
 	None,
 	Ignored,
 	Truncated,
+	Context_Window,
 	Missing_Call_Identity,
 	Duplicate_Call_ID,
 }
@@ -391,6 +392,8 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 	switch notice {
 	case .Truncated:
 		return "the previous response was cut off by the output limit before it finished, so none of it was executed; reissue the work in smaller steps"
+	case .Context_Window:
+		return "the previous response was cut off because the context window filled before it finished, so none of it was executed; the conversation is compacted to make room, so reissue the work in smaller steps"
 	case .Missing_Call_Identity:
 		return "a proposed tool call carried no id or no tool name, so none of the calls ran; every call needs the provider's id and the tool's name"
 	case .Duplicate_Call_ID:
@@ -645,6 +648,13 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 			chat_session_feed_completion(chat, value.source)
 		} else if value.reason == .Length {
 			chat_session_note_notice(chat, value.source, .Truncated)
+		} else if value.reason == .Context_Window {
+			// Resending this context fills the window again, so the next request is made after a
+			// compaction. When none can start, the request that follows meets the ordinary
+			// overflow handling: admission, or the provider's refusal, repairs or ends the turn.
+			if chat_session_note_notice(chat, value.source, .Context_Window) {
+				_ = chat_compact_request(chat, .Provider_Overflow)
+			}
 		} else {
 			// The provider ended the response without an answer the harness can use. A content
 			// filter is the provider's policy, which only the user can act on; any other end
