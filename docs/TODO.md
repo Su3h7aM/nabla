@@ -29,14 +29,10 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 
 ## Tool descriptions
 
-Each description states what the tool does, why it exists, and how to use it, precisely.
-
-- Code Mode: state the result shape. `output` is a table of the tool's fields: `output.content` for `builtin_read`, `output.stdout` and `output.stderr` for `builtin_shell`.
-- Shell: say to create files with `builtin_write` instead of heredocs, and name common fish syntax differences. Replace "bounded stdout and stderr" with the kept output file, since output is never discarded.
+- The read and write descriptions state the 32 KiB preview as a literal; build them from `TOOL_RESULT_PREVIEW_BYTES` as the shell description does.
+- `subagent_select` with an unknown `provider` and no `model` answers `name a model of provider X: none` instead of listing the configured providers.
 - Patch parsing: a mistyped header such as `*** Updat File:` inside a section becomes hunk content instead of an error naming the line.
-- Patch: a hunk of only `-old` and `+new` lines is enough when the line is unique.
-- Read: when a result is cut to the preview, the notice gives the shown line count and the next `offset`. The 2000-line default can exceed the preview size.
-- `agent_spawn`: "provider not found" lists the configured providers, and the schema says which model id form is expected.
+- A literal replace with an expected match count is reported three times (Lua patterns need escaping, the patch tool matches whole lines). Decide where it belongs: a Code Mode helper or a substring form of the patch tool.
 
 ## Simplifications
 

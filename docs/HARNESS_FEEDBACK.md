@@ -1,12 +1,5 @@
 # Harness feedback
 
-## 2026-10-06 Provider spelling when starting a subagent
-
-- Goal: delegate a bounded investigation to the requested model.
-- Attempt: `agent_spawn` with provider `openai` and model `gpt-6.1-sol` returned `provider not found: openai`.
-- Gap: the tool schema does not list configured provider names or explain how model aliases resolve.
-- Workaround: omit provider and pass the full model name `openai/gpt-6.1-sol`; the harness resolved it to the configured provider and started the agent.
-
 ## 2026-10-06 Oversized batched source inspection
 
 - Goal: inspect compaction architecture and its owner-loop call sites together.
@@ -48,13 +41,6 @@ Each report has a dated heading with a short name, then four parts:
 - Gap: no tool selects hunks non-interactively.
 - Workaround: a Python script wrote an intermediate version of the mixed file (the old text with only some hunks applied, and `jj file show -r @-` for the parent text), then `jj split <paths>`, then the full file was copied back.
 
-## 2026-10-06 Heredocs in the shell tool
-
-- Goal: write a short script inline in a shell command.
-- Attempt: `python3 - <<EOF` in the shell tool.
-- Gap: the shell tool runs fish, which has no heredoc, so the command failed to parse.
-- Workaround: the file-write tool created the script under /tmp and the shell ran it.
-
 ## 2026-10-06 Operating-system experiments across processes
 
 - Goal: measure whether an inotify event on a SQLite WAL commit can arrive before a reader sees the commit, and whether a SIGKILLed flock holder raises an inotify close event on its lock file.
@@ -68,34 +54,6 @@ Each report has a dated heading with a short name, then four parts:
 - Attempt: none; the earlier Python helper was reused out of habit.
 - Gap: the same as the first report. Code Mode could do it with `string.find(text, old, 1, true)` and splicing, but there is no literal replace with an expected count, so each replacement takes several lines of Lua.
 - Workaround: the Python `rep(old, new)` script through the shell.
-
-## 2026-10-06 Reading a tool result inside Code Mode
-
-- Goal: read one line of a document in Code Mode, splice a replacement, and pass it to the patch tool.
-- Attempt: `tools.builtin_read(...)` followed by `r.output:match(...)`.
-- Gap: the shape of `output` is not documented in the Code Mode tool description; it was not a string, so the script failed with "attempt to call a nil value (method 'match')". Each tool's result fields need a stated Lua shape, or a helper that returns a file's text.
-- Workaround: the line was read with `sed -n` through the shell and the patch tool was called directly.
-
-## 2026-10-07 Model spelling when starting a subagent
-
-- Goal: start two subagents on Sonnet.
-- Attempt: `agent_spawn` with model `claude-sonnet-5-5` and no provider.
-- Gap: the bare model id did not resolve; only the catalog id with its vendor prefix did. The error listed the valid ids, so the fix was quick, but the schema does not say which form is expected. Related to the provider spelling report above.
-- Workaround: `model = anthropic/claude-sonnet-5-5`, `provider = cliproxyapi`.
-
-## 2026-10-07 Reading a long converted text file
-
-- Goal: read a PDF converted to text with `pdftotext`, about 700 lines per read.
-- Attempt: `builtin_read` with a 700-line limit.
-- Gap: the result was cut at about 32 KB, so the requested range was not all visible, and the notice did not give the next offset to resume from.
-- Workaround: smaller line ranges.
-
-## 2026-10-07 Bash loop syntax in the fish shell tool
-
-- Goal: grep several names across the repository in one shell command.
-- Attempt: a bash `for ...; do ... done` loop and an unquoted `--include=*.odin` glob in `builtin_shell`.
-- Gap: fish rejected both ("Unknown command: do", "No matches for wildcard"). The command ran until exit 124, and the parse error was echoed about 25 times in stderr. The tool description names the shell but not its common syntax differences.
-- Workaround: Code Mode calling `tools.builtin_shell` once per name, with quoted globs.
 
 ## 2026-10-07 Overlapping context in grep results
 
