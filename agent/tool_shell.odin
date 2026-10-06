@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "nabla:subprocess"
 
 TOOL_SHELL_NAME :: "builtin_shell"
 
@@ -110,7 +111,7 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Sh
 // that never started is tried twice: a shell that ran it has already had its
 // effects, and running it again would repeat them.
 @(require_results)
-tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: Tool_Child, spawn: Tool_Spawn, err: os.Error) {
+tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: subprocess.Child, spawn: subprocess.Spawn, err: os.Error) {
 	shell := tool_shell_preferred()
 	child, spawn, err = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
 	if spawn != .Exec_Failed || shell == TOOL_SHELL_FALLBACK { return }
@@ -153,7 +154,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	_ = os.close(stdout_write)
 	_ = os.close(stderr_write)
 	if spawn != .Started { return tool_shell_not_started(ctx, spawn_error, data) }
-	defer tool_child_close(&child)
+	defer subprocess.child_close(&child)
 
 	stop, wait_error, background_terminated := tool_drain_pipes(
 		&child,
@@ -177,7 +178,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	case .None:
 	}
 
-	exited, exit_code, waited := tool_child_reap(&child)
+	exited, exit_code, waited := subprocess.child_reap(&child)
 	if !waited {
 		message := "the command ran, but its exit status could not be read"
 		message = tool_shell_background_message(message, background_terminated)

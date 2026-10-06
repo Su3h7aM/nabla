@@ -9,6 +9,7 @@ import "core:strings"
 import "core:testing"
 
 import "nabla:agent/journal"
+import "nabla:subprocess"
 
 // SHELL_TEST_PROBE_VARIABLE is the variable the inheritance test exports for the
 // command to read back.
@@ -55,11 +56,11 @@ shell_test_clear_shell :: proc(test: ^testing.T) {
 
 @(test)
 test_shell_missing_child_is_not_a_successful_exit :: proc(test: ^testing.T) {
-	child := Tool_Child {
+	child := subprocess.Child {
 		pid = 1,
 	}
-	testing.expect(test, tool_child_poll(&child), "a process that is not our child cannot be waited on")
-	exited, _, waited := tool_child_reap(&child)
+	testing.expect(test, subprocess.child_poll(&child), "a process that is not our child cannot be waited on")
+	exited, _, waited := subprocess.child_reap(&child)
 	testing.expect(test, !waited && !exited, "an absent child has no known exit status")
 }
 

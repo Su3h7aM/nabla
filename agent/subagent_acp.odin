@@ -13,6 +13,7 @@ import "core:time"
 import "nabla:acp"
 import "nabla:agent/journal"
 import "nabla:ai"
+import "nabla:subprocess"
 
 // An ACP subagent is another agent program, driven over the Agent Client Protocol on its
 // stdin and stdout. The subagent's thread is the only one using the connection: it sends one
@@ -138,7 +139,7 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 // ACP_Input is the agent's stdin. Its descriptor pair comes from acp_input_open.
 @(private)
 ACP_Input :: struct {
-	ours:   Tool_Fd,
+	ours:   subprocess.Fd,
 	theirs: ^os.File, // for the child's stdin; closed once the child has it
 	open:   bool,
 }
@@ -166,7 +167,7 @@ acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, o
 @(private)
 ACP_Connection :: struct {
 	member:        ^Subagent,
-	child:         Tool_Child,
+	child:         subprocess.Child,
 	started:       bool,
 	input:         ^ACP_Input,
 	output:        ^os.File, // read end of the agent's stdout
@@ -415,8 +416,8 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 @(private)
 acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duration) {
 	if connection.started {
-		tool_terminate_group(&connection.child)
-		tool_child_close(&connection.child)
+		subprocess.terminate_group(&connection.child)
+		subprocess.child_close(&connection.child)
 	}
 	// The agent's pipes are abandoned here: its process is gone or going.
 	if connection.output != nil { _ = os.close(connection.output) }
@@ -893,35 +894,35 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	}
 	// The agent's exit is watched beside its output, because a descendant that inherited
 	// stdout can keep it open after the agent itself is gone.
-	fds: [5]Tool_Poll
+	fds: [5]subprocess.Poll
 	fds[0] = {
-		fd = tool_fd(connection.output),
+		fd = subprocess.fd(connection.output),
 	}
 	fds[1] = {
-		fd = connection.child.exit.fd,
+		fd = connection.child.exit,
 	}
 	count := 2
 	errors_index := -1
 	if connection.errors != nil {
 		errors_index = count
 		fds[count] = {
-			fd = tool_fd(connection.errors),
+			fd = subprocess.fd(connection.errors),
 		}
 		count += 1
 	}
 	if !connection.cancel_sent {
 		fds[count] = {
-			fd = tool_fd(member.wake.read),
+			fd = subprocess.fd(member.wake.read),
 		}
 		count += 1
 		if member.parent_wake != nil {
 			fds[count] = {
-				fd = tool_fd(member.parent_wake),
+				fd = subprocess.fd(member.parent_wake),
 			}
 			count += 1
 		}
 	}
-	if poll_error := tool_poll(fds[:count], connection.stop_deadline, connection.cancel_sent); poll_error != nil {
+	if poll_error := subprocess.poll(fds[:count], connection.stop_deadline, connection.cancel_sent); poll_error != nil {
 		return fmt.tprintf("the agent could not be waited on: %v", poll_error)
 	}
 	if connection.cancel_sent && time.tick_diff(time.tick_now(), connection.stop_deadline) <= 0 {
@@ -936,7 +937,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 		if fds[1].ready && !stderr_waiting { return acp_ended(connection, "exited") }
 		return ""
 	}
-	read, status := tool_read(connection.output, buffer[:])
+	read, status := subprocess.read(connection.output, buffer[:])
 	switch status {
 	case .Again:
 		return ""
@@ -959,7 +960,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 // its end. It returns false when nothing more is ready.
 @(private)
 acp_stderr_read :: proc(connection: ^ACP_Connection, buffer: []u8) -> bool {
-	taken, status := tool_read(connection.errors, buffer)
+	taken, status := subprocess.read(connection.errors, buffer)
 	if status == .Failed || (status == .Ok && taken == 0) {
 		_ = os.close(connection.errors)
 		connection.errors = nil
@@ -992,8 +993,8 @@ acp_ended :: proc(connection: ^ACP_Connection, what: string) -> string {
 	// ready is read, so a descendant that holds the pipe open cannot hold up the report.
 	buffer: [SUBAGENT_ACP_READ_BYTES]u8
 	for connection.errors != nil {
-		ready := [1]Tool_Poll{{fd = tool_fd(connection.errors)}}
-		if tool_poll(ready[:], time.tick_now(), true) != nil || !ready[0].ready { break }
+		ready := [1]subprocess.Poll{{fd = subprocess.fd(connection.errors)}}
+		if subprocess.poll(ready[:], time.tick_now(), true) != nil || !ready[0].ready { break }
 		if !acp_stderr_read(connection, buffer[:]) { break }
 	}
 	tail := strings.trim_space(string(connection.stderr_tail[:]))

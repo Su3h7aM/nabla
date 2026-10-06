@@ -4,6 +4,7 @@ package agent
 import "core:os"
 import "core:strings"
 import "core:sys/linux"
+import "nabla:subprocess"
 
 // SOCKET_CLOSE_ON_EXEC is SOCK_CLOEXEC, which Linux takes in the socket type argument.
 @(private = "file")
@@ -17,7 +18,7 @@ acp_input_open :: proc() -> (input: ACP_Input, ok: bool) {
 	socket_type := transmute(linux.Socket_Type)(int(linux.Socket_Type.STREAM) | SOCKET_CLOSE_ON_EXEC)
 	if linux.socketpair(.UNIX, socket_type, .HOPOPT, &pair) != .NONE { return {}, false }
 	input = {
-		ours   = Tool_Fd(pair[0]),
+		ours   = subprocess.Fd(pair[0]),
 		theirs = os.new_file(uintptr(pair[1]), "acp-stdin"),
 		open   = true,
 	}

@@ -3,7 +3,7 @@
 A minimal, simple, and robust coding-agent harness written in Odin. The monorepo has three layers, and dependencies point inward from the harness toward the foundation:
 
 - **Foundation**: `text`, `markdown`, `input`, `term`, `layout`, `tui` (with `tui/widgets`). A terminal, layout, text, and Markdown stack that knows nothing about models, agents, or HTTP. `layout` imports nothing else from the repo.
-- **Libraries**: `dns`, `tls`, `http` (with `http/client`), `sse`, `websocket`, `ai`, `mcp`, `acp`, `db` (with `db/sqlite`). Each is a standalone library another Odin project could use.
+- **Libraries**: `dns`, `tls`, `http` (with `http/client`), `sse`, `websocket`, `subprocess`, `ai`, `mcp`, `acp`, `db` (with `db/sqlite`). Each is a standalone library another Odin project could use.
 - **Harness**: `agent` and the root `nabla` executable. Only the root package imports both the foundation and `agent`.
 
 A foundation or library package must be describable without naming Nabla, so it carries no turn, session, tool-policy, catalog, or presentation concept. Code only the harness uses belongs in `agent` or the root package. Prefer extending the package that owns a subject over adding a package.

@@ -163,7 +163,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 
 ```text
 foundation   text  markdown  input  term  layout  tui  tui/widgets
-libraries    dns  tls  http  http/client  sse  websocket  ai  mcp  acp  db  db/sqlite
+libraries    dns  tls  http  http/client  sse  websocket  subprocess  ai  mcp  acp  db  db/sqlite
 harness      agent  agent/journal  agent/material  root package (nabla executable)
 ```
 
@@ -171,6 +171,7 @@ harness      agent  agent/journal  agent/material  root package (nabla executabl
 | --- | --- | --- |
 | foundation | text, Markdown parsing, input, terminal, layout, immediate-mode UI | anything about models, sessions, HTTP |
 | `dns` `tls` `http` `http/client` `sse` `websocket` | protocols, transfer phases, byte and delivery facts | retries of model work, provider knowledge, harness logging policy |
+| `subprocess` | starting a child in its own process group, exit watching, group termination (SIGTERM, grace, SIGKILL), readiness polling | what the child is for, pipes policy, output capture |
 | `ai` | provider API families, encoding with caller-owned encode cache, stream decoding, failure classification, delivery evidence, one-send operations, Responses WebSocket connection | turn control, retry authorization, catalog policy, storage |
 | `mcp` | MCP client protocol over stdio, delivery state | tool policy, naming policy |
 | `acp` | ACP framing, JSON-RPC, payload shapes for both agent and client roles, writer | sessions, turns, Nabla concepts |
@@ -227,7 +228,7 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 | session watcher | 0..1 | `ppoll(inotify fd, stop eventfd)` | owner wakes for shared sessions (section 8.6) |
 | catalog refresh | 0 or 1, on demand, exits when done | network I/O | provider listing and models.dev fetch |
 | job worker (tool call, provider attempt, compaction) | per session: 0..`TOOL_JOBS_MAX_ACTIVE` tool jobs, at most one attempt, at most one compaction | the blocking operation | its kind's record: input and output |
-| MCP server | per configured server, started lazily | (external) | its own process |
+| MCP server | per configured server, started lazily | (external) | its own process, started and stopped through `subprocess` |
 | native subagent owner | 0..`subagents_max_running` | as owner | its own session |
 | ACP subagent | 0..`subagents_max_running`, shared with native | (external) | its own process and session |
 

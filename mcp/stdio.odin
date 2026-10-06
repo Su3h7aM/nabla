@@ -7,6 +7,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import "nabla:subprocess"
 
 // Environment_Entry is one variable a server is launched with. The environment is
 // explicit and frozen: the harness does not pass its own, so a server sees only
@@ -93,7 +94,7 @@ stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocat
 // pipe, and a request outcome never depends on it.
 Stdio :: struct {
 	pipes:            Stdio_Pipes,
-	child:            Stdio_Child,
+	child:            subprocess.Child,
 	started:          bool,
 	line:             [dynamic]u8,
 	// line_start is where the unconsumed bytes of line begin: everything before it has been
@@ -118,24 +119,16 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 	if !strings.has_prefix(config.executable, "/") {
 		return error_make(.Spawn_Failed, "a server executable must be an absolute path", allocator = allocator)
 	}
-	argv, envp, vectors_ok := stdio_alloc_vectors(config.executable, config.arguments, config.environment, allocator)
-	defer stdio_destroy_vectors(argv, envp, allocator)
+	argv, environment, vectors_ok := stdio_vectors(config.executable, config.arguments, config.environment, allocator)
+	defer stdio_vectors_destroy(argv, environment, allocator)
 	if !vectors_ok { return error_make(.Out_Of_Memory, allocator = allocator) }
-
-	name := argv[0]
-	directory: cstring
-	if config.working_directory != "" {
-		cloned, clone_ok := strings_clone_cstring(config.working_directory, context.temp_allocator)
-		if !clone_ok { return error_make(.Out_Of_Memory, allocator = allocator) }
-		directory = cloned
-	}
 
 	// A dead peer must be an error, not a signal that kills the harness.
 	if sigpipe_error := stdio_sigpipe_acquire(); sigpipe_error != nil {
 		return stdio_spawn_error("the SIGPIPE disposition could not be saved", sigpipe_error, allocator)
 	}
 	stdio.sigpipe_owned = true
-	pipes, child, spawn_error := stdio_spawn(name, raw_data(argv), raw_data(envp), directory)
+	pipes, child, spawn_error := stdio_spawn(argv, environment, config.working_directory)
 	if spawn_error != nil {
 		stdio_sigpipe_release()
 		stdio.sigpipe_owned = false
@@ -210,9 +203,9 @@ stdio_stop :: proc(stdio: ^Stdio) {
 		// Every end is closed once, on the way out, and the transport may not report a
 		// failure by then: a close that fails changes nothing.
 		_ = os.close(stdio.pipes.stdin)
-		stdio_child_await(&stdio.child, time.tick_add(time.tick_now(), STDIO_KILL_GRACE))
-		if !stdio.child.reaped { stdio_terminate_group(&stdio.child) }
-		stdio_child_close(&stdio.child)
+		subprocess.child_await(&stdio.child, time.tick_add(time.tick_now(), subprocess.KILL_GRACE))
+		if !stdio.child.reaped { _ = subprocess.terminate_group(&stdio.child) }
+		subprocess.child_close(&stdio.child)
 	}
 	// The drainer still reads standard error, so it is joined before that pipe
 	// end closes.
@@ -241,7 +234,7 @@ stdio_stop :: proc(stdio: ^Stdio) {
 // stdio_running reports whether a server process is still up.
 stdio_running :: proc(stdio: ^Stdio) -> bool {
 	if !stdio.started { return false }
-	return !stdio_child_poll(&stdio.child)
+	return !subprocess.child_poll(&stdio.child)
 }
 
 // stdio_write_line writes one framed message. A message is one line, so the
@@ -309,11 +302,11 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 			return nil, stdio_wait_error(stdio, .Read_Failed, .Delivered, wait_error)
 		}
 		buffer: [4096]u8
-		count, status := stdio_read(stdio.pipes.stdout, buffer[:])
+		count, status := subprocess.read(stdio.pipes.stdout, buffer[:])
 		if status == .Again { continue }
 		if status == .Failed || count <= 0 {
 			kind := Error_Kind.End_Of_Stream
-			if stdio_child_poll(&stdio.child) { kind = .Server_Exited }
+			if subprocess.child_poll(&stdio.child) { kind = .Server_Exited }
 			return nil, stdio_transport_error(stdio, kind, .Delivered)
 		}
 		appended, append_err := append(&stdio.line, ..buffer[:count])
@@ -400,7 +393,7 @@ stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 	for {
 		stopped, wait_error := stdio_await_readable(stdio.pipes.stderr, stdio.drain_stop_read)
 		if stopped || wait_error != nil { return }
-		read_count, status := stdio_read(stdio.pipes.stderr, buffer[:])
+		read_count, status := subprocess.read(stdio.pipes.stderr, buffer[:])
 		if status == .Again { continue }
 		if status == .Failed || read_count <= 0 { return }
 		sync.mutex_lock(&stdio.stderr_mutex)

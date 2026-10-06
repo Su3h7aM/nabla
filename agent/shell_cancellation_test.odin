@@ -16,6 +16,7 @@ import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:ai"
+import "nabla:subprocess"
 
 // Shell cancellation runs the real executor against real processes. The test
 // synchronizes on observable evidence (a pid written by the command, or a request
@@ -240,7 +241,12 @@ test_shell_cancel_escalates_when_sigterm_is_ignored :: proc(test: ^testing.T) {
 	defer tool_result_destroy(&run.result)
 
 	testing.expect_value(test, run.result.outcome, journal.Tool_Outcome.Cancelled)
-	testing.expectf(test, elapsed >= TOOL_KILL_GRACE, "returned in %v without waiting out the SIGTERM grace, so SIGKILL was not the escalation path", elapsed)
+	testing.expectf(
+		test,
+		elapsed >= subprocess.KILL_GRACE,
+		"returned in %v without waiting out the SIGTERM grace, so SIGKILL was not the escalation path",
+		elapsed,
+	)
 }
 
 @(test)
