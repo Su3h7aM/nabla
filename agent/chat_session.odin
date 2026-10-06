@@ -237,6 +237,7 @@ Chat_Session :: struct {
 	instructions_digest:          journal.Digest,
 	manifest_digest:              journal.Digest,
 	disable_project_instructions: bool,
+	subagents_max_running:        int, // zero means SUBAGENTS_MAX_RUNNING
 
 	// role_instructions are appended after everything else the instructions hold, so a
 	// subagent's requests share its orchestrator's instruction prefix. Owned.
@@ -429,6 +430,7 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 @(require_results)
 chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) -> Tool_Registry_Error {
 	chat.disable_project_instructions = options.disable_project_instructions
+	chat.subagents_max_running = options.subagents_max_running
 	chat.acp_agents = options.acp_agents
 	return tool_registry_describe_agents(&chat.tools, options.acp_agents)
 }

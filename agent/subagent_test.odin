@@ -10,6 +10,10 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 
+// SUBAGENT_TEST_MAX_RUNNING is the configured cap the queueing tests run under. It differs from
+// SUBAGENTS_MAX_RUNNING, so a test that passes proves the configured value is the one used.
+SUBAGENT_TEST_MAX_RUNNING :: 2
+
 // subagent_test_call runs one call of the orchestrator through the job table, as a model's
 // proposal would be, so its admission, delegation records, and result are the real ones.
 // It returns the call's outcome.
@@ -441,8 +445,9 @@ subagent_test_full_team :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Cat
 	chat.provider_id = strings.clone("test-provider", chat.allocator)
 	delete(chat.model_id, chat.allocator)
 	chat.model_id = strings.clone("test-model", chat.allocator)
+	chat.subagents_max_running = SUBAGENT_TEST_MAX_RUNNING
 	agent_team_note_parent(chat)
-	chat.team.running = SUBAGENTS_MAX_RUNNING
+	chat.team.running = SUBAGENT_TEST_MAX_RUNNING
 }
 
 // With every slot taken a background subagent queues instead of starting, and a slot freed by a
@@ -483,7 +488,7 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 	subagent_finish(&holder)
 	testing.expect(test, first.status == .Running && first.thread != nil, "the oldest queued child takes the freed slot")
 	testing.expect(test, second.status == .Queued && second.thread == nil, "the next one keeps waiting")
-	testing.expect_value(test, team.running, SUBAGENTS_MAX_RUNNING)
+	testing.expect_value(test, team.running, SUBAGENT_TEST_MAX_RUNNING)
 	holder.admitted = true
 	subagent_finish(&holder)
 	testing.expect(test, second.status == .Running && second.thread != nil, "the next freed slot admits the next child")
@@ -528,7 +533,7 @@ test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	message, _ := inbox_text(records[0])
 	testing.expect(test, strings.contains(message, "agent-1 was stopped"), message)
 	testing.expect_value(test, agent_provider_request_count(&provider), 0)
-	testing.expect_value(test, chat.team.running, SUBAGENTS_MAX_RUNNING)
+	testing.expect_value(test, chat.team.running, SUBAGENT_TEST_MAX_RUNNING)
 }
 
 @(test)
@@ -693,7 +698,8 @@ test_a_crash_with_a_running_and_a_queued_child_reports_both_outcomes_once :: pro
 		catalog = &catalog.catalog,
 	}
 	// One slot is free, so the first child runs and the second queues.
-	chat.team.running = SUBAGENTS_MAX_RUNNING - 1
+	chat.subagents_max_running = SUBAGENT_TEST_MAX_RUNNING
+	chat.team.running = SUBAGENT_TEST_MAX_RUNNING - 1
 
 	_test_accept(test, chat, "start two subagents")
 	connection := ai.Provider_Connection {

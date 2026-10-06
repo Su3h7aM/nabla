@@ -12,8 +12,9 @@ import "nabla:agent/journal"
 import "nabla:ai"
 
 // SUBAGENTS_MAX_RUNNING is how many subagents run at once, native and ACP together. It is a
-// concurrency default, not a refusal: a background subagent started past it queues and starts
-// when a running one finishes, and a blocking subagent always runs on its caller's worker.
+// concurrency default, not a refusal: the `subagents_max_running` configuration option replaces
+// it. A background subagent started past the bound queues and starts when a running one
+// finishes, and a blocking subagent always runs on its caller's worker.
 SUBAGENTS_MAX_RUNNING :: 4
 
 Subagent_Status :: enum {
@@ -91,7 +92,7 @@ Agent_Team :: struct {
 	members:   [dynamic]^Subagent,
 	started:   int,
 	starting:  int,
-	running:   int, // slots in use: running children, which a blocking child may take past SUBAGENTS_MAX_RUNNING
+	running:   int, // slots in use: running children, which a blocking child may take past the configured bound
 	waiting:   [dynamic]^Subagent, // background children queued for a slot, oldest first
 	closing:   bool,
 	abandoned: bool,
@@ -112,6 +113,7 @@ Agent_Parent :: struct {
 	effort:                       string,
 	effort_levels:                []string,
 	disable_project_instructions: bool,
+	subagents_max_running:        int, // zero means SUBAGENTS_MAX_RUNNING
 	tools:                        Tool_Registry,
 	catalog:                      Catalog_Ref,
 	acp_agents:                   []ACP_Agent_Config, // borrowed from the loaded config
@@ -205,6 +207,7 @@ agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^A
 	out.session = chat.session
 	if chat.store != nil { out.run = chat.store.run }
 	out.disable_project_instructions = chat.disable_project_instructions
+	out.subagents_max_running = chat.subagents_max_running
 	out.catalog = chat.catalog
 	out.acp_agents = chat.acp_agents
 	failed = false
@@ -532,8 +535,8 @@ subagent_select :: proc(
 }
 
 // subagent_launch starts a background subagent on a thread of its own, or queues it when
-// SUBAGENTS_MAX_RUNNING slots are in use. It returns false when the subagent neither started nor
-// queued; a failed thread creation leaves the slot held, which subagent_finish releases.
+// the configured number of slots are in use. It returns false when the subagent neither started
+// nor queued; a failed thread creation leaves the slot held, which subagent_finish releases.
 // queued says the subagent waits for a slot: it may start, finish, and be released at any
 // moment after, so the caller must not touch member again.
 @(require_results)
@@ -542,7 +545,8 @@ subagent_launch :: proc(member: ^Subagent) -> (queued, ok: bool) {
 	member.stop.parent = &process_interrupt
 	sync.mutex_lock(&team.mutex)
 	// A closing team has already asked every member to stop, so this one starts only to end.
-	if team.running >= SUBAGENTS_MAX_RUNNING && !team.closing {
+	limit := team.parent.subagents_max_running if team.parent.subagents_max_running > 0 else SUBAGENTS_MAX_RUNNING
+	if team.running >= limit && !team.closing {
 		member.status = .Queued
 		_, append_error := append(&team.waiting, member)
 		sync.mutex_unlock(&team.mutex)

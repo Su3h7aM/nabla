@@ -14,7 +14,6 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 - `OPENAI_TOOL_SCHEMA_DEPTH = 16` (`ai/openai.odin`). Check against the OpenAI documentation; strict structured outputs document a nesting limit, which applies only when strict mode is used.
 - `MAX_MESSAGE_DEPTH = 64` (`mcp/protocol.odin`), with the number repeated in its error text. Neither MCP nor JSON-RPC sets a depth; if the guard protects the recursive JSON parser from hostile input, say so in the comment.
 - `db/error.odin` truncates backend messages to 128 bytes, against "report in full".
-- `SUBAGENTS_MAX_RUNNING = 4` (`agent/subagent.odin`). Keep a cap, but make it a Lua configuration option with 4 as the default.
 - Check that the provider error codes treated as retryable, repairable, or fatal match the providers' documentation.
 
 ## Subagents

@@ -236,6 +236,38 @@ test_lua_config_loads_compact_on_switch :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_lua_config_loads_subagents_max_running :: proc(t: ^testing.T) {
+	directory, directory_error := os.make_directory_temp("", "nabla-config-subagents-*", context.allocator)
+	if !testing.expect_value(t, directory_error, nil) { return }
+	defer delete(directory, context.allocator)
+	defer testing.expect_value(t, os.remove_all(directory), nil)
+	cases := []struct {
+		name:   string,
+		body:   string,
+		want:   int,
+		detail: string,
+	} {
+		{"absent", `return {}`, 0, ""},
+		{"set", `return { subagents_max_running = 8 }`, 8, ""},
+		{"zero", `return { subagents_max_running = 0 }`, 0, "subagents_max_running: expected positive integer, got number"},
+		{"negative", `return { subagents_max_running = -1 }`, 0, "subagents_max_running: expected positive integer, got number"},
+		{"string", `return { subagents_max_running = "4" }`, 0, "subagents_max_running: expected positive integer, got string"},
+	}
+	for entry, index in cases {
+		path := fmt.aprintf("%s/%d.lua", directory, index, allocator = context.temp_allocator)
+		testing.expect(t, os.write_entire_file(path, transmute([]u8)entry.body) == nil)
+		sources, options, servers, err, detail := load_lua_config(path)
+		defer catalog_sources_destroy(&sources)
+		defer mcp_servers_destroy(&servers)
+		defer if detail != "" { delete(detail) }
+		want_error := Config_Error.Invalid if entry.detail != "" else Config_Error.None
+		testing.expectf(t, err == want_error, "%s: got %v want %v", entry.name, err, want_error)
+		testing.expectf(t, detail == entry.detail, "%s: detail %q want %q", entry.name, detail, entry.detail)
+		testing.expectf(t, options.subagents_max_running == entry.want, "%s: got %d want %d", entry.name, options.subagents_max_running, entry.want)
+	}
+}
+
+@(test)
 test_lua_config_preserves_the_parser_message_and_line :: proc(t: ^testing.T) {
 	path := fmt.aprintf("/tmp/nabla-config-syntax-%d.lua", os.get_pid(), allocator = context.temp_allocator)
 	defer os.remove(path)
