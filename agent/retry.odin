@@ -11,11 +11,11 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// CHAT_RETRY_DELAYS is the wait before each resend of a request that failed for a reason the
-// provider calls temporary or nobody names. Once they are spent the request stops: a failure
-// that outlasts them is not the passing kind.
+// CHAT_RETRY_DELAYS is the doubling wait before each of five resends of a request that failed
+// for a reason the provider calls temporary or nobody names. Once they are spent the request
+// stops: a failure that outlasts them is not the passing kind.
 @(rodata)
-CHAT_RETRY_DELAYS := [3]time.Duration{1 * time.Second, 3 * time.Second, 5 * time.Second}
+CHAT_RETRY_DELAYS := [5]time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
 
 // Chat_Retry_Policy is the schedule one chain resends a failed request on: delays[n] is the
 // wait before resend n + 1. delays is borrowed and outlives every chain that uses it.

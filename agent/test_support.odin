@@ -18,7 +18,13 @@ import "nabla:ai"
 // TEST_RETRY_DELAYS is the production schedule's length with waits short enough that a
 // retry costs a test milliseconds instead of seconds.
 @(rodata)
-TEST_RETRY_DELAYS := [len(CHAT_RETRY_DELAYS)]time.Duration{2 * time.Millisecond, 3 * time.Millisecond, 4 * time.Millisecond}
+TEST_RETRY_DELAYS := [len(CHAT_RETRY_DELAYS)]time.Duration {
+	2 * time.Millisecond,
+	3 * time.Millisecond,
+	4 * time.Millisecond,
+	5 * time.Millisecond,
+	6 * time.Millisecond,
+}
 
 // test_retry_policy is the policy the suites run with. A suite that cares about the decision
 // itself calls chat_recovery_decide directly.
