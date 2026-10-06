@@ -27,9 +27,10 @@ import "nabla:ai"
 // The table's records are allocated one at a time and never move, because an effect
 // names a job and a running worker holds that address.
 
-// TOOL_JOBS_MAX_ACTIVE bounds worker-placed jobs running at once. A Code Mode parent
-// never occupies a slot while it waits for its children, so the bound cannot make a
-// parent block its own child.
+// TOOL_JOBS_MAX_ACTIVE is the floor of the bound on worker-placed jobs running at once;
+// the table raises it to the processor core count. A Code Mode parent never occupies a
+// slot while it waits for its children, so the bound cannot make a parent block its own
+// child.
 TOOL_JOBS_MAX_ACTIVE :: 4
 
 // TOOL_JOBS_STOP_PATIENCE is how long a call may keep running after its stop was asked for,
@@ -169,6 +170,7 @@ Tool_Jobs :: struct {
 	allocator:        mem.Allocator, // the session's: it owns the table, not the jobs
 	next_id:          u64,
 	active:           int, // worker-placed jobs running now
+	max_active:       int, // most worker-placed jobs running at once
 	committed:        int, // all durable results, including nested calls
 	committed_roots:  int, // provider calls answered at the turn barrier
 	stop:             Tool_Jobs_Stop,
@@ -192,6 +194,7 @@ Tool_Jobs :: struct {
 tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, worker_allocator: mem.Allocator) {
 	jobs.allocator = chat.allocator
 	jobs.worker_allocator = worker_allocator
+	jobs.max_active = max(TOOL_JOBS_MAX_ACTIVE, os.get_processor_core_count())
 	jobs.abandoned = &chat.abandoned_jobs
 	table, table_error := make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
 	jobs.jobs = table
@@ -628,7 +631,7 @@ tool_jobs_runnable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 		}
 		if job.phase != .Queued { continue }
 		if !tool_jobs_lane_free(jobs, job) { continue }
-		if job.placement == .Worker && jobs.active >= TOOL_JOBS_MAX_ACTIVE { continue }
+		if job.placement == .Worker && jobs.active >= jobs.max_active { continue }
 		return job
 	}
 	return nil
@@ -714,10 +717,11 @@ tool_job_record_placement :: proc(chat: ^Chat_Session, job: ^Tool_Job) -> (node:
 	return chat.response_node, 0
 }
 
-// tool_jobs_dispatch records one call's dispatch entry and starts its executor. The
-// write comes first: a dispatch entry without a result is recovered as an unknown
-// outcome, while a result without a dispatch entry would claim knowledge the harness
-// does not have.
+// tool_jobs_dispatch records one call's dispatch entry and starts its executor. A call the
+// turn stopped before this point is answered not executed and leaves no admission. Past
+// that, the write comes first: a dispatch entry without a result is recovered as an
+// unknown outcome, while a result without a dispatch entry would claim knowledge the
+// harness does not have.
 tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	job := tool_jobs_runnable(jobs, time.tick_now())
 	if job == nil { return }
@@ -726,6 +730,13 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		return
 	}
 	job.phase = .Dispatching
+
+	if tool_control_cancelled(job.exec.control) {
+		job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
+		job.result_present = true
+		job.phase = .Result_Ready
+		return
+	}
 
 	repair_names: [len(Tool_Repair)]string
 	repair_count := 0
@@ -758,14 +769,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	}
 	if !chat_commit(chat, "the tool dispatch could not be recorded") {
 		tool_jobs_latch_stop(jobs, chat)
-		return
-	}
-	// Cancellation can land after the intent was recorded but before execution
-	// begins. The intent is durable, but the call never started.
-	if tool_control_cancelled(job.exec.control) {
-		job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
-		job.result_present = true
-		job.phase = .Result_Ready
 		return
 	}
 	// The executor may run on a worker, which never writes, so the start is recorded here

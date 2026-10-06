@@ -702,6 +702,7 @@ test_running_calls_are_bounded :: proc(test: ^testing.T) {
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	jobs.max_active = TOOL_JOBS_MAX_ACTIVE
 	defer tool_jobs_destroy(&jobs)
 	tool_jobs_submit(&jobs, chat, {})
 
@@ -880,6 +881,7 @@ test_an_owner_placed_call_takes_no_worker_slot :: proc(test: ^testing.T) {
 
 	jobs: Tool_Jobs
 	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	jobs.max_active = TOOL_JOBS_MAX_ACTIVE
 	defer tool_jobs_destroy(&jobs)
 	tool_jobs_submit(&jobs, chat, {})
 
