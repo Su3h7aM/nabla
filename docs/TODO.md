@@ -25,7 +25,6 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 
 - The read and write descriptions state the 32 KiB preview as a literal; build them from `TOOL_RESULT_PREVIEW_BYTES` as the shell description does.
 - Patch parsing: a mistyped header such as `*** Updat File:` inside a section becomes hunk content instead of an error naming the line.
-- A literal replace with an expected match count is reported three times (Lua patterns need escaping, the patch tool matches whole lines). Decide where it belongs: a Code Mode helper or a substring form of the patch tool.
 
 ## Simplifications
 
