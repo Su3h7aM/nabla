@@ -20,6 +20,13 @@ Follow :: struct {
 	// was checked against, zero before one.
 	estimate: int,
 	window:   int,
+	// input is the seq of a `user.input` line the caller waits to see answered, zero for
+	// none. follow_poll sets turn when the User node that delivers it is read, and ended and
+	// outcome when that turn's `turn.completed` is.
+	input:    journal.Journal_Seq,
+	turn:     journal.Turn_Id,
+	ended:    bool,
+	outcome:  journal.Turn_Outcome,
 }
 
 // follow_start positions a follow at the end of the journal, so the transcript the caller
@@ -51,6 +58,10 @@ follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (f
 // - `tool.proposed` announces a call, and `tool.completed` reports its result.
 // - `turn.started` and `turn.completed` move follow.working, and a turn that did not
 //   complete reports why. `request.prepared` updates the estimate and window.
+// - With follow.input set, the User node that delivers that line records its turn in
+//   follow.turn, and that turn's `turn.completed` sets follow.ended and follow.outcome. Both
+//   are set before the observer hears the record, so a callback sees whether the node it is
+//   shown belongs to the awaited turn.
 // - `retry.scheduled`, `runtime.message`, and `selection.applied` show as messages.
 //
 // Records of a Lua script's child calls are skipped, as the live view skips them. A record
@@ -76,7 +87,7 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .User_Input:
 		_observer_user_text(observer, body)
 	case .Node_Committed:
-		return follow_node(store, record, observer)
+		return follow_node(store, follow, record, observer)
 	case .Tool_Proposed:
 		proposed: journal.Tool_Proposed
 		if journal.payload_decode(record.data, &proposed, context.temp_allocator) != nil { return nil }
@@ -88,8 +99,16 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .Turn_Completed:
 		follow.working = false
 		completed: journal.Turn_Completed
-		if journal.payload_decode(record.data, &completed, context.temp_allocator) != nil { return nil }
-		outcome, _ := journal.enum_from_name(journal.TURN_OUTCOME_NAMES, completed.outcome)
+		decoded := journal.payload_decode(record.data, &completed, context.temp_allocator) == nil
+		outcome := journal.Turn_Outcome.Failed
+		if decoded { outcome, _ = journal.enum_from_name(journal.TURN_OUTCOME_NAMES, completed.outcome) }
+		// An undecodable record still ends the awaited turn, as a failure, so a caller
+		// that waits for it is not left waiting on a turn that is over.
+		if follow.turn != 0 && record.turn == follow.turn {
+			follow.ended = true
+			follow.outcome = outcome
+		}
+		if !decoded { return nil }
 		text: string
 		switch outcome {
 		case .Completed:
@@ -147,13 +166,14 @@ follow_prepared :: proc(follow: ^Follow, record: journal.Record) {
 
 // follow_node shows the node a `node.committed` record names.
 @(private = "file", require_results)
-follow_node :: proc(store: ^journal.Journal, record: journal.Record, observer: Chat_Observer) -> journal.Error {
+follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Record, observer: Chat_Observer) -> journal.Error {
 	node := journal.read_node(store, record.session, record.node, context.temp_allocator) or_return
 	body := string(node.body)
 	#partial switch node.kind {
 	case .User:
 		user: journal.User
 		if journal.payload_decode(node.data, &user, context.temp_allocator) != nil { return nil }
+		if follow.input != 0 && user.message == follow.input { follow.turn = node.turn }
 		origin, _ := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
 		// A node that delivers a user.input line repeats a line already shown. One that
 		// delivers an agent's report is the first the transcript shows of it.

@@ -6,6 +6,7 @@ import "core:os"
 import "core:strings"
 
 import "nabla:agent"
+import "nabla:agent/journal"
 
 Cli_Parse_Error :: enum {
 	None,
@@ -117,6 +118,12 @@ Headless_Output :: struct {
 	answer:       io.Writer,
 	answered:     bool,
 	write_failed: bool,
+	// follow is set while the run follows a session another process runs. Only the
+	// assistant messages of the turn it waits for are the answer; the zero value treats
+	// every message as one.
+	follow:       ^agent.Follow,
+	// aside says the assistant message being shown is not the answer and goes to stderr.
+	aside:        bool,
 }
 
 headless_observer :: proc(out: ^Headless_Output) -> agent.Chat_Observer {
@@ -143,21 +150,29 @@ headless_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Even
 headless_assistant_begin :: proc(user_data: rawptr) {
 	out := cast(^Headless_Output)user_data
 	out.answered = false
+	out.aside = out.follow != nil && (out.follow.turn == 0 || out.follow.ended)
+}
+
+// headless_answer_write writes text where the message being shown belongs: stdout for the
+// answer, stderr for a message of a turn this run does not wait for.
+headless_answer_write :: proc(out: ^Headless_Output, text: string) {
+	if out.aside {
+		fmt.eprint(text)
+		return
+	}
+	written, write_err := io.write_string(out.answer, text)
+	if write_err != nil || written != len(text) { out.write_failed = true }
 }
 
 headless_assistant_text :: proc(user_data: rawptr, text: string) {
 	out := cast(^Headless_Output)user_data
 	out.answered = true
-	written, write_err := io.write_string(out.answer, text)
-	if write_err != nil || written != len(text) { out.write_failed = true }
+	headless_answer_write(out, text)
 }
 
 headless_assistant_end :: proc(user_data: rawptr) {
 	out := cast(^Headless_Output)user_data
-	if out.answered {
-		written, write_err := io.write_string(out.answer, "\n")
-		if write_err != nil || written != 1 { out.write_failed = true }
-	}
+	if out.answered { headless_answer_write(out, "\n") }
 }
 
 headless_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
@@ -219,6 +234,57 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	return completed
 }
 
+// run_prompt_follow sends prompt to the process that runs the session app follows and
+// waits for the turn that answers it, reporting through out like run_prompt_turn. The
+// line is committed as a `user.input` record, and the turn is the one whose User node
+// delivers that record. Its assistant messages are the answer; everything else the runner
+// commits meanwhile goes to stderr. It runs no turn and never claims the session, so a
+// runner whose claim drops leaves it waiting for the next one. Only an interrupt ends the
+// wait early, and no timeout does. False means the line was not sent, the session could
+// not be read, the run was interrupted, or the turn did not complete; the observer has
+// said why for a turn that failed.
+@(require_results)
+run_prompt_follow :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
+	setup := &app.setup
+	store := setup.store
+	error := journal.append_input(store, prompt, .Prompt)
+	// The line is the last record of its commit, so the seq the commit reached is its own.
+	seq := store.last_seq
+	if error != nil && journal.error_is_busy(error) { seq, error = journal.commit(store) }
+	if error != nil {
+		fmt.eprintf("nabla: the line was not sent: %s\n", journal.error_text(error, context.temp_allocator))
+		return false
+	}
+
+	setup.follow.input = seq
+	out.follow = &setup.follow
+	observer := headless_observer(out)
+	// The handler is armed for the whole wait, as it is for a turn, so Ctrl-C wakes the
+	// owner wake instead of ending the process with a line still unanswered.
+	previous: agent.Signal_Action
+	agent.chat_signal_arm(&previous)
+	defer agent.chat_signal_disarm(&previous)
+	for {
+		// The wake is read before the poll, so a commit that lands after the poll ends the wait.
+		seen := agent.owner_wake_seen()
+		if poll_error := agent.follow_poll(store, setup.session.session, &setup.follow, observer); poll_error != nil {
+			fmt.eprintf("nabla: cannot read the session: %s\n", journal.error_text(poll_error, context.temp_allocator))
+			return false
+		}
+		if setup.follow.ended { break }
+		if agent.process_interrupted() {
+			fmt.eprintln("nabla: interrupted while waiting for the session's turn")
+			return false
+		}
+		agent.owner_wake_wait(seen, nil)
+	}
+	if out.write_failed {
+		fmt.eprintln("nabla: the answer could not be written")
+		return false
+	}
+	return setup.follow.outcome == .Completed
+}
+
 // run_prompt executes one prompt without a terminal and returns the process exit code. It
 // shares the launch path with the interactive harness, so only the front-end differs and a
 // headless run is the same conversation rather than a second implementation of one.
@@ -244,6 +310,8 @@ run_prompt :: proc(
 		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
 		start.id = options.resume_id
 	}
+	// A resumed session another process runs is followed rather than refused.
+	app.setup.shared_sessions = options.resume
 	app.setup.harness_options = harness_options
 	app.setup.alloc = context.allocator
 	if !run_catalog(sources, mcp_servers, &app.setup, start) { return 1 }
@@ -259,6 +327,11 @@ run_prompt :: proc(
 		}
 	}
 
+	out := Headless_Output {
+		answer = answer,
+	}
+	// A follower runs no turn, so it needs no model and records no selection.
+	if app_following(app) { return run_prompt_follow(app, options.prompt, &out) ? 0 : 1 }
 	if !apply_startup_selection(app, options.provider_id, options.model_id) {
 		fmt.eprintln("nabla:", setup_error_text(app))
 		return 1
@@ -268,9 +341,6 @@ run_prompt :: proc(
 		return 1
 	}
 
-	out := Headless_Output {
-		answer = answer,
-	}
 	return run_prompt_turn(app, options.prompt, &out) ? 0 : 1
 }
 

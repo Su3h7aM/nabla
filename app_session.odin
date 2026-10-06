@@ -54,8 +54,9 @@ Run_Setup :: struct {
 	owns_selection:    bool,
 	// shared_sessions says this front-end shows a session another process runs as a
 	// follower instead of refusing it, and watches the lock file of the session it shows
-	// so that other processes' commits and a dropped claim wake the worker. Headless runs
-	// and the ACP server leave it false and refuse a running session.
+	// so that other processes' commits and a dropped claim wake the worker. A headless
+	// resume sets it too and sends its line to the runner; the ACP server leaves it false
+	// and refuses a running session.
 	shared_sessions:   bool,
 	// follow is where the follower's reading of the journal stands. It is meaningful only
 	// while the running store follows.

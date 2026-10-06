@@ -1614,3 +1614,104 @@ test_resume_restores_an_installed_selection_without_a_later_turn :: proc(t: ^tes
 	testing.expect_value(t, app.setup.session.model_id, "target-model")
 	testing.expect_value(t, app.run.connection.API, ai.API_Kind.OpenAI_Responses)
 }
+
+// Follow_Runner is the claimant's worker thread: it waits for a line in its session's
+// inbox and runs the turn that delivers it, as the runner's own worker does.
+Follow_Runner :: struct {
+	chat:       ^agent.Chat_Session,
+	connection: ai.Provider_Connection,
+	completed:  bool,
+}
+
+follow_runner_thread :: proc(thread_handle: ^thread.Thread) {
+	runner := cast(^Follow_Runner)thread_handle.data
+	deadline := time.tick_add(time.tick_now(), STUB_BOUND)
+	for {
+		lines, read_error := journal.read_inbox(runner.chat.store, runner.chat.session, 0, context.temp_allocator)
+		waiting := read_error == nil && len(lines) > 0
+		free_all(context.temp_allocator)
+		if waiting { break }
+		if time.tick_since(deadline) >= 0 { return }
+		time.sleep(2 * time.Millisecond)
+	}
+	if agent.chat_session_accept_user(runner.chat, "") != .Accepted { return }
+	runner.completed = agent.chat_turn_drive(runner.chat, runner.connection, agent.chat_retry_policy_default(), {}, nil, nil)
+}
+
+// A headless resume of a session another process runs sends its line to the runner and
+// returns the answer of the turn that delivered it: the runner commits the turn through a
+// stub endpoint, and the follower, which runs nothing itself, is woken by the commits.
+@(test)
+test_a_headless_follower_returns_the_answer_of_the_turn_that_delivered_its_line :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
+	defer net.close(listener)
+	if block_err := net.set_blocking(listener, false); block_err != nil { testing.fail_now(t, "the stub endpoint could not be made non-blocking") }
+	endpoint, endpoint_err := net.bound_endpoint(listener)
+	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
+
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	app.setup.catalog = app_test_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner_store: journal.Journal
+	if open_error := journal.open(&runner_store, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
+		testing.fail_now(t, "the runner's journal could not open")
+	}
+	defer _ = journal.close(&runner_store)
+	if _, claim_error := journal.claim(&runner_store, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
+	chat, tool_error := agent.chat_session_init(&runner_store, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "the runner's tool registry could not be created") }
+	defer agent.chat_session_destroy(&chat)
+	chat.skill_instructions = agent.test_skill_instructions(&chat)
+	chat.provider_id = strings.clone("test-provider", chat.allocator)
+	chat.model_id = strings.clone("test-model", chat.allocator)
+	chat.capacity = agent.model_capacity(agent.Catalog_Model{context_window_present = true, context_window = 128_000})
+	runner := Follow_Runner {
+		chat = &chat,
+		connection = {
+			API = .OpenAI_Chat_Completions,
+			Endpoint = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.allocator),
+			Credential = "test-key",
+		},
+	}
+	defer delete(runner.connection.Endpoint, context.allocator)
+
+	if !testing.expect(t, session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)})) { return }
+	if !testing.expect(t, app_following(&app), "the session runs in the other journal") { return }
+
+	serve := Stub_Serve {
+		listener = listener,
+		response = COMPLETION_RESPONSE,
+	}
+	server := thread.create(stub_serve_thread, name = "nabla-stub-provider")
+	if server == nil { testing.fail_now(t, "the stub thread could not be created") }
+	server.data = &serve
+	thread.start(server)
+	runner_thread := thread.create(follow_runner_thread, name = "nabla-follow-runner")
+	if runner_thread == nil { testing.fail_now(t, "the runner thread could not be created") }
+	runner_thread.data = &runner
+	thread.start(runner_thread)
+	defer {
+		thread.join(runner_thread)
+		thread.destroy(runner_thread)
+		thread.join(server)
+		thread.destroy(server)
+		testing.expect(t, serve.served, "the runner's turn never made its request")
+		testing.expect(t, runner.completed, "the runner's turn should complete")
+	}
+
+	answer: strings.Builder
+	defer strings.builder_destroy(&answer)
+	out := Headless_Output {
+		answer = strings.to_writer(&answer),
+	}
+	testing.expect(t, run_prompt_follow(&app, "from the follower", &out), "the followed turn should complete")
+	testing.expect_value(t, strings.to_string(answer), "hello\n")
+	testing.expect(t, app_following(&app), "a follower never takes the session")
+}
