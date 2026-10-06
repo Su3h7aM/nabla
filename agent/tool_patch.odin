@@ -8,7 +8,7 @@ import "core:os"
 
 TOOL_PATCH_NAME :: "builtin_patch"
 
-TOOL_PATCH_DESCRIPTION :: `Apply a patch that adds, deletes, moves, or changes text files. Relative paths start at the session workspace, and absolute paths are used as given. The whole patch is checked before any file is written, so a patch that does not apply changes nothing.
+TOOL_PATCH_DESCRIPTION :: `Edit text files with one patch: add, delete, move, or change any number of files in a single call. Use it to change part of an existing file or to create files in directories that may not exist yet; use builtin_write to replace a whole file with new content. Relative paths start at the session workspace, and absolute paths are used as given. Every file is checked in memory before any is written, so a patch with a hunk that does not apply changes nothing.
 
 *** Begin Patch
 *** Add File: <path>
@@ -23,7 +23,7 @@ TOOL_PATCH_DESCRIPTION :: `Apply a patch that adds, deletes, moves, or changes t
 *** End of File <optional: the hunk ends at the end of the file>
 *** End Patch
 
-Each @@ starts a hunk. A hunk's unchanged and removed lines must match one place in the file, so include about three unchanged lines around each change. A hunk with only added lines goes after its @@ line, or at the end of the file. A unified diff is accepted too.`
+Each @@ line starts a hunk, and a file may have several. A hunk's unchanged and removed lines must match exactly one place in the file. When a removed line is unique in the file, the hunk can be only "-old" and "+new" lines with no unchanged lines around them; add unchanged lines, or an @@ anchor, only to tell apart text that occurs more than once. A hunk that matches several places fails as ambiguous, and one that matches none fails with the nearest lines; neither writes anything. A hunk with only added lines goes after its @@ line, or at the end of the file. A hunk that matches only when whitespace is ignored is applied and counted in the result. A file path may appear in one section only, and a file that is changed more than once needs one section with several hunks. Put nothing after the final *** End Patch line: a file section after it is refused. A unified diff is accepted too.`
 
 TOOL_PATCH_SCHEMA :: `{"type":"object","properties":{"patch":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch."}},"required":["patch"],"additionalProperties":false}`
 

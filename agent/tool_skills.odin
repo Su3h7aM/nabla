@@ -9,14 +9,14 @@ import "core:strings"
 import "nabla:agent/skills"
 
 TOOL_LIST_SKILLS_NAME :: "builtin_list_skills"
-TOOL_LIST_SKILLS_DESCRIPTION :: "List available skills by metadata. Returns name and description records with stable pagination; metadata is not the complete instructions."
-TOOL_LIST_SKILLS_SCHEMA :: `{"type":"object","properties":{"query":{"type":["string","null"],"description":"Whitespace-separated terms; every term must occur in the name or description."},"offset":{"type":["integer","null"],"description":"First match to return."},"limit":{"type":["integer","null"],"description":"Maximum matches to return."}},"additionalProperties":false}`
+TOOL_LIST_SKILLS_DESCRIPTION :: "Search the available skills by name and description. Use it to find which skill fits a task when your instructions do not already list them; it returns metadata only, so load the one you need with builtin_load_skill. query holds whitespace-separated terms, all of which must appear in the name or description (case-insensitive); a skill whose name equals the query comes first; leave query out to list every skill. The result gives total_matches, next_offset when more matches remain (pass it as offset for the next page), and for each skill its name, source, and description. limit defaults to 20 and offset to 0."
+TOOL_LIST_SKILLS_SCHEMA :: `{"type":"object","properties":{"query":{"type":["string","null"],"description":"Whitespace-separated terms; every term must occur in the name or description. Leave out to list all."},"offset":{"type":["integer","null"],"description":"Index of the first match to return, counting from 0. Default: 0. Use next_offset from the previous result."},"limit":{"type":["integer","null"],"description":"Maximum matches to return. Default: 20."}},"additionalProperties":false}`
 TOOL_LIST_SKILLS_FIELDS :: []string{"query", "offset", "limit"}
 TOOL_LIST_SKILLS_DEFAULT_LIMIT :: 20
 
 TOOL_LOAD_SKILL_NAME :: "builtin_load_skill"
-TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by name. Returns the full body in a single tool result."
-TOOL_LOAD_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The skill name from the catalog."}},"required":["name"],"additionalProperties":false}`
+TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by its exact name, before doing work the skill covers. The name comes from your instructions or builtin_list_skills; an unknown name fails and suggests names that start with it. The result gives name, path (the skill's SKILL.md), directory (the skill's folder), and content_digest, and the instructions follow after a blank line."
+TOOL_LOAD_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The exact skill name, as listed in your instructions or by builtin_list_skills."}},"required":["name"],"additionalProperties":false}`
 TOOL_LOAD_SKILL_FIELDS :: []string{"name"}
 
 TOOL_LIST_SKILLS_DEFINITION :: Tool_Definition {

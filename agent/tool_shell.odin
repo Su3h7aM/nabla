@@ -10,9 +10,18 @@ import "nabla:agent/journal"
 
 TOOL_SHELL_NAME :: "builtin_shell"
 
-// TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the
-// shell it does it with.
-TOOL_SHELL_BODY :: "Write the command in that shell's own syntax, which may not be POSIX sh. The command runs in a fresh non-interactive process with standard input closed, and it inherits this process's environment. Directory and environment changes do not persist between calls. Returns bounded stdout and stderr, exit information, and truncation status. This is not a terminal or background-job service."
+// TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the shell it
+// does it with. It is a format: the preview size in KiB, the in-memory size of one stream in
+// MiB, and the default timeout in seconds.
+TOOL_SHELL_BODY ::
+	`The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with builtin_write or builtin_patch, not with a heredoc or echo redirection. This is not a terminal.
+
+The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with builtin_read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
+
+// TOOL_SHELL_FISH_NOTES follows the body when the shell is fish, whose syntax models most
+// often get wrong because they write bash.
+TOOL_SHELL_FISH_NOTES ::
+	` Fish differs from bash in ways that fail the whole command: there is no heredoc (<<); loops and conditionals end with end, as in "for name in a b c; echo $name; end" and "if test -f x; echo yes; end", not do/done or fi; variables are set with "set name value" and the last exit status is $status, not $?; command substitution is (cmd); before fish 3.0 there is no && or ||, and "; and" and "; or" take their place; and a wildcard that matches nothing is an error, so quote a glob meant for the program, as in --include='*.odin'.`
 
 // TOOL_SHELL_FALLBACK is the shell a command ends at when the shell this process
 // was started from cannot run it. /bin/sh is the one shell a POSIX system has.
@@ -27,7 +36,7 @@ tool_shell_preferred :: proc() -> string {
 	return shell
 }
 
-TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string","description":"Shell source to execute."},"working_directory":{"type":["string","null"],"description":"Directory in which to run the command. Relative paths start at the session workspace. Leave out or pass null for the workspace itself."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds. Leave out or pass null for the harness default."}},"required":["command"],"additionalProperties":false}`
+TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string","description":"The command, written in the syntax of the shell the tool description names."},"working_directory":{"type":["string","null"],"description":"Directory in which to run the command. Relative paths start at the session workspace. Leave out or pass null for the workspace itself."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds, with no maximum. Leave out or pass null for the default the tool description states."}},"required":["command"],"additionalProperties":false}`
 
 TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 
@@ -35,6 +44,23 @@ TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
 TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 
 TOOL_SHELL_BACKGROUND_NOTICE :: "background processes left in the command's process group were terminated; start a long-running process with setsid to keep it"
+
+// tool_shell_description describes the shell tool for shell, which decides the syntax the
+// model has to write. The caller owns the text, allocated with allocator.
+@(require_results)
+tool_shell_description :: proc(shell: string, allocator := context.allocator) -> string {
+	notes := TOOL_SHELL_FISH_NOTES if os.base(shell) == "fish" else ""
+	return fmt.aprintf(
+		"Execute a command with %s (%s). " + TOOL_SHELL_BODY + "%s",
+		os.base(shell),
+		shell,
+		TOOL_RESULT_PREVIEW_BYTES / 1024,
+		TOOL_STREAM_MEMORY_BYTES / (1024 * 1024),
+		int(TOOL_SHELL_DEFAULT_TIMEOUT / time.Second),
+		notes,
+		allocator = allocator,
+	)
+}
 
 // tool_shell_definition is the shell tool, described for the shell this process
 // will run: the shell decides the syntax the model has to write, and the tool does
@@ -44,7 +70,7 @@ TOOL_SHELL_BACKGROUND_NOTICE :: "background processes left in the command's proc
 tool_shell_definition :: proc(shell: string, allocator := context.allocator) -> Tool_Definition {
 	return Tool_Definition {
 		name = TOOL_SHELL_NAME,
-		description = fmt.aprintf("Execute a command with %s (%s). " + TOOL_SHELL_BODY, os.base(shell), shell, allocator = allocator),
+		description = tool_shell_description(shell, allocator),
 		input_schema = TOOL_SHELL_SCHEMA,
 		// The command determines the behavior, so unknown is the only honest
 		// static answer for everything but the open world it can reach.

@@ -763,12 +763,15 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 | `builtin_patch` | Write(paths) | Worker |
 | `builtin_shell` | Process | Worker |
 | `builtin_codemode` | None | Lua |
-| `catalog_search` (skill and Task metadata) | Session | Owner |
-| `skill_load` | Read(skill file) | Worker |
-| `task_run` | None | Lua |
-| `agent_spawn` (main sessions only) | Read(all) or Process, by scope | Subagent |
+| `builtin_list_skills` | Session | Worker |
+| `builtin_load_skill` | Read(skill file) | Worker |
+| `agent_spawn` (main sessions only) | Read(all) or Process, by scope | Worker |
+| `agent_send` | Session | Owner |
+| `agent_stop` (main sessions only) | Session | Owner |
 | `context_compact` | Session | Owner |
 | MCP tools `<server>_<tool>` | External(client lane) | Worker |
+
+`catalog_search` and `task_run` (section 18) are not built. Each native tool's description and schema are constants in its own file (`TOOL_<NAME>_DESCRIPTION`, `TOOL_<NAME>_SCHEMA`), except the shell's description, which `tool_shell_description` builds for the shell the process runs. A description states what the tool does, when to use it instead of another tool, the exact shape of its result, and the facts a call gets wrong; each statement must match the code.
 
 ### 14.2 Admission pipeline
 
@@ -793,7 +796,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 - The executor renders the model-visible bytes once with the tool's `render` procedure when it builds the result, while it holds the typed output. At commit the owner adds any repair note, applies retention, and stores those bytes in the `tool.completed` body. The projection uses the stored bytes from then on, so resume and cache stay byte-stable. Lua parents receive typed values converted from `Tool_Output`, never the rendering.
 - Rendering format: first line `ok` or `error <kind>: <message>`, then tool-specific `key: value` lines, then a blank line and the raw body (file text, stdout and stderr sections). Raw text avoids JSON escaping inside provider JSON; the format is kept only while measured tokens per successful task confirm it.
 - Retention: a result is never discarded. One larger than what the model is shown is written whole to `$XDG_CACHE_HOME/nabla/tool-output/<session>/<call>.txt`, which outlives the process so a resumed session can still read it. The journal stores the text the model was shown, so the file is non-essential: when the user clears the cache, a read of it fails as ordinary feedback. If the file cannot be written, the result is sent whole instead.
-- Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. The model reads the rest with `builtin_read`; there is no separate result-reading tool.
+- Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. For a `builtin_read` result the notice also gives the complete lines of the read that were shown and the `offset` that continues the file, taken from the result's `first_line`, so the model reads the next window of the original file. The model reads the rest of any other result from the kept file with `builtin_read`; there is no separate result-reading tool.
 - Context budget: a batch charges root results in call order against the room left in the context, reserving `TOOL_RESULT_NOTICE_TOKENS` for each later result, and a result's preview shrinks to its allowance, down to the notice alone. The decision is stored with the result, so later requests project identical bytes.
 
 ### 14.4 Native tools
