@@ -428,3 +428,75 @@ test_a_claim_and_its_close_record_claimed_then_released :: proc(test: ^testing.T
 		if index < len(expected) { testing.expect_value(test, record.kind, expected[index]) }
 	}
 }
+
+// A follower of a session another journal claimed appends only user.input, and the
+// claimant reads it as a line with no turn or branch.
+@(test)
+test_a_follower_appends_input_the_claimant_reads :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	claimant, follower: Journal
+	_open_journal(test, &claimant, directory)
+	defer _close_journal(test, &claimant)
+	session := _create_session(test, &claimant, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(test, &claimant)
+
+	_open_journal(test, &follower, directory)
+	defer _close_journal(test, &follower)
+	_, claim_error := claim(&follower, session)
+	_expect_error(test, claim_error, .Claimed)
+	_expect_ok(test, follow(&follower, session))
+	_expect_ok(test, append_input(&follower, "from the other terminal", .Steering))
+
+	lines, lines_error := read_inbox(&claimant, session, 0, context.allocator)
+	_expect_ok(test, lines_error)
+	defer records_destroy(lines, context.allocator)
+	if !testing.expect_value(test, len(lines), 1) { return }
+	testing.expect_value(test, string(lines[0].body), "from the other terminal")
+	testing.expect_value(test, lines[0].turn, Turn_Id(0))
+	testing.expect_value(test, lines[0].branch, Branch_Id(0))
+	input: User_Input
+	_decode_payload(test, lines[0].data, &input)
+	testing.expect_value(test, input.origin, USER_ORIGIN_NAMES[.Steering])
+}
+
+// A follower retries the claim on the descriptor it holds: it fails while the claimant
+// lives and succeeds once the claimant closes, with the claimant's ids.
+@(test)
+test_a_follower_claims_after_the_claimant_closes :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	claimant, follower: Journal
+	_open_journal(test, &claimant, directory)
+	session := _create_session(test, &claimant, {workspace = "/tmp/project", role = .Main})
+	_ = append_node(&claimant, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{}, _body("hello"))
+	_commit_ok(test, &claimant)
+
+	_open_journal(test, &follower, directory)
+	defer _close_journal(test, &follower)
+	_expect_ok(test, follow(&follower, session))
+	_, early_error := try_claim(&follower)
+	_expect_error(test, early_error, .Claimed)
+	testing.expect_value(test, follower.followed, session)
+	testing.expect_value(test, follower.claimed, Session_Id{})
+
+	_expect_ok(test, close(&claimant))
+	counters, claim_error := try_claim(&follower)
+	_expect_ok(test, claim_error)
+	testing.expect_value(test, follower.claimed, session)
+	testing.expect_value(test, follower.followed, Session_Id{})
+	testing.expect_value(test, counters.node, Node_Id(1))
+	testing.expect_value(test, counters.turn, Turn_Id(1))
+	testing.expect_value(test, follower.counters, counters)
+
+	_commit_ok(test, &follower)
+	records := _records_of_session(test, &follower, session)
+	defer records_destroy(records, context.allocator)
+	claims := 0
+	for record in records {
+		if record.kind == .Session_Claimed { claims += 1 }
+	}
+	testing.expect_value(test, claims, 2)
+}

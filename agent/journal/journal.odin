@@ -103,14 +103,20 @@ Journal :: struct {
 	connection: db.Conn,
 	allocator:  mem.Allocator,
 	directory:  string, // owned
-	// locks holds one lock file per claimed session, owned. The files are never
-	// deleted: replacing a locked inode would let two processes hold one claim.
+	// locks holds one lock file per claimed or followed session, owned. The files
+	// are never deleted: replacing a locked inode would let two processes hold one
+	// claim.
 	locks:      string,
 	run:        Run_Id,
 	open:       bool,
 	read_only:  bool,
 	claimed:    Session_Id,
-	claim_file: ^os.File,
+	// followed is the session another process claimed, which this journal watches
+	// and appends `user.input` for. It is never set together with claimed.
+	followed:   Session_Id,
+	// lock_file is the descriptor of the claimed or followed session's lock file.
+	// A follower holds it without the flock, so try_claim retries on it.
+	lock_file:  ^os.File,
 	counters:   Counters,
 
 	// batch owns the bytes of every pending item until the commit that writes it.
@@ -211,28 +217,66 @@ close :: proc(journal: ^Journal) -> Error {
 @(require_results)
 claim :: proc(journal: ^Journal, session: Session_Id) -> (counters: Counters, error: Error) {
 	assert(journal.open && !journal.read_only, "claim needs a writable journal")
-	assert(journal.claimed == {}, "the journal already holds a claim")
+	assert(journal.claimed == {} && journal.followed == {}, "the journal already holds a session")
 	take_claim(journal, session) or_return
 	// Dropping the claim is teardown; the load error is what the caller needs.
 	defer if error != nil { _ = release(journal) }
-
-	exists: bool
-	counters, exists = load_counters(journal, session) or_return
-	if !exists { return {}, Journal_Error.Not_Found }
-	journal.counters = counters
-	append_record(journal, Record{kind = .Session_Claimed, session = session}, Session_Claimed{resumed = true})
-	return counters, nil
+	return claim_enter(journal, session)
 }
 
-// release drops the writer claim, if any.
+// follow opens the lock file of a session another process claimed and keeps the
+// descriptor without taking the flock, so the journal follows the session: it
+// appends `user.input` for it through append_input and retries the claim through
+// try_claim. Following needs no claim to be held elsewhere, and a session that
+// is not claimed anywhere can be followed too.
+@(require_results)
+follow :: proc(journal: ^Journal, session: Session_Id) -> Error {
+	assert(journal.open && !journal.read_only, "follow needs a writable journal")
+	assert(journal.claimed == {} && journal.followed == {}, "the journal already holds a session")
+	journal.lock_file = lock_open(journal, session) or_return
+	journal.followed = session
+	return nil
+}
+
+// try_claim retries the flock without waiting on the descriptor follow kept, so
+// no close event reaches the other watchers of the lock file. On success the
+// journal holds the claim exactly as claim leaves it and returns the ids the
+// session has used. It returns Claimed while another process holds the claim,
+// and any other failure; the journal stays a follower then.
+@(require_results)
+try_claim :: proc(journal: ^Journal) -> (counters: Counters, error: Error) {
+	assert(journal.open && !journal.read_only, "try_claim needs a writable journal")
+	assert(journal.followed != {}, "try_claim needs a followed session")
+	held_elsewhere, lock_error := claim_lock_take(journal.lock_file)
+	if lock_error != nil { return {}, lock_error }
+	if held_elsewhere { return {}, Journal_Error.Claimed }
+
+	session := journal.followed
+	journal.claimed = session
+	journal.followed = {}
+	journal.counters = {}
+	defer if error != nil {
+		// The lock is let go again and the journal follows as before; the load
+		// error is what the caller needs.
+		_ = claim_lock_drop(journal.lock_file)
+		journal.claimed = {}
+		journal.followed = session
+	}
+	return claim_enter(journal, session)
+}
+
+// release drops the writer claim or the follow, if any.
 @(require_results)
 release :: proc(journal: ^Journal) -> Error {
-	file := journal.claim_file
-	journal.claim_file = nil
+	file := journal.lock_file
+	was_claimed := journal.claimed != {}
+	journal.lock_file = nil
 	journal.claimed = {}
+	journal.followed = {}
 	journal.counters = {}
 	if file == nil { return nil }
-	unlock_error := claim_lock_drop(file)
+	unlock_error: os.Error
+	if was_claimed { unlock_error = claim_lock_drop(file) }
 	close_error := os.close(file)
 	if unlock_error != nil { return unlock_error }
 	return close_error
@@ -243,7 +287,7 @@ release :: proc(journal: ^Journal) -> Error {
 @(require_results)
 create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Session_Id, error: Error) {
 	assert(journal.open && !journal.read_only, "create_session needs a writable journal")
-	assert(journal.claimed == {}, "the journal already holds a claim")
+	assert(journal.claimed == {} && journal.followed == {}, "the journal already holds a session")
 	assert(new_session.workspace != "", "a session runs in a workspace")
 	if journal.failure != nil { return {}, journal.failure }
 
@@ -315,22 +359,30 @@ enable_write_ahead_log :: proc(journal: ^Journal) -> (error: Error) {
 	return nil
 }
 
-// take_claim flocks the session's lock file, which the kernel releases when the
-// process dies. The file is pinned against periodic clean-up of its directory.
+// lock_open opens the session's lock file, creating it, and pins it against
+// periodic clean-up of its directory. The caller owns the file.
 @(private, require_results)
-take_claim :: proc(journal: ^Journal, session: Session_Id) -> Error {
+lock_open :: proc(journal: ^Journal, session: Session_Id) -> (file: ^os.File, error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	make_private_directory(journal.locks) or_return
 	hex_text: [SESSION_ID_HEX_LENGTH]u8
 	name := fmt.tprintf("%s.lock", session_id_to_hex(session, hex_text[:]))
 	path := filepath.join({journal.locks, name}, context.temp_allocator) or_return
 
-	file := os.open(path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS) or_return
+	file = os.open(path, {.Read, .Write, .Create}, PRIVATE_FILE_PERMISSIONS) or_return
 	if pin_error := claim_file_pin(file); pin_error != nil {
 		// The file is abandoned; the pin failure is what the caller needs.
 		_ = os.close(file)
-		return pin_error
+		return nil, pin_error
 	}
+	return file, nil
+}
+
+// take_claim flocks the session's lock file, which the kernel releases when the
+// process dies.
+@(private, require_results)
+take_claim :: proc(journal: ^Journal, session: Session_Id) -> Error {
+	file := lock_open(journal, session) or_return
 	held_elsewhere, lock_error := claim_lock_take(file)
 	if lock_error != nil || held_elsewhere {
 		// The file is abandoned; the lock outcome is what the caller needs.
@@ -339,9 +391,21 @@ take_claim :: proc(journal: ^Journal, session: Session_Id) -> Error {
 		return Journal_Error.Claimed
 	}
 	journal.claimed = session
-	journal.claim_file = file
+	journal.lock_file = file
 	journal.counters = {}
 	return nil
+}
+
+// claim_enter loads the ids the claimed session has used and records
+// `session.claimed`. The caller has set journal.claimed and undoes it on failure.
+@(private, require_results)
+claim_enter :: proc(journal: ^Journal, session: Session_Id) -> (counters: Counters, error: Error) {
+	exists: bool
+	counters, exists = load_counters(journal, session) or_return
+	if !exists { return {}, Journal_Error.Not_Found }
+	journal.counters = counters
+	append_record(journal, Record{kind = .Session_Claimed, session = session}, Session_Claimed{resumed = true})
+	return counters, nil
 }
 
 @(private)

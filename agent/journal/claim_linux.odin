@@ -36,3 +36,15 @@ claim_lock_drop :: proc(file: ^os.File) -> os.Error {
 	if flock_error := linux.flock(linux.Fd(os.fd(file)), {.UN}); flock_error != .NONE { return os.Platform_Error(flock_error) }
 	return nil
 }
+
+// claim_file_touch sets the access and modification times of file to now, which
+// raises IN_ATTRIB for every inotify watch on it. A null path makes utimensat act
+// on the descriptor, as futimens does.
+@(private, require_results)
+claim_file_touch :: proc(file: ^os.File) -> os.Error {
+	times := [2]linux.Time_Spec{{time_nsec = linux.UTIME_NOW}, {time_nsec = linux.UTIME_NOW}}
+	if touch_error := linux.utimensat(linux.Fd(os.fd(file)), nil, raw_data(times[:]), {}); touch_error != .NONE {
+		return os.Platform_Error(touch_error)
+	}
+	return nil
+}

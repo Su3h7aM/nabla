@@ -75,6 +75,26 @@ INSERT_SQL := [Insert]string {
 // journal.failure and surfaces at the next commit.
 append_record :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8 = nil) {
 	if !writable(journal, header.session) { return }
+	record_buffer(journal, header, data, body)
+}
+
+// append_input appends a `user.input` record for the followed session and commits
+// it, so a nil return means the runner will see the line. Turn and branch stay
+// zero: the follower allocates no ids. This is the one append a journal makes
+// without a claim. On a busy database the record stays pending and the error is
+// returned; the caller commits again and does not append the line a second time.
+@(require_results)
+append_input :: proc(journal: ^Journal, text: string, origin: User_Origin) -> Error {
+	assert(journal.open && !journal.read_only, "appends need a writable journal")
+	assert(journal.followed != {}, "append_input needs a followed session")
+	if journal.failure != nil { return journal.failure }
+	record_buffer(journal, Record{kind = .User_Input, session = journal.followed}, User_Input{origin = USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
+	_, error := commit(journal)
+	return error
+}
+
+@(private)
+record_buffer :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8) {
 	record := header
 	record.seq = 0
 	record.run = journal.run
@@ -172,6 +192,10 @@ commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
 		return journal.last_seq, error
 	}
 	journal.last_seq = last
+	// The commit is durable, so a watcher woken by this touch reads it. A failed
+	// touch is ignored: it only delays a wake until the next one, and never loses
+	// or reorders data.
+	if journal.lock_file != nil { _ = claim_file_touch(journal.lock_file) }
 	return last, nil
 }
 
