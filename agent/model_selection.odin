@@ -93,20 +93,13 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 	built.capacity = model.capacity
 	built.cost = model.cost
 	built.tools = model.tools_present && model.tools && chat_supports_tools(api)
-	clone_error: mem.Allocator_Error
-	built.provider_id, clone_error = strings.clone(provider_id, allocator)
-	if clone_error != nil { return {}, "the model selection could not be held" }
-	built.model_id, clone_error = strings.clone(model_id, allocator)
-	if clone_error != nil { return {}, "the model selection could not be held" }
-	built.connection.Endpoint, clone_error = strings.clone(provider.base_url, allocator)
-	if clone_error != nil { return {}, "the model selection could not be held" }
+	if model_selection_clone_identity(&built, provider_id, model_id, provider.base_url, allocator) != nil {
+		return {}, "the model selection could not be held"
+	}
 	if model.thinking.levels_present {
-		built.effort_levels, clone_error = make([]string, len(model.thinking.levels), allocator)
-		if clone_error != nil { return {}, "the model's effort levels could not be held" }
-		for level, index in model.thinking.levels {
-			built.effort_levels[index], clone_error = strings.clone(level, allocator)
-			if clone_error != nil { return {}, "the model's effort levels could not be held" }
-		}
+		levels, levels_error := model_selection_clone_levels(model.thinking.levels, allocator)
+		if levels_error != nil { return {}, "the model's effort levels could not be held" }
+		built.effort_levels = levels
 	}
 	failed = false
 	return built, ""
@@ -203,34 +196,8 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 	allocator := chat.allocator
 	// The session's own copies are built before it releases the ones it holds, so a failure
 	// leaves it on the model it was running rather than on none.
-	provider_id, provider_error := strings.clone(selection.provider_id, allocator)
-	model_id, model_error := strings.clone(selection.model_id, allocator)
-	if provider_error != nil || model_error != nil {
-		delete(provider_id, allocator)
-		delete(model_id, allocator)
-		return false, false
-	}
-	levels: [dynamic]string
-	levels.allocator = allocator
-	held := true
-	defer if held {
-		for level in levels { delete(level, allocator) }
-		delete(levels)
-	}
-	for level in selection.effort_levels {
-		cloned, clone_error := strings.clone(level, allocator)
-		if clone_error != nil {
-			delete(provider_id, allocator)
-			delete(model_id, allocator)
-			return false, false
-		}
-		if _, append_error := append(&levels, cloned); append_error != nil {
-			delete(cloned, allocator)
-			delete(provider_id, allocator)
-			delete(model_id, allocator)
-			return false, false
-		}
-	}
+	provider_id, model_id, levels, clone_error := chat_selection_clone(selection, allocator)
+	if clone_error != nil { return false, false }
 	chat.capacity = selection.capacity
 	chat.cost = selection.cost
 	if selection.provider_id != chat.provider_id || selection.model_id != chat.model_id || selection.connection.API != chat.model_api {
@@ -251,6 +218,50 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 	for level in chat.effort_levels { delete(level, allocator) }
 	delete(chat.effort_levels)
 	chat.effort_levels = levels
-	held = false
 	return true, chat_session_set_effort(chat, effort)
+}
+@(private, require_results)
+model_selection_clone_identity :: proc(selection: ^Model_Selection, provider_id, model_id, endpoint: string, allocator: mem.Allocator) -> mem.Allocator_Error {
+	selection.provider_id = strings.clone(provider_id, allocator) or_return
+	selection.model_id = strings.clone(model_id, allocator) or_return
+	selection.connection.Endpoint = strings.clone(endpoint, allocator) or_return
+	return nil
+}
+
+@(private, require_results)
+model_selection_clone_levels :: proc(levels: []string, allocator: mem.Allocator) -> (result_value: []string, error: mem.Allocator_Error) {
+	owned := make([]string, len(levels), allocator) or_return
+	complete := false
+	defer if !complete {
+		for level in owned { delete(level, allocator) }
+		delete(owned, allocator)
+	}
+	for level, index in levels { owned[index] = strings.clone(level, allocator) or_return }
+	complete = true
+	return owned, nil
+}
+
+@(private, require_results)
+chat_selection_clone :: proc(selection: Model_Selection, allocator: mem.Allocator) -> (provider: string, model: string, owned_levels: [dynamic]string, error: mem.Allocator_Error) {
+	provider_id, model_id: string
+	levels: [dynamic]string
+	levels.allocator = allocator
+	complete := false
+	defer if !complete {
+		delete(provider_id, allocator)
+		delete(model_id, allocator)
+		for level in levels { delete(level, allocator) }
+		delete(levels)
+	}
+	provider_id = strings.clone(selection.provider_id, allocator) or_return
+	model_id = strings.clone(selection.model_id, allocator) or_return
+	for level in selection.effort_levels {
+		cloned := strings.clone(level, allocator) or_return
+		if _, append_error := append(&levels, cloned); append_error != nil {
+			delete(cloned, allocator)
+			return "", "", nil, append_error
+		}
+	}
+	complete = true
+	return provider_id, model_id, levels, nil
 }

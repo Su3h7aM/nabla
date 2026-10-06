@@ -289,86 +289,58 @@ instruction_manifest_kind :: proc(kind: skills.Source_Kind) -> string {
 }
 
 @(require_results)
-snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Allocator) -> (skills.Skill, bool) {
+snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Allocator) -> (result_value: skills.Skill, error: mem.Allocator_Error) {
 	skill: skills.Skill
-	clone_error: mem.Allocator_Error
-	skill.name, clone_error = strings.clone(entry.name, allocator)
-	if clone_error != nil { return {}, false }
-	skill.description, clone_error = strings.clone(entry.description, allocator)
-	if clone_error != nil {
-		delete(skill.name, allocator)
-		return {}, false
-	}
-	skill.logical_path, clone_error = strings.clone(entry.logical_path, allocator)
-	if clone_error != nil {
-		delete(skill.name, allocator)
-		delete(skill.description, allocator)
-		return {}, false
-	}
-	skill.directory, clone_error = strings.clone(entry.directory, allocator)
-	if clone_error != nil {
+	complete := false
+	defer if !complete {
 		delete(skill.name, allocator)
 		delete(skill.description, allocator)
 		delete(skill.logical_path, allocator)
-		return {}, false
+		delete(skill.directory, allocator)
 	}
+	skill.name = strings.clone(entry.name, allocator) or_return
+	skill.description = strings.clone(entry.description, allocator) or_return
+	skill.logical_path = strings.clone(entry.logical_path, allocator) or_return
+	skill.directory = strings.clone(entry.directory, allocator) or_return
 	skill.root_index = entry.root_index
 	skill.metadata_digest = skill_digest_parse(entry.metadata_digest)
-	return skill, true
+	complete = true
+	return skill, nil
 }
 
 @(require_results)
-snapshot_root_make :: proc(entry: Instruction_Manifest_Root, allocator: mem.Allocator) -> (skills.Root, bool) {
+snapshot_root_make :: proc(entry: Instruction_Manifest_Root, source: skills.Source_Kind, allocator: mem.Allocator) -> (result_value: skills.Root, error: mem.Allocator_Error) {
 	root: skills.Root
-	source, source_ok := instruction_manifest_source(entry.kind)
-	if !source_ok { return {}, false }
-	path, path_error := strings.clone(entry.path, allocator)
-	if path_error != nil { return {}, false }
-	authority, authority_error := strings.clone(entry.authority, allocator)
-	if authority_error != nil {
-		delete(path, allocator)
-		return {}, false
+	complete := false
+	defer if !complete {
+		delete(root.path, allocator)
+		delete(root.authority, allocator)
 	}
-	root = skills.Root {
-		source    = source,
-		path      = path,
-		authority = authority,
-	}
-	return root, true
+	root.path = strings.clone(entry.path, allocator) or_return
+	root.authority = strings.clone(entry.authority, allocator) or_return
+	root.source = source
+	complete = true
+	return root, nil
 }
 
 @(require_results)
-snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocator: mem.Allocator) -> (skills.Diagnostic, bool) {
+snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocator: mem.Allocator) -> (result_value: skills.Diagnostic, error: mem.Allocator_Error) {
 	diagnostic: skills.Diagnostic
-	path, path_error := strings.clone(entry.path, allocator)
-	if path_error != nil { return {}, false }
-	detail, detail_error := strings.clone(entry.detail, allocator)
-	if detail_error != nil {
-		delete(path, allocator)
-		return {}, false
+	complete := false
+	defer if !complete {
+		delete(diagnostic.path, allocator)
+		delete(diagnostic.detail, allocator)
+		delete(diagnostic.winner, allocator)
+		delete(diagnostic.loser, allocator)
 	}
-	winner, winner_error := strings.clone(entry.winner, allocator)
-	if winner_error != nil {
-		delete(path, allocator)
-		delete(detail, allocator)
-		return {}, false
-	}
-	loser, loser_error := strings.clone(entry.loser, allocator)
-	if loser_error != nil {
-		delete(path, allocator)
-		delete(detail, allocator)
-		delete(winner, allocator)
-		return {}, false
-	}
-	diagnostic = skills.Diagnostic {
-		kind       = skills.Diagnostic_Kind(entry.kind),
-		root_index = entry.root_index,
-		path       = path,
-		detail     = detail,
-		winner     = winner,
-		loser      = loser,
-	}
-	return diagnostic, true
+	diagnostic.path = strings.clone(entry.path, allocator) or_return
+	diagnostic.detail = strings.clone(entry.detail, allocator) or_return
+	diagnostic.winner = strings.clone(entry.winner, allocator) or_return
+	diagnostic.loser = strings.clone(entry.loser, allocator) or_return
+	diagnostic.kind = skills.Diagnostic_Kind(entry.kind)
+	diagnostic.root_index = entry.root_index
+	complete = true
+	return diagnostic, nil
 }
 
 @(require_results)
@@ -403,20 +375,22 @@ chat_apply_snapshot :: proc(chat: ^Chat_Session, instructions, manifest_json: st
 	if diagnostics_error != nil { return false }
 	catalog.diagnostics = catalog_diagnostics
 	for entry, index in manifest.skills {
-		skill, skill_ok := snapshot_skill_make(entry, chat.allocator)
-		if !skill_ok { return false }
+		skill, skill_error := snapshot_skill_make(entry, chat.allocator)
+		if skill_error != nil { return false }
 		catalog.skills[index] = skill
 	}
 	// The manifest records each root's canonical directory, which is what says whether a root
 	// holds a skill. A restored root has no configured logical path.
 	for entry, index in manifest.roots {
-		root, root_ok := snapshot_root_make(entry, chat.allocator)
-		if !root_ok { return false }
+		source, source_ok := instruction_manifest_source(entry.kind)
+		if !source_ok { return false }
+		root, root_error := snapshot_root_make(entry, source, chat.allocator)
+		if root_error != nil { return false }
 		catalog.roots[index] = root
 	}
 	for entry, index in manifest.diagnostics {
-		diagnostic, diagnostic_ok := snapshot_diagnostic_make(entry, chat.allocator)
-		if !diagnostic_ok { return false }
+		diagnostic, diagnostic_error := snapshot_diagnostic_make(entry, chat.allocator)
+		if diagnostic_error != nil { return false }
 		catalog.diagnostics[index] = diagnostic
 	}
 	catalog.omitted = manifest.omitted_diagnostics

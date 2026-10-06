@@ -106,22 +106,18 @@ Agents_File :: struct {
 }
 
 @(require_results)
-agents_file_clone :: proc(path, scope, body: string, allocator: mem.Allocator) -> (Agents_File, mem.Allocator_Error) {
+agents_file_clone :: proc(path, scope, body: string, allocator: mem.Allocator) -> (result_value: Agents_File, error: mem.Allocator_Error) {
 	file: Agents_File
-	clone_error: mem.Allocator_Error
-	file.path, clone_error = strings.clone(path, allocator)
-	if clone_error != nil { return {}, clone_error }
-	file.scope, clone_error = strings.clone(scope, allocator)
-	if clone_error != nil {
-		delete(file.path, allocator)
-		return {}, clone_error
-	}
-	file.body, clone_error = strings.clone(body, allocator)
-	if clone_error != nil {
+	complete := false
+	defer if !complete {
 		delete(file.path, allocator)
 		delete(file.scope, allocator)
-		return {}, clone_error
+		delete(file.body, allocator)
 	}
+	file.path = strings.clone(path, allocator) or_return
+	file.scope = strings.clone(scope, allocator) or_return
+	file.body = strings.clone(body, allocator) or_return
+	complete = true
 	return file, nil
 }
 
@@ -321,35 +317,22 @@ write_json_string :: proc(builder: ^strings.Builder, value: string) -> bool {
 }
 
 @(require_results)
-instruction_skill_roots :: proc(roots: []Instruction_Root, allocator := context.allocator) -> ([]skills.Root, mem.Allocator_Error) {
-	converted, converted_error := make([]skills.Root, len(roots), allocator)
-	if converted_error != nil { return nil, converted_error }
-	for root, index in roots {
-		logical_path, path_error := strings.clone(root.path, allocator)
-		if path_error != nil {
-			for &owned in converted[:index] {
-				delete(owned.logical_path, allocator)
-				delete(owned.authority, allocator)
-			}
-			delete(converted, allocator)
-			return nil, path_error
+instruction_skill_roots :: proc(roots: []Instruction_Root, allocator := context.allocator) -> (result_value: []skills.Root, error: mem.Allocator_Error) {
+	converted := make([]skills.Root, len(roots), allocator) or_return
+	complete := false
+	defer if !complete {
+		for root in converted {
+			delete(root.logical_path, allocator)
+			delete(root.authority, allocator)
 		}
-		authority, authority_error := strings.clone(root.authority, allocator)
-		if authority_error != nil {
-			delete(logical_path, allocator)
-			for &owned in converted[:index] {
-				delete(owned.logical_path, allocator)
-				delete(owned.authority, allocator)
-			}
-			delete(converted, allocator)
-			return nil, authority_error
-		}
-		converted[index] = skills.Root {
-			source       = instruction_source_kind(root.kind),
-			logical_path = logical_path,
-			authority    = authority,
-		}
+		delete(converted, allocator)
 	}
+	for root, index in roots {
+		converted[index].source = instruction_source_kind(root.kind)
+		converted[index].logical_path = strings.clone(root.path, allocator) or_return
+		converted[index].authority = strings.clone(root.authority, allocator) or_return
+	}
+	complete = true
 	return converted, nil
 }
 

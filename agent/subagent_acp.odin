@@ -76,34 +76,30 @@ subagent_program :: proc(args: Agent_Spawn_Args, parent: ^Agent_Parent, allocato
 	}
 	path, found := subagent_command_path(config.command, parent.workspace)
 	if !found { return {}, fmt.tprintf("ACP agent %s: command %q is neither an executable file nor a program on PATH; nothing started", config.name, config.command) }
-	// Everything the program owns is copied into a local, so a copy that fails releases it
-	// rather than starting an agent from what it held so far.
-	built: Subagent_Program
-	failed := true
-	defer if failed { subagent_program_destroy(&built, allocator) }
-	clone_error: mem.Allocator_Error
-	built.name, clone_error = strings.clone(config.name, allocator)
+	built, clone_error := subagent_program_clone(config, path, args.model, parent, allocator)
 	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	built.command, clone_error = strings.clone(path, allocator)
-	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	built.arguments, clone_error = make([]string, len(config.arguments), allocator)
-	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	for argument, index in config.arguments {
-		built.arguments[index], clone_error = strings.clone(argument, allocator)
-		if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	}
-	built.model, clone_error = strings.clone(args.model, allocator)
-	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	built.parent_effort, clone_error = strings.clone(parent.effort, allocator)
-	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	built.parent_levels, clone_error = make([]string, len(parent.effort_levels), allocator)
-	if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	for level, index in parent.effort_levels {
-		built.parent_levels[index], clone_error = strings.clone(level, allocator)
-		if clone_error != nil { return {}, "the ACP agent's program could not be held" }
-	}
-	failed = false
 	return built, ""
+}
+
+@(private, require_results)
+subagent_program_clone :: proc(config: ACP_Agent_Config, path, model: string, parent: ^Agent_Parent, allocator: mem.Allocator) -> (result_value: Subagent_Program, error: mem.Allocator_Error) {
+	built: Subagent_Program
+	complete := false
+	defer if !complete { subagent_program_destroy(&built, allocator) }
+	built.name = strings.clone(config.name, allocator) or_return
+	built.command = strings.clone(path, allocator) or_return
+	built.arguments = make([]string, len(config.arguments), allocator) or_return
+	for argument, index in config.arguments {
+		built.arguments[index] = strings.clone(argument, allocator) or_return
+	}
+	built.model = strings.clone(model, allocator) or_return
+	built.parent_effort = strings.clone(parent.effort, allocator) or_return
+	built.parent_levels = make([]string, len(parent.effort_levels), allocator) or_return
+	for level, index in parent.effort_levels {
+		built.parent_levels[index] = strings.clone(level, allocator) or_return
+	}
+	complete = true
+	return built, nil
 }
 
 // subagent_command_path finds the executable command names, temp-allocated: a path relative to

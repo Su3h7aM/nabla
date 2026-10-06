@@ -29,7 +29,7 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 ## Simplifications
 
 - Process spawning is written three times: `mcp/stdio_process*`, `agent/tool_process*`, and `agent/subagent_acp_linux.odin`. A small `process` library package would remove about 350 lines. Needs a decision because it adds a package.
-- Clone-and-check ladders (`x, clone_error = strings.clone(...)`, then `if clone_error != nil`) repeat in `subagent.odin`, `model_selection.odin`, `subagent_acp.odin`, `chat_instructions.odin`, `instructions.odin`, `config_mcp.odin`, `tool_skills.odin`. Return `mem.Allocator_Error` and use `or_return`; clone multi-field values into an owning arena so destroy is one call.
+- Clone-and-check ladders (`x, clone_error = strings.clone(...)`, then `if clone_error != nil`) remain in `agent/subagent.odin`. Return `mem.Allocator_Error` and use `or_return`; consider shared string storage only where it simplifies ownership and destruction.
 - `agent_team_make` unwinds two dynamic arrays that could grow lazily.
 - `agent/tool_agent.odin`: `fmt.tprintf("%s", x)` used as a clone; the same `member` and `agents` checks in three executors; one literal error repeated three times.
 
@@ -43,4 +43,3 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 ## Architecture document drift
 
 - §14.1 lists tool kinds, placements, `Tool_Definition` fields, and tool names that no longer match `agent/tool_args.odin` and `agent/tool.odin` (`agent_send`, `agent_stop`, `builtin_list_skills`, `builtin_load_skill`; no `Task_Run`).
-- §27 constant names differ from the code (`TOOL_KILL_GRACE`, `CHAT_COMPACT_KEEP_MESSAGES`), about ten listed constants do not exist yet without saying so, and several code constants are missing.
