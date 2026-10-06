@@ -75,7 +75,7 @@ The harness keeps running for as long as it reasonably can. Robustness comes fir
 
 - A non-critical failure degrades only its own work. A failed tool, request, hook, config reload, catalog refresh, MCP server, or subagent is recovered or reported to whoever can act (section 2.2), or recorded as a diagnostic, and the session and process continue.
 - A worker that stops responding costs only its own resources. It is abandoned (section 7.2): its call reports `Unknown`, its memory leaks, and the session keeps admitting turns.
-- No non-critical failure blocks the agent permanently. Every wait on another job ends when that job commits, times out, or is abandoned, and an abandoned job's claims pass to the next job that needs them. Letting new work take over from stuck work is preferred over holding the agent back.
+- No non-critical failure blocks the agent permanently. Every wait on another job ends when that job commits, times out, or is abandoned, and an abandoned job's worker slot and native lane pass to the next job that needs them. Letting new work take over from stuck work is preferred over holding the agent back.
 - A thread is never killed. `thread.terminate` cancels at an arbitrary point, possibly while it holds a `sync.Mutex` or is inside an allocator, and `core:sync` locks have no owner-death recovery, so every later waiter would deadlock. Stopping is cooperative through `Stop` tokens (section 7.4).
 - A lock guards only plain memory access. No `Mutex` is held across I/O, a blocking wait, a callback, or a call into Lua, SQLite, or another package, so a slow or stuck holder never stalls another thread. Data crosses threads by ownership handoff and atomics where they suffice.
 - Threads share one address space, so a panic, failed assertion, bounds-check trap, or memory fault on any thread ends the process. No code tries to survive one in-process. The crash boundary is the child process: shell commands, MCP servers, and ACP subagents run in their own processes, and their crash is a tool result. Native subagents run in-process (section 21.1). A harness crash is answered by the journal, which recovers every session on its next open (section 9).
@@ -123,7 +123,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 | Session (state, registry, projection) | heap, session allocator | session close |
 | Turn (batch tables, turn scratch) | turn `virtual.Arena` | turn finish, after all turn jobs retired |
 | Request chain (projection copy, encoded body) | chain `virtual.Arena` | after the last attempt job retired |
-| Job (input copy, output, stream bytes) | job `virtual.Arena` | job retire |
+| Job (record, input copy, output) | process heap, never the session's allocator | job retire, or reclaim after abandonment |
 | Lua execution | Lua allocator over heap with quota | execution end, after children retired |
 | Owner loop iteration | `context.temp_allocator` | iteration end |
 | Worker scratch | worker thread temp allocator | thread exit |
@@ -204,7 +204,7 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 | State | what the owner currently knows (`Session_State`) |
 | Event | one observed fact applied to state |
 | Effect | one unit of work selected from state |
-| Job | one bounded live asynchronous execution with a handoff record |
+| Job | one bounded live worker thread: a tool call, a provider attempt, or a compaction (section 7.1) |
 | Record | one journal fact |
 | Node | one committed conversational step in the session tree |
 | Task | one stored reusable Lua program |
@@ -224,7 +224,7 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 | config watcher | 1 | `ppoll(inotify fd, shutdown eventfd)` | snapshot construction |
 | session watcher | 0..1 | `ppoll(inotify fd, stop eventfd)` | owner wakes for shared sessions (section 8.6) |
 | catalog refresh | 0 or 1, on demand, exits when done | network I/O | provider listing and models.dev fetch |
-| job worker | 0..`TOOL_JOBS_MAX_ACTIVE` | the blocking operation | one job's input and output |
+| job worker (tool call, provider attempt, compaction) | per session: 0..`TOOL_JOBS_MAX_ACTIVE` tool jobs, at most one attempt, at most one compaction | the blocking operation | its kind's record: input and output |
 | MCP server | per configured server, started lazily | (external) | its own process |
 | native subagent owner | 0..`SUBAGENTS_MAX_RUNNING` | as owner | its own session |
 | ACP subagent | 0..`SUBAGENTS_MAX_RUNNING`, shared with native | (external) | its own process and session |
@@ -260,15 +260,7 @@ owner_run :: proc(owner: ^Owner) {
 - `owner_collect` turns external facts into typed `Event` values and calls `owner_apply(state, event)`. Apply checks identity (turn, request, attempt, job) and transition legality; stale events are dropped with a debug record and their payload is freed.
 - `owner_select` is pure. `owner_perform` first applies a claim transition (for example `Send_Attempt` moves the attempt to `Claimed`), so repeated selection cannot launch twice.
 - `owner_perform` never blocks on network, process, or filesystem I/O. Allowed blocking inside the owner: journal commit (fsync), owner-placed tools (journal reads), one Lua slice, one hook run. All are bounded.
-- `Effect` is a closed union; `owner_perform` switches exhaustively.
-
-```odin
-Effect :: union {
-	Adopt_Snapshot, Start_Turn, Record_Input, Prepare_Request, Send_Attempt, Commit_Response,
-	Reject_Response, Admit_Call, Start_Job, Resume_Lua, Commit_Result, Retire_Job, Stop_Jobs,
-	Abandon_Job, Start_Compaction, Install_Checkpoint, Finish_Turn, Recover,
-}
-```
+- Effects are closed sets, and `owner_perform` switches exhaustively. In the code the sets are per subject. `Chat_Effect_Kind` selects the turn's next step (`Start_Request`, `Send_Attempt`, `Await_Provider`, `Wait_Retry`, `Repair_Context`, `Commit_Response`, `Run_Tools`, `Step_Tools`, `Wait_Tools`, `Finish_Tools`, `Turn_Finished`), and `Step_Tools` carries one `Tool_Job_Effect` (`Commit`, `Refuse`, `Abandon`, `Retire`, `Dispatch`, `Wait`, `Done`). Starting, retiring, and abandoning a worker is part of the effect that owns its kind, through the `Job` procedures of section 7.1; there is no separate `Start_Job`, `Retire_Job`, or `Abandon_Job`.
 
 Selection priority, first match wins:
 
@@ -308,7 +300,7 @@ Every producer writes its fact first, then calls `owner_wake_signal`: job worker
 
 - Frontend commands: a mutex-guarded bounded queue (`OWNER_COMMAND_QUEUE`) of `Command` values. A full queue refuses the command to the frontend; it never blocks the owner.
 - Cancel: `session.control.cancel_requested` atomic plus wake. Works with a full queue and from a signal handler (the process `interrupt` atomic maps to the active session's cancel).
-- Job handoffs: section 7.2. Each job owns its terminal slot, so terminal outcomes cannot be dropped.
+- Job publication: section 7.2. Each job publishes through its own `published` flag and record, so terminal outcomes cannot be dropped.
 - Snapshots: the watcher and catalog thread publish `^Config_Snapshot` / `^Catalog_Snapshot` into a single-slot atomic "latest" per kind and wake every owner.
 
 ```odin
@@ -332,7 +324,8 @@ Session_State :: struct {
 	config:     ^Config_Snapshot,    // newest adopted
 	catalog:    ^Catalog_Snapshot,
 	turn:       Maybe(Turn),         // at most one foreground turn
-	jobs:       Job_Table,
+	jobs:       Tool_Jobs,           // the active batch's tool jobs; the attempt is in chain and compaction in compact
+	abandoned:  [dynamic]^Job,       // abandoned workers of every kind, reclaimed when they publish (section 7.2)
 	compaction: Compaction,
 }
 
@@ -370,82 +363,86 @@ any active phase -> Stopping -> Finishing -> Idle
 
 ### 7.1 Job record
 
+Compaction, tool calls, and provider attempts each run one worker thread, and the three share one small record, `Job` (`agent/job.odin`). A kind embeds it as the first field of its own record, so a pointer to the record is a pointer to the `Job` and back. The `Job` holds only what every worker needs, and the kind keeps its own input, output, and commit step beside it.
+
 ```odin
-Job_Kind  :: enum u8 { Attempt, Tool, Lua, Subagent, Compaction }
-Job_Phase :: enum u8 { Queued, Awaiting_Decision, Running, Waiting_Children, Stopping, Published, Committed, Retired, Abandoned }
+Job_Phase :: enum u8 { Idle, Running, Retired, Abandoned }   // owner-only
 
 Job :: struct {
-	id:       Job_Id,
-	kind:     Job_Kind,
-	phase:    Job_Phase,             // owner-only
-	parent:   Job_Id,                // Lua or Task parent, or zero
-	call:     Call_Id,
-	access:   Access,
-	start:    time.Tick,
-	deadline: Maybe(time.Tick),      // start + effective timeout, fixed at Start_Job
-	stop_at:  Maybe(time.Tick),      // when stop was requested; + STOP_PATIENCE is a deadline
-	stop:     Stop,                  // atomic flag the worker polls; the worker also reads turn.stop
-	input:    Job_Input,             // union, immutable after Start_Job, stored in the arena
-	handoff:  Job_Handoff,           // the only memory a worker writes
-	thread:   ^thread.Thread,        // created and destroyed by the owner
-	arena:    virtual.Arena,
-	usage:    Job_Usage,             // cpu time, retained bytes, tokens where relevant
-}
-
-Job_Handoff :: struct {
-	mu:        sync.Mutex,
-	stream:    [dynamic]u8,          // Attempt: appended text and reasoning chunks, job arena
-	progress:  u32,                  // atomic; bumped with each stream append
-	lost:      bool,                 // atomic; a fact the worker could not hand over
-	published: bool,                 // atomic; set once, after result is complete
-	result:    Job_Result,           // union; valid when published
+	kind:      journal.Job_Kind,      // Tool, Provider_Attempt, Compaction, Subagent
+	phase:     Job_Phase,             // owner-only
+	run:       proc(job: ^Job),       // the worker body; job_main publishes after it returns
+	allocator: mem.Allocator,         // the process heap: the record and every payload the worker reads or allocates
+	thread:    ^thread.Thread,
+	published: bool,                  // atomic; the worker's last write
+	stop_at:   Maybe(time.Tick),      // the owner's first sight that the worker should stop
+	record:    journal.Record,        // request, attempt, call, or subagent, for job.abandoned and job.reclaimed
 }
 ```
 
-Job records are heap-allocated individually (stable addresses) into `Job_Table.slots: [dynamic]^Job`, allocated on admission and freed on retirement. The table grows with the work the model asks for; `TOOL_JOBS_MAX_ACTIVE` only decides how many run at once. Lua jobs have no thread; they run as owner slices.
+The procedures are owner-only. `job_main`, the thread procedure, is private to `agent/job.odin`:
+
+| Procedure | Does |
+| --- | --- |
+| `job_launch` | creates the thread with the watched signals blocked, starts it, sets `Running`; reports false when the thread cannot be created |
+| `job_published` | atomic load of `published` |
+| `job_note_stop` | records `stop_at` at the owner's first sight of a stop on a running job, which starts the patience |
+| `job_overdue` | true once the worker has ignored its stop for `TOOL_JOBS_STOP_PATIENCE` |
+| `job_stop_deadline` | `stop_at` plus the patience, for waits and `owner_nearest_deadline` |
+| `job_wait_published` | waits on the owner wake until the worker publishes or a deadline passes |
+| `job_retire` | asserts `published`, calls `thread.destroy`, sets `Retired` |
+| `job_abandon` | sets `Abandoned`, records `job.abandoned`, and lists the job in `chat.abandoned` |
+| `job_reclaim` | for each listed job whose worker has published: destroys the thread, records `job.reclaimed`, and releases the kind's record |
+
+Each kind adds its own state:
+
+- A tool job (`Tool_Job`) keeps its call, arguments, result, placement, and lane. A batch drives its jobs with its own machine, `Tool_Job_Phase` (`Queued`, `Dispatching`, `Running`, `Waiting`, `Result_Ready`, `Committing`, `Retiring`, `Retired`, `Unrecorded`, `Abandoned`), which says what step the call owes next, whatever its thread is doing. `tool_jobs_commit` records the earliest uncommitted result. A Lua parent is a tool job with `Lua` placement and no thread of its own: it runs as owner slices and waits on the child jobs it started.
+- A provider attempt (`Chat_Request_Worker`) keeps the frozen request it borrows from the chain, an `Owner_Mailbox` of events, and a `terminal` (the operation error and the finish reason). The chain (`Chat_Request_Chain`) owns the rest: `chat_chain_settle` turns the terminal into the next stage (commit, resend after backoff, repair, or stop), and `chat_chain_commit` records the response. Retry and backoff belong to the chain, not to the worker (section 11.3).
+- Compaction (`Compact_Job`) embeds the `Job` and keeps its snapshot, output, and usage. Its owner-side `Compact_State` (`Idle`, `Running`, `Ready`, `Backoff`, `Retiring`) says whether a summary is running, waiting to be installed, waiting out a backoff with no worker, or being stopped.
+
+A subagent has a `Job_Kind` for the journal but keeps its own list and has not moved onto `Job`.
+
+A job's record and payloads come from the process heap, never from the session's allocator, because an abandoned worker outlives anything the session releases. There is no job table with ids and no per-job arena. A tool batch owns a table of its `Tool_Job` records (`Tool_Jobs`), and a record is allocated individually, so its address is stable while the worker holds it.
 
 ### 7.2 Ownership protocol
 
-1. The owner builds `input` in the job arena and commits intent, then creates the thread with the job pointer as data.
-2. The worker sets its context, reads `input`, executes, writes `result` into the job arena under `handoff.mu`, stores `published = true`, calls `owner_wake_signal`, and returns. It touches nothing after the wake.
-   A fact the worker cannot hand over, because an allocation for it failed, sets `lost` instead. Setting a flag cannot fail the way the handoff did, so the owner always learns of the loss: an attempt with a lost fact is an unusable response (section 6.5), never a complete one.
-3. The owner sees `published`, commits the result (barrier), delivers it, then calls `thread.join` and `thread.destroy` (join is the retirement proof), then destroys the arena and frees the record.
-4. A worker that does not publish within `STOP_PATIENCE` after a stop request is abandoned. The owner commits `Unknown` for the call, saying the operation may still be running, moves the job to `Abandoned`, and records `job.abandoned`. The job releases its access claim and worker slot, and its turn counts it as retired, so the session keeps working. The owner frees nothing the worker can reach: the job record, its arena, its thread handle, and the stop token and snapshot references it borrows stay alive. Releasing the claim lets conflicting work start while the abandoned worker may still touch the same paths; this is the accepted price of never blocking the agent on a stuck worker, and the `Unknown` result names the paths it held so the model rereads them before relying on them.
+1. The owner builds the kind's record, with its input and `allocator`, and commits intent. `job_launch` then creates the thread with the record as its data.
+2. The worker runs `run`, which writes the kind's output into its own record: a tool result, an attempt `terminal`, or a compaction summary. `job_main` then makes the atomic `published` store, signals the owner wake (`owner_wake_signal`), and touches nothing after that. The owner reads the output only once `published` is set.
+   A fact the worker cannot hand over, because an allocation for it failed, sets `lost` on the mailbox instead (`output_lost` on a compaction). Setting a flag cannot fail the way the handoff did, so the owner always learns of the loss: an attempt with a lost fact is an unusable response (section 6.5), never a complete one.
+3. An attempt also streams events through its `Owner_Mailbox` before it publishes. A push signals the wake, and the mailbox mutex guards only the append and the owner's swap of the queue. The owner takes the publication first, then the events, then the terminal, so every fact the worker observed arrives before the decision.
+4. The owner sees `published`, commits the result (barrier) as the kind requires, and calls `job_retire`. `thread.destroy` is the join, and it returns at once because the worker has stored `published` and touches nothing else. No owner or teardown path joins a worker that has not published.
+5. A worker that does not publish within `TOOL_JOBS_STOP_PATIENCE` of the owner's first sight of its stop is overdue, and the owner abandons it. `job_abandon` records `job.abandoned` and lists the job in `chat.abandoned`; the kind first answers its own open work:
+   - a tool call commits `Unknown`, saying the operation may still be running, and gives back its worker slot and, for the native lane, the lane, so later native work takes over;
+   - an attempt is answered with the cancellation that asked it to stop, and it takes over the session's WebSocket if it was sending through it, so the next WebSocket request opens a fresh one;
+   - a compaction closes its open send row as cancelled and frees the session's one compaction slot.
 
-This protocol applies to every job kind with a thread, provider attempts and compaction included: no owner or teardown path calls `thread.join` on a worker that has not published.
-5. If an abandoned worker publishes later, the owner records `job.reclaimed`, discards the result (the call already has its outcome), joins, and frees the job as in step 3. Otherwise its memory leaks until process exit, which never joins abandoned threads.
+   The owner frees nothing the worker can reach: the record, its payloads, its thread handle, and the borrowed stop token. For an attempt that includes the chain's scratch arena, which holds the frozen bytes and the mailbox and moves into the attempt record when the chain is released.
+6. Teardown waits the same patience, through `job_wait_published`, before it abandons: `tool_jobs_destroy` and `chat_compact_destroy` request every stop first, then wait out the remaining patience for each worker, and `chat_chain_release` does the same for an attempt it finds still running. Each retires the workers that publish and abandons the rest.
+7. `chat.abandoned` is one session-wide list. `job_reclaim` runs wherever the owner observes (`chat_session_observe_at`, `chat_compact_poll`, `chat_compact_destroy`, and `chat_session_workers_outstanding`). When an abandoned worker has published, it records `job.reclaimed`, discards the result (the call already has its outcome), destroys the thread, and releases the kind's record. It leaves a tool job alone while its batch's table still holds it (`tabled`), and an attempt while the chain that abandoned it still holds it. If the worker never publishes, the memory leaks until process exit, which never joins abandoned threads. Session teardown does not wait for it: the list is deleted and the records stay allocated.
 
-There is one lifetime rule: the owner frees job memory, and only after join. No self-cleanup, orphan flags, or worker-side frees.
+There is one lifetime rule: the owner frees job memory, and only after the join. No self-cleanup, orphan flags, or worker-side frees.
 
-### 7.3 Access classes and scheduling
+### 7.3 Scheduling
 
-```odin
-Access_Class :: enum u8 { None, Session, Read, Write, Process, External }
-Access :: struct {
-	class: Access_Class,
-	paths: []string,   // canonical absolute paths; nil with Read means the whole workspace
-	lane:  u32,        // External: MCP client
-}
-```
+A tool call is placed by its tool definition (`Tool_Placement`) and its lane:
 
-| Class | Used by | Conflicts with |
-| --- | --- | --- |
-| None | Lua and Task parents | nothing (children carry their own access) |
-| Session | owner-placed tools | nothing (run inline, serialized by the owner) |
-| Read | read, skill load, read-only subagent | Write on an overlapping path, Process |
-| Write | write, patch | Read or Write on an overlapping path, Process |
-| Process | shell, write-scope subagent, external harness | Read, Write, Process |
-| External | MCP tool | External on the same lane |
+- `Worker` jobs run on a thread. At most `jobs.max_active` run at once, which is `TOOL_JOBS_MAX_ACTIVE` raised to the processor core count.
+- `Owner` jobs run inline on the owner.
+- `Lua` jobs are Code Mode parents. They run as owner slices, hold no worker slot, and never wait for a lane, so a parent waiting on its children cannot deadlock them.
 
-A queued job starts when no earlier-admitted job that is neither retired nor abandoned conflicts with it and running blocking jobs are below `TOOL_JOBS_MAX_ACTIVE`. Earlier means admission order, which is model call order for root calls. The owner scans the bounded table; there are no cached occupancy counts. Lua parents hold no access and no worker slot, so a parent waiting on children cannot deadlock them. Access comes from typed admitted arguments, never from MCP annotations or tool names.
+A lane is a serialization domain: two calls with the same lane never run at once. Every native tool shares one lane (`lane` is nil). Each MCP server has a lane of its own, its client, because one stdio stream cannot serve two calls at once. A blocking subagent call is its own lane. Occupancy is derived from the batch's table, not counted: a lane is busy while one of its jobs is `Dispatching` or `Running`.
+
+`tool_jobs_runnable` starts the earliest queued job whose lane is free and, for a worker, while a slot is free. A later job may start ahead of an earlier one that waits for its lane. Results are still recorded in submission order. An abandoned job gives up its slot and the native lane. An abandoned MCP lane stays held: a queued call on it is answered `Unavailable` and not executed, because the stuck worker may still be using that backend. Placement and lane come from the tool definition, never from MCP annotations or tool names.
+
+Target: access classes (read, write, process, and similar) that let calls on overlapping paths run apart or in parallel by what they touch. They are added only when a measured gain justifies them (section 26).
 
 ### 7.4 Deadlines and cancellation
 
-- The effective timeout is resolved once at admission: `args.timeout` when the model gave one, else `definition.default`, else none. There is no maximum. The clock starts at `Start_Job`, not at admission. A timed-out job returns `Timed_Out` with its partial output, so the model can rerun it with a longer timeout.
+- The effective timeout is resolved once at admission: `args.timeout` when the model gave one, else `definition.default`, else none. There is no maximum. The clock starts when the job starts, not at admission. A timed-out job returns `Timed_Out` with its partial output, so the model can rerun it with a longer timeout.
 - Outcomes distinguish `Timed_Out` (own deadline), `Cancelled` (turn or job stop), and `Unknown` (stop not confirmed).
 - `Stop` is per turn and per job. Each token chains to the wider one that owns it: a job's stop to its turn's, the turn's to the front-end's control, and that to the process interrupt, so a check anywhere sees every stop above it without the owner relaying it. The turn outlives every job it owns, and no token is ever reset while work still reads it.
 - A worker blocked in a wait wakes for its stop: the owner signals the job's wake pipe when it requests the stop, and the worker includes that pipe in the same `poll` as its I/O.
-- Provider attempts receive cancellation only; model deliberation has no harness deadline.
+- Provider attempts receive cancellation only; model deliberation has no harness deadline. The patience of an attempt starts only when a stop is seen, and a wait on one has no deadline until then.
 
 ## 8. Journal
 
@@ -643,7 +640,7 @@ Replay: provider-native opaque items (encrypted reasoning, signed or redacted th
 ### 11.3 Chain, freeze, send
 
 - `Prepare_Request` copies the projection and encodes into the chain arena, runs `request.prepare` hooks, checks capacity (section 23), then freezes: the encoded body is immutable for every attempt of this request.
-- `Send_Attempt` commits `request.sent{attempt, body digest, sizes}` (barrier), then starts an `Attempt` job that borrows the frozen bytes and streams into its handoff.
+- `Send_Attempt` commits `request.sent{attempt, body digest, sizes}` (barrier), then launches an attempt job that borrows the frozen bytes and streams its events through its mailbox.
 - The owner forwards new stream bytes to the view queue as progress. Completion is validated (identities, count, argument sizes) before `Commit_Response` writes the `Assistant` node and `tool.proposed` records in one barrier.
 - Recovery authorization lives only in `agent` (`agent/retry.odin`), and it is one table from the failure class `ai` names to one recovery: resend, repair, or stop. Order: end on cancel or storage failure; end on a response the harness failed itself; accept a validated completion, including one a later transport failure followed; then the class decides, overridden by the provider's documented `x-should-retry` directive where it gave one.
 - Resend: rate limited, provider or connection unavailable, a stream cut off or unreadable, a response the provider ended without a usable answer, and a failure nothing names. The same frozen bytes are sent again after each wait of the doubling schedule `CHAT_RETRY_DELAYS` (1 s, 2 s, 4 s, 8 s, 16 s: five resends over about half a minute), or after the provider's `retry-after` when it is longer; once the schedule is spent the turn ends. A resend is safe after the stream started: nothing in a response runs before it is committed, so the partial answer is dropped and the front-end closes what it showed of it.
@@ -778,12 +775,12 @@ Every call, whatever its source, runs:
 ```text
 decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hook tool.before_admit
   -> policy (allow | ask | deny) -> commit tool.admitted (barrier: effective args, repairs, access)
-  -> hook tool.after_admit -> schedule (section 7.3) -> hook tool.before_execute -> Start_Job
+  -> hook tool.after_admit -> schedule (section 7.3) -> hook tool.before_execute -> start the job
 ```
 
 - Decode: `args_from_json(kind, json.Value)` after a strict parse with duplicate-key checks produces `Tool_Args`. It is the only decoder: Lua children arrive as JSON text (section 17.1). `args_validate(kind, &args)` is the single semantic validator (paths, ranges, types). Argument size and nesting are not validated: the model's output limit is the only bound. MCP args stay a `json.Value`; the server validates their semantics.
 - A call that fails any step gets a committed result (`Invalid_Arguments`, `Unavailable`, `Denied`, `Not_Executed`) and its siblings proceed. A defective response (missing or duplicate call ids, empty names) executes no call and becomes a `Notice` (section 2.2). There is no call count limit per response.
-- Policy: config `policy.tools = { name = "allow" | "ask" | "deny" }`, default allow. The decision comes before admission, so a call waiting for it holds nothing durable beyond its `tool.proposed`. `ask` moves the job to `Awaiting_Decision` and asks the frontend (TUI prompt, ACP `session/request_permission`). The answer arrives as `Permission_Answer`: an allow commits `tool.admitted` with `asked = true`, a refusal commits `tool.completed{Denied}`. A crash while waiting leaves `tool.proposed` without `tool.admitted`, which recovery closes as `Not_Executed` (section 9). `tool.decision` is declared and never written.
+- Policy: config `policy.tools = { name = "allow" | "ask" | "deny" }`, default allow. The decision comes before admission, so a call waiting for it holds nothing durable beyond its `tool.proposed`. `ask` asks the frontend (TUI prompt, ACP `session/request_permission`). The permission wait belongs to the tool-policy feature, which section 29 lists as not built. The answer arrives as `Permission_Answer`: an allow commits `tool.admitted` with `asked = true`, a refusal commits `tool.completed{Denied}`. A crash while waiting leaves `tool.proposed` without `tool.admitted`, which recovery closes as `Not_Executed` (section 9). `tool.decision` is declared and never written.
 - Cancellation is checked before `tool.admitted` is committed, not after: a call the turn stopped before admission completes as `Not_Executed` and leaves no admission that recovery would have to call `Unknown`.
 - A Lua child commits before its result is delivered; a parent's result commits after all its children settle.
 
@@ -892,7 +889,7 @@ return {ok = a.outcome == "success", errors = b.output.stderr}
 ```
 
 - `job.start` yields a host request; the owner admits a child through section 14.2 and returns an integer handle. `job.wait(h)` yields until that child's result commits and returns its typed table (`outcome`, `message`, `output`). An unknown or already consumed handle raises a Lua error.
-- A script may hold any number of unfinished children. They queue in the job table and run as access and `TOOL_JOBS_MAX_ACTIVE` allow.
+- A script may hold any number of unfinished children. They queue in the batch's job table and run as their lanes and `TOOL_JOBS_MAX_ACTIVE` allow.
 - When a script ends with unconsumed children, they are stopped, awaited, and reported in the parent result. A background `agent_spawn` (`wait` left false) is not stopped: its call returns at once, and the subagent it starts outlives the script, so `job.start` without `job.wait` is enough to start one.
 - `builtin_codemode` and `task_run` are not callable from Lua (nesting depth one). `agent_spawn` is callable from Lua in a main session.
 - A refusal the script can fix (an unknown tool name, which lists the tools; a bad handle; arguments that are not one table of named fields; a nested `builtin_codemode`) is a Lua error at the calling line, which `pcall` can catch. Reading a name that is not a tool from `tools` raises the same error; `rawget(tools, name)` tests for one.
@@ -1098,7 +1095,7 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `SUBAGENTS_MAX_RUNNING` | 4 | concurrency; excess children queue |
 | `ACP_MAX_SESSIONS` | 8 | sessions one connection runs at once; the next open is refused with an error |
 | `CHAT_RETRY_DELAYS` | 1, 2, 4, 8, 16 s | resend schedule of a failed provider request (section 11.3) |
-| `STOP_PATIENCE` | 10 s | time to confirm a requested stop |
+| `TOOL_JOBS_STOP_PATIENCE` | 10 s | time to confirm a requested stop, for every job kind |
 | `SHELL_KILL_GRACE` | 500 ms | TERM to KILL |
 | shell timeout | 120 s | default when the model gives none; no maximum |
 | read window | 2000 lines | default when the model gives none; no maximum |
@@ -1140,7 +1137,7 @@ These mechanisms exist in the code today and are replaced by the named target. D
 | one live ACP session per connection: opening another replaces it, and requests for any other session are refused | one owner per open ACP session, up to `ACP_MAX_SESSIONS` (section 22) |
 | a session another process has claimed cannot be opened | runner and followers over `user.input` records, with an inotify wake (sections 6.5 and 8.6) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
-| request attempts and tool jobs each with their own worker lifecycle and abandonment code; tool jobs scheduled by placement and MCP lane only | one `Job` record and ownership protocol for every kind, scheduled by access class (sections 7.1 to 7.3) |
+| tool jobs scheduled by placement and lane, with no access classes | access classes when a measured gain justifies them (sections 7.3 and 26) |
 | `agent/skills` with skill list and load tools | `agent/material` (sections 18, 19) |
 | no hooks, Tasks, rules, commands, tool policy, fork or branch selection, ratings, resource measurements | sections 10.2, 14.2, 18 to 24, and 26 |
 
