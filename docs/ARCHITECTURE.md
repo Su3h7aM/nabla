@@ -36,7 +36,7 @@ A limit exists only when an external constraint imposes it: the provider or its 
 - A limit is data from its source: a catalog fact (`context_window`, `max_output`), a provider refusal classified by `ai`, or an OS error. A constant in source that caps model-driven work is a defect.
 - The context window is the one limit the harness applies before sending, because it is the model's own. Large content is kept whole in a file and the model is shown a preview that names it (section 14.3); the bytes are never discarded.
 - A timeout is a default the model may override with any value, never a maximum. A model-supplied timeout is honored as given.
-- Internal buffers (view queue, journal batch) size memory, not work. When one fills, the producer degrades its own output (drops a redraw delta and resyncs) and never refuses or truncates model-visible data.
+- Internal buffers (journal batch, ACP writer queue) size memory, not work, and never refuse or truncate model-visible data.
 - Hooks, config, and material metadata run user code on the owner or the watcher. Their wall-time bound (section 17) keeps those threads responsive; it is a system constraint on the harness's own threads, not a limit on the model.
 
 ### 2.2 Feedback goes to whoever can act
@@ -66,7 +66,7 @@ A failure is reported to whoever can correct it. The model is told about what it
 - Resident memory is the working set. Durable history lives in the journal and is loaded by bounded ranges. The conversation is read from the journal for each request (section 11.1) and released with it; the covering checkpoint bounds that read by the model window.
 - Large transient data (request preparation, models.dev parsing, compaction snapshots, job output) lives in a `virtual.Arena` owned by that lifetime and is released with `virtual.arena_destroy`, which returns pages to the OS. Small long-lived data uses the heap allocator.
 - Files follow the XDG Base Directory categories, each under a `nabla/` directory created owner-only (`agent/xdg.odin`). `$XDG_CONFIG_HOME` holds what the user writes (section 13.1). `$XDG_STATE_HOME` holds the journal, which is the session history and the logs, the two things the specification names as state. `$XDG_CACHE_HOME` holds what can be deleted at any time without breaking anything: catalog listings, which are fetched again, and kept tool outputs (section 14.3), whose loss only makes a later read of them fail. `$XDG_RUNTIME_DIR` holds what means nothing once its process exits: session claim locks (section 8.1). It is never used for large files, since it may live in memory. Nothing belongs in `$XDG_DATA_HOME` yet.
-- Concurrency exists where work is independent and blocking or CPU-bound. Blocking jobs get a thread each, created on admission and joined on completion, bounded by `BLOCKING_JOBS_MAX_RUNNING`. A CPU-bound native operation that splits into independent pieces creates a `thread.Pool` sized `min(os.get_processor_core_count(), pieces)` for that operation and destroys it before returning. No process-lifetime worker pool.
+- Concurrency exists where work is independent and blocking or CPU-bound. Blocking jobs get a thread each, created on admission and joined on completion, bounded by `TOOL_JOBS_MAX_ACTIVE`. A CPU-bound native operation that splits into independent pieces creates a `thread.Pool` sized `min(os.get_processor_core_count(), pieces)` for that operation and destroys it before returning. No process-lifetime worker pool.
 - An optimization stays only with a measured end-to-end gain (section 26). Complexity without one is deleted.
 
 ### 2.4 Robustness
@@ -217,13 +217,13 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 
 | Thread or process | Count | Blocks in (idle) | Owns |
 | --- | --- | --- | --- |
-| main (TUI, headless, or ACP) | 1 | `ppoll(tty or stdin, view eventfd)` | terminal or protocol stream, frontend state |
+| main (TUI, headless, or ACP) | 1 | `poll(tty, wake eventfd)` (TUI), `read(stdin)` (ACP) | terminal or protocol stream, frontend state |
 | ACP reader | 1 in `nabla acp` | `read(stdin)` | frame decoding |
 | ACP writer | 1 per `acp.Writer` | `write(stdout)`, or its queue's condition when idle | the output stream |
 | owner | 1 per live session | `futex_wait(wake.seq)` | `Session_State`, journal writes for the session |
 | config watcher | 1 | `ppoll(inotify fd, shutdown eventfd)` | snapshot construction |
 | catalog refresh | 0 or 1, on demand, exits when done | network I/O | provider listing and models.dev fetch |
-| job worker | 0..`BLOCKING_JOBS_MAX_RUNNING` | the blocking operation | one job's input and output |
+| job worker | 0..`TOOL_JOBS_MAX_ACTIVE` | the blocking operation | one job's input and output |
 | MCP server | per configured server, started lazily | (external) | its own process |
 | native subagent owner | 0..`SUBAGENTS_MAX_RUNNING` | as owner | its own session |
 | ACP subagent | 0..`SUBAGENTS_MAX_RUNNING`, shared with native | (external) | its own process and session |
@@ -333,7 +333,6 @@ Session_State :: struct {
 	turn:       Maybe(Turn),         // at most one foreground turn
 	jobs:       Job_Table,
 	compaction: Compaction,
-	view:       ^View_Queue,
 }
 
 Turn :: struct {
@@ -364,7 +363,7 @@ any active phase -> Stopping -> Finishing -> Idle
 - An unusable response (undecodable, incomplete, cut off at the model's output limit, or with defective call identities) is committed as audit data plus a harness `Notice` node, executes nothing, and returns to `Preparing` (section 2.2). A turn has no request count limit: it ends when the model answers without calls, the user cancels, or the model cannot be reached.
 - `Stopping` latches one cause, refuses new work, requests stop on every job, and waits for commit and retirement or abandonment. User cancel wins the user-facing status; storage failure still latches `Storage_Failed`.
 - Steering: frontend lines queue in `Steer_Queue` and become `User` nodes with origin `Steering` only at a settled boundary. A line leaves the queue only when its node commits. Until then it lives only in memory, so a crash loses it, and the resumed transcript shows the user which lines the session kept. Committing it earlier would need a second record and a recovery rule for a rare failure (section 2.4).
-- `Finish_Turn` commits `turn.completed` (barrier), releases snapshot references, destroys the turn arena, and emits the terminal view event once.
+- `Finish_Turn` commits `turn.completed` (barrier), releases snapshot references, destroys the turn arena, and reports the turn's end to the frontend once.
 
 ## 7. Jobs and concurrency
 
@@ -402,7 +401,7 @@ Job_Handoff :: struct {
 }
 ```
 
-Job records are heap-allocated individually (stable addresses) into `Job_Table.slots: [dynamic]^Job`, allocated on admission and freed on retirement. The table grows with the work the model asks for; `BLOCKING_JOBS_MAX_RUNNING` only decides how many run at once. Lua jobs have no thread; they run as owner slices.
+Job records are heap-allocated individually (stable addresses) into `Job_Table.slots: [dynamic]^Job`, allocated on admission and freed on retirement. The table grows with the work the model asks for; `TOOL_JOBS_MAX_ACTIVE` only decides how many run at once. Lua jobs have no thread; they run as owner slices.
 
 ### 7.2 Ownership protocol
 
@@ -437,7 +436,7 @@ Access :: struct {
 | Process | shell, write-scope subagent, external harness | Read, Write, Process |
 | External | MCP tool | External on the same lane |
 
-A queued job starts when no earlier-admitted job that is neither retired nor abandoned conflicts with it and running blocking jobs are below `BLOCKING_JOBS_MAX_RUNNING`. Earlier means admission order, which is model call order for root calls. The owner scans the bounded table; there are no cached occupancy counts. Lua parents hold no access and no worker slot, so a parent waiting on children cannot deadlock them. Access comes from typed admitted arguments, never from MCP annotations or tool names.
+A queued job starts when no earlier-admitted job that is neither retired nor abandoned conflicts with it and running blocking jobs are below `TOOL_JOBS_MAX_ACTIVE`. Earlier means admission order, which is model call order for root calls. The owner scans the bounded table; there are no cached occupancy counts. Lua parents hold no access and no worker slot, so a parent waiting on children cannot deadlock them. Access comes from typed admitted arguments, never from MCP annotations or tool names.
 
 ### 7.4 Deadlines and cancellation
 
@@ -643,7 +642,7 @@ Replay: provider-native opaque items (encrypted reasoning, signed or redacted th
 
 ### 11.4 Usage and cache accounting
 
-`provider.observed` records input, output, cache-read, cache-write, and reasoning tokens, each with presence. Missing is unknown, never zero. Within one attempt the latest cumulative value wins; attempts sum. Every attempt's terminal record carries that attempt's usage and cost: `response.committed` for the accepted one, `response.rejected` or `request.interrupted` for one that failed or was cancelled, because a provider bills an attempt it answered whatever the harness did with the answer. Session totals sum all three kinds.
+`provider.observed` records input, output, cache-read, cache-write, and reasoning tokens, each with presence. Missing is unknown, never zero. Within one attempt the latest cumulative value wins; attempts sum. Every attempt's terminal record carries that attempt's usage and cost: `response.committed` for the accepted one, `response.rejected` or `request.interrupted` for one that failed or was cancelled, and `compaction.completed` for an accepted compaction summary, because a provider bills an attempt it answered whatever the harness did with the answer. Session totals sum all four kinds.
 
 ```text
 paired_input = sum(input where input and cache_read are both reported)
@@ -772,15 +771,15 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 - Decode: `args_from_json(kind, json.Value)` after a strict parse with duplicate-key checks produces `Tool_Args`. It is the only decoder: Lua children arrive as JSON text (section 17.1). `args_validate(kind, &args)` is the single semantic validator (paths, ranges, types). Argument size and nesting are not validated: the model's output limit is the only bound. MCP args stay a `json.Value`; the server validates their semantics.
 - A call that fails any step gets a committed result (`Invalid_Arguments`, `Unavailable`, `Denied`, `Not_Executed`) and its siblings proceed. A defective response (missing or duplicate call ids, empty names) executes no call and becomes a `Notice` (section 2.2). There is no call count limit per response.
-- Policy: config `policy.tools = { name = "allow" | "ask" | "deny" }`, default allow. The decision comes before admission, so a call waiting for it holds nothing durable beyond its `tool.proposed`. `ask` moves the job to `Awaiting_Decision` and emits a permission view event (TUI prompt, ACP `session/request_permission`). The answer arrives as `Permission_Answer`: an allow commits `tool.admitted` with `asked = true`, a refusal commits `tool.completed{Denied}`. A crash while waiting leaves `tool.proposed` without `tool.admitted`, which recovery closes as `Not_Executed` (section 9). `tool.decision` is declared and never written.
+- Policy: config `policy.tools = { name = "allow" | "ask" | "deny" }`, default allow. The decision comes before admission, so a call waiting for it holds nothing durable beyond its `tool.proposed`. `ask` moves the job to `Awaiting_Decision` and asks the frontend (TUI prompt, ACP `session/request_permission`). The answer arrives as `Permission_Answer`: an allow commits `tool.admitted` with `asked = true`, a refusal commits `tool.completed{Denied}`. A crash while waiting leaves `tool.proposed` without `tool.admitted`, which recovery closes as `Not_Executed` (section 9). `tool.decision` is declared and never written.
 - Cancellation is checked before `tool.admitted` is committed, not after: a call the turn stopped before admission completes as `Not_Executed` and leaves no admission that recovery would have to call `Unknown`.
 - A Lua child commits before its result is delivered; a parent's result commits after all its children settle.
 
 ### 14.3 Results
 
 - `Outcome`: `Success`, `Tool_Failed`, `Invalid_Arguments`, `Denied`, `Unavailable`, `Not_Executed`, `Transport_Failed` (proven undelivered), `Cancelled`, `Timed_Out`, `Unknown`. An outcome requires its evidence; lacking evidence it is `Unknown`.
-- `Tool_Result :: struct { outcome: Outcome, failure: Maybe(Failure), output: Tool_Output }` is typed and lives in the job arena until committed.
-- At commit the owner renders the model-visible bytes once with the tool's `render` procedure and stores them in the `tool.completed` body; typed fields go to `data`. The projection uses those stored bytes from then on, so resume and cache stay byte-stable. Lua parents receive typed values converted from `Tool_Output`, never the rendering.
+- `Tool_Result :: struct { outcome: Outcome, failure: Maybe(Failure), output: Tool_Output, content: string }` lives in the job's memory until committed.
+- The executor renders the model-visible bytes once with the tool's `render` procedure when it builds the result, while it holds the typed output. At commit the owner adds any repair note, applies retention, and stores those bytes in the `tool.completed` body. The projection uses the stored bytes from then on, so resume and cache stay byte-stable. Lua parents receive typed values converted from `Tool_Output`, never the rendering.
 - Rendering format: first line `ok` or `error <kind>: <message>`, then tool-specific `key: value` lines, then a blank line and the raw body (file text, stdout and stderr sections). Raw text avoids JSON escaping inside provider JSON; the format is kept only while measured tokens per successful task confirm it.
 - Retention: a result is never discarded. One larger than what the model is shown is written whole to `$XDG_CACHE_HOME/nabla/tool-output/<session>/<call>.txt`, which outlives the process so a resumed session can still read it. The journal stores the text the model was shown, so the file is non-essential: when the user clears the cache, a read of it fails as ordinary feedback. If the file cannot be written, the result is sent whole instead.
 - Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. The model reads the rest with `builtin_read`; there is no separate result-reading tool.
@@ -881,7 +880,7 @@ return {ok = a.outcome == "success", errors = b.output.stderr}
 ```
 
 - `job.start` yields a host request; the owner admits a child through section 14.2 and returns an integer handle. `job.wait(h)` yields until that child's result commits and returns its typed table (`outcome`, `message`, `output`). An unknown or already consumed handle raises a Lua error.
-- A script may hold any number of unfinished children. They queue in the job table and run as access and `BLOCKING_JOBS_MAX_RUNNING` allow.
+- A script may hold any number of unfinished children. They queue in the job table and run as access and `TOOL_JOBS_MAX_ACTIVE` allow.
 - When a script ends with unconsumed children, they are stopped, awaited, and reported in the parent result. A background `agent_spawn` (`wait` left false) is not stopped: its call returns at once, and the subagent it starts outlives the script, so `job.start` without `job.wait` is enough to start one.
 - `builtin_codemode` and `task_run` are not callable from Lua (nesting depth one). `agent_spawn` is callable from Lua in a main session.
 - A refusal the script can fix (an unknown tool name, which lists the tools; a bad handle; arguments that are not one table of named fields; a nested `builtin_codemode`) is a Lua error at the calling line, which `pcall` can catch. Reading a name that is not a tool from `tools` raises the same error; `rawget(tools, name)` tests for one.
@@ -954,7 +953,7 @@ An omitted model inherits the parent's selection. A model override resolves thro
 
 Each child has its own store connection, session, instruction snapshot, request state, and tool registry. Its provider requests carry `x-parent-session-id` and use the parent session's cache key. The shared harness instructions remain a common prefix. Child registries exclude `agent_spawn` and `agent_stop`, including access through Code Mode. Their executors also reject child callers. Delegation has one level.
 
-A call runs its child in the background unless it sets `wait`: it returns an agent id at once, the child runs in parallel with the parent and sends its final answer through the parent's steering queue. A call with `wait` blocks and returns the child's final answer. `agent_send` lets the parent address a child and lets a child message its parent; sibling delivery is refused. Messages follow steering: each enters context at the next settled boundary, and one recorded after the final answer continues the turn. A child closes its inbox only when the inbox is empty, in the same step that checks it, so a message is either answered or refused to its sender. `agent_stop` requests cancellation and the child reports its stopped outcome. A background child never holds its parent: only `wait` blocks. The TUI and an ACP V2 client start a turn for a child report while idle, after any queued user input. An ACP V1 prompt is answered when its own turn ends; V1 cannot carry a turn the client did not request, so reports wait in the inbox for the next prompt's turn. Headless waits for outstanding children before it exits, since exiting would lose their reports.
+A call runs its child in the background unless it sets `wait`: it returns an agent id at once, the child runs in parallel with the parent and sends its final answer through the parent's steering queue. A call with `wait` blocks and returns the child's final answer. At most `SUBAGENTS_MAX_RUNNING` children run at once: a background child beyond the bound is queued, reported as `queued`, and started in spawn order as a slot frees, and stopping it before it starts reports it stopped without running. A `wait` child runs at once on its caller's worker and counts toward the bound, since its caller already holds a tool slot. `agent_send` lets the parent address a child and lets a child message its parent; sibling delivery is refused. Messages follow steering: each enters context at the next settled boundary, and one recorded after the final answer continues the turn. A child closes its inbox only when the inbox is empty, in the same step that checks it, so a message is either answered or refused to its sender. `agent_stop` requests cancellation and the child reports its stopped outcome. A background child never holds its parent: only `wait` blocks. The TUI and an ACP V2 client start a turn for a child report while idle, after any queued user input. An ACP V1 prompt is answered when its own turn ends; V1 cannot carry a turn the client did not request, so reports wait in the inbox for the next prompt's turn. Headless waits for outstanding children before it exits, since exiting would lose their reports.
 
 The team owns the parent snapshot and child records. Teardown closes admission, requests cancellation, and waits using the existing worker stop patience. Unresponsive workers and everything they may reach stay allocated until process exit. Abandonment remains visible after session teardown so callers do not free shared tool backends. Shared MCP clients refuse overlapping requests, and backend refresh waits until child and abandoned workers no longer use the bindings. Concurrent native children share the workspace; this stage does not provide access scopes or serialize conflicting file edits. Until it does, the prompts carry the rule: the `agent_spawn` description tells the parent not to redo delegated work, to give concurrent children disjoint files, and to tell each child that others share its workspace, and the subagent role tells a child to edit only its own files and to leave changes it did not make alone.
 
@@ -992,14 +991,14 @@ The `agent_spawn` description lists the configured names and descriptions, so th
 
 ## 22. Frontends and ACP
 
-- Frontends own no agent semantics. They send `Command` values and consume view events. TUI, headless, and the ACP server are peers over the same owner.
-- `View_Queue`: owner to the TUI and headless frontends, bounded by `VIEW_QUEUE_BYTES`, mutex-guarded, signalled by an `eventfd` the frontend includes in its `ppoll`. Events: user text, assistant text delta (entry id, bytes), tool admitted, tool settled, permission request, usage, retry, notice, turn state, config and catalog changes, branch changes. On overflow the owner drops deltas and sets `resync`; the frontend then rebuilds its recent transcript from a bounded read-only journal page. The owner never performs frontend I/O and never blocks on a frontend.
-- TUI: immediate-mode `layout` and `term` rendering; its own display transcript bounded by `TRANSCRIPT_MAX_BYTES`; `ppoll` with no timeout when idle and `SPINNER_INTERVAL` only while a turn runs. Commands: `/new`, `/resume`, `/fork`, `/branch`, `/model`, `/effort`, `/compact`, `/rate`, `/reload`, `/status`, `/help`, `/quit`, plus material commands.
+- Frontends own no agent semantics. They send `Command` values and observe the owner through `Chat_Observer` callbacks. TUI, headless, and the ACP server are peers over the same owner.
+- TUI handoff: the observer updates a shared snapshot under a lock that guards only that memory, bumps its generation, and writes the TUI's wake `eventfd`. The TUI thread renders from the snapshot, so the owner never performs terminal I/O and never waits for a redraw. The resize and interrupt signal handlers write the same `eventfd`.
+- TUI: immediate-mode `layout` and `term` rendering; its own display transcript bounded by `TRANSCRIPT_MAX_BYTES`; `poll` on the tty and the wake `eventfd` with no timeout when idle and `SPINNER_INTERVAL` only while a turn runs. Commands: `/new`, `/resume`, `/fork`, `/branch`, `/model`, `/effort`, `/compact`, `/rate`, `/reload`, `/status`, `/help`, `/quit`, plus material commands.
 - TUI colors: Nabla has no theme. The terminal's theme is Nabla's theme, so a user who changes the terminal theme recolors Nabla with no Nabla setting. A theme reliably defines the default foreground and background and the 16 ANSI palette entries (0 to 7 normal, 8 to 15 bright); entries 16 to 255 are a fixed xterm cube and grayscale in most themes, and truecolor bypasses the theme entirely. The TUI therefore draws with the default colors, ANSI indices 1 to 6 for semantic accents (each meaning one fixed index, such as red for failure and cyan for code), and the attributes bold, dim, italic, underline, reverse, and strikethrough. It never emits RGB colors or indices above 15, and it avoids 0, 7, and 15 as foregrounds because their contrast against an unknown background is unknown. It does not query the terminal's colors (OSC 4, 10, 11), because replies add latency, support varies, and multiplexers can block them.
-- Headless (`nabla --prompt`): the main thread consumes view events, writes the final answer to stdout and everything else to stderr.
+- Headless (`nabla --prompt`): the observer writes the final answer to stdout and everything else to stderr on the owner thread. Those streams are the run's only consumer, so a reader that stops reading should hold the run back; the answer is never dropped to keep the owner moving.
 - ACP server (`nabla acp`): the reader thread decodes frames into commands. A connection may open several sessions, each an independent conversation; the target runs one owner per open session, up to `ACP_MAX_SESSIONS`, and prompts within one session run one at a time, so a prompt that arrives during a turn is queued (V2) or refused as busy (V1). `session/fork` maps to `Fork`, permission requests to `session/request_permission`, and `_nabla/rate` and `_nabla/branches` are extension methods. `acp` also implements the client role used by subagents.
 - ACP protocol rules the server keeps: `initialize` advertises exactly the methods and content it implements (`loadSession`, the session list capability for `session/list`, embedded context, stdio MCP), since a client treats an omitted capability as unsupported; every `session/update` of a prompt is queued before that prompt's response; a cancelled turn ends with `stopReason: cancelled` (V1) or an idle state carrying the cancelled reason (V2), after its pending updates; `session/load` replays the conversation as updates before its response.
-- ACP output: ACP needs no `View_Queue`, because its writer queue already is one. The owner's observer encodes a whole frame and appends it under a lock that guards only the append, never the write; one writer thread writes the queue in order. The owner therefore never blocks on the client. The queue has no bound, since a harness limit would drop protocol frames. An update that reports a durable outcome (a message, a finished tool call) is queued only after the journal commit that records it, so the stream is a view of the journal: a client that stops reading loses nothing that `session/load` cannot replay. Shutdown drains the queue within `SHUTDOWN_JOIN_PATIENCE`; a writer still blocked in a write is abandoned and keeps what it can reach.
+- ACP output: the owner hands ACP frames to a writer queue. The owner's observer encodes a whole frame and appends it under a lock that guards only the append, never the write; one writer thread writes the queue in order. The owner therefore never blocks on the client. The queue has no bound, since a harness limit would drop protocol frames. An update that reports a durable outcome (a message, a finished tool call) is queued only after the journal commit that records it, so the stream is a view of the journal: a client that stops reading loses nothing that `session/load` cannot replay. Shutdown drains the queue within `SHUTDOWN_JOIN_PATIENCE`; a writer still blocked in a write is abandoned and keeps what it can reach.
 
 ## 23. Context, capacity, compaction
 
@@ -1080,10 +1079,9 @@ These values schedule work, size internal buffers, and time the harness's own th
 | --- | --- | --- |
 | `OWNER_EFFECTS_PER_PASS` | 64 | scheduling quantum; the rest run on the next pass |
 | `OWNER_COMMAND_QUEUE` | 64 | frontend input buffer |
-| `VIEW_QUEUE_BYTES` | 1 MiB | frontend buffer; overflow resyncs |
 | `TRANSCRIPT_MAX_BYTES` | 1 MiB | TUI display memory; older lines reload from the journal |
 | `SPINNER_INTERVAL` | 100 ms | redraw while busy |
-| `BLOCKING_JOBS_MAX_RUNNING` | `max(4, core count)` | concurrency; excess jobs queue |
+| `TOOL_JOBS_MAX_ACTIVE` | `max(4, core count)` | concurrency; excess jobs queue |
 | `SUBAGENTS_MAX_RUNNING` | 4 | concurrency; excess children queue |
 | `ACP_MAX_SESSIONS` | 8 | concurrency; excess sessions wait for a free owner |
 | `CHAT_RETRY_DELAYS` | 1, 2, 4, 8, 16 s | resend schedule of a failed provider request (section 11.3) |
@@ -1126,14 +1124,10 @@ These mechanisms exist in the code today and are replaced by the named target. D
 
 | Current | Target |
 | --- | --- |
-| TUI 50 ms input poll; headless output written to stdout and stderr by `Chat_Observer` callbacks on the owner | `View_Queue` and eventfd, the owner never blocks on a frontend (section 22) |
 | one live ACP session per connection: opening another replaces it, and requests for any other session are refused | one owner per open ACP session, up to `ACP_MAX_SESSIONS` (section 22) |
-| `SHUTDOWN_JOIN_POLL` sleep loop in root | one wait on the thread or its stop wake, with a real deadline as the only timeout (section 2.3) |
-| a result rendered by `tool_result_of` where the executor built it | typed output kept until commit, rendered once at commit (section 14.3) |
 | catalog replaced under a mutex and the old one destroyed; selection reapplied mid-turn | immutable reference-counted snapshots, kept by admitted work (section 13.3) |
 | request attempts and tool jobs each with their own worker lifecycle and abandonment code; tool jobs scheduled by placement and MCP lane only | one `Job` record and ownership protocol for every kind, scheduled by access class (sections 7.1 to 7.3) |
 | subagent starts, messages, and completions recorded, but delivery and delegation state held in in-memory team state, so a crash loses a running delegation | the journal protocol of section 21.2 |
-| native background subagents start without an admission gate | `SUBAGENTS_MAX_RUNNING` (section 27) |
 | `agent/skills` with skill list and load tools | `agent/material` (sections 18, 19) |
 | no hooks, Tasks, rules, commands, tool policy, fork or branch selection, ratings, resource measurements | sections 10.2, 14.2, 18 to 24, and 26 |
 
