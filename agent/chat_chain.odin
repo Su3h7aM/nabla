@@ -620,6 +620,11 @@ chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usa
 		chat_chain_apply_event(chat, usages, &event)
 		chat_event_destroy(&event, chain.mailbox.allocator)
 	}
+	if mailbox_take_lost(chain.mailbox) {
+		// A response the harness could not keep whole is not the response the model sent,
+		// so nothing in it is executed.
+		chat_session_feed_error(chat, chain.source, CHAT_RESPONSE_NOT_KEPT)
+	}
 	if published {
 		chat_chain_join(chat)
 		chain.operation_error = terminal.error

@@ -14,13 +14,15 @@ Chat_Attempt_Terminal :: struct {
 
 // Owner_Mailbox carries a request worker's events to the owner in order, plus one terminal
 // published after every event. A push never blocks. Payloads and the queue use allocator,
-// which must be safe to use from a worker thread.
+// which must be safe to use from a worker thread. lost is atomic: the producer sets it for a
+// fact it could not hand over, which needs no allocation, and the owner takes it.
 Owner_Mailbox :: struct {
 	allocator:        mem.Allocator,
 	mutex:            sync.Mutex,
 	events:           [dynamic]Chat_Event,
 	terminal:         Chat_Attempt_Terminal,
 	terminal_present: bool,
+	lost:             bool,
 }
 
 mailbox_init :: proc(mailbox: ^Owner_Mailbox, allocator: mem.Allocator) {
@@ -38,6 +40,20 @@ mailbox_push :: proc(mailbox: ^Owner_Mailbox, event: Chat_Event) -> bool {
 	if err != nil { return false }
 	owner_wake_signal()
 	return true
+}
+
+// mailbox_mark_lost records that a fact of the response could not be handed over. It
+// allocates nothing, so it cannot fail the way the handoff did.
+mailbox_mark_lost :: proc(mailbox: ^Owner_Mailbox) {
+	sync.atomic_store(&mailbox.lost, true)
+	owner_wake_signal()
+}
+
+// mailbox_take_lost reports whether a fact was lost since the last call, and clears the
+// report. Take it after the terminal: the worker marks a loss before it publishes.
+@(require_results)
+mailbox_take_lost :: proc(mailbox: ^Owner_Mailbox) -> bool {
+	return sync.atomic_exchange(&mailbox.lost, false)
 }
 
 // mailbox_take_all transfers the queued events, oldest first. The caller destroys each event

@@ -68,8 +68,8 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 // chat_worker_event is the transport callback. The transport frees the event it hands over
 // as soon as this returns, so everything worth keeping is copied into an owned Chat_Event
 // and pushed to the owner. The callback has no error to return, so a copy or a push that
-// fails is reported to the owner as a response it cannot use: a fact the response carried
-// that the worker could not keep is what tells the owner nothing in it may be trusted.
+// fails sets the mailbox's lost flag: a fact the response carried that the worker could not
+// keep is what tells the owner nothing in it may be trusted.
 @(private)
 chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	runtime := cast(^Chat_Worker_Runtime)user_data
@@ -78,10 +78,10 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	case ai.Provider_Text_Event:
 		text, clone_error := strings.clone(value.Text, worker.allocator)
 		if clone_error != nil {
-			chat_worker_lost(worker, runtime.source)
+			mailbox_mark_lost(worker.mailbox)
 			return
 		}
-		chat_worker_deliver(worker, runtime.source, Chat_Text_Event{source = runtime.source, text = text})
+		chat_worker_deliver(worker, Chat_Text_Event{source = runtime.source, text = text})
 	case ai.Provider_Reasoning_Event:
 	// Reasoning is opaque replay material. The stored response is what replays it, so
 	// the owner never needs the live copy.
@@ -89,17 +89,17 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		runtime.finish_reason = value.Reason
 		completion, kept := chat_worker_completion(worker, runtime.source, value)
 		if !kept {
-			chat_worker_lost(worker, runtime.source)
+			mailbox_mark_lost(worker.mailbox)
 			return
 		}
-		chat_worker_deliver(worker, runtime.source, completion)
+		chat_worker_deliver(worker, completion)
 	case ai.Provider_Error_Event:
 		message, clone_error := strings.clone(value.Message, worker.allocator)
 		if clone_error != nil {
-			chat_worker_lost(worker, runtime.source)
+			mailbox_mark_lost(worker.mailbox)
 			return
 		}
-		chat_worker_deliver(worker, runtime.source, Chat_Failure_Event{source = runtime.source, kind = value.Kind, message = message})
+		chat_worker_deliver(worker, Chat_Failure_Event{source = runtime.source, kind = value.Kind, message = message})
 	case ai.Provider_Usage_Event:
 		// Usage is a measurement, not text: it is copied whole and needs no ownership, and a
 		// queue that cannot take it does not make the response unusable the way a lost
@@ -145,24 +145,12 @@ chat_worker_completion :: proc(
 	return completion, true
 }
 
-// chat_worker_deliver hands one owned event to the mailbox, or releases it and reports the
+// chat_worker_deliver hands one owned event to the mailbox, or releases it and marks the
 // fact it carried as lost when the queue could not take it.
 @(private)
-chat_worker_deliver :: proc(worker: ^Chat_Request_Worker, source: Chat_Event_Source, event: Chat_Event) {
+chat_worker_deliver :: proc(worker: ^Chat_Request_Worker, event: Chat_Event) {
 	if mailbox_push(worker.mailbox, event) { return }
 	owned := event
 	chat_event_destroy(&owned, worker.allocator)
-	chat_worker_lost(worker, source)
-}
-
-// chat_worker_lost tells the owner that a fact the response carried could not be kept, so
-// that response is not usable as it stands. The owner answers it with the notice that says
-// the harness could not keep the response, which tells the model nothing in it ran and asks
-// it to send the work again: the only correction available to the owner, and the only one
-// the model can act on. The report owns no string, so it cannot fail the way the fact it
-// reports did. A queue that cannot take the report leaves the worker no other channel
-// to the owner, and it never writes the journal.
-@(private)
-chat_worker_lost :: proc(worker: ^Chat_Request_Worker, source: Chat_Event_Source) {
-	_ = mailbox_push(worker.mailbox, Chat_Lost_Event{source = source})
+	mailbox_mark_lost(worker.mailbox)
 }

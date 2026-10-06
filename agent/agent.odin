@@ -590,15 +590,6 @@ Chat_Usage_Event :: struct {
 	usage: ai.Provider_Usage_Event,
 }
 
-// Chat_Lost_Event is a fact the running response carried that was lost between the transport
-// and the owner: a fragment of the answer, one of its calls, or the response itself did not
-// fit in memory. It owns nothing, because the thing it reports is exactly what could not be
-// allocated. A response the harness could not hold in full is not the response the model
-// sent, so the owner applies it as one it cannot use.
-Chat_Lost_Event :: struct {
-	source: Chat_Event_Source,
-}
-
 // Chat_Event is one external fact delivered to the owner for application. A provider
 // callback decodes the wire event into one of these, and applying it is the only way an
 // external fact changes turn state. A queued event owns its payload: the producer clones it,
@@ -608,7 +599,6 @@ Chat_Event :: union {
 	Chat_Provider_Completion,
 	Chat_Failure_Event,
 	Chat_Usage_Event,
-	Chat_Lost_Event,
 }
 
 // chat_completion_destroy releases what one completed provider response owns. The strings and
@@ -631,7 +621,6 @@ chat_event_destroy :: proc(event: ^Chat_Event, allocator: mem.Allocator) {
 	case Chat_Failure_Event:
 		delete(value.message, allocator)
 	case Chat_Usage_Event:
-	case Chat_Lost_Event:
 	}
 	event^ = nil
 }
@@ -665,11 +654,6 @@ chat_session_apply :: proc(chat: ^Chat_Session, event: ^Chat_Event) -> Chat_Appl
 	case Chat_Usage_Event:
 		// Usage is a measurement the driver records for the request, not a turn
 		// transition; nothing about the turn changes here.
-		return {}
-	case Chat_Lost_Event:
-		// A response the harness could not keep whole is not the response the model sent,
-		// so nothing in it is executed.
-		chat_session_feed_error(chat, value.source, CHAT_RESPONSE_NOT_KEPT)
 		return {}
 	case Chat_Provider_Completion:
 		// One response feeds one path: tool handoff when the provider assembled calls, plain
