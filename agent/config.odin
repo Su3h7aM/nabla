@@ -638,64 +638,6 @@ load_acp_agents_from :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.
 	return acp_agents_load(state, -1, allocator)
 }
 
-@(require_results)
-load_lua_config :: proc(path: string, allocator := context.allocator) -> ([dynamic]Catalog_Provider_Source, Config_Error) {
-	if path == "" { return {}, .None }
-	if info, stat_err := os.stat(path, context.temp_allocator); stat_err != nil {
-		if stat_err == os.General_Error.Not_Exist { return {}, .Missing }
-		return {}, .Read
-	} else if info.type != .Regular {
-		return {}, .Read
-	}
-	data, read_err := os.read_entire_file(path, context.temp_allocator)
-	if read_err != nil { return {}, .Read }
-	state := lua.L_newstate()
-	if state == nil { return {}, .Lua }
-	defer lua.close(state)
-	lua.sethook(state, lua_limit_hook, lua.MASKCOUNT, CONFIG_INSTRUCTIONS)
-	if lua.L_loadbuffer(state, raw_data(data), c.size_t(len(data)), "@nabla-config", "t") != .OK { return {}, .Lua }
-	if lua.pcall(state, 0, 1, 0) != 0 { return {}, .Lua }
-	if !lua_plain_table(state, -1) { return {}, .Root }
-	base := lua.gettop(state)
-	lua_field(state, -1, "providers")
-	if lua.type(state, -1) == .NIL { return {}, .None }
-	if !lua_plain_table(state, -1) { return {}, .Invalid }
-	result: [dynamic]Catalog_Provider_Source
-	result.allocator = allocator
-	providers_idx := lua.absindex(state, -1)
-	lua.pushnil(state)
-	for {
-		if lua.next(state, providers_idx) == 0 { break }
-		if lua.type(state, -2) != .STRING {
-			catalog_sources_destroy(&result, allocator)
-			return {}, .Invalid
-		}
-		provider_id, provider_id_error := lua_string(state, -2, allocator)
-		if provider_id_error != .None {
-			catalog_sources_destroy(&result, allocator)
-			return {}, provider_id_error
-		}
-		provider: Catalog_Provider_Source
-		err, detail := load_provider(state, -1, provider_id, allocator, &provider)
-		delete(provider_id, allocator)
-		if err != .None {
-			if detail != "" { delete(detail, allocator) }
-			catalog_provider_source_destroy(&provider, allocator)
-			catalog_sources_destroy(&result, allocator)
-			return {}, err
-		}
-		appended := append(&result, provider)
-		if appended != 1 {
-			if appended == 0 { catalog_provider_source_destroy(&provider, allocator) }
-			catalog_sources_destroy(&result, allocator)
-			return {}, .Allocation
-		}
-		lua.settop(state, providers_idx + 1)
-	}
-	lua.settop(state, base)
-	return result, .None
-}
-
 // config_env_reference reports whether a configured value names an environment
 // variable. `${NAME}` is the reference syntax configuration values already use
 // for environment variables, and it is unambiguous: a literal secret never

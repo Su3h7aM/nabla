@@ -36,8 +36,10 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, write_err == nil)
 
-	sources, err := load_lua_config(path)
+	sources, _, servers, err, detail := load_lua_config_full(path)
 	testing.expect_value(t, err, Config_Error.None)
+	defer mcp_servers_destroy(&servers)
+	defer if detail != "" { delete(detail) }
 	defer catalog_sources_destroy(&sources)
 	testing.expect_value(t, len(sources), 1)
 	provider := sources[0]
@@ -87,9 +89,11 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 
 	// A missing config is a valid empty setup, not an error; a path that exists
 	// but cannot be read as a file still is.
-	_, missing_err := load_lua_config("/tmp/nabla-config-test-missing.lua")
+	_, _, _, missing_err, missing_detail := load_lua_config_full("/tmp/nabla-config-test-missing.lua")
+	defer if missing_detail != "" { delete(missing_detail) }
 	testing.expect_value(t, missing_err, Config_Error.Missing)
-	_, unreadable_err := load_lua_config("/tmp")
+	_, _, _, unreadable_err, unreadable_detail := load_lua_config_full("/tmp")
+	defer if unreadable_detail != "" { delete(unreadable_detail) }
 	testing.expect_value(t, unreadable_err, Config_Error.Read)
 }
 
@@ -169,9 +173,11 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 		path := fmt.aprintf("/tmp/nabla-config-test-fail-%d-%d.lua", os.get_pid(), i, allocator = context.temp_allocator)
 		defer os.remove(path)
 		testing.expect(t, os.write_entire_file(path, transmute([]u8)config) == nil)
-		sources, err := load_lua_config(path)
+		sources, _, servers, err, detail := load_lua_config_full(path)
 		testing.expectf(t, err != .None, "case %d loaded without error", i)
 		testing.expect_value(t, len(sources), 0)
+		if detail != "" { delete(detail) }
+		mcp_servers_destroy(&servers)
 		catalog_sources_destroy(&sources)
 	}
 }
