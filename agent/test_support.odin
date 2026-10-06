@@ -120,7 +120,20 @@ test_skill_instructions :: proc(chat: ^Chat_Session) -> string {
 }
 
 chat_test_end :: proc(test: ^testing.T, fixture: ^Chat_Test) {
-	chat_session_destroy(&fixture.chat)
+	chat := &fixture.chat
+	// Teardown abandons a summary whose worker has not published, and the session then keeps
+	// what that worker can reach. The summary is stopped and awaited first, so no test depends
+	// on whether its worker was quick enough.
+	chat_compact_cancel(chat)
+	deadline := time.tick_add(time.tick_now(), 2 * time.Second)
+	for chat.compact.state == .Retiring && time.tick_since(deadline) < 0 {
+		seen := owner_wake_seen()
+		chat_compact_poll(chat, {})
+		if chat.compact.state != .Retiring { break }
+		owner_wake_wait(seen, deadline)
+	}
+	testing.expect(test, chat.compact.state != .Retiring, "the summary's worker did not stop when the test ended")
+	chat_session_destroy(chat)
 	if close_error := journal.close(&fixture.store); close_error != nil {
 		testing.expectf(test, false, "the journal did not close: %s", journal.error_text(close_error, context.temp_allocator))
 	}

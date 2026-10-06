@@ -127,11 +127,12 @@ Chat_Session :: struct {
 	// working; each job is released once its worker publishes, and until then nothing the
 	// worker can reach (the workspace, the skill catalog, the tool backends) is freed.
 	abandoned_jobs:               [dynamic]^Tool_Job,
-	// abandoned_attempts are provider attempts whose workers ignored their stop, and
-	// abandoned_compactions are summaries whose workers did. Each is released once its worker
-	// publishes; until then nothing that worker can reach is freed.
+	// abandoned_attempts are provider attempts whose workers ignored their stop. Each is
+	// released once its worker publishes; until then nothing that worker can reach is freed.
 	abandoned_attempts:           [dynamic]^Chat_Abandoned_Attempt,
-	abandoned_compactions:        [dynamic]^Compact_Job,
+	// abandoned are the jobs that have moved onto Job (compaction so far) whose workers ignored
+	// their stop. job_reclaim releases each once its worker publishes.
+	abandoned:                    [dynamic]^Job,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
 	// replaceable while the chat is idle and frozen for the entire user turn,
@@ -313,7 +314,7 @@ chat_session_init :: proc(
 	chat.effort_levels.allocator = allocator
 	chat.abandoned_jobs.allocator = allocator
 	chat.abandoned_attempts.allocator = allocator
-	chat.abandoned_compactions.allocator = allocator
+	chat.abandoned.allocator = allocator
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
 	chat.team = agent_team_make(os.heap_allocator())
 	if chat.team != nil { chat.inbox = &chat.team.inbox }
@@ -368,10 +369,12 @@ chat_skill_catalog_release :: proc(chat: ^Chat_Session) {
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
 	tool_jobs_reclaim(chat)
 	chat_chain_attempts_reclaim(chat)
+	job_reclaim(chat)
 	return(
 		chat.workers_retained ||
 		len(chat.abandoned_jobs) > 0 ||
 		len(chat.abandoned_attempts) > 0 ||
+		len(chat.abandoned) > 0 ||
 		agent_team_running(chat.team) ||
 		(chat.team != nil && sync.atomic_load(&chat.team.abandoned)) \
 	)
@@ -460,10 +463,10 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.tool_output_directory, chat.allocator)
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
-	// An abandoned attempt and an abandoned summary are released only when their workers
+	// An abandoned attempt and an abandoned job are released only when their workers
 	// publish, which nothing here waits for: the records stay allocated for the process.
 	delete(chat.abandoned_attempts)
-	delete(chat.abandoned_compactions)
+	delete(chat.abandoned)
 	tool_registry_destroy(&chat.tools)
 	chat^ = {
 		workers_retained = outstanding,

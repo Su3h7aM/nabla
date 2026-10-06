@@ -4,8 +4,6 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:sync"
-import "core:thread"
 import "core:time"
 
 import "core:mem/virtual"
@@ -292,26 +290,17 @@ Compact_Outcome :: enum {
 }
 
 // Compact_Job is one summarization in flight. The worker owns everything it
-// touches until it stops: the snapshot it reads, the output it accumulates, and
+// touches until it publishes: the snapshot it reads, the output it accumulates, and
 // the interrupt that bounds it. The owner touches none of it between
-// start and join.
+// start and retire. Its allocator is the shared job's process heap.
 Compact_Job :: struct {
+	using job:         Job,
 	snapshot:          Compact_Snapshot,
 	provider_id:       string,
 	optional_features: Optional_Request_Features,
 	request:           journal.Request_Id,
 	interrupt:         ai.Interrupt,
-	thread:            ^thread.Thread,
-	// allocator is the thread-safe heap the job itself and the worker-owned storage come from:
-	// the frozen snapshot, the output it accumulates, and everything the request allocates while
-	// it runs. It is deliberately not the session's allocator: wrapping the worker's own
-	// allocations in a lock would not serialize the owner's writes through the same backing
-	// allocator, so the two threads never share one, and a job whose worker ignores its stop
-	// outlives the allocator the session releases.
-	allocator:         mem.Allocator,
-	// finished is atomic: the worker stores it once the fields below are final.
-	finished:          bool,
-	output:            [dynamic]u8, // owner after join
+	output:            [dynamic]u8, // owner after retire
 	// output_lost records that a fragment of the summary could not be kept, so what the job
 	// holds is not what the model wrote. Such a job has no summary at all: installing what fit
 	// in memory would replace committed history with a partial account of it.
@@ -324,10 +313,6 @@ Compact_Job :: struct {
 	// usage is the latest figure the provider reported for each count during the running send.
 	usage:             ai.Provider_Usage_Event,
 	started_at:        time.Tick,
-	// stop_at is when the owner asked this job's worker to stop, and the patience the worker is
-	// given to publish is measured from it. A job that has not published by the end of it is
-	// abandoned: the owner stops waiting for it and keeps the session working.
-	stop_at:           Maybe(time.Tick),
 	// attempts counts the sends this chain has made, including the one in flight.
 	attempts:          int,
 	// due_at is when a job in Backoff is sent again, or none when the delay it waits out
@@ -370,15 +355,6 @@ Compact_Request_Result :: enum {
 	Unavailable,
 }
 
-// chat_compact_job_allocator gives a job the heap it and its worker-owned storage come from. The
-// heap is process-wide and thread-safe, so the worker allocates with it directly, the owner
-// releases what is left after the join with the same allocator, and a job whose worker ignores
-// its stop is not held in memory the session's allocator owns.
-@(private)
-chat_compact_job_allocator :: proc(job: ^Compact_Job) {
-	job.allocator = os.heap_allocator()
-}
-
 @(private)
 chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	job := cast(^Compact_Job)user_data
@@ -412,17 +388,12 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	}
 }
 
-// chat_compact_worker is the summarization request itself. It touches no session
-// state, runs no tool, and reports nothing: the owner reads its result when it
-// joins, and the owner records the compaction's lifecycle.
+// chat_compact_run is the summarization request itself. It touches no session
+// state, runs no tool, and reports nothing: the owner reads its result once the job
+// has published, and the owner records the compaction's lifecycle.
 @(private)
-chat_compact_worker :: proc(thread: ^thread.Thread) {
-	job := cast(^Compact_Job)thread.data
-	// The thread library gives this thread its own default context, whose allocator is the
-	// heap. Adopting the job's allocator keeps everything the request allocates owned by the
-	// allocator the owner releases it with, and that allocator is a thread-safe heap because
-	// the owner is allocating from its own at the same time.
-	context.allocator = job.allocator
+chat_compact_run :: proc(shared: ^Job) {
+	job := cast(^Compact_Job)shared
 	job.started_at = time.tick_now()
 
 	connection := ai.Provider_Connection {
@@ -451,8 +422,6 @@ chat_compact_worker :: proc(thread: ^thread.Thread) {
 		job.error_text = job.operation.detail
 		job.operation.detail = ""
 	}
-	sync.atomic_store(&job.finished, true)
-	owner_wake_signal()
 }
 
 @(private)
@@ -554,9 +523,14 @@ chat_compact_selection_matches :: proc(chat: ^Chat_Session, job: ^Compact_Job) -
 }
 
 // chat_compact_begin_attempt records a send before its worker starts, with the digest and
-// the size of the frozen bytes that send will carry.
+// the size of the frozen bytes that send will carry. The attempt it names is the one the
+// job's journal record names if the worker is abandoned.
 @(private, require_results)
 chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bool {
+	job.record = {
+		request = job.request,
+		attempt = journal.Attempt_No(job.attempts),
+	}
 	header := journal.Record {
 		kind     = .Request_Sent,
 		request  = job.request,
@@ -579,26 +553,6 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 		},
 	)
 	return chat_commit(chat, "the compaction request could not be recorded")
-}
-
-// chat_compact_launch starts the worker for the attempt whose row already exists. The
-// worker must never run the process signal handler, so the handled signals are blocked
-// across the thread's creation: a thread inherits the mask its creator had, and blocking
-// inside the worker would leave a startup window. The handle comes from the process heap,
-// because a job whose worker ignores its stop keeps it and the session's allocator may already
-// be released by then.
-@(private, require_results)
-chat_compact_launch :: proc(job: ^Compact_Job) -> bool {
-	previous := chat_signal_block_watched()
-	previous_allocator := context.allocator
-	context.allocator = os.heap_allocator()
-	job.thread = thread.create(chat_compact_worker, name = "nabla-compaction")
-	context.allocator = previous_allocator
-	chat_signal_restore(previous)
-	if job.thread == nil { return false }
-	job.thread.data = job
-	thread.start(job.thread)
-	return true
 }
 
 // chat_compact_start freezes the compaction request for the context that prep was
@@ -662,9 +616,9 @@ chat_compact_start :: proc(
 		return false
 	}
 	job^ = Compact_Job {
+		job = {kind = .Compaction, run = chat_compact_run, allocator = os.heap_allocator()},
 		attempts = 1,
 	}
-	chat_compact_job_allocator(job)
 	provider_id, clone_error := strings.clone(chat.provider_id, job.allocator)
 	if clone_error != nil {
 		chat_compact_job_destroy(job)
@@ -714,7 +668,7 @@ chat_compact_start :: proc(
 		chat_compact_job_destroy(job)
 		return false
 	}
-	if !chat_compact_launch(job) {
+	if !job_launch(job) {
 		chat_finish_send(chat, job.request, job.attempts, {outcome = .Failed, message = "compaction could not be started"})
 		chat_compact_job_destroy(job)
 		return false
@@ -846,7 +800,7 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 		_observer_message(observer, .Warning, "the summary request could not be recorded")
 		return false
 	}
-	if !chat_compact_launch(job) {
+	if !job_launch(job) {
 		chat_finish_send(chat, job.request, job.attempts, {outcome = .Failed, message = "compaction could not be started"})
 		chat_compact_failed_job(control, job)
 		_observer_message(observer, .Warning, "the summary could not be sent again")
@@ -865,18 +819,15 @@ chat_compact_resume :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> boo
 // control boundary.
 @(private)
 chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
-	chat_compact_jobs_reclaim(chat)
+	job_reclaim(chat)
 	control := &chat.compact
 	job := control.job
-	if job == nil || job.thread == nil { return }
-	if !sync.atomic_load(&job.finished) {
-		if chat_compact_overdue(job) { chat_compact_abandon(chat, observer, job) }
+	if job == nil || job.phase != .Running { return }
+	if !job_published(job) {
+		if job_overdue(job, time.tick_now()) { chat_compact_abandon(chat, observer, job) }
 		return
 	}
-
-	thread.join(job.thread)
-	thread.destroy(job.thread)
-	job.thread = nil
+	job_retire(job)
 
 	switch control.state {
 	case .Running:
@@ -891,15 +842,6 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	}
 }
 
-// chat_compact_overdue reports whether a job the owner stopped has ignored its stop for the
-// whole patience, which is as long as the owner waits for a worker that has not published.
-@(private)
-chat_compact_overdue :: proc(job: ^Compact_Job) -> bool {
-	at, stopped := job.stop_at.?
-	if !stopped { return false }
-	return time.tick_since(at) >= TOOL_JOBS_STOP_PATIENCE
-}
-
 // chat_compact_abandon gives up on a stopped summary whose worker has not published. Its send
 // may still be running, so the row it left open is closed with the cancellation that asked it
 // to stop, and the slot is free for the next summary. The job is retained rather than
@@ -908,9 +850,7 @@ chat_compact_overdue :: proc(job: ^Compact_Job) -> bool {
 chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^Compact_Job) {
 	control := &chat.compact
 	chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled})
-	waited := time.Duration(0)
-	if at, stopped := job.stop_at.?; stopped { waited = time.tick_since(at) }
-	chat_record_job_abandoned(chat, {request = job.request, attempt = journal.Attempt_No(job.attempts)}, .Compaction, waited)
+	job_abandon(chat, job)
 	_observer_message(observer, .Notice, "compaction cancelled")
 	control.last_failure_at = time.tick_now()
 	control.trigger = .None
@@ -918,27 +858,6 @@ chat_compact_abandon :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: 
 	control.state = .Idle
 	control.completed_generation = control.job_generation
 	control.completed_outcome = .Failed
-	if append(&chat.abandoned_compactions, job) != 1 {
-		// The list could not grow, so the job stays where it is with the worker that reaches it.
-		chat_runtime_message(chat, .Error, "an abandoned compaction could not be listed for reclaim and is leaked")
-	}
-}
-
-// chat_compact_jobs_reclaim releases every abandoned summary whose worker has published since.
-// Its result is dropped, because the attempt already has the outcome it was recorded with, and
-// the worker is joined only now, when joining cannot block on it. Owner only: it records each
-// release in the session's journal.
-chat_compact_jobs_reclaim :: proc(chat: ^Chat_Session) {
-	jobs := &chat.abandoned_compactions
-	for index := len(jobs) - 1; index >= 0; index -= 1 {
-		job := jobs[index]
-		if !sync.atomic_load(&job.finished) { continue }
-		thread.destroy(job.thread)
-		job.thread = nil
-		chat_record_job_reclaimed(chat, {request = job.request, attempt = journal.Attempt_No(job.attempts)}, .Compaction)
-		chat_compact_job_destroy(job)
-		unordered_remove(jobs, index)
-	}
 }
 
 // chat_compact_adopt reads a finished job's result. A complete summary becomes a
@@ -1306,7 +1225,7 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 	switch control.state {
 	case .Running:
 		ai.interrupt_request(&job.interrupt)
-		job.stop_at = time.tick_now()
+		job_note_stop(job, true, time.tick_now())
 		control.state = .Retiring
 	case .Ready:
 		control.completed_generation = control.job_generation
@@ -1326,26 +1245,20 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 // worker can still reach, and teardown never waits on a worker that ignores its stop.
 chat_compact_destroy :: proc(chat: ^Chat_Session) {
 	control := &chat.compact
-	chat_compact_jobs_reclaim(chat)
+	job_reclaim(chat)
 	job := control.job
 	if job != nil {
 		if control.state == .Backoff {
 			chat_retry_record_completed(chat, job.request, job.attempts, .Compaction, .Cancelled)
 		}
 		ai.interrupt_request(&job.interrupt)
-		if job.thread != nil && sync.atomic_load(&job.finished) {
-			thread.join(job.thread)
-			thread.destroy(job.thread)
-			job.thread = nil
-		}
-		if job.thread == nil {
-			chat_compact_job_destroy(job)
-		} else {
+		if job.phase == .Running && job_published(job) { job_retire(job) }
+		if job.phase == .Running {
 			// The worker ignored its stop. The job, its frozen snapshot, and its thread handle
 			// stay where they are: they are what the worker may still be reading.
-			waited := time.Duration(0)
-			if at, stopped := job.stop_at.?; stopped { waited = time.tick_since(at) }
-			chat_record_job_abandoned(chat, {request = job.request, attempt = journal.Attempt_No(job.attempts)}, .Compaction, waited)
+			job_abandon(chat, job)
+		} else {
+			chat_compact_job_destroy(job)
 		}
 	}
 	delete(control.attempted_identity, chat.allocator)

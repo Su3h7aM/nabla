@@ -1161,21 +1161,19 @@ test_a_failed_chain_waits_for_the_context_to_move :: proc(test: ^testing.T) {
 // would. A summary against a real provider is a transport that observes cancellation, so only
 // a hold like this can outlive its stop. A test allocates one on the process heap: the worker
 // reaches it after the test's frame may be gone, and the owner releases the thread handle,
-// never the test.
+// never the test. The hold is the job: it embeds the compaction job as its first field.
 Compact_Summary_Hold :: struct {
-	job:     ^Compact_Job,
-	release: sync.Sema,
+	using compact: Compact_Job,
+	release:       sync.Sema,
 }
 
 // COMPACT_HOLD_BOUND is how long a hold ignores its stop. It outlasts anything a test waits, so a
 // test that abandons one never waits for the hold to give up by itself.
 COMPACT_HOLD_BOUND :: time.Minute
 
-compact_summary_hold_serve :: proc(thread: ^thread.Thread) {
-	hold := cast(^Compact_Summary_Hold)thread.data
+compact_summary_hold_run :: proc(job: ^Job) {
+	hold := cast(^Compact_Summary_Hold)job
 	_ = sync.sema_wait_with_timeout(&hold.release, COMPACT_HOLD_BOUND)
-	sync.atomic_store(&hold.job.finished, true)
-	owner_wake_signal()
 }
 
 // compact_hold_job_start builds the summary a running job is: its frozen request, the row of
@@ -1183,12 +1181,11 @@ compact_summary_hold_serve :: proc(thread: ^thread.Thread) {
 // which starts the real transport instead.
 @(private)
 compact_hold_job_start :: proc(test: ^testing.T, chat: ^Chat_Session, hold: ^Compact_Summary_Hold) -> ^Compact_Job {
-	job := new(Compact_Job, os.heap_allocator())
-	if job == nil { return nil }
+	job := &hold.compact
 	job^ = {
+		job = {kind = .Compaction, run = compact_summary_hold_run, allocator = os.heap_allocator()},
 		attempts = 1,
 	}
-	chat_compact_job_allocator(job)
 	job.output = make([dynamic]u8, 0, job.allocator)
 	job.snapshot = Compact_Snapshot {
 		api  = .OpenAI_Chat_Completions,
@@ -1198,9 +1195,7 @@ compact_hold_job_start :: proc(test: ^testing.T, chat: ^Chat_Session, hold: ^Com
 	if !chat_compact_begin_attempt(chat, job) {
 		testing.fail_now(test, "the stuck summary's send could not be recorded")
 	}
-	hold.job = job
-	job.thread = test_thread_start(compact_summary_hold_serve, hold, "nabla-stuck-summary")
-	if job.thread == nil { return nil }
+	if !job_launch(job) { return nil }
 	chat.compact.job = job
 	chat.compact.state = .Running
 	chat.compact.trigger = .Agent_Tool
@@ -1224,17 +1219,17 @@ test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	job := compact_hold_job_start(test, chat, hold)
 	if job == nil { testing.fail_now(test, "the stuck summary job could not be started") }
 
-	// A model change stops the summary, which is what gives its worker a stop to ignore.
+	// The owner first sees the stop past the patience, then a model change stops the summary,
+	// which is what gives its worker a stop to ignore. The first sight is the one that counts.
+	job_note_stop(job, true, time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond)))
 	chat_compact_cancel(chat)
 	testing.expect_value(test, chat.compact.state, Compact_State.Retiring)
 
-	// An observation past the patience: the worker has had as long as it gets, so the owner
-	// stops waiting for it.
-	job.stop_at = time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond))
+	// The worker has had as long as it gets, so the owner stops waiting for it.
 	chat_compact_poll(chat, {})
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
 	testing.expect_value(test, chat.compact.job, nil)
-	testing.expect_value(test, len(chat.abandoned_compactions), 1)
+	testing.expect_value(test, len(chat.abandoned), 1)
 	interrupted := _test_records(test, chat, {.Request_Interrupted})
 	if !testing.expect_value(test, len(interrupted), 1) { return }
 	testing.expect_value(test, interrupted[0].request, job.request)
@@ -1247,11 +1242,11 @@ test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	sync.sema_post(&hold.release)
 	released = true
 	deadline := time.tick_add(time.tick_now(), COMPACT_TEST_BOUND)
-	for len(chat.abandoned_compactions) > 0 && time.tick_since(deadline) < 0 {
+	for len(chat.abandoned) > 0 && time.tick_since(deadline) < 0 {
 		chat_compact_poll(chat, {})
 		time.sleep(time.Millisecond)
 	}
-	testing.expect_value(test, len(chat.abandoned_compactions), 0)
+	testing.expect_value(test, len(chat.abandoned), 0)
 
 	// Giving up on the worker and releasing it late are both recorded, under the summary's request.
 	_test_commit(test, chat)
@@ -1289,19 +1284,20 @@ test_teardown_abandons_a_summary_that_ignores_its_stop :: proc(test: ^testing.T)
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
 	testing.expect_value(test, chat.compact.job, nil)
 	// The worker is still parked, and the job it reads was not released under it.
-	testing.expect(test, !sync.atomic_load(&job.finished), "teardown joined a summary's worker")
+	testing.expect(test, !job_published(job), "teardown joined a summary's worker")
 
 	// The rest of the session goes the way a front-end teardown leaves it.
+	workspace, allocator := chat.workspace, chat.allocator
 	chat_test_end(test, &fixture)
 
 	// This test releases what teardown left behind, so the leak it is about does not outlive it:
-	// the worker publishes, and the handle and job it can no longer reach are released.
+	// the worker publishes, and the workspace, handle, and job it can no longer reach are released.
+	delete(workspace, allocator)
 	sync.sema_post(&hold.release)
 	released = true
 	published := time.tick_add(time.tick_now(), COMPACT_TEST_BOUND)
-	for !sync.atomic_load(&job.finished) && time.tick_since(published) < 0 { time.sleep(time.Millisecond) }
-	if !testing.expect(test, sync.atomic_load(&job.finished), "the abandoned worker never published") { return }
-	thread.destroy(job.thread)
-	job.thread = nil
+	for !job_published(job) && time.tick_since(published) < 0 { time.sleep(time.Millisecond) }
+	if !testing.expect(test, job_published(job), "the abandoned worker never published") { return }
+	job_retire(job)
 	chat_compact_job_destroy(job)
 }
