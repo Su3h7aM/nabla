@@ -284,7 +284,7 @@ test_selection_compacts_again_only_after_target_estimate_decreases :: proc(test:
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(current.Endpoint, chat.allocator)
-	target := selection_test_target(test, .OpenAI_Chat_Completions, 12_000)
+	target := selection_test_target(test, .OpenAI_Chat_Completions, 10_500)
 	defer model_selection_destroy(&target, context.allocator)
 	transition: Selection_Transition
 	status, _, error := chat_selection_check(chat, target, &transition, true, current)

@@ -215,6 +215,9 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 	}
 	chat.capacity = selection.capacity
 	chat.cost = selection.cost
+	if selection.provider_id != chat.provider_id || selection.model_id != chat.model_id || selection.connection.API != chat.model_api {
+		chat.calibration = {}
+	}
 	chat.model_api = selection.connection.API
 	chat.refused_features = {}
 	chat.compact.omitted_features = {}

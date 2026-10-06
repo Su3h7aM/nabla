@@ -666,7 +666,14 @@ chat_chain_apply_event :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Reque
 // the last input measurement, and one usage entry per report for the request's usage log.
 @(private)
 chat_session_observe_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage, usage: ai.Provider_Usage_Event) {
-	if usage.Input_Tokens_Present { chat.last_input_measured = usage.Input_Tokens }
+	if usage.Input_Tokens_Present {
+		chat.last_input_measured = usage.Input_Tokens
+		// The pair is this attempt's: the chain's prep is the body it sent.
+		chat.calibration = {
+			measured  = usage.Input_Tokens,
+			estimated = i64(chat.chain.prep.raw_estimate),
+		}
+	}
 	if _, append_error := append(usages, Chat_Request_Usage{operation = u64(chat.operation.id), usage = usage}); append_error == nil { return }
 	// The record of the send is missing the numbers this report carried, and ending the turn
 	// would not bring them back: the runtime message is what records the loss.

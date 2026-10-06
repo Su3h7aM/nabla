@@ -40,6 +40,9 @@ Chat_Request_Prep :: struct {
 	calls:          [dynamic][dynamic]ai.Provider_Tool_Call,
 	// feedback holds text the request borrows: what a refused call is said to be.
 	feedback:       [dynamic]string,
+	// raw_estimate is the uncalibrated count, which is what a provider report is paired with;
+	// estimate is the calibrated one every decision reads.
+	raw_estimate:   int,
 	estimate:       int,
 	// sizes is what each part of this request costs on its own. A part measured alone is
 	// not a share of the whole, and that is the point: one that alone exceeds what the
@@ -168,6 +171,7 @@ chat_build_request_into :: proc(
 		chat.tools_enabled,
 		chat.effort,
 		chat.refused_features,
+		chat.calibration,
 		directive,
 		arena,
 	)
@@ -187,6 +191,7 @@ chat_build_request_selection_into :: proc(
 	tools_enabled: bool,
 	effort: string,
 	refused_features: Optional_Request_Features,
+	calibration: Chat_Calibration,
 	directive: string,
 	arena: mem.Allocator,
 ) -> mem.Allocator_Error {
@@ -279,7 +284,13 @@ chat_build_request_selection_into :: proc(
 		prep.request.Tools = prep.tools[:]
 	}
 	prep.sizes = chat_request_sizes(instructions, prep.wire[:], prep.tools[:])
-	prep.estimate = chat_estimate_input_tokens(instructions, prep.wire[:], prep.tools[:])
+	prep.raw_estimate = chat_estimate_input_tokens(instructions, prep.wire[:], prep.tools[:])
+	prep.estimate = chat_calibrated_estimate(calibration, prep.raw_estimate)
+	prep.sizes = {
+		instructions = chat_calibrated_estimate(calibration, prep.sizes.instructions),
+		tools        = chat_calibrated_estimate(calibration, prep.sizes.tools),
+		conversation = chat_calibrated_estimate(calibration, prep.sizes.conversation),
+	}
 	// What this request may generate depends on what it carries, because the window is one
 	// budget: a fuller context asks for a smaller answer rather than being refused. The
 	// estimate does not depend on the bound, which is why it is computed first. A

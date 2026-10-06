@@ -29,15 +29,15 @@ CHAT_DEFAULT_OUTPUT_TOKENS :: 4096
 CHAT_OUTPUT_MIN_TOKENS :: 1024
 
 // CHAT_MARGIN_PERCENT and CHAT_MARGIN_MIN_TOKENS bound what the estimator's error may cost:
-// a share of the window, with a floor so it cannot vanish on a small one.
-CHAT_MARGIN_PERCENT :: 10
+// a share of the window, with a floor so it cannot vanish on a small one. The provider's own
+// count calibrates the estimate (Chat_Calibration), so the margin only covers what is left.
+CHAT_MARGIN_PERCENT :: 5
 CHAT_MARGIN_MIN_TOKENS :: 1024
 
-// CHAT_COMPACT_RESERVE_PERCENT is the share of the window background compaction leaves
-// for the foreground to keep working in. A summary has to be written and installed
-// before the window is full, so it is started while this much room remains, and that
-// room is what it has to finish inside.
-CHAT_COMPACT_RESERVE_PERCENT :: 20
+// CHAT_COMPACT_RESERVE_PERCENT is the share of the window between the compaction trigger
+// and the input ceiling: the room the foreground keeps working in while a summary is
+// written and installed.
+CHAT_COMPACT_RESERVE_PERCENT :: 10
 
 // model_capacity divides one resolved model's window. Presence decides the window:
 // a stated one is used as stated, including an explicit zero, which admission then
@@ -50,9 +50,31 @@ model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
 	stated := model.max_output_tokens
 	if !model.max_output_tokens_present || stated <= 0 { stated = CHAT_DEFAULT_OUTPUT_TOKENS }
 
-	margin := max(window * CHAT_MARGIN_PERCENT / 100, CHAT_MARGIN_MIN_TOKENS)
+	capacity := Model_Capacity {
+		window           = window,
+		model_max_output = stated,
+		margin           = max(window * CHAT_MARGIN_PERCENT / 100, CHAT_MARGIN_MIN_TOKENS),
+	}
 	reserve := window * CHAT_COMPACT_RESERVE_PERCENT / 100
-	return {window = window, model_max_output = stated, margin = margin, trigger = max(window - margin - reserve, 0)}
+	capacity.trigger = max(chat_capacity_input_ceiling(capacity) - reserve, 0)
+	return capacity
+}
+
+// Chat_Calibration is the provider's count against the harness's raw estimate for one
+// request of the session's current selection. The zero value is no pair: the raw estimate
+// stands until the provider reports.
+Chat_Calibration :: struct {
+	measured:  i64, // input tokens the provider reported for the request
+	estimated: i64, // the raw estimate of that same request
+}
+
+// chat_calibrated_estimate turns a raw estimate into the one admission, the compaction
+// trigger, and the output bound all read: raw * measured / estimated, or raw itself when
+// there is no usable pair. The product is computed in i64, so no realistic window overflows.
+@(require_results)
+chat_calibrated_estimate :: proc(calibration: Chat_Calibration, raw: int) -> int {
+	if calibration.measured <= 0 || calibration.estimated <= 0 { return raw }
+	return int(i64(raw) * calibration.measured / calibration.estimated)
 }
 
 // chat_capacity_input_ceiling is the largest input the harness will send: the window

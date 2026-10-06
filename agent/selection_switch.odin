@@ -109,6 +109,8 @@ chat_selection_check :: proc(
 	if same_identity {
 		refused_features = chat.refused_features
 	}
+	// The pair describes the current selection only; a different target starts raw.
+	calibration := chat.calibration if same_identity else Chat_Calibration{}
 	prep: Chat_Request_Prep
 	build_error := chat_build_request_selection_into(
 		chat,
@@ -122,6 +124,7 @@ chat_selection_check :: proc(
 		target.tools,
 		effort,
 		refused_features,
+		calibration,
 		"",
 		virtual.arena_allocator(&arena),
 	)

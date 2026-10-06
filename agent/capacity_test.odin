@@ -1,7 +1,11 @@
 #+test
 package agent
 
+import "core:mem/virtual"
+import "core:strings"
 import "core:testing"
+
+import "nabla:ai"
 
 // capacity_of builds the capacity of a model that states a window and, optionally,
 // an output bound. It is the test's way of naming a model rather than arithmetic.
@@ -35,7 +39,7 @@ test_the_answer_bound_shrinks_as_the_context_fills :: proc(t: ^testing.T) {
 	// request asks for the room that is left, so a fuller context asks for a smaller
 	// answer instead of being refused.
 	capacity := capacity_of(32_000, 8_000)
-	testing.expect_value(t, capacity.margin, 3_200)
+	testing.expect_value(t, capacity.margin, 1_600)
 
 	// With the whole window free, the model's own maximum is what is asked for.
 	roomy, roomy_fits := chat_request_output_bound(capacity, 2_000)
@@ -45,12 +49,12 @@ test_the_answer_bound_shrinks_as_the_context_fills :: proc(t: ^testing.T) {
 	// Past the trigger the bound is whatever is left, and it is still a usable answer.
 	tight, tight_fits := chat_request_output_bound(capacity, 27_000)
 	testing.expect(t, tight_fits)
-	testing.expect_value(t, tight, 1_800)
+	testing.expect_value(t, tight, 3_400)
 
 	// One token too far and there is nowhere for an answer to go.
-	_, impossible := chat_request_output_bound(capacity, 28_000)
+	_, impossible := chat_request_output_bound(capacity, 29_377)
 	testing.expect(t, !impossible)
-	testing.expect(t, !model_capacity_admits(capacity, 28_000))
+	testing.expect(t, !model_capacity_admits(capacity, 29_377))
 }
 
 @(test)
@@ -60,10 +64,55 @@ test_a_context_past_the_trigger_is_still_sendable :: proc(t: ^testing.T) {
 	// has, and only the window itself stops it.
 	capacity := capacity_of(32_000, 8_000)
 	testing.expect(t, capacity.trigger < chat_capacity_input_ceiling(capacity))
-	for estimate in ([]int{capacity.trigger, 25_000, 27_000}) {
+	for estimate in ([]int{capacity.trigger, 27_000, 29_000}) {
 		testing.expectf(t, model_capacity_admits(capacity, estimate), "an estimate of %d must still send", estimate)
 	}
-	testing.expect_value(t, chat_capacity_input_ceiling(capacity), 27_776)
+	testing.expect_value(t, chat_capacity_input_ceiling(capacity), 29_376)
+	testing.expect_value(t, capacity.trigger, 26_176)
+}
+
+@(test)
+test_the_ceiling_and_trigger_follow_the_window :: proc(t: ^testing.T) {
+	// W = 200k: margin 10k, ceiling 200k - 10k - 1024, trigger 20k below the ceiling.
+	capacity := capacity_of(200_000, 8_000)
+	testing.expect_value(t, capacity.margin, 10_000)
+	testing.expect_value(t, chat_capacity_input_ceiling(capacity), 188_976)
+	testing.expect_value(t, capacity.trigger, 168_976)
+
+	// A small window keeps the margin floor, and a model that cannot answer 1024 tokens
+	// holds back only what it can.
+	small := capacity_of(8_000, 512)
+	testing.expect_value(t, small.margin, CHAT_MARGIN_MIN_TOKENS)
+	testing.expect_value(t, chat_capacity_input_ceiling(small), 8_000 - CHAT_MARGIN_MIN_TOKENS - 512)
+}
+
+@(test)
+test_a_provider_report_calibrates_admission :: proc(t: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(t, &fixture, tool_loop_workspace(t))
+	defer chat_test_end(t, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 32_000, 8_000)
+	_test_accept(t, chat, strings.repeat("x", 130_000, context.temp_allocator))
+
+	// By bytes alone the request is far past the ceiling.
+	raw_arena: virtual.Arena
+	raw := request_test_prepare(t, chat, tool_loop_connection, &raw_arena)
+	defer virtual.arena_destroy(&raw_arena)
+	testing.expect_value(t, raw.estimate, raw.raw_estimate)
+	_, raw_admitted := chat_admission_check(chat, raw.estimate, raw.sizes)
+	testing.expect(t, !raw_admitted, "the raw estimate must be refused")
+
+	// The provider counts the same request at a third of that, so the next estimate admits it.
+	chat.chain.prep.raw_estimate = raw.raw_estimate
+	usages := make([dynamic]Chat_Request_Usage, 0, context.temp_allocator)
+	chat_session_observe_usage(chat, &usages, ai.Provider_Usage_Event{Input_Tokens = i64(raw.raw_estimate / 3), Input_Tokens_Present = true})
+	calibrated_arena: virtual.Arena
+	calibrated := request_test_prepare(t, chat, tool_loop_connection, &calibrated_arena)
+	defer virtual.arena_destroy(&calibrated_arena)
+	testing.expect(t, calibrated.estimate < raw.raw_estimate / 2, "the estimate follows the provider's count")
+	_, calibrated_admitted := chat_admission_check(chat, calibrated.estimate, calibrated.sizes)
+	testing.expect(t, calibrated_admitted, "the calibrated estimate must be admitted")
 }
 
 @(test)
@@ -71,7 +120,7 @@ test_the_input_ceiling_leaves_only_the_margin_and_one_answer :: proc(t: ^testing
 	// The only room held back is the estimator's margin and the smallest answer worth
 	// asking for, which is what makes the ceiling the window rather than a share of it.
 	capacity := capacity_of(1_000_000, 128 * 1_024)
-	testing.expect_value(t, chat_capacity_input_ceiling(capacity), 1_000_000 - 100_000 - CHAT_OUTPUT_MIN_TOKENS)
+	testing.expect_value(t, chat_capacity_input_ceiling(capacity), 1_000_000 - 50_000 - CHAT_OUTPUT_MIN_TOKENS)
 
 	// A model's stated maximum still caps what a request asks for, however empty the
 	// window is, and a model that cannot generate the harness's floor is not asked for
@@ -82,7 +131,7 @@ test_the_input_ceiling_leaves_only_the_margin_and_one_answer :: proc(t: ^testing
 	tiny, tiny_fits := chat_request_output_bound(small_maximum, 0)
 	testing.expect(t, tiny_fits, "an empty window has room whatever the model can generate")
 	testing.expect_value(t, tiny, 512)
-	testing.expect_value(t, chat_capacity_input_ceiling(small_maximum), 1_000_000 - 100_000 - 512)
+	testing.expect_value(t, chat_capacity_input_ceiling(small_maximum), 1_000_000 - 50_000 - 512)
 }
 
 @(test)

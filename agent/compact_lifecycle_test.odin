@@ -471,7 +471,7 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(test: ^testi
 	chat_test_capacity(chat, 500_000)
 	_test_accept(test, chat, "first")
 	// Enough context that the next request crosses the compaction trigger.
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	// More entries than the kept tail, so there is a prefix to summarize.
@@ -532,7 +532,7 @@ test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(test: ^testing.
 	_test_accept(test, chat, "first")
 	// Enough context that the next request crosses the compaction trigger, and more entries
 	// than the kept tail, so there is a prefix to summarize.
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -686,7 +686,7 @@ test_a_rejected_payload_without_a_compactable_prefix_ends_the_turn :: proc(test:
 	defer virtual.arena_destroy(&arena)
 	chat_test_capacity(chat, 500_000)
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 
@@ -743,7 +743,7 @@ test_an_idle_session_starts_the_summary_a_refusal_recorded :: proc(test: ^testin
 	defer virtual.arena_destroy(&arena)
 	chat_test_capacity(chat, 500_000)
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -809,7 +809,7 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(test: ^tes
 	chat_test_capacity(chat, 500_000)
 	chat.compact_retry = test_retry_policy()
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -880,7 +880,7 @@ test_repeated_invalid_compaction_refusals_restore_omitted_features :: proc(test:
 	chat_test_capacity(chat, 500_000)
 	chat.compact_retry = test_retry_policy()
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -965,7 +965,7 @@ test_a_summary_that_produced_nothing_is_not_sent_again :: proc(test: ^testing.T)
 	chat_test_capacity(chat, 500_000)
 	chat.compact_retry = test_retry_policy()
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -1018,7 +1018,7 @@ test_a_terminal_summary_failure_suppresses_automatic_starts :: proc(test: ^testi
 	chat_test_capacity(chat, 500_000)
 	chat.compact_retry = test_retry_policy()
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
@@ -1069,7 +1069,7 @@ test_a_failed_chain_waits_for_the_context_to_move :: proc(test: ^testing.T) {
 	chat_test_capacity(chat, 500_000)
 	chat.compact_retry = test_retry_policy()
 	_test_accept(test, chat, "first")
-	large := strings.repeat("work ", 320_000) or_else ""
+	large := strings.repeat("work ", 360_000) or_else ""
 	defer delete(large)
 	_test_user(test, chat, large, .Prompt)
 	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {

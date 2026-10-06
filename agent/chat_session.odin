@@ -207,6 +207,9 @@ Chat_Session :: struct {
 	// session totals never depend on which stream events already arrived.
 	last_input_measured:          Maybe(i64),
 	last_estimate:                int,
+	// calibration is the latest (measured, estimated) pair of the current selection; the
+	// zero value means the provider has not reported one, and a selection change drops it.
+	calibration:                  Chat_Calibration,
 	// turn_recovery and turn_repair_refusal are why the last turn ended without
 	// completing: the reason its chain stopped, and, when the context did not fit, what
 	// stood in the way of making room. They are typed rather than read back out of a
