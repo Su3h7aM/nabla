@@ -214,7 +214,8 @@ chat_failure_recovery :: proc(class: ai.Provider_Failure_Class) -> Chat_Failure_
 //  2. A send that completed, or whose completion was accepted before a later failure.
 //  3. The recovery the failure class allows, overridden by the provider's own directive
 //     where it gave one: a class that is retried is stopped when the provider forbids it,
-//     and a class that stops is retried when the provider says a resend can help.
+//     and a stopped class is retried when the provider says a resend can help, except a
+//     quota, authentication, content or refused-request class, which a resend cannot fix.
 //  4. Optional features are omitted one at a time in their declared order. A context
 //     repair is used once, and a retry waits the scheduled delay or the provider's own
 //     delay, whichever is longer, until the schedule is spent.
@@ -231,7 +232,10 @@ chat_recovery_decide :: proc(policy: Chat_Retry_Policy, facts: Chat_Attempt_Fact
 	case .Forbid:
 		if recovery == .Retry { recovery = .Stop }
 	case .Allow:
-		if recovery == .Stop && class != .None { recovery = .Retry }
+		// The official SDKs obey x-should-retry: true, but OpenAI documents that billing,
+		// quota and authentication failures are not fixed by retrying, so it never reopens
+		// those, nor a refused request or content, nor a connection that failed to verify.
+		if recovery == .Stop && class == .Not_Found { recovery = .Retry }
 	case .Unspecified:
 	}
 

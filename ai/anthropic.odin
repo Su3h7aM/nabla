@@ -761,6 +761,8 @@ anthropic_failure_class :: proc(code, detail_code, message: string) -> (Provider
 		if detail_code == "enforced_spend_limit_reached" { return .Quota, true }
 		return .Rate_Limited, true
 	case "conflict_error", "api_error", "timeout_error", "overloaded_error":
+		// Anthropic documents conflict_error as "Resolve the conflict, then retry", and its
+		// SDKs retry 409 and 408 alike.
 		return .Provider_Unavailable, true
 	case "authentication_error", "permission_error":
 		return .Authentication, true

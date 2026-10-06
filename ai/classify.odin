@@ -51,8 +51,10 @@ Provider_Retry_Directive :: enum {
 	Allow,
 }
 
-// PROVIDER_RETRY_DIRECTIVE_HEADER is the response field all three APIs use to tell
-// a client whether sending the same request again could help.
+// PROVIDER_RETRY_DIRECTIVE_HEADER is the response field the official OpenAI and
+// Anthropic SDKs obey to decide whether to send the same request again. Neither API
+// documents it; openai-python calls it "not a standard header". It is an SDK
+// convention, so a recovery policy may weigh it but not treat it as a contract.
 PROVIDER_RETRY_DIRECTIVE_HEADER :: "x-should-retry"
 
 // Provider_Transport_Cause is what the transport reported, in the terms a recovery
@@ -195,6 +197,9 @@ provider_status_class :: proc(status: int) -> Provider_Failure_Class {
 	case status == 404:
 		return .Not_Found
 	case status == 408 || status == 409:
+		// The official OpenAI and Anthropic SDKs retry both ("Retry on request timeouts",
+		// "Retry on lock timeouts"). Anthropic documents 409 conflict_error as "Resolve the
+		// conflict, then retry"; neither API documents 408.
 		return .Provider_Unavailable
 	case status == 413:
 		return .Payload_Too_Large
@@ -300,8 +305,8 @@ provider_request_id_header :: proc(api: API_Kind) -> string {
 	return ""
 }
 
-// provider_retry_directive reads the directive an API documents for whether to
-// send again.
+// provider_retry_directive reads the x-should-retry header, which the official SDKs
+// obey but no API documents, for whether to send again.
 provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provider_Retry_Directive {
 	switch api {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages:

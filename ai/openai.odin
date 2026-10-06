@@ -105,8 +105,15 @@ openai_failure_class :: proc(code: string) -> (Provider_Failure_Class, bool) {
 	switch code {
 	case "context_length_exceeded":
 		return .Context_Overflow, true
-	case "insufficient_quota", "credit_balance_exhausted", "usage_limit_exceeded", "organization_spend_limit_exceeded", "project_spend_limit_exceeded":
+	case "insufficient_quota",
+	     "credit_balance_exhausted",
+	     "usage_limit_exceeded",
+	     "organization_usage_limit_exceeded",
+	     "organization_spend_limit_exceeded",
+	     "project_spend_limit_exceeded":
 		return .Quota, true
+	// invalid_api_key and model_not_found are not in the published error-codes guide; they
+	// are classified by their meaning, and the status decides when they are absent.
 	case "invalid_api_key", "authentication_error":
 		return .Authentication, true
 	case "model_not_found", "not_found_error":

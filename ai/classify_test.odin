@@ -210,6 +210,7 @@ test_openai_failure_codes :: proc(t: ^testing.T) {
 		{"insufficient_quota", .Quota},
 		{"credit_balance_exhausted", .Quota},
 		{"usage_limit_exceeded", .Quota},
+		{"organization_usage_limit_exceeded", .Quota},
 		{"organization_spend_limit_exceeded", .Quota},
 		{"project_spend_limit_exceeded", .Quota},
 		{"invalid_api_key", .Authentication},

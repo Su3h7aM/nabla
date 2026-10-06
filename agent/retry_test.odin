@@ -134,3 +134,19 @@ test_recovery_decision_reads_the_provider_directive :: proc(test: ^testing.T) {
 	testing.expect_value(test, decision.action, Request_Recovery_Action.Retry)
 	testing.expect_value(test, decision.reason, Request_Recovery_Reason.Transient_Failure)
 }
+
+// x-should-retry: true is an SDK convention, not a documented API contract, so it never
+// reopens a failure OpenAI documents as unfixable by retrying.
+@(test)
+test_recovery_decision_ignores_allow_for_user_action_failures :: proc(test: ^testing.T) {
+	policy := test_retry_policy()
+	for class in ([]ai.Provider_Failure_Class{.Quota, .Authentication, .Invalid_Request, .Content_Policy}) {
+		error := ai.Provider_Operation_Error {
+			kind            = .HTTP,
+			failure_class   = class,
+			retry_directive = .Allow,
+		}
+		decision := chat_recovery_decide(policy, {error = error})
+		testing.expect(test, decision.action != .Retry, "a resend cannot fix this class")
+	}
+}

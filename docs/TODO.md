@@ -11,11 +11,8 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 
 Provider error classification mostly matches the Anthropic and OpenAI documentation. Open points:
 
-- `x-should-retry` (`ai/classify.odin`, `agent/retry.odin`) overrides the class table in both directions, but no API document in the reference set describes the header; only SDK code uses it. Source it or demote it to a hint that cannot turn a stop into a retry.
-- Anthropic `conflict_error` (409) and status 408 are resent unchanged. The Anthropic documentation says to resolve the conflict before retrying, so an identical resend cannot succeed.
 - Anthropic models from 4.5 on return `stop_reason: "model_context_window_exceeded"` instead of an error on context overflow. Check that it is handled as overflow; `"prompt is too long"` is not in the documentation.
 - OpenRouter can turn a Responses API context overflow into a successful `finish_reason: "length"`, which is not classified as overflow.
-- Several OpenAI codes in `ai/openai.odin` (`insufficient_quota`, `invalid_api_key`, `model_not_found`, the spend-limit codes) are not in the reference documents. Add the OpenAI error-code guide to the references and re-check.
 
 ## Subagents
 
