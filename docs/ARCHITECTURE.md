@@ -1118,8 +1118,6 @@ These values schedule work, size internal buffers, and time the harness's own th
 
 | Name | Default | Kind |
 | --- | --- | --- |
-| `OWNER_EFFECTS_PER_PASS` | 64 | scheduling quantum; the rest run on the next pass |
-| `OWNER_COMMAND_QUEUE` | 64 | frontend input buffer |
 | `TRANSCRIPT_MAX_BYTES` | 1 MiB | TUI display memory; older lines reload from the journal |
 | `SPINNER_INTERVAL` | 100 ms | redraw while busy |
 | `TOOL_JOBS_MAX_ACTIVE` | `max(4, core count)` | concurrency; excess jobs queue |
@@ -1128,27 +1126,27 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `ACP_MAX_SESSIONS` | 8 | sessions one connection runs at once; a new open evicts the least recently used idle session, or is refused if all sessions are busy |
 | `CHAT_RETRY_DELAYS` | 1, 2, 4, 8, 16 s | resend schedule of a failed provider request (section 11.3) |
 | `TOOL_JOBS_STOP_PATIENCE` | 10 s | time to confirm a requested stop, for every job kind |
-| `SHELL_KILL_GRACE` | 500 ms | TERM to KILL |
-| shell timeout | 120 s | default when the model gives none; no maximum |
-| read window | 2000 lines | default when the model gives none; no maximum |
+| `TOOL_KILL_GRACE` | 500 ms | TERM to KILL |
+| `TOOL_SHELL_DEFAULT_TIMEOUT` | 120 s | default when the model gives none; no maximum |
+| `TOOL_READ_DEFAULT_LINES` | 2000 lines | default when the model gives none; no maximum |
 | `TOOL_RESULT_PREVIEW_BYTES` | 32 KiB | what one result shows the model; the rest is kept in a file |
 | `TOOL_RESULT_NOTICE_TOKENS` | 128 | context reserved per later result in a batch |
 | `TOOL_STREAM_MEMORY_BYTES` | 1 MiB | shell output held in memory per stream; the rest goes to its kept file (section 14.4) |
 | `LUA_SLICE_INSTRUCTIONS` | 10,000 | scheduling quantum |
-| `LUA_HOST_RESERVE` | 64 KiB | host headroom inside a quota |
-| `LUA_HOOK_MEMORY` / `_WALL` | 4 MiB / 100 ms | keeps the owner responsive |
 | `CONFIG_INSTRUCTIONS` | 200,000 | config Lua run length; keeps the thread that evaluates it responsive |
-| `LUA_META_MEMORY` / `_WALL` | 1 MiB / 100 ms | keeps the watcher responsive |
-| `hooks.max_continues` | 3 | user setting for hook-driven continuations |
-| `CONFIG_DEBOUNCE` | 100 ms | reload coalescing |
-| `SKILL_INLINE_CATALOG` | 16 KiB | inline catalog versus `catalog_search` |
-| `CATALOG_REFRESH_COOLDOWN` / `CATALOG_CACHE_TTL` | 10 min / 24 h | network use |
+| `SKILL_INLINE_CATALOG_BYTES` | 16 KiB | inline catalog versus `builtin_list_skills` |
+| `CATALOG_REFRESH_COOLDOWN` | 10 min | network use |
 | `CHAT_DEFAULT_CONTEXT_WINDOW` | 131072 | used only when the catalog has no window, and flagged |
 | `CHAT_DEFAULT_OUTPUT_TOKENS` | 4096 | output a request asks for when the catalog states no maximum; the window bound (section 23.1) still applies |
-| `COMPACT_KEEP_MESSAGES` / `_MIN_REDUCTION` / `_COOLDOWN` | 10 / 1024 tokens / 30 s | compaction policy |
-| `ENCODE_CACHE_MAX_BYTES` | 16 MiB | cache memory |
-| `JOURNAL_BATCH_RECORDS` / `_BYTES` / `_AGE` | 256 / 1 MiB / 1 s | write batching |
-| `IDLE_RSS_SLACK` | 8 MiB | acceptance check |
+| `CHAT_COMPACT_KEEP_MESSAGES` / `CHAT_COMPACT_MIN_REDUCTION_TOKENS` / `CHAT_COMPACT_COOLDOWN` | 10 / 1024 tokens / 30 s | compaction policy |
+| `JOURNAL_BATCH_RECORDS` / `JOURNAL_BATCH_BYTES` / `JOURNAL_BATCH_AGE` | 256 / 1 MiB / 1 s | write batching |
+| `TOOL_LIST_SKILLS_DEFAULT_LIMIT` | 20 | skills returned when the model gives no limit |
+| `TOOL_STREAM_READ_BYTES` | 4 KiB | shell stream read buffer |
+| `MAX_MESSAGE_DEPTH` | 256 | MCP JSON nesting depth admitted by the parser |
+| `MAX_STDERR_TAIL_BYTES` | 32 KiB | recent MCP server stderr kept for diagnostics |
+| `SUBAGENT_ACP_STDERR_TAIL_BYTES` | 32 KiB | recent ACP subagent stderr kept for diagnostics |
+| `CHAT_TITLE_MAX_BYTES` | 80 bytes | derived session title length |
+| `BUSY_TIMEOUT_MS` | 5000 ms | journal commit wait for another process's write lock |
 
 A default changes only with a measurement from the journal or a benchmark test. A new entry that would cap model-driven work is refused by section 2.1.
 
