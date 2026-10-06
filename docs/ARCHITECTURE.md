@@ -48,6 +48,7 @@ A failure is reported to whoever can correct it. The model is told about what it
 | tool failure, invalid arguments, denial, timeout, unknown outcome | the typed result for that call (section 14.3) | the result | continues |
 | repaired tool call | the result, naming what was repaired | the result | continues |
 | response truncated at the output limit, or with defective calls | a `Notice` node saying what was wrong and that nothing ran | the notice | continues |
+| response that filled the context window (`model_context_window_exceeded`) | a `Notice` node saying the window filled and that nothing ran, and a compaction request | the notice | continues; a context that still does not fit meets the overflow handling |
 | transient provider or network failure, a stream cut off or unreadable, a failure nothing names | nothing | each retry and its wait | continues; the request is resent on the fixed schedule, then the turn ends |
 | request the harness can repair: context overflow, payload too large, or an invalid request carrying optional features | nothing | the repair | continues after optional-feature resends or one checkpoint repair |
 | authentication, quota, missing model, content policy, untrusted peer, an invalid request nothing can repair | nothing | the provider's message and what would fix it | ends |
