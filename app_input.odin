@@ -349,7 +349,7 @@ handle_event :: proc(app: ^App, event: input.Event) {
 }
 
 cancel_or_quit :: proc(app: ^App) {
-	if runtime_busy(app) {
+	if runtime_busy(app) && !runtime_following(app) {
 		stop_turn(app)
 		return
 	}
@@ -368,7 +368,7 @@ stop_turn :: proc(app: ^App) {
 
 // interrupt resolves one Ctrl+C press in the order the prompt's state demands:
 // text being composed is discarded first, then a running request is cancelled,
-// and only an empty, idle prompt exits. The first state that applies wins, so a
+// and an empty prompt exits when idle or following another process. The first state that applies wins, so a
 // half-written prompt can neither cancel work nor end the session.
 interrupt :: proc(app: ^App) {
 	if len(widgets.input_text(&app.input)) > 0 {

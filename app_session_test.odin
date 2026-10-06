@@ -19,6 +19,7 @@ import "core:time"
 import "nabla:agent"
 import "nabla:agent/journal"
 import "nabla:ai"
+import "nabla:db"
 import "nabla:tui/widgets"
 
 // The session commands are the only part of the front-end that owns a store, so
@@ -65,6 +66,7 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 }
 
 app_session_end :: proc(app: ^App, directory: string) {
+	journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
 	agent.chat_session_destroy(&app.setup.session)
 	agent.session_watch_stop(&app.setup.watch)
 	_ = session_store_close(app.setup.store, app.setup.alloc)
@@ -105,6 +107,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 // attach_setup_destroy releases what run_session_attach built, without the
 // catalog teardown an empty setup does not need.
 attach_setup_destroy :: proc(setup: ^Run_Setup) {
+	journal.records_destroy(setup.follow_pending, setup.alloc)
 	agent.chat_session_destroy(&setup.session)
 	agent.session_watch_stop(&setup.watch)
 	// The launch's own teardown; a close failure changes nothing the test reads.
@@ -1714,4 +1717,136 @@ test_a_headless_follower_returns_the_answer_of_the_turn_that_delivered_its_line 
 	testing.expect(t, run_prompt_follow(&app, "from the follower", &out), "the followed turn should complete")
 	testing.expect_value(t, strings.to_string(answer), "hello\n")
 	testing.expect(t, app_following(&app), "a follower never takes the session")
+}
+
+@(test)
+test_follower_attachment_replays_captured_pending_input_once :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	sender: journal.Journal
+	if error := journal.open(&sender, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "sender open failed") }
+	defer _ = journal.close(&sender)
+	if error := journal.follow(&sender, id); error != nil { testing.fail_now(t, "sender follow failed") }
+	if error := journal.append_input(&sender, "captured pending line", .Prompt); error != nil { testing.fail_now(t, "input failed") }
+	waiting, error := journal.read_inbox(&runner, id, 0, context.temp_allocator)
+	if !testing.expect(t, error == nil && len(waiting) == 1) { return }
+	opened, message, ok := session_open(&app.setup, {kind = .Resume_Id, id = app_session_id_text(id)}, app.setup.workspace)
+	defer delete(message, app.setup.alloc)
+	defer opened_session_destroy(&opened, app.setup.alloc)
+	if !testing.expect(t, ok) { return }
+	_, head, head_error := journal.session_head(&runner, id)
+	if !testing.expect(t, head_error == nil) { return }
+	_ = journal.append_node(
+		&runner,
+		{session = id, branch = journal.INITIAL_BRANCH, parent = head, kind = .User},
+		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt], message = waiting[0].seq},
+		transmute([]u8)string("captured pending line"),
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "delivery failed") }
+	if !testing.expect(t, session_install(&app.setup, &opened)) { return }
+	session_replay(&app, &app.setup.session)
+	_ = app_follow_poll(&app, run_observer(&app))
+	testing.expect_value(t, app_entries_count(&app, "captured pending line"), 1)
+	testing.expect_value(t, len(app.setup.follow_pending), 0)
+}
+
+@(test)
+test_busy_follower_input_retries_once_and_keeps_order :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	if !testing.expect(t, session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)})) { return }
+	if error := db.exec(&app.setup.store.connection, "PRAGMA busy_timeout=0"); error != nil { testing.fail_now(t, "busy timeout failed") }
+	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
+	defer _ = db.rollback(&runner.connection)
+	observer := run_observer(&app)
+	app_follow_submit(&app, "first pending line", observer)
+	app_follow_submit(&app, "second pending line", observer)
+	testing.expect_value(t, app_entries_count(&app, "first pending line"), 0)
+	testing.expect(t, app.setup.follow_input_busy)
+	deadline, present := journal.flush_deadline(app.setup.store).?
+	testing.expect(t, present && time.tick_diff(time.tick_now(), deadline) > 0, "Busy must rearm a future deadline")
+	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
+	_ = app_follow_service(&app, observer)
+	_ = app_follow_service(&app, observer)
+	testing.expect_value(t, app_entries_count(&app, "first pending line"), 1)
+	testing.expect_value(t, app_entries_count(&app, "second pending line"), 1)
+	waiting, error := journal.read_inbox(&runner, id, 0, context.temp_allocator)
+	testing.expect(t, error == nil)
+	if !testing.expect_value(t, len(waiting), 2) { return }
+	testing.expect_value(t, string(waiting[0].body), "first pending line")
+	testing.expect_value(t, string(waiting[1].body), "second pending line")
+}
+
+@(test)
+test_busy_takeover_retries_only_on_new_submit :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	if !testing.expect(t, session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)})) { return }
+	if error := db.exec(&app.setup.store.connection, "PRAGMA busy_timeout=0"); error != nil { testing.fail_now(t, "busy timeout failed") }
+	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
+	defer _ = db.rollback(&runner.connection)
+	observer := run_observer(&app)
+	app_follow_submit(&app, "retained during takeover", observer)
+	if error := journal.release(&runner); error != nil { testing.fail_now(t, "runner release failed") }
+	_ = app_follow_service(&app, observer)
+	testing.expect(t, app.setup.takeover_failed && app.setup.takeover_retryable && app_following(&app))
+	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
+	_ = app_follow_service(&app, observer)
+	testing.expect(t, app_following(&app), "release wake must not retry the failed takeover")
+	app_follow_submit(&app, "explicit retry", observer)
+	_ = app_follow_service(&app, observer)
+	testing.expect(t, !app_following(&app), "a new submission retries transient takeover failure")
+	testing.expect_value(t, app_entries_count(&app, "retained during takeover"), 1)
+	testing.expect_value(t, app_entries_count(&app, "explicit retry"), 1)
+}
+
+@(test)
+test_takeover_shows_input_first_committed_by_recovery :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	if !testing.expect(t, session_switch(&app, {kind = .Resume_Id, id = app_session_id_text(id)})) { return }
+	if error := db.exec(&app.setup.store.connection, "PRAGMA busy_timeout=0"); error != nil { testing.fail_now(t, "busy timeout failed") }
+	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
+	defer _ = db.rollback(&runner.connection)
+	observer := run_observer(&app)
+	app_follow_submit(&app, "first committed in recovery", observer)
+	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
+	if error := journal.release(&runner); error != nil { testing.fail_now(t, "runner release failed") }
+	if _, error := journal.try_claim(app.setup.store); error != nil { testing.fail_now(t, "takeover claim failed") }
+	app_takeover(&app, observer)
+	testing.expect(t, !app_following(&app))
+	testing.expect_value(t, app_entries_count(&app, "first committed in recovery"), 1)
 }

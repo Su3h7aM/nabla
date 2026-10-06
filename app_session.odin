@@ -20,63 +20,66 @@ import "nabla:tui"
 import "nabla:tui/widgets"
 
 Run_Setup :: struct {
-	harness_options:   agent.Harness_Options,
-	catalog:           agent.Catalog,
-	api:               ai.API_Kind,
-	credential:        string, // owned,
+	harness_options:    agent.Harness_Options,
+	catalog:            agent.Catalog,
+	api:                ai.API_Kind,
+	credential:         string, // owned,
 	// store is the running session's journal, owned. Chat_Session borrows it, so it
 	// is replaced only together with the chat.
-	store:             ^journal.Journal,
-	journal_directory: string, // owned
-	lock_directory:    string, // owned; where the journal takes session claims
-	run:               journal.Run_Id,
+	store:              ^journal.Journal,
+	journal_directory:  string, // owned
+	lock_directory:     string, // owned; where the journal takes session claims
+	run:                journal.Run_Id,
 	// run_open says the running session's journal carries this launch's run.started, so
 	// run.finished is owed when the launch ends.
-	run_open:          bool,
-	session:           agent.Chat_Session,
-	workspace:         string, // owned; the directory sessions here run in
-	provider_id:       string, // owned,
-	model_id:          string, // owned,
+	run_open:           bool,
+	session:            agent.Chat_Session,
+	workspace:          string, // owned; the directory sessions here run in
+	provider_id:        string, // owned,
+	model_id:           string, // owned,
 	// resumed_provider and resumed_model are what the opened session last ran
 	// with. They are empty for a new session, and they are only a fallback for
 	// when no selection exists anywhere else.
-	resumed_provider:  string, // owned,
-	resumed_model:     string, // owned,
-	resumed_effort:    string, // owned,
+	resumed_provider:   string, // owned,
+	resumed_model:      string, // owned,
+	resumed_effort:     string, // owned,
 	// configured holds the provider ids the user's own configuration declares;
 	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
-	configured:        [dynamic]string, // owned,
+	configured:         [dynamic]string, // owned,
 	// owns_selection says whether this run's model choice is the user's. The
 	// interactive harness owns it: its choice is published to the front-end and
 	// remembered for the next launch. A headless or child run does not, because it
 	// selects a model for one job and must not change what the user starts with.
-	owns_selection:    bool,
+	owns_selection:     bool,
 	// shared_sessions says this front-end shows a session another process runs as a
 	// follower instead of refusing it, and watches the lock file of the session it shows
 	// so that other processes' commits and a dropped claim wake the worker. A headless
 	// resume sets it too and sends its line to the runner; the ACP server leaves it false
 	// and refuses a running session.
-	shared_sessions:   bool,
+	shared_sessions:    bool,
 	// follow is where the follower's reading of the journal stands. It is meaningful only
 	// while the running store follows.
-	follow:            agent.Follow,
+	follow:             agent.Follow,
 	// takeover_failed stops a follower from claiming again after a claim it won could not
 	// be used, so every later wake does not repeat the failure.
-	takeover_failed:   bool,
+	takeover_failed:    bool,
+	takeover_retryable: bool,
+	follow_pending:     []journal.Record, // owned until initial replay
+	follow_input_busy:  bool,
 	// watch wakes the worker for changes of the shown session's lock file. watched is the
 	// session whose lock file it watches, and watch_id the kernel's name for it.
-	watch:             agent.Session_Watch,
-	watched:           journal.Session_Id,
-	watch_id:          agent.Session_Watch_Id,
+	watch:              agent.Session_Watch,
+	watched:            journal.Session_Id,
+	watch_id:           agent.Session_Watch_Id,
 	// mcp_servers is borrowed from the launch's configuration, which outlives the
 	// setup. mcp owns the running MCP clients and the bindings a tool definition may
 	// borrow, so it is released after the session that holds the registry.
-	mcp_servers:       []agent.MCP_Server_Config,
-	mcp:               MCP_Runtime,
+	mcp_servers:        []agent.MCP_Server_Config,
+	mcp:                MCP_Runtime,
 	// workers_abandoned stays set after a replaced session leaves a worker behind.
-	workers_abandoned: bool,
-	alloc:             mem.Allocator,
+	workers_abandoned:  bool,
+	alloc:              mem.Allocator,
 }
 
 App :: struct {
@@ -311,29 +314,32 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 // Opened_Session is a session resolved and taken in its own journal, not yet
 // running. It owns store and its strings until session_install takes them.
 Opened_Session :: struct {
-	store:      ^journal.Journal,
-	id:         journal.Session_Id,
-	workspace:  string,
-	branch:     journal.Branch_Id,
-	head:       journal.Node_Id,
+	store:        ^journal.Journal,
+	id:           journal.Session_Id,
+	workspace:    string,
+	branch:       journal.Branch_Id,
+	head:         journal.Node_Id,
 	// provider and model are what the session's last turn ran with, "" for a new session.
-	provider:   string,
-	model:      string,
-	effort:     string,
-	recovery:   journal.Recovery,
+	provider:     string,
+	model:        string,
+	effort:       string,
+	recovery:     journal.Recovery,
 	// queued is how many lines the session accepted and never delivered, which go with the
 	// next prompt.
-	queued:     int,
+	queued:       int,
 	// own_queued counts the queued lines this process wrote as a follower, which a takeover
 	// delivers.
-	own_queued: int,
+	own_queued:   int,
 	// following says store follows the session another process claimed. follow is where its
 	// reading of the journal starts.
-	following:  bool,
-	follow:     agent.Follow,
+	following:    bool,
+	follow:       agent.Follow,
+	pending:      []journal.Record, // owned, captured with the follower cursor and head
+	settle_error: journal.Error,
 }
 
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
+	journal.records_destroy(opened.pending, allocator)
 	// The opened session is being released; its close failure changes nothing here.
 	_ = session_store_close(opened.store, allocator)
 	delete(opened.workspace, allocator)
@@ -422,8 +428,8 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 }
 
 // session_follow makes opened follow the session another process runs: it opens the
-// session's lock file without the claim, arms the watch on it, and only then positions the
-// follow, so a commit after the first read raises a wake. A failure leaves the watch on
+// session's lock file without the claim and arms the watch before session_settle captures
+// the attachment snapshot, so a commit after the first read raises a wake. A failure leaves the watch on
 // the target; the caller that keeps the running session restores it with app_watch_sync.
 @(require_results)
 session_follow :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (message: string, ok: bool) {
@@ -434,9 +440,6 @@ session_follow :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (message: 
 	if watch_error := app_watch_session(setup, opened.id); watch_error != nil {
 		return fmt.aprintf("cannot watch the session: %v", watch_error, allocator = allocator), false
 	}
-	follow_error: journal.Error
-	opened.follow, follow_error = agent.follow_start(opened.store, opened.id)
-	if follow_error != nil { return session_error_message("cannot read the session", follow_error, allocator), false }
 	opened.following = true
 	return "", true
 }
@@ -449,31 +452,68 @@ session_follow :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (message: 
 session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: mem.Allocator) -> (message: string, ok: bool) {
 	store := opened.store
 	id := opened.id
+	snapshot_open := false
+	defer if snapshot_open {
+		if snapshot_error := journal.end_read_snapshot(store); snapshot_error != nil {
+			delete(message, allocator)
+			opened.settle_error = snapshot_error
+			message = session_error_message("cannot finish reading the session", snapshot_error, allocator)
+			ok = false
+		}
+	}
 	claimed := store.claimed != {}
 	if claimed {
 		recover_error: journal.Error
 		opened.recovery, recover_error = journal.recover(store)
-		if recover_error != nil { return session_error_message("cannot settle the session", recover_error, allocator), false }
+		if recover_error != nil {
+			opened.settle_error = recover_error
+			return session_error_message("cannot settle the session", recover_error, allocator), false
+		}
+	}
+	if opened.following {
+		if snapshot_error := journal.begin_read_snapshot(store); snapshot_error != nil {
+			opened.settle_error = snapshot_error
+			return session_error_message("cannot read the session", snapshot_error, allocator), false
+		}
+		snapshot_open = true
+		follow_error: journal.Error
+		opened.follow, follow_error = agent.follow_start(store, id)
+		if follow_error != nil {
+			opened.settle_error = follow_error
+			return session_error_message("cannot read the session", follow_error, allocator), false
+		}
 	}
 	head_error: journal.Error
 	opened.branch, opened.head, head_error = journal.session_head(store, id)
-	if head_error != nil { return session_error_message("cannot read the session", head_error, allocator), false }
+	if head_error != nil {
+		opened.settle_error = head_error
+		return session_error_message("cannot read the session", head_error, allocator), false
+	}
 
-	if claimed {
+	if claimed || opened.following {
 		delivered, delivered_error := journal.last_delivered_message(store, id)
-		if delivered_error != nil { return session_error_message("cannot read the session", delivered_error, allocator), false }
+		if delivered_error != nil {
+			opened.settle_error = delivered_error
+			return session_error_message("cannot read the session", delivered_error, allocator), false
+		}
 		waiting, waiting_error := journal.read_inbox(store, id, delivered, allocator)
-		if waiting_error != nil { return session_error_message("cannot read the session", waiting_error, allocator), false }
+		if waiting_error != nil {
+			opened.settle_error = waiting_error
+			return session_error_message("cannot read the session", waiting_error, allocator), false
+		}
 		for record in waiting {
 			if record.kind != .User_Input { continue }
 			opened.queued += 1
 			if record.run == store.run { opened.own_queued += 1 }
 		}
-		journal.records_destroy(waiting, allocator)
+		if opened.following { opened.pending = waiting } else { journal.records_destroy(waiting, allocator) }
 	}
 
 	selection_record, selection_found, read_error := journal.read_latest(store, {session = id, kinds = {.Selection_Applied}}, allocator)
-	if read_error != nil { return session_error_message("cannot read the session selection", read_error, allocator), false }
+	if read_error != nil {
+		opened.settle_error = read_error
+		return session_error_message("cannot read the session selection", read_error, allocator), false
+	}
 	if selection_found {
 		defer journal.record_destroy(&selection_record, allocator)
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -486,6 +526,7 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 			session = selection_record.session,
 			seq = selection_record.seq,
 		); decode_error != nil {
+			opened.settle_error = decode_error
 			return session_error_message("cannot read the session selection", decode_error, allocator), false
 		}
 		provider, provider_error := strings.clone(selection.provider, allocator)
@@ -502,7 +543,10 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 		opened.effort = effort
 	} else {
 		latest, found, turn_read_error := journal.read_latest(opened.store, {session = id, kinds = {.Turn_Started}}, allocator)
-		if turn_read_error != nil { return session_error_message("cannot read the session", turn_read_error, allocator), false }
+		if turn_read_error != nil {
+			opened.settle_error = turn_read_error
+			return session_error_message("cannot read the session", turn_read_error, allocator), false
+		}
 		defer journal.record_destroy(&latest, allocator)
 		if found {
 			provider, provider_error := strings.clone(latest.provider, allocator)
@@ -553,8 +597,12 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	setup.resumed_provider = opened.provider
 	setup.resumed_model = opened.model
 	setup.resumed_effort = opened.effort
+	journal.records_destroy(setup.follow_pending, setup.alloc)
+	setup.follow_pending = opened.pending
 	setup.follow = opened.follow
 	setup.takeover_failed = false
+	setup.takeover_retryable = false
+	setup.follow_input_busy = false
 	opened^ = {}
 	setup.session = new_session
 	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {

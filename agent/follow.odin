@@ -29,11 +29,10 @@ Follow :: struct {
 	outcome:  journal.Turn_Outcome,
 }
 
-// follow_start positions a follow at the end of the journal, so the transcript the caller
-// loads next and the records follow_poll reads meet without a gap: a commit that lands
-// between the two is shown by both rather than by neither. The caller arms the session
-// watch before it calls this. working and the estimate start from the newest turn and
-// request records of session.
+// follow_start positions a follow at the end of the journal. The caller arms its session
+// watch first and captures this cursor, transcript head, and pending input in one read
+// snapshot, then ends that snapshot before replay or callbacks. working and the estimate
+// start from the newest turn and request records of session.
 @(require_results)
 follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (follow: Follow, error: journal.Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()

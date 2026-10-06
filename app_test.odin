@@ -232,6 +232,19 @@ test_ctrl_c_resolves_by_prompt_state :: proc(t: ^testing.T) {
 	testing.expect(t, !agent.turn_control_stop_requested(&idle.run.control))
 }
 
+@(test)
+test_ctrl_c_leaves_a_follower_without_cancelling_the_runner :: proc(t: ^testing.T) {
+	app := ctrl_c_app(t, "unsent text", true)
+	defer widgets.input_destroy(&app.input)
+	app.run.snap.status.following = true
+	interrupt(&app)
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+	testing.expect(t, !app.quit)
+	interrupt(&app)
+	testing.expect(t, app.quit, "a follower must not wait for the other process's turn to end")
+	testing.expect(t, !agent.turn_control_stop_requested(&app.run.control))
+}
+
 // A stopped runtime refuses new work at the front-end, so a command typed while
 // the harness is shutting down is dropped rather than queued for a worker that
 // will abandon it.

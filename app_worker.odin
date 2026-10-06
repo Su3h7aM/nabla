@@ -50,7 +50,11 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 				changed := app_follow_service(app, observer)
 				if changed { refresh_status(app) }
 				free_all(context.temp_allocator)
-				if !changed { agent.owner_wake_wait(seen, nil) }
+				if !changed {
+					deadline: Maybe(time.Tick)
+					if app.setup.follow_input_busy { deadline = journal.flush_deadline(app.setup.store) }
+					agent.owner_wake_wait(seen, deadline)
+				}
 				continue
 			}
 			// A background subagent's report, or a line another process sent, that arrived
@@ -330,20 +334,39 @@ follower_refuse :: proc(app: ^App, action: string) {
 // accepted when its commit returns, and the poll that follows shows it. A commit that
 // failed busy keeps the record pending, so it is committed again and never appended twice.
 app_follow_submit :: proc(app: ^App, text: string, observer: agent.Chat_Observer) {
-	store := app.setup.store
+	setup := &app.setup
+	if setup.takeover_failed && setup.takeover_retryable {
+		setup.takeover_failed = false
+		setup.takeover_retryable = false
+	}
+	_ = app_follow_flush(app)
+	store := setup.store
 	error := journal.append_input(store, text, .Prompt)
 	if error != nil && journal.error_is_busy(error) {
 		_, error = journal.commit(store)
 	}
+	setup.follow_input_busy = journal.error_is_busy(error)
 	if error != nil {
-		if journal.error_is_busy(error) {
-			snap_append(app, .Warning, "the session database is busy; the line is sent with the next commit")
+		if setup.follow_input_busy {
+			snap_append(app, .Warning, "the session database is busy; the line is pending and has not been sent")
 		} else {
 			snap_append(app, .Error, fmt.tprintf("the line was not sent: %s", journal.error_text(error, context.temp_allocator)))
 		}
 		return
 	}
 	_ = app_follow_poll(app, observer)
+}
+
+// app_follow_flush retries the existing batch without appending input again.
+app_follow_flush :: proc(app: ^App) -> bool {
+	setup := &app.setup
+	if !setup.follow_input_busy { return false }
+	_, error := journal.commit(setup.store)
+	setup.follow_input_busy = journal.error_is_busy(error)
+	if error != nil && !setup.follow_input_busy {
+		snap_append(app, .Error, fmt.tprintf("pending input was not sent: %s", journal.error_text(error, context.temp_allocator)))
+	}
+	return error == nil
 }
 
 // app_follow_poll shows what the runner committed since the last poll and takes the size
@@ -365,6 +388,7 @@ app_follow_poll :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 // raises a wake, and a claim that fails costs one syscall, so every wake tries. It reports
 // whether the display or the role changed.
 app_follow_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
+	_ = app_follow_flush(app)
 	setup := &app.setup
 	if !setup.takeover_failed {
 		_, claim_error := journal.try_claim(setup.store)
@@ -374,6 +398,7 @@ app_follow_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 		}
 		if claim_error != journal.Journal_Error.Claimed {
 			setup.takeover_failed = true
+			setup.takeover_retryable = journal.error_is_busy(claim_error)
 			snap_append(app, .Error, fmt.tprintf("cannot take over the session: %s", journal.error_text(claim_error, context.temp_allocator)))
 		}
 	}
@@ -384,7 +409,7 @@ app_follow_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 // shows what the old runner committed last, runs recovery, installs the session as the
 // runner through the install every open uses (the transcript on screen stays), applies the
 // selection this process runs with, and delivers the lines it wrote as a follower that no
-// turn has read. Those lines were shown when they were sent, so their delivery reports none.
+// turn has read. The post-settlement poll shows every committed line before delivery, which reports none.
 app_takeover :: proc(app: ^App, observer: agent.Chat_Observer) {
 	setup := &app.setup
 	_ = app_follow_poll(app, observer)
@@ -394,12 +419,14 @@ app_takeover :: proc(app: ^App, observer: agent.Chat_Observer) {
 	}
 	if message, settled := session_settle(&opened, setup.workspace, setup.alloc); !settled {
 		// The store stays with its owner; only what settling read is released here.
+		retryable := journal.error_is_busy(opened.settle_error)
 		opened.store = nil
 		opened_session_destroy(&opened, setup.alloc)
-		app_takeover_abort(app, message)
+		app_takeover_abort(app, message, retryable)
 		delete(message, setup.alloc)
 		return
 	}
+	_ = app_follow_poll(app, observer)
 	recovery := opened.recovery
 	own_queued := opened.own_queued
 	if !session_install(setup, &opened) {
@@ -429,9 +456,10 @@ app_takeover :: proc(app: ^App, observer: agent.Chat_Observer) {
 // app_takeover_abort gives the claim back when this process won it and could not use it,
 // so a session is never held by a process that cannot run it, and follows again. It stops
 // the claims from being retried, because the release raises a wake that would retry them.
-app_takeover_abort :: proc(app: ^App, reason: string) {
+app_takeover_abort :: proc(app: ^App, reason: string, retryable := false) {
 	setup := &app.setup
 	setup.takeover_failed = true
+	setup.takeover_retryable = retryable
 	snap_append(app, .Error, fmt.tprintf("cannot take over the session: %s; this process keeps following it", reason))
 	session := setup.store.claimed
 	_ = journal.release(setup.store)
@@ -536,6 +564,10 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 // session_replay shows the tail of a resumed conversation. The store keeps every
 // entry; this is the part a person needs to recognise where they left off.
 session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
+	defer {
+		journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
+		app.setup.follow_pending = nil
+	}
 	following := chat.store.followed != {}
 	if following { snap_append(app, .Notice, "the session runs in another process; this one follows it") }
 	arena: virtual.Arena
@@ -579,18 +611,14 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 			snap_append_tool(app, call_names[payload.call], payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
 		}
 	}
-	if following { session_replay_queued(app, chat) }
+	if following { session_replay_queued(app) }
 }
 
 // session_replay_queued shows the lines the session accepted and the runner has not
 // delivered yet. They are no node, so the replay above has none of them, and the node that
 // delivers one later is skipped as a repeat of the line (see follow_poll).
-session_replay_queued :: proc(app: ^App, chat: ^agent.Chat_Session) {
-	delivered, delivered_error := journal.last_delivered_message(chat.store, chat.session)
-	if delivered_error != nil { return }
-	waiting, waiting_error := journal.read_inbox(chat.store, chat.session, delivered, context.temp_allocator)
-	if waiting_error != nil { return }
-	for record in waiting {
+session_replay_queued :: proc(app: ^App) {
+	for record in app.setup.follow_pending {
 		if record.kind == .User_Input { snap_append(app, .User, string(record.body)) }
 	}
 }

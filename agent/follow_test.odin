@@ -354,3 +354,49 @@ _claim_records :: proc(test: ^testing.T, store: ^journal.Journal, session: journ
 	if read_error != nil { testing.fail_now(test, "the claim records could not be read") }
 	return records
 }
+
+@(test)
+test_follow_attachment_snapshot_keeps_delivery_between_reads_once :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	store := &fixture.store
+	session := fixture.chat.session
+	follower: journal.Journal
+	follow_open(test, &fixture, &follower)
+	defer _ = journal.close(&follower)
+	follow_send(test, &follower, "queued at attachment")
+	pending, pending_error := journal.read_inbox(store, session, 0, context.temp_allocator)
+	if !testing.expect(test, pending_error == nil && len(pending) == 1) { return }
+	if error := journal.begin_read_snapshot(&follower); error != nil { testing.fail_now(test, "snapshot begin failed") }
+	snapshot_open := true
+	defer if snapshot_open { _ = journal.end_read_snapshot(&follower) }
+	follow, start_error := follow_start(&follower, session)
+	if !testing.expect(test, start_error == nil) { return }
+	_, captured_head, head_error := journal.session_head(&follower, session)
+	if !testing.expect(test, head_error == nil) { return }
+	_ = journal.append_node(
+		store,
+		{session = session, branch = journal.INITIAL_BRANCH, parent = captured_head, kind = .User},
+		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt], message = pending[0].seq},
+		follow_body("queued at attachment"),
+	)
+	follow_commit(test, store)
+	delivered, delivered_error := journal.last_delivered_message(&follower, session)
+	if !testing.expect(test, delivered_error == nil) { return }
+	captured_pending, inbox_error := journal.read_inbox(&follower, session, delivered, context.allocator)
+	defer journal.records_destroy(captured_pending, context.allocator)
+	if !testing.expect(test, inbox_error == nil && len(captured_pending) == 1) { return }
+	_, still_captured_head, captured_error := journal.session_head(&follower, session)
+	testing.expect(test, captured_error == nil)
+	testing.expect_value(test, still_captured_head, captured_head)
+	if error := journal.end_read_snapshot(&follower); error != nil { testing.fail_now(test, "snapshot end failed") }
+	snapshot_open = false
+	log: Follow_Log
+	defer follow_log_destroy(&log)
+	observer := follow_log_observer(&log)
+	for record in captured_pending { if record.kind == .User_Input { observer.user_text(observer.user_data, string(record.body)) } }
+	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)
+	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)
+	testing.expect_value(test, follow_log_count(&log, "user:queued at attachment"), 1)
+}

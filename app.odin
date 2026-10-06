@@ -363,6 +363,7 @@ Session_Start :: struct {
 }
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {
+	journal.records_destroy(setup.follow_pending, setup.alloc)
 	agent.chat_session_destroy(&setup.session)
 	// The watch only wakes owners, so it stops once the session it woke is gone.
 	agent.session_watch_stop(&setup.watch)
@@ -615,9 +616,9 @@ tui_run :: proc(
 			present_frame(app, app.storage)
 		}
 
-		// SIGINT or SIGTERM stops the running turn through the owner, and ends the
-		// process once no turn runs.
-		if agent.process_interrupted() && !runtime_busy(app) {
+		// Signals stop this process's turn before exit. A follower owns no remote turn,
+		// so it leaves without waiting for the runner.
+		if agent.process_interrupted() && (!runtime_busy(app) || runtime_following(app)) {
 			app.quit = true
 			break
 		}

@@ -100,36 +100,36 @@ Corruption :: struct {
 // not move while open: the connection and arena keep their address. The zero
 // value is closed.
 Journal :: struct {
-	connection: db.Conn,
-	allocator:  mem.Allocator,
-	directory:  string, // owned
+	connection:  db.Conn,
+	allocator:   mem.Allocator,
+	directory:   string, // owned
 	// locks holds one lock file per claimed or followed session, owned. The files
 	// are never deleted: replacing a locked inode would let two processes hold one
 	// claim.
-	locks:      string,
-	run:        Run_Id,
-	open:       bool,
-	read_only:  bool,
-	claimed:    Session_Id,
+	locks:       string,
+	run:         Run_Id,
+	open:        bool,
+	read_only:   bool,
+	claimed:     Session_Id,
 	// followed is the session another process claimed, which this journal watches
 	// and appends `user.input` for. It is never set together with claimed.
-	followed:   Session_Id,
+	followed:    Session_Id,
 	// lock_file is the descriptor of the claimed or followed session's lock file.
 	// A follower holds it without the flock, so try_claim retries on it.
-	lock_file:  ^os.File,
-	counters:   Counters,
+	lock_file:   ^os.File,
+	counters:    Counters,
 
 	// batch owns the bytes of every pending item until the commit that writes it.
-	batch:      virtual.Arena,
-	pending:    [dynamic]Pending,
-	oldest:     time.Tick, // when the first pending item was appended
-	last_seq:   Journal_Seq,
-	inserts:    [Insert]db.Statement, // prepared by the first commit
+	batch:       virtual.Arena,
+	pending:     [dynamic]Pending,
+	batch_since: time.Tick, // when this pending batch started or its last busy commit returned
+	last_seq:    Journal_Seq,
+	inserts:     [Insert]db.Statement, // prepared by the first commit
 
 	// failure is the first failure that stopped the journal from writing. Every
 	// later append is dropped and every later commit returns it.
-	failure:    Error,
-	corrupt:    Corruption,
+	failure:     Error,
+	corrupt:     Corruption,
 }
 
 // open opens the journal in directory, creating it private to the user and

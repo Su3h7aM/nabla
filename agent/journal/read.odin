@@ -7,6 +7,21 @@ import "core:strings"
 
 import "nabla:db"
 
+// begin_read_snapshot starts a read transaction on an open journal with no transaction
+// in progress. Reads share the snapshot fixed by the first query. It returns a database
+// error on failure. The caller must call end_read_snapshot before callbacks, writes, or waits.
+@(require_results)
+begin_read_snapshot :: proc(journal: ^Journal) -> Error {
+	return db.begin(&journal.connection)
+}
+
+// end_read_snapshot releases the transaction started by begin_read_snapshot without
+// changing the journal. It returns a database error if rollback fails.
+@(require_results)
+end_read_snapshot :: proc(journal: ^Journal) -> Error {
+	return db.rollback(&journal.connection)
+}
+
 // Filter selects records. A zero field matches anything; empty kinds or nodes
 // match every kind or node.
 Filter :: struct {

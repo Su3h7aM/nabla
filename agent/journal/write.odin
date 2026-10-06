@@ -184,7 +184,10 @@ commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
 	if len(journal.pending) == 0 { return journal.last_seq, nil }
 
 	last, error := write_pending(journal)
-	if error_is_busy(error) { return journal.last_seq, error }
+	if error_is_busy(error) {
+		journal.batch_since = time.tick_now()
+		return journal.last_seq, error
+	}
 	clear(&journal.pending)
 	virtual.arena_free_all(&journal.batch)
 	if error != nil {
@@ -204,15 +207,15 @@ commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
 flush_due :: proc(journal: ^Journal, now: time.Tick) -> Error {
 	if len(journal.pending) == 0 { return journal.failure }
 	full := len(journal.pending) >= JOURNAL_BATCH_RECORDS || journal.batch.total_used >= JOURNAL_BATCH_BYTES
-	if !full && time.tick_diff(journal.oldest, now) < JOURNAL_BATCH_AGE { return nil }
+	if !full && time.tick_diff(journal.batch_since, now) < JOURNAL_BATCH_AGE { return nil }
 	_, error := commit(journal)
 	return error
 }
 
-// flush_deadline is when the oldest pending item is due, nil when none is.
+// flush_deadline is when the pending batch is due, nil when none is. Busy commits restart its batch age.
 flush_deadline :: proc(journal: ^Journal) -> Maybe(time.Tick) {
 	if len(journal.pending) == 0 { return nil }
-	return time.tick_add(journal.oldest, JOURNAL_BATCH_AGE)
+	return time.tick_add(journal.batch_since, JOURNAL_BATCH_AGE)
 }
 
 @(private, require_results)
@@ -316,7 +319,7 @@ push :: proc(journal: ^Journal, item: Pending) {
 		journal.failure = error
 		return
 	}
-	if len(journal.pending) == 1 { journal.oldest = time.tick_now() }
+	if len(journal.pending) == 1 { journal.batch_since = time.tick_now() }
 }
 
 // batch_text, batch_bytes, and batch_json copy into the batch arena and latch an
