@@ -442,6 +442,25 @@ test_patch_missing_file_writes_nothing :: proc(test: ^testing.T) {
 }
 
 @(test)
+test_patch_section_after_end_marker_writes_nothing :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	workspace := tool_test_workspace(&tool_test)
+	code := strings.concatenate({workspace, "/code.txt"}, context.temp_allocator)
+	later := strings.concatenate({workspace, "/later.txt"}, context.temp_allocator)
+	if !tool_write_file(test, code, "one\ntwo\n") { return }
+
+	patch := `{"patch":"*** Begin Patch\n*** Update File: code.txt\n-two\n+TWO\n*** End Patch\n*** Add File: later.txt\n+x\n*** End Patch"}`
+	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Invalid_Arguments)
+	testing.expect(test, strings.contains(result.content, "after *** End Patch") && strings.contains(result.content, "line 6"), result.content)
+	tool_file_is(test, code, "one\ntwo\n")
+	testing.expect(test, !os.exists(later), "a rejected patch adds no file")
+}
+
+@(test)
 test_patch_add_refuses_a_dangling_symlink :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
 	tool_test_begin(test, &tool_test)

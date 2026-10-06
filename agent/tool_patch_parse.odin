@@ -93,7 +93,13 @@ patch_parse :: proc(patch: string, allocator: mem.Allocator) -> (args: Patch_Arg
 	for index := 0; index < len(raw_lines); index += 1 {
 		line := strings.trim_suffix(raw_lines[index], "\r")
 		marker := strings.trim_right_space(line)
-		if strings.equal_fold(marker, PATCH_END) || patch_is_wrapper_end(raw_lines[index:]) { break }
+		if strings.equal_fold(marker, PATCH_END) {
+			if offset := patch_header_after(raw_lines[index + 1:]); offset >= 0 {
+				problem = fmt.tprintf("a patch with no file header after %s, but line %d starts a file section", PATCH_END, index + offset + 2)
+			}
+			break
+		}
+		if patch_is_wrapper_end(raw_lines[index:]) { break }
 		if strings.equal_fold(marker, PATCH_BEGIN) { continue }
 		if operation, path, is_header := patch_header(line); is_header {
 			if problem = patch_open_section(&parser, operation, path, "", index + 1) or_return; problem != "" { break }
@@ -115,6 +121,17 @@ patch_parse :: proc(patch: string, allocator: mem.Allocator) -> (args: Patch_Arg
 	if problem == "" && len(parser.files) == 0 { problem = "a patch with at least one *** Add File:, *** Delete File:, or *** Update File: header" }
 	args = {parser.files[:], parser.hunks[:], parser.lines[:]}
 	return
+}
+
+// patch_header_after returns the index of the first line in lines that opens a file section, or
+// -1. Text after *** End Patch is ignored, but a section there would be dropped without a word.
+@(private = "file", require_results)
+patch_header_after :: proc(lines: []string) -> int {
+	for line, index in lines {
+		if _, _, is_header := patch_header(strings.trim_suffix(line, "\r")); is_header { return index }
+		if _, _, _, is_header := patch_unified_header(lines[index:], false); is_header { return index }
+	}
+	return -1
 }
 
 // patch_is_wrapper_end reports whether lines start with a closing code fence or heredoc
