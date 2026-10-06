@@ -406,11 +406,16 @@ Subagent_Started :: struct {
 // Subagent_Completed ends a delegation in the parent's session; the child's
 // final answer, or why there is none, is in the body. name is the id the parent's
 // model knows the child by, "" when recovery wrote the record.
+// ACP fields preserve its external session, selection, and last consumed inbox sequence.
 Subagent_Completed :: struct {
-	version: int,
-	outcome: string, // TOOL_OUTCOME_NAMES
-	detail:  string,
-	name:    string,
+	version:     int,
+	outcome:     string, // TOOL_OUTCOME_NAMES
+	detail:      string,
+	name:        string,
+	acp_session: string,
+	acp_after:   Journal_Seq,
+	acp_model:   string,
+	acp_effort:  string,
 }
 
 // Subagent_Message carries one message of a delegation in the body. The record's

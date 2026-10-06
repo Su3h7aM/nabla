@@ -816,6 +816,7 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent
 		start := header
 		start.kind = .Subagent_Started
 		started := journal.Subagent_Started {
+			program    = send.resume.program,
 			name       = send.agent,
 			provider   = send.provider,
 			model      = send.model,

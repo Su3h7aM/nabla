@@ -756,10 +756,30 @@ while IFS= read -r line; do
 	id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
 	case "$line" in
 	*'"method":"initialize"'*)
-		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"info":{"name":"fake","version":"1"}}}\n' "$id" ;;
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"info":{"name":"fake","version":"1"},"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}\n' "$id" ;;
 	*'"method":"session/new"'*)
-		printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1"}}\n' "$id" ;;
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1","configOptions":[{"id":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}\n' "$id" ;;
+	*'"method":"session/resume"'*)
+		case "$line" in *'"sessionId":"s1"'*) ;; *) echo "wrong resumed session" >&2; exit 1 ;; esac
+		resumed=yes
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}\n' "$id" ;;
+	*'"method":"session/set_config_option"'*)
+		case "$line" in *'"configId":"model"'*'"value":"model-b"'*) model_switched=yes ;; *'"configId":"effort"'*'"value":"high"'*) effort_switched=yes ;; esac
+		printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
 	*'"method":"session/prompt"'*)
+		case "$line" in *'Check switch.'*)
+ if [ "$model_switched" != yes ] || [ "$effort_switched" != yes ]; then echo "model or effort was not configured" >&2; exit 1; fi
+ printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u3"}}\n' "$id"
+ update '{"sessionUpdate":"agent_message_chunk","messageId":"m4","content":{"type":"text","text":"configured"}}'
+ update '{"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}'
+ continue ;; esac
+		case "$line" in *'Now double it.'*)
+			if [ "$resumed" != yes ]; then echo "session/resume was not received" >&2; exit 1; fi
+ if [ "$model_switched" != yes ] || [ "$effort_switched" != yes ]; then echo "model or effort was not configured" >&2; exit 1; fi
+			printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u2"}}\n' "$id"
+			update '{"sessionUpdate":"agent_message_chunk","messageId":"m3","content":{"type":"text","text":"eighty-four"}}'
+			update '{"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}'
+			continue ;; esac
 		case "$line" in *'Answer in one word.'*'six times seven'*) ;; *) printf 'the beginning\n' 1>&2; head -c SUBAGENT_TEST_ACP_NOISE_BYTES /dev/zero | tr '\000' x 1>&2; echo "prompt lost its instruction or task" >&2; exit 1 ;; esac
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u1"}}\n' "$id"
 		printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"other","update":{"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}}}\n'
@@ -785,6 +805,27 @@ subagent_test_acp_agent :: proc() -> string {
 		1,
 		context.temp_allocator,
 	)
+	return text
+}
+
+// subagent_test_acp_version_one answers prompts after their updates, as version 1 requires.
+subagent_test_acp_version_one :: proc() -> string {
+	text := subagent_test_acp_agent()
+	replacements := [][2]string {
+		{`"protocolVersion":2`, `"protocolVersion":1`},
+		{`printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u1"}}\n' "$id"`, ""},
+		{`printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u2"}}\n' "$id"`, ""},
+		{`printf '{"jsonrpc":"2.0","id":%s,"result":{"messageId":"u3"}}\n' "$id"`, ""},
+		{
+			`update '{"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}'`,
+			`printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"`,
+		},
+	}
+	for replacement in replacements {
+		replaced, ok := strings.replace(text, replacement[0], replacement[1], -1, context.temp_allocator)
+		if !ok { return "" }
+		text = replaced
+	}
 	return text
 }
 
@@ -1331,4 +1372,170 @@ test_agent_send_compacts_a_running_subagent_without_stopping_it :: proc(test: ^t
 		records, _, read_error := journal.read_records(chat.store, {session = children[0].id, kinds = {kind}}, 0, 0, context.temp_allocator)
 		testing.expect(test, read_error == nil && len(records) == 1, "the child's journal holds the compaction")
 	}
+}
+@(test)
+test_agent_send_resumes_a_finished_acp_subagent :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	directory, directory_error := os.make_directory_temp("", "nabla-acp-resume-*", context.allocator)
+	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
+	defer { _ = os.remove_all(directory); delete(directory) }
+	script := strings.concatenate({directory, "/agent"}, context.temp_allocator)
+	if os.write_entire_file(script, transmute([]u8)subagent_test_acp_agent()) != nil { testing.fail_now(test, "could not write the agent") }
+	if os.chmod(script, {.Read_User, .Write_User, .Execute_User}) != nil { testing.fail_now(test, "could not make the agent executable") }
+	chat.acp_agents = {{name = "fake", command = script}}
+	agent_team_note_parent(chat)
+	_test_accept(test, chat, "start one")
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(
+		test,
+		subagent_test_call(
+			test,
+			chat,
+			"acp_spawn",
+			TOOL_AGENT_SPAWN_NAME,
+			`{"instruction":"Answer in one word.","prompt":"six times seven","acp_agent":"fake"}`,
+		),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "forty-two"))
+	children, problem := subagent_children(chat.store, chat.session)
+	if !testing.expect(test, problem == "" && len(children) == 1) { return }
+	testing.expect_value(test, children[0].acp_session, "s1")
+	status, status_problem := subagent_status_format(chat.store, chat.session, "agent-1")
+	testing.expect(test, status_problem == "" && strings.contains(status, "ACP session: s1"), status)
+	compact := Agent_Send_Args {
+		agent   = "agent-1",
+		compact = true,
+	}
+	_, refusal := subagent_resume_plan(chat, chat.team, &compact)
+	testing.expect_value(test, refusal, "ACP agents manage their own context")
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "acp_send", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Now double it.","model":"model-b","effort":"high"}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "eighty-four"))
+
+	version_one := subagent_test_acp_version_one()
+	if !testing.expect(test, version_one != "") { return }
+	if os.write_entire_file(script, transmute([]u8)version_one) != nil { testing.fail_now(test, "could not write the version 1 agent") }
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "acp_resume_v1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Now double it."}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "eighty-four"))
+
+	// A version 1 agent without either capability must not receive a resume or load call.
+	unsupported, replace_error := strings.replace(
+		version_one,
+		`"agentCapabilities":{"sessionCapabilities":{"resume":{}}}`,
+		`"agentCapabilities":{}`,
+		1,
+		context.temp_allocator,
+	)
+	if !replace_error { testing.fail_now(test, "could not construct the unsupported agent") }
+	if os.write_entire_file(script, transmute([]u8)unsupported) != nil { testing.fail_now(test, "could not write the unsupported agent") }
+	testing.expect_value(
+		test,
+		subagent_test_call(
+			test,
+			chat,
+			"acp_unsupported",
+			TOOL_AGENT_SEND_NAME,
+			`{"agent":"agent-1","message":"Now double it.","model":"model-b","effort":"high"}`,
+		),
+		success,
+	)
+	report := subagent_test_report(test, chat)
+	testing.expect(test, strings.contains(report, "advertises neither sessionCapabilities.resume nor loadSession"), report)
+	// Version 1 loads only when advertised and does not report replayed text as its answer.
+	loaded := version_one
+	replacements := [][2]string {
+		{`"agentCapabilities":{"sessionCapabilities":{"resume":{}}}`, `"agentCapabilities":{"loadSession":true}`},
+		{`"method":"session/resume"`, `"method":"session/load"`},
+		{`resumed=yes`, "resumed=yes\n update '{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"old replayed answer\"}}'"},
+	}
+	for replacement in replacements {
+		text, replaced := strings.replace(loaded, replacement[0], replacement[1], -1, context.temp_allocator)
+		if !replaced { testing.fail_now(test, "could not construct the loading agent") }
+		loaded = text
+	}
+	if os.write_entire_file(script, transmute([]u8)loaded) != nil { testing.fail_now(test, "could not write the loading agent") }
+	testing.expect_value(test, subagent_test_call(test, chat, "acp_load", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Now double it."}`), success)
+	report = subagent_test_report(test, chat)
+	testing.expect(test, strings.contains(report, "eighty-four") && !strings.contains(report, "old replayed answer"), report)
+
+}
+@(test)
+test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	directory, directory_error := os.make_directory_temp("", "nabla-acp-switch-*", context.allocator)
+	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
+	defer { _ = os.remove_all(directory); delete(directory) }
+	script := strings.concatenate({directory, "/agent"}, context.temp_allocator)
+	if os.write_entire_file(script, transmute([]u8)subagent_test_acp_agent()) != nil { testing.fail_now(test, "could not write the agent") }
+	if os.chmod(script, {.Read_User, .Write_User, .Execute_User}) != nil { testing.fail_now(test, "could not make the agent executable") }
+	fixture.chat.acp_agents = {{name = "fake", command = script}}
+	agent_team_note_parent(&fixture.chat)
+	child := journal.session_id_create()
+	member, problem := subagent_start(fixture.chat.team, {acp_agent = "fake"}, {}, child, context.allocator)
+	if !testing.expect(test, member != nil, problem) { return }
+	defer subagent_finish(member)
+	chat_record(&fixture.chat, {kind = .Subagent_Started, subagent = child}, journal.Subagent_Started{name = member.name, program = "fake", background = true})
+	if !chat_commit(&fixture.chat, "could not record the child") { testing.fail_now(test, "could not record the child") }
+	connection := ACP_Connection {
+		member = member,
+	}
+	connection.frames.allocator = member.allocator
+	connection.answer.allocator = member.allocator
+	connection.stderr_tail.allocator = member.allocator
+	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
+	if problem = acp_connection_open(&connection); !testing.expect_value(test, problem, "") { return }
+	if problem = acp_session_open(&connection); !testing.expect_value(test, problem, "") { return }
+	reason, prompt_problem := acp_prompt(&connection, "Answer in one word. six times seven")
+	testing.expect_value(test, prompt_problem, "")
+	testing.expect_value(test, reason, "end_turn")
+	testing.expect_value(test, string(connection.answer[:]), "forty-two")
+	compact := Agent_Send_Args {
+		agent   = member.name,
+		compact = true,
+	}
+	_, live, refusal := subagent_control_plan(member.team, &compact)
+	testing.expect(test, live)
+	testing.expect_value(test, refusal, "ACP agents manage their own context")
+	invalid := Agent_Send_Args {
+		agent = member.name,
+		model = "missing",
+	}
+	_, live, refusal = subagent_control_plan(member.team, &invalid)
+	if !testing.expect(test, live && refusal == "", refusal) { return }
+	subagent_control_apply(member.team, member.name, &invalid.control)
+	if problem = acp_control_apply(&connection); !testing.expect_value(test, problem, "") { return }
+	messages, inbox_error := journal.read_inbox(fixture.chat.store, fixture.chat.session, 0, context.temp_allocator)
+	if testing.expect(test, inbox_error == nil && len(messages) == 1) {
+		text, _ := inbox_text(messages[0])
+		testing.expect(test, strings.contains(text, "offers no model") && strings.contains(text, "missing"), text)
+	}
+	send := Agent_Send_Args {
+		agent  = member.name,
+		model  = "model-b",
+		effort = "high",
+	}
+	_, live, refusal = subagent_control_plan(member.team, &send)
+	testing.expect(test, live)
+	if !testing.expect_value(test, refusal, "") { return }
+	subagent_control_apply(member.team, member.name, &send.control)
+	if problem = acp_control_apply(&connection); !testing.expect_value(test, problem, "") { return }
+	reason, prompt_problem = acp_prompt(&connection, "Check switch.")
+	testing.expect_value(test, prompt_problem, "")
+	testing.expect_value(test, reason, "end_turn")
+	testing.expect_value(test, string(connection.answer[:]), "configured")
+	testing.expect_value(test, member.program.model, "model-b")
+	testing.expect_value(test, member.effort, "high")
 }

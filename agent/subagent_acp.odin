@@ -7,6 +7,7 @@ import "core:io"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 import "nabla:acp"
@@ -177,6 +178,8 @@ ACP_Connection :: struct {
 	next_id:       i64,
 	version:       int, // the ACP version the agent agreed to
 	session_id:    string,
+	opened:        ACP_Session_Opened, // borrowed from the thread's scratch memory
+	replaying:     bool,
 	answer:        [dynamic]u8, // the text of the agent's latest message since its last tool call
 	message_id:    string, // the latest message's id, owned; "" when the agent sends none
 	idle:          bool, // version 2: the agent reported its turn over
@@ -209,7 +212,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		subagent_fail(member, .Failed, problem)
 		return
 	}
-	if problem := acp_session_open(&connection); problem != "" {
+	if problem := acp_session_open(&connection, member.acp_session); problem != "" {
 		subagent_fail(member, acp_stopped(&connection) ? .Stopped : .Failed, problem)
 		return
 	}
@@ -218,7 +221,12 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		subagent_fail(member, .Failed, "the agent's session id could not be held")
 		return
 	}
-	member.acp_session = session_text
+
+	{
+		sync.mutex_guard(&member.team.mutex)
+		delete(member.acp_session, allocator)
+		member.acp_session = session_text
+	}
 
 	// The program has no Nabla session, so what the orchestrator sends it is read from the
 	// orchestrator's journal records, through a connection of its own.
@@ -231,13 +239,30 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	defer _ = journal.close(&store)
 
 	text := member.prompt
-	if member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
+	if !member.resumed && member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
 	// text is a copy this loop releases once its prompt is answered, after the first.
 	owned := false
-	after: journal.Journal_Seq
+	after := member.acp_after
+	if member.resumed {
+		records, read_error := journal.read_inbox(&store, member.session, after, context.temp_allocator)
+		if read_error != nil { subagent_fail(member, .Failed, "the subagent's inbox could not be read"); return }
+		if len(records) > 0 {
+			after = records[len(records) - 1].seq
+			lines, lines_error := make([]string, len(records), context.temp_allocator)
+			if lines_error != nil { subagent_fail(member, .Failed, "the orchestrator's message could not be held"); return }
+			for record, index in records { lines[index], _ = inbox_text(record) }
+			joined, join_error := strings.join(lines, "\n\n", allocator)
+			if join_error != nil { subagent_fail(member, .Failed, "the orchestrator's message could not be held"); return }
+			text, owned = joined, true
+		}
+	}
 	loop: for {
 		// Each prompt releases the temp memory its answers were decoded into.
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		if problem := acp_control_apply(&connection); problem != "" {
+			if owned { delete(text, allocator) }
+			subagent_fail(member, .Failed, problem); return
+		}
 		stop_reason, problem := acp_prompt(&connection, text)
 		if owned { delete(text, allocator) }
 		owned = false
@@ -253,6 +278,10 @@ subagent_acp_run :: proc(member: ^Subagent) {
 			subagent_fail(member, .Failed, reason)
 			return
 		}
+		if problem = acp_control_apply(&connection); problem != "" {
+			subagent_fail(member, .Failed, problem)
+			return
+		}
 		records, read_error := journal.read_inbox(&store, member.session, after, context.temp_allocator)
 		if read_error != nil {
 			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
@@ -260,7 +289,8 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		}
 		if len(records) == 0 { break loop }
 		after = records[len(records) - 1].seq
-		lines := make([]string, len(records), context.temp_allocator)
+		lines, lines_error := make([]string, len(records), context.temp_allocator)
+		if lines_error != nil { subagent_fail(member, .Failed, "the orchestrator's message could not be held"); return }
 		for record, index in records { lines[index], _ = inbox_text(record) }
 		joined, join_error := strings.join(lines, "\n\n", allocator)
 		if join_error != nil {
@@ -276,6 +306,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		subagent_fail(member, .Failed, "the agent's answer could not be held")
 		return
 	}
+	member.acp_after = after
 	member.status = .Completed
 	member.answer = answer_text
 }
@@ -410,10 +441,11 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 	connection^ = {}
 }
 
-// acp_session_open agrees on the protocol, preferring version 2, opens a session in the workspace,
+// acp_session_open initializes the connection, opens a new session or continues previous_session,
 // and chooses the model and effort among what the agent offers.
 @(private, require_results)
-acp_session_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
+acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") -> (problem: string) {
+	session_id := previous_session
 	member := connection.member
 	// Version 2 names the client in info; a version 1 agent answers with its own version and
 	// reads the missing clientCapabilities as no file system and no terminal.
@@ -423,8 +455,14 @@ acp_session_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 		info:             acp.Implementation `json:"info"`,
 	}
 	Initialized :: struct {
-		protocol_version: int `json:"protocolVersion"`,
-		info:             acp.Implementation `json:"info"`,
+		protocol_version:   int `json:"protocolVersion"`,
+		info:               acp.Implementation `json:"info"`,
+		agent_capabilities: struct {
+			load_session:         bool `json:"loadSession"`,
+			session_capabilities: struct {
+				resume: json.Value `json:"resume"`,
+			} `json:"sessionCapabilities"`,
+		} `json:"agentCapabilities"`,
 	}
 	initialized: Initialized
 	request := Initialize {
@@ -445,11 +483,44 @@ acp_session_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 		mcp_servers: []acp.MCP_Server `json:"mcpServers"`,
 	}
 	opened: ACP_Session_Opened
-	if problem = acp_call(connection, acp.METHOD_SESSION_NEW, New_Session{cwd = member.workspace}, &opened); problem != "" { return }
-	if opened.session_id == "" { return "the agent opened a session without an id" }
-	connection.session_id = strings.clone(opened.session_id, member.allocator)
+	if session_id == "" {
+		if problem = acp_call(connection, acp.METHOD_SESSION_NEW, New_Session{cwd = member.workspace}, &opened); problem != "" { return }
+		if opened.session_id == "" { return "the agent opened a session without an id" }
+		session_id = opened.session_id
+	} else {
+		method := acp.METHOD_SESSION_RESUME
+		_, supports_resume := initialized.agent_capabilities.session_capabilities.resume.(json.Object)
+		if connection.version == 1 && !supports_resume {
+			if !initialized.agent_capabilities.load_session { return "the ACP agent advertises neither sessionCapabilities.resume nor loadSession; its session cannot be resumed" }
+			method = acp.METHOD_SESSION_LOAD
+		}
+		Resume :: struct {
+			session_id:  string `json:"sessionId"`,
+			cwd:         string `json:"cwd"`,
+			mcp_servers: []acp.MCP_Server `json:"mcpServers"`,
+		}
+		connection.replaying = true
+		problem = acp_call(connection, method, Resume{session_id = session_id, cwd = member.workspace}, &opened)
+		connection.replaying = false
+		if problem != "" { return }
+	}
+	connection.session_id = strings.clone(session_id, member.allocator) or_else ""
+	if connection.session_id == "" { return "the agent's session id could not be held" }
+	connection.opened = opened
+	return acp_session_configure(connection, opened, member.program.model, member.effort)
+}
 
-	model := member.program.model
+@(private, require_results)
+acp_session_configure :: proc(
+	connection: ^ACP_Connection,
+	opened: ACP_Session_Opened,
+	model, requested_effort: string,
+	default_effort := true,
+) -> (
+	problem: string,
+) {
+	member := connection.member
+
 	if model != "" {
 		if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_MODEL); found && acp_option_value(option, model) != "" {
 			if problem = acp_set_option(connection, option, acp_option_value(option, model)); problem != "" { return }
@@ -468,14 +539,55 @@ acp_session_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	// An effort the agent does not offer is treated as one left out, as for a native subagent.
 	// When the agent shares no level with the orchestrator, its own default stays, since its
 	// lowest level may turn reasoning off.
-	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_EFFORT); found {
+	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_EFFORT); found && (default_effort || requested_effort != "") {
 		levels, levels_error := make([]string, len(option.options), context.temp_allocator)
 		if levels_error != nil { return "the agent's effort levels could not be held" }
 		for choice, index in option.options { levels[index] = choice.value }
-		effort := acp_option_value(option, member.effort)
+		effort := acp_option_value(option, requested_effort)
 		if effort == "" { effort = effort_step_down(member.program.parent_levels, levels, member.program.parent_effort) }
-		if effort != "" && effort != option.current_value {
+		if effort != "" {
 			if problem = acp_set_option(connection, option, effort); problem != "" { return }
+		}
+	}
+	return ""
+}
+
+@(private, require_results)
+acp_control_apply :: proc(connection: ^ACP_Connection) -> (problem: string) {
+	member := connection.member
+	control: Subagent_Control
+	{
+		sync.mutex_guard(&member.team.mutex)
+		control = member.control
+		member.control = {}
+	}
+	defer subagent_control_destroy(&control)
+	if !control.switching { return "" }
+	if refused := acp_session_configure(connection, connection.opened, control.acp_model, control.effort, false); refused != "" {
+		text := fmt.tprintf("Message from subagent %s: your request to switch model or effort was not applied: %s", member.name, refused)
+		// The ACP child owns no journal session. Feedback enters the parent's inbox as agent input.
+		sender: journal.Journal
+		if open_error := journal.open(&sender, member.store_directory, member.lock_directory, member.run, .Read_Write, member.allocator);
+		   open_error != nil { return "the refusal of a model switch could not be recorded" }
+		defer _ = journal.close(&sender)
+		if follow_error := journal.follow(&sender, member.parent_session); follow_error != nil { return "the refusal of a model switch could not be recorded" }
+		if append_error := journal.append_input(&sender, text, .Agent); append_error != nil { return "the refusal of a model switch could not be recorded" }
+
+		owner_wake_signal()
+		return ""
+	}
+
+	{
+		sync.mutex_guard(&member.team.mutex)
+		if control.acp_model != "" {
+			delete(member.program.model, member.allocator)
+			member.program.model = control.acp_model
+			control.acp_model = ""
+		}
+		if control.effort != "" {
+			delete(member.effort, member.allocator)
+			member.effort = control.effort
+			control.effort = ""
 		}
 	}
 	return ""
@@ -492,8 +604,8 @@ ACP_Config_Option :: struct {
 	options:       []acp.Config_Value `json:"options"`,
 }
 
-// ACP_Session_Opened is what session/new answers in either version. models is the
-// pre-standard model list some version 1 agents send.
+// ACP_Session_Opened is the configuration returned by session/new, session/resume, or session/load.
+// Only session/new returns session_id. models is the pre-standard list some version 1 agents send.
 @(private)
 ACP_Session_Opened :: struct {
 	session_id:     string `json:"sessionId"`,
@@ -616,7 +728,7 @@ acp_handle :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool 
 // message with a new id. It reports false when what it followed could not be held.
 @(private, require_results)
 acp_notification :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
-	if envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
+	if connection.replaying || envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
 	kind: acp.Session_Notification(acp.Update_Kind)
 	switch acp.params_decode(envelope.params, &kind, context.temp_allocator) {
 	case .None:

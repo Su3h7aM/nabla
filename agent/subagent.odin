@@ -80,6 +80,7 @@ Subagent :: struct {
 	wake:                         Tool_Wake,
 	parent_wake:                  ^os.File,
 	thread:                       ^thread.Thread, // background only
+	acp_after:                    journal.Journal_Seq,
 	acp_session:                  string, // the ACP agent's own session id; "" for a native subagent, whose session is session
 	status:                       Subagent_Status,
 	cause:                        string, // why the subagent did not complete; "" once it completed
@@ -91,6 +92,7 @@ Subagent :: struct {
 // provider, model, and effort, already resolved so a name that does not exist was refused at
 // dispatch, and a compaction. Its selection and effort are owned by allocator.
 Subagent_Control :: struct {
+	acp_model: string,
 	selection: Model_Selection,
 	effort:    string,
 	switching: bool,
@@ -101,6 +103,7 @@ Subagent_Control :: struct {
 // subagent_control_destroy releases the switch a control holds, if any.
 subagent_control_destroy :: proc(control: ^Subagent_Control) {
 	if control.switching {
+		delete(control.acp_model, control.allocator)
 		model_selection_destroy(&control.selection, control.allocator)
 		delete(control.effort, control.allocator)
 	}
@@ -290,15 +293,19 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 // subagent_reopen runs member again, on the same record, when it completed in the
 // background while a message to it waits unread in its inbox: the message arrived after the
 // run's last read, and a child that finished is otherwise never read again. It reports
-// whether it did. A child that failed, was stopped, answered a call as a blocking one, is an
-// ACP agent, or left workers outstanding is not reopened; its message stays in the journal
+// whether it did. A child that failed, was stopped, answered a call as a blocking one, or
+// left workers outstanding is not reopened; its message stays in the journal
 // for its next resume. Owner only.
 @(private, require_results)
 subagent_reopen :: proc(chat: ^Chat_Session, member: ^Subagent) -> bool {
-	if member.status != .Completed || !member.background || member.abandoned || member.program.name != "" { return false }
+	if member.status != .Completed || !member.background || member.abandoned { return false }
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	delivered, delivered_error := journal.last_delivered_message(chat.store, member.session)
-	if delivered_error != nil { return false }
+	delivered := member.acp_after
+	if member.program.name == "" {
+		latest, delivered_error := journal.last_delivered_message(chat.store, member.session)
+		if delivered_error != nil { return false }
+		delivered = latest
+	}
 	waiting, read_error := journal.read_inbox(chat.store, member.session, delivered, context.temp_allocator)
 	if read_error != nil || len(waiting) == 0 { return false }
 	team := member.team
@@ -340,7 +347,15 @@ subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 	chat_record(
 		chat,
 		{kind = .Subagent_Completed, call = member.parent_call, subagent = member.session},
-		journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[outcome], detail = member.cause, name = member.name},
+		journal.Subagent_Completed {
+			outcome = journal.TOOL_OUTCOME_NAMES[outcome],
+			detail = member.cause,
+			name = member.name,
+			acp_session = member.acp_session,
+			acp_after = member.acp_after,
+			acp_model = member.program.model,
+			acp_effort = member.effort if member.program.name != "" else "",
+		},
 		transmute([]u8)member.answer,
 	)
 }
@@ -449,6 +464,9 @@ subagent_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string
 // turn, which then starts from the orchestrator's selection as a new child does. The strings
 // are borrowed and valid until the start returns.
 Subagent_Resume :: struct {
+	program:     string,
+	acp_session: string,
+	after:       journal.Journal_Seq,
 	name:        string,
 	instruction: string,
 	provider_id: string,
@@ -536,6 +554,9 @@ subagent_start :: proc(
 		return nil, "the subagent could not be allocated"
 	}
 	if program.name != "" {
+		created.acp_session = strings.clone(resume.acp_session, allocator) or_else ""
+		if resume.acp_session != "" && created.acp_session == "" { return nil, "the agent's session id could not be held" }
+		created.acp_after = resume.after
 		wake, wake_error := tool_wake_open()
 		if wake_error != nil {
 			return nil, "the subagent's stop signal could not be created"
@@ -1034,7 +1055,22 @@ subagent_control_plan :: proc(team: ^Agent_Team, send: ^Agent_Send_Args) -> (ses
 		if !switching && !send.compact { return }
 		if member.program.name != "" {
 			if send.compact { return session, true, "ACP agents manage their own context" }
-			return session, true, fmt.tprintf("%s is an ACP agent and chooses its own model", send.agent)
+			if send.provider != "" { return session, true, "ACP agents choose their own provider; name only model and effort" }
+			wanted_model, wanted_effort := member.program.model, member.effort
+			if member.control.switching { wanted_model, wanted_effort = member.control.acp_model, member.control.effort }
+			if send.model != "" { wanted_model = send.model }
+			if send.effort != "" { wanted_effort = send.effort }
+			model, model_error := strings.clone(wanted_model, member.allocator)
+			effort, effort_error := strings.clone(wanted_effort, member.allocator)
+			if model_error != nil ||
+			   effort_error != nil { delete(model, member.allocator); delete(effort, member.allocator); return session, true, "the switch could not be held" }
+			send.control = {
+				acp_model = model,
+				effort    = effort,
+				switching = true,
+				allocator = member.allocator,
+			}
+			return
 		}
 		current, effort := &member.selection, member.effort
 		if member.control.switching { current, effort = &member.control.selection, member.control.effort }
@@ -1246,11 +1282,15 @@ subagent_outcome :: proc(completions: []journal.Record, start: journal.Record) -
 }
 
 Subagent_Child :: struct {
-	name:     string,
-	program:  string,
-	start:    journal.Record,
-	outcome:  journal.Tool_Outcome,
-	finished: bool,
+	acp_model:   string,
+	acp_effort:  string,
+	name:        string,
+	program:     string,
+	acp_session: string,
+	after:       journal.Journal_Seq,
+	start:       journal.Record,
+	outcome:     journal.Tool_Outcome,
+	finished:    bool,
 }
 
 // subagent_children reads this session's newest delegation for each child. The result
@@ -1280,12 +1320,27 @@ subagent_children :: proc(store: ^journal.Journal, session: journal.Session_Id) 
 		}
 		ended, finished := subagent_outcome(completions, record)
 		entry.outcome, entry.finished = ended, finished
+		for completion in completions {
+			if completion.call != record.call || completion.subagent != record.subagent { continue }
+			completed: journal.Subagent_Completed
+			if journal.payload_decode(completion.data, &completed, context.temp_allocator) == nil {entry.acp_model = completed.acp_model
+				entry.acp_effort = completed.acp_effort
+				entry.acp_session = completed.acp_session; entry.after = completed.acp_after}
+		}
 		never_started := finished && ended == .Not_Executed
 		replaced := false
 		for &candidate in known {
 			if candidate.name != started.name { continue }
 			replaced = true
-			if !never_started { candidate = entry }
+			if !never_started {
+				if entry.program != "" && entry.acp_session == "" && entry.start.subagent == candidate.start.subagent {
+					entry.acp_session = candidate.acp_session
+					entry.acp_model = candidate.acp_model
+					entry.acp_effort = candidate.acp_effort
+					entry.after = candidate.after
+				}
+				candidate = entry
+			}
 		}
 		if !replaced {
 			if _, err := append(&known, entry); err != nil { return nil, "the delegations could not be held" }
@@ -1323,7 +1378,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	target := known[found]
 	if target.program != "" {
 		if send.compact { return {}, "ACP agents manage their own context" }
-		return {}, fmt.tprintf("%s is an ACP agent (%s), and continuing an ACP agent is not supported; start a new one with agent_spawn", name, target.program)
+		if send.provider != "" { return {}, "ACP agents choose their own provider; name only model and effort" }
 	}
 	ended, finished := target.outcome, target.finished
 	if !finished { return {}, fmt.tprintf("%s has not finished", name) }
@@ -1334,6 +1389,18 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
 	}
 
+	if target.program != "" {
+		if target.acp_session == "" { return {}, "the ACP agent has no recorded session id to resume; start a new one with agent_spawn" }
+		send.resume = {
+			name        = name,
+			program     = target.program,
+			acp_session = target.acp_session,
+			after       = target.after,
+			model_id    = target.acp_model,
+			effort      = target.acp_effort,
+		}
+		return target.start.subagent, ""
+	}
 	latest, latest_found, latest_error := journal.read_latest(
 		chat.store,
 		{session = target.start.subagent, kinds = {.Turn_Started, .Selection_Applied}},
@@ -1373,7 +1440,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 // subagent_status_format renders the children of parent, or one child's journal status.
 // The text and problem live in temporary memory. Owner only; it changes no child state.
 @(private)
-subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_Id, name: string) -> (text, problem: string) {
+subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_Id, name: string, team: ^Agent_Team = nil) -> (text, problem: string) {
 	children, read_problem := subagent_children(store, parent)
 	if read_problem != "" { return "", read_problem }
 	listed: strings.Builder
@@ -1381,9 +1448,19 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 	target: Subagent_Child
 	found := false
 	hex: [journal.SESSION_ID_HEX_LENGTH]u8
-	for child in children {
+	for &child in children {
+		if team != nil {
+			sync.mutex_guard(&team.mutex)
+			if member := subagent_find(team, child.name); member != nil && member.program.name != "" {
+				cloned, clone_error := strings.clone(member.acp_session, context.temp_allocator)
+				if clone_error != nil { return "", "the ACP agent's session id could not be held" }
+				child.acp_session = cloned
+			}
+		}
 		status := subagent_outcome_status(child.outcome, child.finished)
-		fmt.sbprintf(&listed, "%s: %s, session %s\n", child.name, status, journal.session_id_to_hex(child.start.subagent, hex[:]))
+		fmt.sbprintf(&listed, "%s: %s, session %s", child.name, status, journal.session_id_to_hex(child.start.subagent, hex[:]))
+		if child.acp_session != "" { fmt.sbprintf(&listed, ", ACP session %s", child.acp_session) }
+		fmt.sbprintf(&listed, "\n")
 		if child.name == name { target, found = child, true }
 	}
 	if name == "" { return strings.to_string(listed), "" }
@@ -1398,6 +1475,7 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 		subagent_outcome_status(target.outcome, target.finished),
 		journal.session_id_to_hex(child_session, hex[:]),
 	)
+	if target.acp_session != "" { fmt.sbprintf(&block, "ACP session: %s\n", target.acp_session) }
 	turn, has_turn, turn_error := journal.read_latest(store, {session = child_session, kinds = {.Turn_Started}}, context.temp_allocator)
 	if turn_error != nil { return "", "the child's last turn could not be read" }
 	if has_turn {
