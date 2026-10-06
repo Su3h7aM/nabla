@@ -3,6 +3,7 @@ package client
 import "core:mem"
 import "core:net"
 import "core:os"
+import "core:time"
 
 import "core:crypto/x509"
 
@@ -19,6 +20,8 @@ Connection :: struct {
 	anchors:     []^x509.Certificate,
 	probe:       Probe,
 	ca_file:     string,
+	// idle_timeout bounds each wait for the peer's bytes. Zero waits indefinitely.
+	idle_timeout: time.Duration,
 	allocator:   mem.Allocator,
 	stop:        Transport_Stop,
 	nonblocking: bool,
@@ -56,7 +59,10 @@ connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem
 	connection.allocator = allocator
 	connection.probe = options.probe
 	connection.ca_file = options.ca_file
-	connection.nonblocking = options.probe.check != nil
+	connection.idle_timeout = options.idle_timeout
+	// An idle timeout needs the event loop as much as a probe does: a blocking read
+	// cannot be ended from outside.
+	connection.nonblocking = options.probe.check != nil || options.idle_timeout > 0
 
 	socket: net.TCP_Socket
 	if connection.nonblocking {
@@ -289,10 +295,15 @@ connection_read_socket :: proc(connection: ^Connection, buffer: []u8) -> (count:
 
 // connection_wait waits on the event loop until the socket is ready, or the
 // caller's probe ends the request. Cancellation is reported ahead of readiness,
-// so an accepted cancellation can never turn into a success.
+// so an accepted cancellation can never turn into a success. A wait for the peer's
+// bytes also ends when the connection's idle timeout passes; a wait to write does
+// not, since the idle timeout counts what the peer sends.
 connection_wait :: proc(connection: ^Connection, kind: Ready_For) -> Transport_Stop {
-	result, stop := wait_ready(connection.socket, kind, connection.probe)
+	timeout: time.Duration
+	if kind == .Read { timeout = connection.idle_timeout }
+	result, stop := wait_ready(connection.socket, kind, connection.probe, timeout)
 	if result == .Ready { return .None }
+	if result == .Expired { stop = .Idle }
 	if connection.stop == .None { connection.stop = stop }
 	return stop
 }

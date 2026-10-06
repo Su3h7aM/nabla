@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 @(test)
 test_lua_config_roundtrip :: proc(t: ^testing.T) {
@@ -265,6 +266,64 @@ test_lua_config_loads_subagents_max_running :: proc(t: ^testing.T) {
 		testing.expectf(t, detail == entry.detail, "%s: detail %q want %q", entry.name, detail, entry.detail)
 		testing.expectf(t, options.subagents_max_running == entry.want, "%s: got %d want %d", entry.name, options.subagents_max_running, entry.want)
 	}
+}
+
+@(test)
+test_lua_config_loads_stream_idle_timeout :: proc(t: ^testing.T) {
+	directory, directory_error := os.make_directory_temp("", "nabla-config-idle-*", context.allocator)
+	if !testing.expect_value(t, directory_error, nil) { return }
+	defer delete(directory, context.allocator)
+	defer testing.expect_value(t, os.remove_all(directory), nil)
+	cases := []struct {
+		name:    string,
+		body:    string,
+		present: bool,
+		want:    time.Duration,
+		invalid: bool,
+	} {
+		{"absent", `return { providers = { acme = {} } }`, false, 0, false},
+		{"set", `return { providers = { acme = { stream_idle_timeout_ms = 45000 } } }`, true, 45 * time.Second, false},
+		{"none", `return { providers = { acme = { stream_idle_timeout_ms = 0 } } }`, true, 0, false},
+		{"negative", `return { providers = { acme = { stream_idle_timeout_ms = -1 } } }`, false, 0, true},
+		{"string", `return { providers = { acme = { stream_idle_timeout_ms = "60" } } }`, false, 0, true},
+	}
+	for entry, index in cases {
+		path := fmt.aprintf("%s/%d.lua", directory, index, allocator = context.temp_allocator)
+		testing.expect(t, os.write_entire_file(path, transmute([]u8)entry.body) == nil)
+		sources, _, servers, err, detail := load_lua_config(path)
+		defer catalog_sources_destroy(&sources)
+		defer mcp_servers_destroy(&servers)
+		defer if detail != "" { delete(detail) }
+		if entry.invalid {
+			testing.expectf(t, err == .Invalid, "%s: got %v", entry.name, err)
+			testing.expectf(t, strings.has_prefix(detail, `providers["acme"].stream_idle_timeout_ms: expected`), "%s: detail %q", entry.name, detail)
+			continue
+		}
+		if !testing.expectf(t, err == .None && len(sources) == 1, "%s: got %v", entry.name, err) { continue }
+		testing.expectf(t, sources[0].stream_idle_timeout_present == entry.present, "%s: presence", entry.name)
+		testing.expectf(t, sources[0].stream_idle_timeout == entry.want, "%s: got %v", entry.name, sources[0].stream_idle_timeout)
+	}
+}
+
+// The timeout a request uses is the live catalog's: a stated value, including zero, wins,
+// and everything else gets the default.
+@(test)
+test_stream_idle_timeout_reads_the_live_catalog :: proc(t: ^testing.T) {
+	catalog := Catalog {
+		allocator = context.allocator,
+	}
+	defer delete(catalog.providers)
+	append(&catalog.providers, Catalog_Provider{id = "stated", stream_idle_timeout_present = true, stream_idle_timeout = 20 * time.Second})
+	append(&catalog.providers, Catalog_Provider{id = "off", stream_idle_timeout_present = true})
+	append(&catalog.providers, Catalog_Provider{id = "silent"})
+	ref := Catalog_Ref {
+		catalog = &catalog,
+	}
+	testing.expect_value(t, catalog_stream_idle_timeout(ref, "stated"), 20 * time.Second)
+	testing.expect_value(t, catalog_stream_idle_timeout(ref, "off"), time.Duration(0))
+	testing.expect_value(t, catalog_stream_idle_timeout(ref, "silent"), STREAM_IDLE_TIMEOUT_DEFAULT)
+	testing.expect_value(t, catalog_stream_idle_timeout(ref, "unknown"), STREAM_IDLE_TIMEOUT_DEFAULT)
+	testing.expect_value(t, catalog_stream_idle_timeout({}, "stated"), STREAM_IDLE_TIMEOUT_DEFAULT)
 }
 
 @(test)

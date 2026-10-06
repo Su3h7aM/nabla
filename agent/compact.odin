@@ -130,6 +130,8 @@ Compact_Snapshot :: struct {
 	model:             string, // owned
 	tools:             int,
 	session_id:        string, // owned
+	// idle_timeout is the provider's stream idle timeout when the snapshot was taken.
+	idle_timeout:      time.Duration,
 	parent_session_id: string, // owned; "" for a main session
 	user_agent:        string, // owned
 	base:              journal.Node_Id,
@@ -413,7 +415,8 @@ chat_compact_run :: proc(shared: ^Job) {
 		User_Agent         = job.snapshot.user_agent,
 	}
 	options := ai.Provider_Operation_Options {
-		interrupt = &job.interrupt,
+		interrupt    = &job.interrupt,
+		idle_timeout = job.snapshot.idle_timeout,
 	}
 	job.operation = ai.Provider_Request_Operation_Encoded(connection, request, job, chat_compact_event, options, job.allocator)
 	if job.operation.detail != "" && job.error_text == "" {
@@ -659,6 +662,7 @@ chat_compact_start :: proc(
 		return false
 	}
 	job.snapshot = snapshot
+	job.snapshot.idle_timeout = catalog_stream_idle_timeout(chat.catalog, chat.provider_id)
 
 	job.request = journal.next_request(chat.store)
 	identity, identity_ok := chat_compact_identity(chat, connection)

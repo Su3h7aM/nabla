@@ -66,7 +66,7 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 	if head_err != .None {
 		http.headers_destroy(&headers)
 		connection_destroy(connection)
-		return nil, failure_from_error(head_err, request.allocator)
+		return nil, failure_from_read(head_err, options, request.allocator)
 	}
 	summary.response_head_received = true
 	summary.status = status

@@ -66,6 +66,9 @@ Responses_WebSocket_Fixture_Mode :: enum {
 	// End the one connection without answering it: a peer that dropped a connection none of
 	// the response arrived on.
 	Silence,
+	// Read the request and then send nothing, holding the connection open until the client
+	// ends it: a peer that went quiet after the request.
+	Hold,
 }
 
 // Responses_WebSocket_Fixture is the test's own WebSocket server. It answers the upgrade,
@@ -167,10 +170,21 @@ responses_websocket_fixture_connection :: proc(fixture: ^Responses_WebSocket_Fix
 	if !responses_websocket_fixture_upgrade(socket) { return false }
 	fixture.connections += 1
 	if !responses_websocket_fixture_read_request(socket) { return false }
+	if fixture.mode == .Hold { return responses_websocket_fixture_hold(socket) }
 	if fixture.mode == .End_After_Answering {
 		if !responses_websocket_fixture_write_frame(socket, .Text, RESPONSES_WEBSOCKET_COMPLETION) { return false }
 	}
 	return responses_websocket_fixture_write_frame(socket, .Close, RESPONSES_WEBSOCKET_CLOSE)
+}
+
+// responses_websocket_fixture_hold waits for the client to end the connection, which is
+// the only thing that ends it. The wait is bounded so a client that never gives up fails
+// the test instead of holding the suite.
+responses_websocket_fixture_hold :: proc(socket: net.TCP_Socket) -> bool {
+	if net.set_option(socket, .Receive_Timeout, RESPONSES_WEBSOCKET_FIXTURE_BOUND) != .None { return false }
+	buffer: [64]u8
+	count, recv_err := net.recv_tcp(socket, buffer[:])
+	return recv_err == nil && count == 0
 }
 
 // responses_websocket_fixture_upgrade answers the upgrade: it reads the request head and
@@ -306,6 +320,8 @@ Responses_WebSocket_Case :: struct {
 	endpoint: string,
 	session:  ^Provider_WebSocket_Session,
 	encoded:  Provider_Encoded_Request,
+	// idle_timeout is the request option the case sends with.
+	idle_timeout: time.Duration,
 }
 
 // responses_websocket_case_open opens a session against the fixture on port and freezes the
@@ -372,7 +388,8 @@ responses_websocket_outcome_event :: proc(user_data: rawptr, event: Provider_Eve
 // the operation reported to observed. The outcome owns its error.
 responses_websocket_request_run :: proc(test_case: ^Responses_WebSocket_Case, observed: ^Transport_Observation, outcome: ^Responses_WebSocket_Outcome) {
 	options := Provider_Operation_Options {
-		observer = {user_data = observed, report = transport_observation_report},
+		observer     = {user_data = observed, report = transport_observation_report},
+		idle_timeout = test_case.idle_timeout,
 	}
 	outcome.error = Provider_WebSocket_Request(test_case.session, test_case.encoded, outcome, responses_websocket_outcome_event, options)
 }
@@ -441,4 +458,31 @@ test_responses_websocket_a_connection_that_never_answered_is_not_replaced :: pro
 	testing.expect_value(t, observed.reconnects, 0)
 	testing.expect_value(t, observed.chunks, 0)
 	testing.expect_value(t, fixture.connections, 1)
+}
+
+// A peer that goes quiet after the request is cut by the idle timeout, and the attempt
+// fails as an incomplete stream so the chain resends it.
+@(test)
+test_responses_websocket_a_silent_peer_is_cut_by_the_idle_timeout :: proc(t: ^testing.T) {
+	fixture: Responses_WebSocket_Fixture
+	if !responses_websocket_fixture_start(t, &fixture, .Hold) { return }
+	defer responses_websocket_fixture_stop(t, &fixture)
+
+	test_case, opened := responses_websocket_case_open(t, fixture.port)
+	defer responses_websocket_case_destroy(&test_case)
+	if !opened { return }
+	test_case.idle_timeout = 200 * time.Millisecond
+
+	observed: Transport_Observation
+	outcome: Responses_WebSocket_Outcome
+	started := time.tick_now()
+	responses_websocket_request_run(&test_case, &observed, &outcome)
+	elapsed := time.tick_since(started)
+	defer Provider_Operation_Error_Destroy(&outcome.error, context.allocator)
+
+	testing.expect_value(t, outcome.error.kind, Provider_Operation_Error_Kind.Stream)
+	testing.expect_value(t, outcome.error.failure_class, Provider_Failure_Class.Incomplete_Stream)
+	testing.expect(t, strings.contains(outcome.error.detail, "no bytes were received"), outcome.error.detail)
+	testing.expect_value(t, outcome.completions, 0)
+	testing.expectf(t, elapsed >= 200 * time.Millisecond && elapsed < RESPONSES_WEBSOCKET_FIXTURE_BOUND, "the peer was cut after %v", elapsed)
 }

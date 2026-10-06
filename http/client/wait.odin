@@ -48,6 +48,8 @@ Wait_Result :: enum {
 	Stopped,
 	// The wait itself failed.
 	Failed,
+	// The wait's own timeout passed before the socket was ready.
+	Expired,
 }
 
 // Connect_State is a dial operation's answer, taken out of the operation while its
@@ -126,24 +128,24 @@ on_poll_ready :: proc(op: ^nbio.Operation, state: ^Wait_State) {
 
 /*
 wait_ready blocks until `socket` is ready in the requested direction, the caller's
-probe ends the request, or the wait fails.
+probe ends the request, `timeout` passes, or the wait fails. A timeout of zero is no
+timeout, and an expired one reports .Expired with no stop: it is the wait's own bound,
+never the caller's deadline.
 
 Readiness comes from the event loop rather than from the caller, so the caller's
 probe only has to answer "keep going?", which is what makes it cheap enough to
 ask on every slice: the upper bound on cancellation latency is WAIT_SLICE.
 
-A connection whose probe is empty does blocking I/O and never waits here.
+A connection with neither a probe nor a timeout does blocking I/O and never waits here.
 */
-wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeout: time.Duration = 0) -> (result: Wait_Result, stop: Transport_Stop) {
-	if probe.check == nil { return .Ready, .None }
+wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeout: time.Duration) -> (result: Wait_Result, stop: Transport_Stop) {
+	if probe.check == nil && timeout <= 0 { return .Ready, .None }
 	if nbio.acquire_thread_event_loop() != nil { return .Failed, .Failed }
 	defer nbio.release_thread_event_loop()
 
 	event := nbio.Poll_Event.Receive
 	if kind == .Write { event = nbio.Poll_Event.Send }
 
-	// A timeout bounds this one wait, and is separate from the caller's own
-	// deadline, which reaches us through the probe.
 	attempt_deadline: time.Tick
 	bounded := timeout > 0
 	if bounded { attempt_deadline = time.tick_add(time.tick_now(), timeout) }
@@ -164,7 +166,7 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 			remaining := -time.tick_since(attempt_deadline)
 			if remaining <= 0 {
 				nbio.remove(op)
-				return .Stopped, .Timed_Out
+				return .Expired, .None
 			}
 			if remaining < slice { slice = remaining }
 		}
@@ -178,7 +180,7 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 	case .Ready:
 		return .Ready, .None
 	case .Timeout:
-		return .Stopped, .Timed_Out
+		return .Expired, .None
 	case .Invalid_Argument, .Error:
 		return .Failed, .Failed
 	}

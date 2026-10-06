@@ -106,7 +106,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 
 	head, headers, head_err := read_final_response_head(&reader, request.allocator, request.method)
 	defer http.headers_destroy(&headers)
-	if head_err != .None { return failure_from_error(head_err, request.allocator) }
+	if head_err != .None { return failure_from_read(head_err, options, request.allocator) }
 	status := head.code
 	summary.response_head_received = true
 	summary.status = status
@@ -173,7 +173,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 			refusal.cause = body_err
 			return refusal
 		}
-		return failure_from_error(body_err, request.allocator)
+		return failure_from_read(body_err, options, request.allocator)
 	}
 	if refusal.kind != .None { return refusal }
 
@@ -746,6 +746,10 @@ failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failu
 			kind = .Closed
 		case .Truncated:
 			kind = .Truncated
+		case .Idle_Timeout:
+			// The connection stopped carrying the response, which is a cut stream and
+			// not a deadline the caller set.
+			kind = .Truncated
 		case .TLS_Config, .TLS_Trust, .TLS_Hostname, .TLS_Peer_Rejected, .TLS_Handshake, .TLS_Read, .TLS_Write:
 			kind = .TLS
 		case .Invalid_URL:
@@ -765,6 +769,16 @@ failure_from_error :: proc(err: Error, allocator: mem.Allocator, override: Failu
 	return Failure{kind = kind, cause = err, detail = message}
 }
 
+// failure_from_read is failure_from_error for an error read off the response. An idle
+// expiry names how long the peer sent nothing, which error_text alone cannot say.
+@(require_results)
+failure_from_read :: proc(err: Error, options: Options, allocator: mem.Allocator) -> Failure {
+	if err != .Idle_Timeout { return failure_from_error(err, allocator) }
+	detail := fmt.aprintf("no bytes were received from the peer for %v", options.idle_timeout, allocator = allocator)
+	defer delete(detail, allocator)
+	return failure_from_error(err, allocator, detail = detail)
+}
+
 error_text :: proc(err: Error) -> string {
 	switch err {
 	case .None:
@@ -773,6 +787,8 @@ error_text :: proc(err: Error) -> string {
 		return "request cancelled"
 	case .Timed_Out:
 		return "request deadline exceeded"
+	case .Idle_Timeout:
+		return "no bytes were received from the peer within the idle timeout"
 	case .Closed:
 		return "connection closed before a response arrived"
 	case .Truncated:

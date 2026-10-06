@@ -2,6 +2,7 @@ package ai
 
 import "core:mem"
 import "core:net"
+import "core:time"
 
 import "nabla:http"
 import "nabla:http/client"
@@ -21,11 +22,13 @@ HTTP_Request :: struct {
 	allocator:   mem.Allocator,
 }
 
-// HTTP_Control is the caller's interruption policy for one request. Both are
-// optional; a zero value restores blocking I/O.
+// HTTP_Control is the caller's interruption policy for one request. Each is
+// optional; a zero value restores blocking I/O. idle_timeout is the longest the
+// response may go without a byte, and zero means no limit.
 HTTP_Control :: struct {
-	interrupt: ^Interrupt,
-	deadline:  Deadline,
+	interrupt:    ^Interrupt,
+	deadline:     Deadline,
+	idle_timeout: time.Duration,
 }
 
 // HTTP_Response_Facts is where one provider request reports what the transport saw
@@ -65,6 +68,7 @@ http_post_sse :: proc(
 	options := client.Options {
 		ca_file     = request.ca_file,
 		nameservers = request.nameservers,
+		idle_timeout = control.idle_timeout,
 	}
 	if control.interrupt != nil || control.deadline.active {
 		options.probe = {

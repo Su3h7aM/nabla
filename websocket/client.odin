@@ -255,6 +255,7 @@ upgraded_read :: proc(user_data: rawptr, buffer: []u8) -> (count: int, err: Erro
 	// The exchange's own classification is kept: an orderly end of stream is the
 	// peer's close, and a cancellation or a deadline is not.
 	if read_err == .Closed { return read, .Closed }
+	if read_err == .Idle_Timeout { return read, .Idle_Timeout }
 	if read_err != .None { return read, .Transport }
 	return read, .None
 }

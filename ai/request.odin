@@ -233,6 +233,13 @@ provider_encoded_request :: proc(request: Provider_Request, body: string, cache:
 Provider_Operation_Options :: struct {
 	interrupt:   ^Interrupt,
 	deadline:    Deadline,
+	// idle_timeout is the longest the response may go without a byte arriving, from the
+	// end of the request write to the end of the response. Any byte restarts it,
+	// keepalive comments and pings included. Zero means no timeout. An expiry fails the
+	// attempt as a cut stream, which is Incomplete_Stream and not Timed_Out: the
+	// deadline stays the caller's own bound. A WebSocket session applies the value it
+	// was dialed with.
+	idle_timeout: time.Duration,
 	// Empty uses the platform trust store. Credentialed HTTPS is never sent over
 	// an unverified connection, even when this is empty.
 	ca_file:     string,
@@ -506,7 +513,7 @@ Provider_Request_Operation_Encoded :: proc(
 			nameservers = options.nameservers,
 			allocator = allocator,
 		},
-		HTTP_Control{interrupt = options.interrupt, deadline = options.deadline},
+		HTTP_Control{interrupt = options.interrupt, deadline = options.deadline, idle_timeout = options.idle_timeout},
 		encoded.API,
 		facts,
 		options.observer,
@@ -706,6 +713,9 @@ provider_state_release :: proc(state: ^Provider_Request_Stream_State) {
 // a connection that broke, and sending again can succeed.
 provider_operation_error_kind :: proc(failure: client.Failure) -> Provider_Operation_Error_Kind {
 	if failure.cause == .TLS_Read || failure.cause == .TLS_Write { return .Transport }
+	// A peer that went silent opened a stream and never finished it, whichever phase
+	// the silence began in.
+	if failure.cause == .Idle_Timeout { return .Stream }
 	switch failure.kind {
 	case .Cancelled:
 		return .Cancelled

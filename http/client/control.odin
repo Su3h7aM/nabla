@@ -1,6 +1,7 @@
 package client
 
 import "core:net"
+import "core:time"
 
 import "nabla:http"
 
@@ -31,10 +32,17 @@ probe_now :: proc(probe: Probe) -> Wait_Status {
 // Options carries caller policy. An empty ca_file uses the platform trust store;
 // a value replaces it. TLS verification is always on. Empty nameservers use the
 // system resolver configuration.
+//
+// idle_timeout is the longest a response may go without a byte arriving, counted
+// from the end of the request write and restarted by every byte the peer sends,
+// whether it belongs to the head or the body. It covers neither the dial nor the
+// request write. Zero waits indefinitely, which is what a caller with no policy
+// of its own gets.
 Options :: struct {
 	probe:         Probe,
 	ca_file:       string,
 	nameservers:   []net.Endpoint,
+	idle_timeout:  time.Duration,
 	// observer, when set, is told once how the transfer ended and how many
 	// plaintext bytes it accepted. A zero observer observes nothing.
 	observer:      Transfer_Observer,
@@ -115,6 +123,9 @@ Error :: enum {
 	None,
 	Cancelled,
 	Timed_Out,
+	// Idle_Timeout is a response that sent no byte for the whole of Options.idle_timeout.
+	// It is not a deadline: the caller's own bound stays Timed_Out.
+	Idle_Timeout,
 	Closed,
 	Truncated,
 	Invalid_URL,
@@ -140,6 +151,7 @@ Transport_Stop :: enum {
 	None,
 	Cancelled,
 	Timed_Out,
+	Idle,
 	Peer_Closed,
 	Truncated,
 	Failed,
@@ -168,6 +180,8 @@ error_from_stop :: proc(stop: Transport_Stop) -> Error {
 		return .Cancelled
 	case .Timed_Out:
 		return .Timed_Out
+	case .Idle:
+		return .Idle_Timeout
 	case .Peer_Closed:
 		return .Closed
 	case .Truncated:

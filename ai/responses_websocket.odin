@@ -1,8 +1,10 @@
 package ai
 
+import "core:fmt"
 import "core:mem"
 import "core:nbio"
 import "core:strings"
+import "core:time"
 
 import "nabla:http/client"
 import "nabla:websocket"
@@ -15,6 +17,9 @@ Provider_WebSocket_Session :: struct {
 	connection: Provider_Connection,
 	socket:     ^websocket.Conn,
 	control:    HTTP_Control,
+	// idle_timeout is what the open socket was dialed with, and what an idle failure
+	// reports. It is zero while no socket is open.
+	idle_timeout: time.Duration,
 	allocator:  mem.Allocator,
 }
 
@@ -203,6 +208,10 @@ provider_websocket_exchange :: proc(
 		if read_err != .None {
 			provider_websocket_drop(session)
 			if reused && delivery == .Model_Send_Started && provider_websocket_ended(state, read_err) { return {}, true }
+			if read_err == .Idle_Timeout {
+				detail := fmt.tprintf("no bytes were received from the WebSocket peer for %v", session.idle_timeout)
+				return provider_websocket_error(state, read_err, detail, delivery), false
+			}
 			return provider_websocket_error(state, read_err, "the WebSocket response ended before a terminal event", delivery), false
 		}
 		if opcode != .Text {
@@ -274,6 +283,7 @@ provider_websocket_dial :: proc(
 	http_options := client.Options {
 		ca_file = options.ca_file,
 		nameservers = options.nameservers,
+		idle_timeout = options.idle_timeout,
 		probe = {check = http_probe, user_data = &session.control},
 	}
 	socket, failure := websocket.dial(endpoint, {http = http_options, headers = headers}, allocator)
@@ -300,6 +310,7 @@ provider_websocket_dial :: proc(
 		return result
 	}
 	session.socket = socket
+	session.idle_timeout = options.idle_timeout
 	return {}
 }
 
@@ -346,6 +357,8 @@ provider_websocket_error :: proc(
 	} else if deadline_expired(state.deadline) {
 		kind = .Timed_Out
 		failure_kind = .Timed_Out
+	} else if cause == .Idle_Timeout {
+		kind = .Stream
 	} else if cause == .Protocol {
 		kind = .Stream
 		failure_kind = .Invalid_Data

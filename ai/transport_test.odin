@@ -54,7 +54,14 @@ Fixture_Phase :: enum {
 	Declared,
 	// Send exactly the response the test wrote, then close. It is how a refusal and its fields are exercised without a second server.
 	Custom,
+	// Send the head, then keepalive comments one period apart, then the complete
+	// stream: a response that takes longer than a short idle timeout to finish but
+	// never goes quiet for that long.
+	Drip,
 }
+
+TRANSPORT_DRIP_PERIOD :: 100 * time.Millisecond
+TRANSPORT_DRIP_COUNT :: 7
 
 Transport_Fixture :: struct {
 	phase:          Fixture_Phase,
@@ -163,6 +170,14 @@ transport_fixture_serve :: proc(thread: ^thread.Thread) {
 		net.shutdown(socket, .Send)
 	case .Custom:
 		transport_fixture_write(socket, fixture.response)
+		net.shutdown(socket, .Send)
+	case .Drip:
+		transport_fixture_write(socket, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+		for _ in 0 ..< TRANSPORT_DRIP_COUNT {
+			time.sleep(TRANSPORT_DRIP_PERIOD)
+			transport_fixture_write(socket, ": keepalive\n\n")
+		}
+		transport_fixture_write(socket, TRANSPORT_RESPONSE_BODY)
 		net.shutdown(socket, .Send)
 	}
 }
@@ -906,4 +921,54 @@ test_transport_reports_a_request_that_never_left :: proc(t: ^testing.T) {
 		return
 	}
 	testing.fail_now(t, "the closed port kept being reused by another fixture")
+}
+
+// A response that goes silent after its head and a first event is cut by the idle
+// timeout, and fails as the incomplete stream a resend repairs, not as a deadline.
+@(test)
+test_a_silent_stream_is_cut_by_the_idle_timeout :: proc(t: ^testing.T) {
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Stall) { return }
+	defer transport_fixture_stop(&fixture)
+
+	job: Transport_Job
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
+	defer transport_job_destroy(&job, job.allocator)
+	job.options.idle_timeout = 200 * time.Millisecond
+
+	started := time.tick_now()
+	transport_job_start(&job)
+	transport_job_join(&job)
+	elapsed := time.tick_since(started)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.Stream)
+	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Incomplete_Stream)
+	testing.expect(t, strings.contains(job.error.detail, "no bytes were received"), job.error.detail)
+	testing.expect(t, strings.contains(job.error.detail, "200ms"), job.error.detail)
+	testing.expect_value(t, job.completions, 0)
+	testing.expectf(t, elapsed >= 200 * time.Millisecond && elapsed < TRANSPORT_FIXTURE_BOUND, "the stream was cut after %v", elapsed)
+}
+
+// Every byte restarts the idle timeout, keepalive comments included, so a stream that
+// takes longer than the timeout in total but never stays quiet for it is not cut.
+@(test)
+test_a_slow_stream_that_keeps_sending_is_not_cut :: proc(t: ^testing.T) {
+	fixture: Transport_Fixture
+	if !transport_fixture_start(t, &fixture, .Drip) { return }
+	defer transport_fixture_stop(&fixture)
+
+	job: Transport_Job
+	if !transport_job_init(t, &job, "localhost", fixture.port) { return }
+	defer transport_job_destroy(&job, job.allocator)
+	idle := 500 * time.Millisecond
+	job.options.idle_timeout = idle
+
+	started := time.tick_now()
+	transport_job_start(&job)
+	transport_job_join(&job)
+	elapsed := time.tick_since(started)
+
+	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.None)
+	testing.expect_value(t, job.completions, 1)
+	testing.expectf(t, elapsed > idle, "the response took %v, which does not exceed the %v idle timeout", elapsed, idle)
 }

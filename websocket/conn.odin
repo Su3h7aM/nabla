@@ -7,7 +7,8 @@ import "core:unicode/utf8"
 // Transport is how a connection reaches its peer. Both calls block until they moved
 // bytes, or the caller ended the wait: a read that moved none reports why, so a
 // cancellation or a deadline is never mistaken for the peer closing. `err` is one of
-// .None, .Closed for the peer's orderly end of the stream, or .Transport for the
+// .None, .Closed for the peer's orderly end of the stream, .Idle_Timeout for a peer
+// that sent nothing for as long as the transport allows, or .Transport for the
 // caller's own reason for stopping.
 //
 // release, when set, is called once by destroy, so a transport that owns what it
@@ -46,6 +47,9 @@ Error :: enum {
 	Closed,
 	// Abnormal_Closure is the underlying stream ending without a close frame.
 	Abnormal_Closure,
+	// Idle_Timeout is a peer that sent no byte for as long as the transport allows a
+	// read to wait.
+	Idle_Timeout,
 	No_Room,
 }
 

@@ -43,10 +43,27 @@ test_a_cancelled_wait_leaves_unrelated_work_alone :: proc(t: ^testing.T) {
 	defer nbio.remove(other_op)
 
 	start := time.tick_now()
-	result, stop := wait_ready(socket, .Read, {check = stop_at_once})
+	result, stop := wait_ready(socket, .Read, {check = stop_at_once}, 0)
 	elapsed := time.tick_since(start)
 	testing.expect_value(t, result, Wait_Result.Stopped)
 	testing.expect_value(t, stop, Transport_Stop.Cancelled)
 	testing.expect(t, elapsed < 2 * time.Second, "a cancelled wait blocked on unrelated work")
 	testing.expect(t, !other.done, "the unrelated operation was reaped by the wait")
+}
+
+// A wait's own timeout ends it as Expired with no stop, so the caller can tell a silent
+// peer from a probe that ended the request, and it does so with no probe at all.
+@(test)
+test_a_wait_with_a_timeout_expires_without_a_probe :: proc(t: ^testing.T) {
+	created, create_err := net.create_socket(.IP4, .UDP)
+	if !testing.expectf(t, create_err == nil, "the test socket could not be created: %v", create_err) { return }
+	socket := created.(net.UDP_Socket)
+	defer net.close(socket)
+
+	start := time.tick_now()
+	result, stop := wait_ready(socket, .Read, {}, 100 * time.Millisecond)
+	elapsed := time.tick_since(start)
+	testing.expect_value(t, result, Wait_Result.Expired)
+	testing.expect_value(t, stop, Transport_Stop.None)
+	testing.expect(t, elapsed >= 100 * time.Millisecond && elapsed < 2 * time.Second, "the wait did not end at its timeout")
 }

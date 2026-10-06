@@ -2,6 +2,8 @@ package agent
 
 import "core:mem"
 import "core:strings"
+import "core:sync"
+import "core:time"
 
 // Provider and model metadata: what a configuration source states, and what the runtime
 // reads once that configuration has been resolved.
@@ -123,6 +125,12 @@ Catalog_Provider_Source :: struct {
 	api:               string,
 	transport_present: bool,
 	transport:         Provider_Transport,
+	// stream_idle_timeout is the longest a response of this provider may go without a
+	// byte before the attempt is cut. Off by default (zero), because no provider
+	// documents an idle limit; the user opts in per provider. It restarts on every byte
+	// and never bounds the total time of a response.
+	stream_idle_timeout_present: bool,
+	stream_idle_timeout:         time.Duration,
 	// A literal secret, or `${NAME}` naming an environment variable. Resolved
 	// only when a connection is built, so no secret is ever held here.
 	api_key_present:   bool,
@@ -169,6 +177,8 @@ Catalog_Provider :: struct {
 	api_present:       bool,
 	transport:         Provider_Transport,
 	transport_present: bool,
+	stream_idle_timeout_present: bool,
+	stream_idle_timeout:         time.Duration,
 	api_key_present:   bool,
 	api_key:           string,
 }
@@ -196,6 +206,38 @@ catalog_find_provider :: proc(catalog: ^Catalog, id: string) -> (int, bool) {
 		if provider.id == id { return index, true }
 	}
 	return 0, false
+}
+
+// STREAM_IDLE_TIMEOUT_DEFAULT is how long a provider's response may go without a byte
+// before the attempt is cut, when the provider's configuration states no
+// `stream_idle_timeout_ms`. It is zero, which is no timeout: no provider documents an
+// idle limit, and a long request such as a compaction summary can legitimately stay
+// quiet for many minutes, so the harness imposes none until the user asks for one.
+STREAM_IDLE_TIMEOUT_DEFAULT :: time.Duration(0)
+
+// catalog_stream_idle_timeout reads the idle timeout of provider_id's responses from the
+// live catalog, so a configuration change reaches the next request. A catalog that is
+// not published, a provider it does not list, and a provider that states no value get
+// STREAM_IDLE_TIMEOUT_DEFAULT. Zero means no timeout, and no other bound is derived from
+// the value: it never limits how long a response may take in total.
+@(require_results)
+catalog_stream_idle_timeout :: proc(ref: Catalog_Ref, provider_id: string) -> time.Duration {
+	if ref.catalog == nil { return STREAM_IDLE_TIMEOUT_DEFAULT }
+	if ref.mutex != nil {
+		sync.mutex_lock(ref.mutex)
+		defer sync.mutex_unlock(ref.mutex)
+		return catalog_provider_idle_timeout(ref.catalog, provider_id)
+	}
+	return catalog_provider_idle_timeout(ref.catalog, provider_id)
+}
+
+@(private, require_results)
+catalog_provider_idle_timeout :: proc(catalog: ^Catalog, provider_id: string) -> time.Duration {
+	index, found := catalog_find_provider(catalog, provider_id)
+	if !found { return STREAM_IDLE_TIMEOUT_DEFAULT }
+	provider := &catalog.providers[index]
+	if !provider.stream_idle_timeout_present { return STREAM_IDLE_TIMEOUT_DEFAULT }
+	return provider.stream_idle_timeout
 }
 
 @(require_results)
@@ -404,6 +446,10 @@ catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: Catalog_Provider_Sou
 	if !dst.transport_present && src.transport_present {
 		dst.transport_present = true
 		dst.transport = src.transport
+	}
+	if !dst.stream_idle_timeout_present && src.stream_idle_timeout_present {
+		dst.stream_idle_timeout_present = true
+		dst.stream_idle_timeout = src.stream_idle_timeout
 	}
 	if !dst.api_key_present && src.api_key_present {
 		api_key, api_key_error := strings.clone(src.api_key, allocator)

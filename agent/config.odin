@@ -6,6 +6,7 @@ import "core:math"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:time"
 import lua "vendor:lua/5.4"
 
 // CONFIG_INSTRUCTIONS bounds how long the user's configuration Lua code may run.
@@ -441,6 +442,16 @@ load_provider :: proc(
 		}
 		delete(value, allocator)
 		out^.transport_present = true
+	}
+	lua.settop(state, base)
+	lua_field(state, idx, "stream_idle_timeout_ms")
+	if lua.type(state, -1) != .NIL {
+		milliseconds, ok := lua_int(state, -1)
+		if !ok {
+			return .Invalid, config_provider_field_detail(provider_id, "stream_idle_timeout_ms", "non-negative integer of milliseconds, 0 for none", state, -1, allocator)
+		}
+		out^.stream_idle_timeout = time.Duration(milliseconds) * time.Millisecond
+		out^.stream_idle_timeout_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "api_key")

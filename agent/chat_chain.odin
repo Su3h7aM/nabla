@@ -325,11 +325,13 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 		return
 	}
 
-	// The request carries interruption only. No deadline is set: it stays open as long as
-	// the provider keeps it open, and ends when the provider, the transport, or
-	// cancellation ends it.
+	// The request carries interruption and the provider's stream idle timeout, which is
+	// zero unless the user configured one, and no deadline: it stays open as long as the
+	// provider keeps it open, and ends when the provider, the transport, a configured
+	// idle expiry, or cancellation ends it.
 	options := ai.Provider_Operation_Options {
-		interrupt = &chat.stop,
+		interrupt    = &chat.stop,
+		idle_timeout = catalog_stream_idle_timeout(chat.catalog, chat.provider_id),
 	}
 	// The bytes this request sends are frozen once, before the first attempt, so every
 	// attempt of the chain sends exactly what the first would have sent instead of a fresh
