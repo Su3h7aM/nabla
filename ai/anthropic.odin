@@ -45,9 +45,6 @@ anthropic_encode_request :: proc(
 	// would either truncate an answer or silently pick a bound the model does not
 	// share.
 	if !request.Max_Output_Tokens_Present { return "", .Missing_Max_Output_Tokens }
-	for tool in request.Tools {
-		if !openai_tool_schema_valid(tool.Parameters_JSON) { return "", .Invalid_Tools }
-	}
 
 	cursor := encode_cursor(cache, allocator)
 	body, body_error := encode_body_begin(&cursor, allocator)

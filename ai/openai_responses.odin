@@ -46,9 +46,6 @@ openai_responses_encode_request_body :: proc(
 	Provider_Request_Error,
 ) {
 	if request_err := Provider_Validate_Request(request); request_err != .None { return "", request_err }
-	for tool in request.Tools {
-		if !openai_tool_schema_valid(tool.Parameters_JSON) { return "", .Invalid_Tools }
-	}
 
 	cursor := encode_cursor(cache, allocator)
 	body, body_error := encode_body_begin(&cursor, allocator)

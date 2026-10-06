@@ -1033,13 +1033,33 @@ test_request_failure_suppresses_retained_completion :: proc(t: ^testing.T) {
 	testing.expect_value(t, whole[0], "error:0")
 }
 
-// The provider boundary no longer judges the argument document; the agent does,
-// and it compares decoded keys. The schema check stays here because the
-// request encoder still requires an object-shaped schema.
+// No API limits how deeply a tool schema nests, so a deep schema from an MCP server is
+// written to the wire rather than refused.
 @(test)
-test_tool_args_reject_duplicates :: proc(t: ^testing.T) {
-	testing.expect(t, openai_tool_schema_valid(`{"type":"object","properties":{},"required":[],"additionalProperties":false}`))
-	testing.expect(t, !openai_tool_schema_valid(`[1]`))
+test_encode_accepts_deeply_nested_tool_schema :: proc(t: ^testing.T) {
+	nesting :: 40
+	schema := strings.concatenate(
+		{strings.repeat(`{"properties":{"n":`, nesting, context.temp_allocator), `{"type":"string"}`, strings.repeat(`}}`, nesting, context.temp_allocator)},
+		context.temp_allocator,
+	)
+	tools := []Provider_Tool_Def{{Name = "deep", Description = "A deeply nested schema.", Parameters_JSON = schema}}
+	messages := []Provider_Message{{Role = .User, Content = "Hi."}}
+	apis := [?]API_Kind{.OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages}
+	for api in apis {
+		request := Provider_Request {
+			API                       = api,
+			Model_Present             = true,
+			Model                     = "test-model",
+			Messages_Present          = true,
+			Messages                  = messages,
+			Tools                     = tools,
+			Max_Output_Tokens_Present = true,
+			Max_Output_Tokens         = 64,
+		}
+		body, err := Provider_Encode_Request(request, context.temp_allocator)
+		testing.expectf(t, err == .None, "%v refused a deep tool schema: %v", api, err)
+		testing.expectf(t, strings.contains(body, schema), "%v did not carry the schema", api)
+	}
 }
 
 // The output bound goes out in the field every current model accepts. The older

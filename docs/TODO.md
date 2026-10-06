@@ -6,7 +6,7 @@ Open work found in reviews. Each item names where the problem lives and the simp
 
 Each limit stays only if a protocol, API, provider, model, or the OS imposes it, and then its comment names the source.
 
-- `OPENAI_TOOL_SCHEMA_DEPTH = 16` (`ai/openai.odin`) is harness-invented. Nabla never sends `strict`, and neither OpenAI nor Anthropic documents a depth limit for non-strict tool schemas. Remove it. If strict mode is added later, apply OpenAI's strict-mode limits only when `strict` is sent.
+- If strict tool mode is added, apply OpenAI's strict-mode schema limits only when `strict` is sent.
 - `MAX_MESSAGE_DEPTH = 64` (`mcp/protocol.odin`): no protocol sets it, but RFC 8259 §9 permits a nesting limit, and `core:encoding/json` recurses without bound on peer input. Keep the guard, name that reason, and derive the error text from the constant.
 - The same unbounded recursion is unguarded where provider and ACP input is parsed: `acp/protocol.odin`, `ai/anthropic.odin`, `ai/openai_chat.odin`, `ai/openai_responses.odin`, `ai/classify.odin`, `mcp/tools.odin`. One shared guard, or an iterative parse, would cover all of them.
 - `db/error.odin` stores backend messages in a 128-byte inline buffer. SQLite has no such limit. Own the full message.
