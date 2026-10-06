@@ -15,7 +15,7 @@ TOOL_READ_NAME :: "builtin_read"
 
 TOOL_READ_DESCRIPTION :: `Read a text file and return a window of its lines. Use it to see a file before editing it and to continue a result that was cut off; to find text across many files, run a search command with builtin_shell instead of reading them all. Relative paths start at the session workspace, and absolute paths are used as given. Directories, binary files, and files that are not valid UTF-8 fail.
 
-offset is the first line, counting from 1 (default 1), and limit is the number of lines (default 2000). The result starts with path, first_line, line_count (lines returned), total_lines, and truncated, which is true when lines remain after the window; the text of the lines follows after a blank line. At most 32 KiB of one result is shown to you. When the window is longer, the text is cut at a line break and a notice gives the number of complete lines shown and the offset to continue from; call builtin_read again with that offset and a smaller limit. The notice also names a file that holds the whole result.`
+offset is the first line, counting from 1 (default 1), and limit is the number of lines (default 2000). The result starts with path, first_line, line_count (lines returned), total_lines, and truncated, which is true when lines remain after the window; the text of the lines follows after a blank line. At most %d KiB of one result is shown to you. When the window is longer, the text is cut at a line break and a notice gives the number of complete lines shown and the offset to continue from; call builtin_read again with that offset and a smaller limit. The notice also names a file that holds the whole result.`
 
 TOOL_READ_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"offset":{"type":["integer","null"],"description":"First line to read, counting from 1. Default: 1."},"limit":{"type":["integer","null"],"description":"Maximum number of lines to read. Default: 2000."}},"required":["path"],"additionalProperties":false}`
 
@@ -32,12 +32,29 @@ TOOL_READ_DEFINITION :: Tool_Definition {
 	execute = tool_read_execute,
 }
 
+// tool_read_definition returns the read tool with its preview size in the description.
+// The caller owns the description, allocated with allocator.
+@(require_results)
+tool_read_definition :: proc(allocator := context.allocator) -> Tool_Definition {
+	definition := TOOL_READ_DEFINITION
+	definition.description = fmt.aprintf(TOOL_READ_DESCRIPTION, TOOL_RESULT_PREVIEW_BYTES / 1024, allocator = allocator)
+	return definition
+}
+
 @(require_results)
 tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Read_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator) or_return
 	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
-	args.offset = tool_field_optional_int(arguments, "offset", 1, 1, max(int) / 2, &ctx.repairs, allocator = ctx.allocator) or_return
-	args.limit = tool_field_optional_int(arguments, "limit", TOOL_READ_DEFAULT_LINES, 1, max(int) / 2, &ctx.repairs, allocator = ctx.allocator) or_return
+	args.offset = tool_field_optional_int(arguments, "offset", 1, 1, TOOL_PAGE_MAX_VALUE, &ctx.repairs, allocator = ctx.allocator) or_return
+	args.limit = tool_field_optional_int(
+		arguments,
+		"limit",
+		TOOL_READ_DEFAULT_LINES,
+		1,
+		TOOL_PAGE_MAX_VALUE,
+		&ctx.repairs,
+		allocator = ctx.allocator,
+	) or_return
 	return
 }
 

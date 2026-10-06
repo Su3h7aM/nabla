@@ -248,6 +248,10 @@ patch_section_line :: proc(parser: ^Patch_Parser, line: string, line_number: int
 		file.move_to = patch_clean_path(rest)
 		return
 	}
+	// Added files may contain raw lines without '+' prefixes, including these markers.
+	if file.operation != .Add && strings.has_prefix(line, "*** ") && !strings.equal_fold(strings.trim_right_space(line), PATCH_END_OF_FILE) {
+		return fmt.tprintf("a patch whose line %d has a known marker, but got %q", line_number, line), nil
+	}
 	if strings.has_prefix(line, "\\") { return }
 
 	switch file.operation {

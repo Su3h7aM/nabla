@@ -461,6 +461,24 @@ test_patch_section_after_end_marker_writes_nothing :: proc(test: ^testing.T) {
 }
 
 @(test)
+test_patch_rejects_unknown_section_markers :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	for patch in ([]string{`{"patch":"*** Update File: code.txt\n@@\n-one\n+two\n*** Updat File: other.txt"}`, `{"patch":"*** Delete File: code.txt\n\n\n\n*** Delet File:"}`}) {
+		result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+		testing.expect_value(test, result.outcome, journal.Tool_Outcome.Invalid_Arguments)
+		testing.expect(test, strings.contains(result.content, "line 5"), result.content)
+	}
+
+	added := tool_run(test, &tool_test, TOOL_PATCH_NAME, `{"patch":"*** Add File: raw.txt\n*** Updat File: literal"}`)
+	testing.expect_value(test, added.outcome, journal.Tool_Outcome.Success)
+	path := strings.concatenate({tool_test.workspace, "/raw.txt"}, context.temp_allocator)
+	tool_file_is(test, path, "*** Updat File: literal\n")
+}
+
+@(test)
 test_patch_add_refuses_a_dangling_symlink :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
 	tool_test_begin(test, &tool_test)

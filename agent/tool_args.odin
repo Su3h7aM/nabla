@@ -3,6 +3,9 @@ package agent
 import "core:encoding/json"
 import "core:time"
 
+// TOOL_PAGE_MAX_VALUE keeps the sum of a page offset and limit representable as int.
+TOOL_PAGE_MAX_VALUE :: max(int) / 2
+
 // Tool_Kind names what a tool's arguments are, which is what tells the one reader in
 // tool_args_decode how to read the document a call arrived as. Custom is the zero value: a
 // definition whose arguments the harness does not read itself, such as an MCP tool, whose

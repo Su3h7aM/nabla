@@ -198,15 +198,19 @@ tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Re
 	// description until it has.
 	shell := tool_shell_definition(tool_shell_preferred(), allocator)
 	defer delete(shell.description, allocator)
+	read := tool_read_definition(allocator)
+	defer delete(read.description, allocator)
 	for definition in TOOL_DECLARED {
 		if add_error := tool_registry_add(&registry, definition); add_error.kind != .None {
 			tool_registry_destroy(&registry)
 			return {}, add_error
 		}
 	}
-	if add_error := tool_registry_add(&registry, shell); add_error.kind != .None {
-		tool_registry_destroy(&registry)
-		return {}, add_error
+	for definition in ([?]Tool_Definition{shell, read}) {
+		if add_error := tool_registry_add(&registry, definition); add_error.kind != .None {
+			tool_registry_destroy(&registry)
+			return {}, add_error
+		}
 	}
 	tool_registry_sort(&registry)
 	return registry, {}
@@ -541,14 +545,13 @@ AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session wor
 
 // TOOL_DECLARED is the native tools written as constants, in the order they are
 // registered. tool_registry_sort fixes the advertised order after this list is
-// read. The shell tool is not here: its description names the shell this process
-// will run, so tool_registry_make builds it. Only the shell states a timeout
+// read. The shell and read tools are not here: tool_registry_make builds their
+// descriptions with the shell and preview size. Only the shell states a timeout
 // policy; the file and skill tools carry a zero policy, which means no
 // tool-specific bound rather than a forgotten configuration.
 @(private)
 TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_PATCH_DEFINITION,
-	TOOL_READ_DEFINITION,
 	TOOL_WRITE_DEFINITION,
 	TOOL_LIST_SKILLS_DEFINITION,
 	TOOL_LOAD_SKILL_DEFINITION,
@@ -561,6 +564,6 @@ TOOL_DECLARED := [?]Tool_Definition {
 }
 
 // TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,
-// plus the shell tool, whose definition is built at run time.
+// plus the shell and read tools, whose definitions are built at run time.
 @(private)
-TOOL_NATIVE_COUNT :: len(TOOL_DECLARED) + 1
+TOOL_NATIVE_COUNT :: len(TOOL_DECLARED) + 2

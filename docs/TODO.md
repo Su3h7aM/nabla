@@ -21,23 +21,16 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 - ACP status and resume through `session/resume` (step 7). The ACP refusal of `compact` has no test.
 - An interrupted tool call can carry the output it produced so far. Writing shell streams to their kept file as they arrive would let recovery name that file in the `Unknown` result.
 
-## Tool descriptions
-
-- The read and write descriptions state the 32 KiB preview as a literal; build them from `TOOL_RESULT_PREVIEW_BYTES` as the shell description does.
-- Patch parsing: a mistyped header such as `*** Updat File:` inside a section becomes hunk content instead of an error naming the line.
-
 ## Simplifications
 
 - Process spawning is written three times: `mcp/stdio_process*`, `agent/tool_process*`, and `agent/subagent_acp_linux.odin`. A small `process` library package would remove about 350 lines. Needs a decision because it adds a package.
 - Clone-and-check ladders (`x, clone_error = strings.clone(...)`, then `if clone_error != nil`) remain in `agent/subagent.odin`. Return `mem.Allocator_Error` and use `or_return`; consider shared string storage only where it simplifies ownership and destruction.
 - `agent_team_make` unwinds two dynamic arrays that could grow lazily.
-- `agent/tool_agent.odin`: `fmt.tprintf("%s", x)` used as a clone; the same `member` and `agents` checks in three executors; one literal error repeated three times.
 
 ## Naming
 
 - Acronyms in type names: `Acp_Server`, `Mcp_Server`, `Mcp_Environment` beside `ACP_Agent_Config`, `MCP_Runtime`. Use the uppercase form, as `core:net` does with `TCP_Socket`.
 - `acp_serve.odin` and `acp_server.odin` differ by one letter; name them for their subjects.
-- Name the repeated `max(int) / 2` literal.
 - Use `sync.mutex_guard` where a lock covers a scoped block in `subagent.odin`.
 
 ## Architecture document drift

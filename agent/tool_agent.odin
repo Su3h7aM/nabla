@@ -157,6 +157,8 @@ tool_agent_stop_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (arg
 	return
 }
 
+TOOL_AGENT_DESCRIPTION_ALLOCATION_FAILURE :: "the description could not be built"
+
 // tool_registry_describe_agents names the configured ACP agents in the spawn tool's description,
 // so the model knows which it may start. agents is borrowed.
 @(require_results)
@@ -167,12 +169,12 @@ tool_registry_describe_agents :: proc(registry: ^Tool_Registry, agents: []ACP_Ag
 	}
 	if index < 0 { return {} }
 	parts, parts_error := make([dynamic]string, 0, 2 + 4 * len(agents), context.temp_allocator)
-	if parts_error != nil { return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = "the description could not be built"} }
+	if parts_error != nil { return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = TOOL_AGENT_DESCRIPTION_ALLOCATION_FAILURE} }
 	if describe_error := tool_agent_description_parts(&parts, agents); describe_error != nil {
-		return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = "the description could not be built"}
+		return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = TOOL_AGENT_DESCRIPTION_ALLOCATION_FAILURE}
 	}
 	description, allocation_error := strings.concatenate(parts[:], registry.allocator)
-	if allocation_error != nil { return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = "the description could not be built"} }
+	if allocation_error != nil { return {kind = .Allocation, tool = TOOL_AGENT_SPAWN_NAME, detail = TOOL_AGENT_DESCRIPTION_ALLOCATION_FAILURE} }
 	definition := &registry.definitions[index]
 	delete(definition.description, registry.allocator)
 	definition.description = description
@@ -184,8 +186,11 @@ tool_registry_describe_agents :: proc(registry: ^Tool_Registry, agents: []ACP_Ag
 @(private = "file", require_results)
 tool_agent_description_parts :: proc(parts: ^[dynamic]string, agents: []ACP_Agent_Config) -> mem.Allocator_Error {
 	append(parts, TOOL_AGENT_SPAWN_DESCRIPTION) or_return
-	if len(agents) == 0 { append(parts, " No ACP agents are configured, so leave acp_agent out.") or_return }
-	if len(agents) > 0 { append(parts, " Configured ACP agents:") or_return }
+	if len(agents) == 0 {
+		append(parts, " No ACP agents are configured, so leave acp_agent out.") or_return
+	} else {
+		append(parts, " Configured ACP agents:") or_return
+	}
 	for agent in agents {
 		append(parts, "\n- ", agent.name) or_return
 		if agent.description != "" { append(parts, ": ", agent.description) or_return }
@@ -235,9 +240,15 @@ tool_agent_started_output :: proc(member: ^Subagent, requested_effort: string) -
 @(private, require_results)
 tool_agent_launch :: proc(ctx: ^Tool_Context, member: ^Subagent, output: Agent_Output, verb: string) -> Tool_Result {
 	output := output
-	output.agent = fmt.tprintf("%s", output.agent)
-	output.model = fmt.tprintf("%s", output.model)
-	output.effort = fmt.tprintf("%s", output.effort)
+	for field in ([]^string{&output.agent, &output.model, &output.effort}) {
+		cloned, clone_error := strings.clone(field^, context.temp_allocator)
+		if clone_error != nil {
+			subagent_fail(member, .Failed, "the start result could not be allocated; nothing ran")
+			subagent_finish(member)
+			return tool_result_failure(ctx, .Tool_Failed, "the start result could not be allocated; nothing ran", "not started")
+		}
+		field^ = cloned
+	}
 	result := tool_result_success(ctx, output, fmt.tprintf("%s %s", output.agent, verb))
 	if result.allocation_failed {
 		subagent_fail(member, .Failed, "the start result could not be allocated; nothing ran")
