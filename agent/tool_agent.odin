@@ -84,6 +84,37 @@ Agent_Stop_Args :: struct {
 	agent: string,
 }
 
+TOOL_AGENT_STATUS_DEFINITION :: Tool_Definition {
+	name = "agent_status",
+	description = "Inspect this session's subagents without sending a message or changing their work. Leave agent out to list each child's name, status, and session. Name a child to see its status, session, last provider/model/effort, newest journal record and its age, last turn failure, and last committed Assistant text, marked partial when it is. A finished native child also shows the agent_send call that resumes it. The age of the last record helps distinguish a slow child from a stalled one. It reads the journal, so children no longer in memory remain visible. Unknown names list known children. Only the orchestrator can inspect subagents.",
+	input_schema = `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"Child id returned by agent_spawn. Leave out to list all children of this session."}},"additionalProperties":false}`,
+	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
+	placement = .Owner,
+	kind = .Agent_Status,
+	execute = tool_agent_status_execute,
+}
+
+Agent_Status_Args :: struct {
+	agent: string,
+}
+
+@(require_results)
+tool_agent_status_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Agent_Status_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, {"agent"}, allocator = ctx.allocator) or_return
+	args.agent = tool_field_optional_string(arguments, "agent", allocator = ctx.allocator) or_return
+	return
+}
+
+@(require_results)
+tool_agent_status_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
+	if ctx.status_store == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
+	args := arguments.(Agent_Status_Args)
+	text, problem := subagent_status_format(ctx.status_store, ctx.status_session, args.agent)
+	if problem != "" { return tool_result_failure(ctx, .Tool_Failed, problem, "not read") }
+	return tool_result_success(ctx, Agent_Status_Output{content = text}, "status")
+}
+
 @(require_results)
 tool_agent_spawn_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Agent_Spawn_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_AGENT_SPAWN_FIELDS, allocator = ctx.allocator) or_return

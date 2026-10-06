@@ -4,6 +4,7 @@ package agent
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:time"
 
@@ -13,6 +14,53 @@ import "nabla:ai"
 // SUBAGENT_TEST_MAX_RUNNING is the configured cap the queueing tests run under. It differs from
 // SUBAGENTS_MAX_RUNNING, so a test that passes proves the configured value is the one used.
 SUBAGENT_TEST_MAX_RUNNING :: 2
+
+@(test)
+test_agent_status_reads_running_and_finished_children :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, {agent_provider_reply("finished")}, deferred = true) { return }
+	defer agent_provider_stop(&provider)
+	provider.hold = 1
+	agent_provider_serve_now(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, nil)
+	chat.catalog = {catalog = &catalog.catalog}
+	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = strings.clone("test-provider", chat.allocator)
+	delete(chat.model_id, chat.allocator)
+	chat.model_id = strings.clone("test-model", chat.allocator)
+	agent_team_note_parent(chat)
+	_test_accept(test, chat, "start one")
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"answer"}`), journal.TOOL_OUTCOME_NAMES[.Success])
+	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)
+	for {
+		starts := _test_records(test, chat, {.Subagent_Started})
+		if len(starts) != 1 { testing.fail_now(test, "the child start was not recorded") }
+		latest, found, read_error := journal.read_latest(chat.store, {session = starts[0].subagent}, context.temp_allocator)
+		if read_error != nil { testing.fail_now(test, "the child journal could not be read") }
+		if found && latest.kind == .Request_Sent { break }
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(test, "the child did not send its request") }
+		time.sleep(time.Millisecond)
+	}
+	ctx := Tool_Context{allocator = context.allocator, agents = chat.team, status_store = chat.store, status_session = chat.session}
+	running := tool_agent_status_execute(&ctx, Agent_Status_Args{agent = "agent-1"})
+	defer tool_result_destroy(&running)
+	testing.expect_value(test, running.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(running.content, "status: running") && strings.contains(running.content, "last record: request.sent") && strings.contains(running.content, "age:"), running.content)
+	sync.sema_post(&provider.release)
+	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	finished := tool_agent_status_execute(&ctx, Agent_Status_Args{agent = "agent-1"})
+	defer tool_result_destroy(&finished)
+	testing.expect_value(test, finished.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(finished.content, "status: completed") && strings.contains(finished.content, `resume: agent_send({"agent":"agent-1","message":"Continue your task."})`), finished.content)
+}
 
 // subagent_test_call runs one call of the orchestrator through the job table, as a model's
 // proposal would be, so its admission, delegation records, and result are the real ones.

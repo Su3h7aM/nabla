@@ -493,7 +493,7 @@ subagent_start :: proc(
 	if tools_error.kind != .None { return nil, "the subagent tools could not be copied" }
 	for index := len(tools.definitions) - 1; index >= 0; index -= 1 {
 		definition := &tools.definitions[index]
-		if definition.kind == .Agent_Spawn || definition.kind == .Agent_Stop {
+		if definition.kind == .Agent_Spawn || definition.kind == .Agent_Stop || definition.kind == .Agent_Status {
 			tool_definition_destroy(definition, tools.allocator)
 			ordered_remove(&tools.definitions, index)
 		}
@@ -1005,6 +1005,55 @@ subagent_outcome :: proc(completions: []journal.Record, start: journal.Record) -
 	return .Unknown, false
 }
 
+Subagent_Child :: struct {
+	name: string,
+	program: string,
+	start: journal.Record,
+	outcome: journal.Tool_Outcome,
+	finished: bool,
+}
+
+// subagent_children reads this session's newest delegation for each child. The result
+// and its records live in temporary memory. Owner only.
+@(private)
+subagent_children :: proc(store: ^journal.Journal, session: journal.Session_Id) -> ([]Subagent_Child, string) {
+	filter := journal.Filter {
+		session = session,
+		kinds   = {.Subagent_Started},
+	}
+	starts, _, starts_error := journal.read_records(store, filter, 0, 0, context.temp_allocator)
+	filter.kinds = {.Subagent_Completed}
+	completions, _, completions_error := journal.read_records(store, filter, 0, 0, context.temp_allocator)
+	if starts_error != nil || completions_error != nil { return nil, "the delegations could not be read from the journal" }
+
+	// The newest start of a name says what the child is and how its last run began. A
+	// continuation that never started leaves the child as it was.
+	known := make([dynamic]Subagent_Child, context.temp_allocator)
+	for record in starts {
+		started: journal.Subagent_Started
+		if journal.payload_decode(record.data, &started, context.temp_allocator) != nil { continue }
+		entry := Subagent_Child {
+			name    = started.name,
+			program = started.program,
+			start   = record,
+			outcome = .Unknown,
+		}
+		ended, finished := subagent_outcome(completions, record)
+		entry.outcome, entry.finished = ended, finished
+		never_started := finished && ended == .Not_Executed
+		replaced := false
+		for &candidate in known {
+			if candidate.name != started.name { continue }
+			replaced = true
+			if !never_started { candidate = entry }
+		}
+		if !replaced {
+			if _, err := append(&known, entry); err != nil { return nil, "the delegations could not be held" }
+		}
+	}
+	return known[:], ""
+}
+
 // subagent_resume_plan finds the child send names among the delegations the orchestrator's
 // journal records, and fills send.resume with what continuing it needs: its instruction from
 // its newest start and the selection of its last turn. It returns the child's session, and
@@ -1016,41 +1065,8 @@ subagent_outcome :: proc(completions: []journal.Record, start: journal.Record) -
 subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agent_Send_Args) -> (child: journal.Session_Id, problem: string) {
 	name := send.agent
 	if !chat_journal_writable(chat) { return {}, "subagents are not available in this session" }
-	filter := journal.Filter {
-		session = chat.session,
-		kinds   = {.Subagent_Started},
-	}
-	starts, _, starts_error := journal.read_records(chat.store, filter, 0, 0, context.temp_allocator)
-	filter.kinds = {.Subagent_Completed}
-	completions, _, completions_error := journal.read_records(chat.store, filter, 0, 0, context.temp_allocator)
-	if starts_error != nil || completions_error != nil { return {}, "the delegations could not be read from the journal" }
-
-	// The newest start of a name says what the child is and how its last run began. A
-	// continuation that never started leaves the child as it was.
-	Known :: struct {
-		name:    string,
-		program: string,
-		start:   journal.Record,
-	}
-	known := make([dynamic]Known, context.temp_allocator)
-	for record in starts {
-		started: journal.Subagent_Started
-		if journal.payload_decode(record.data, &started, context.temp_allocator) != nil { continue }
-		entry := Known {
-			name    = started.name,
-			program = started.program,
-			start   = record,
-		}
-		ended, finished := subagent_outcome(completions, record)
-		never_started := finished && ended == .Not_Executed
-		replaced := false
-		for &candidate in known {
-			if candidate.name != started.name { continue }
-			replaced = true
-			if !never_started { candidate = entry }
-		}
-		if !replaced { append(&known, entry) }
-	}
+	known, read_problem := subagent_children(chat.store, chat.session)
+	if read_problem != "" { return {}, read_problem }
 	found := -1
 	for candidate, index in known {
 		if candidate.name == name { found = index }
@@ -1058,7 +1074,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	if found < 0 {
 		listed := make([dynamic]string, 0, len(known), context.temp_allocator)
 		for candidate in known {
-			ended, finished := subagent_outcome(completions, candidate.start)
+			ended, finished := candidate.outcome, candidate.finished
 			append(&listed, fmt.tprintf("%s (%s)", candidate.name, subagent_outcome_status(ended, finished)))
 		}
 		joined, _ := strings.join(listed[:], ", ", context.temp_allocator)
@@ -1069,7 +1085,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 		if send.compact { return {}, "ACP agents manage their own context" }
 		return {}, fmt.tprintf("%s is an ACP agent (%s), and continuing an ACP agent is not supported; start a new one with agent_spawn", name, target.program)
 	}
-	ended, finished := subagent_outcome(completions, target.start)
+	ended, finished := target.outcome, target.finished
 	if !finished { return {}, fmt.tprintf("%s has not finished", name) }
 	if ended == .Not_Executed {
 		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
@@ -1092,6 +1108,77 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	if problem != "" { return {}, problem }
 	send.resume = continued
 	return target.start.subagent, ""
+}
+
+// subagent_status_format renders the children of parent, or one child's journal status.
+// The text and problem live in temporary memory. Owner only; it changes no child state.
+@(private)
+subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_Id, name: string) -> (text, problem: string) {
+	children, read_problem := subagent_children(store, parent)
+	if read_problem != "" { return "", read_problem }
+	listed: strings.Builder
+	strings.builder_init(&listed, context.temp_allocator)
+	target: Subagent_Child
+	found := false
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	for child in children {
+		status := subagent_outcome_status(child.outcome, child.finished)
+		fmt.sbprintf(&listed, "%s: %s, session %s\n", child.name, status, journal.session_id_to_hex(child.start.subagent, hex[:]))
+		if child.name == name { target, found = child, true }
+	}
+	if name == "" { return strings.to_string(listed), "" }
+	if !found { return "", fmt.tprintf("no subagent named %q; the subagents of this session:\n%s", name, strings.to_string(listed)) }
+	child_session := target.start.subagent
+	block: strings.Builder
+	strings.builder_init(&block, context.temp_allocator)
+	fmt.sbprintf(&block, "agent: %s\nstatus: %s\nsession: %s\n", name, subagent_outcome_status(target.outcome, target.finished), journal.session_id_to_hex(child_session, hex[:]))
+	turn, has_turn, turn_error := journal.read_latest(store, {session = child_session, kinds = {.Turn_Started}}, context.temp_allocator)
+	if turn_error != nil { return "", "the child's last turn could not be read" }
+	if has_turn {
+		started: journal.Turn_Started
+		if journal.payload_decode(turn.data, &started, context.temp_allocator) != nil { return "", "the child's last selection could not be decoded" }
+		fmt.sbprintf(&block, "provider: %s\nmodel: %s\neffort: %s\n", turn.provider, turn.model, started.effort)
+	}
+	latest, has_latest, latest_error := journal.read_latest(store, {session = child_session}, context.temp_allocator)
+	if latest_error != nil { return "", "the child's newest journal record could not be read" }
+	if has_latest {
+		age_ms := max(i64(0), time.time_to_unix_nano(time.now()) / 1_000_000 - latest.time_ms)
+		fmt.sbprintf(&block, "last record: %s\nage: %.3f seconds\n", journal.RECORD_KIND_NAMES[latest.kind], f64(age_ms) / 1000)
+	}
+	completed, has_completed, completed_error := journal.read_latest(store, {session = child_session, kinds = {.Turn_Completed}}, context.temp_allocator)
+	if completed_error != nil { return "", "the child's last turn outcome could not be read" }
+	if has_completed && (!has_turn || completed.turn == turn.turn) {
+		outcome: journal.Turn_Completed
+		if journal.payload_decode(completed.data, &outcome, context.temp_allocator) != nil { return "", "the child's last turn outcome could not be decoded" }
+		fmt.sbprintf(&block, "last turn: %s\n", outcome.outcome)
+		if outcome.detail != "" {
+			fmt.sbprintf(&block, "last failure: %s\n", outcome.detail)
+		} else if outcome.outcome == journal.TURN_OUTCOME_NAMES[.Failed] {
+			rejected, has_rejected, rejection_error := journal.read_latest(store, {session = child_session, turn = completed.turn, kinds = {.Response_Rejected}}, context.temp_allocator)
+			if rejection_error != nil { return "", "the child's last provider failure could not be read" }
+			if has_rejected {
+				failure: journal.Response_Rejected
+				if journal.payload_decode(rejected.data, &failure, context.temp_allocator) != nil { return "", "the child's last provider failure could not be decoded" }
+				fmt.sbprintf(&block, "last failure: %s, status %d, provider code %s: %s\n", failure.failure_class, failure.status, failure.provider_code, failure.detail)
+			}
+		}
+	}
+	answer, has_answer, answer_error := journal.read_last_node(store, child_session, .Assistant, context.temp_allocator)
+	if answer_error != nil { return "", "the child's last Assistant text could not be read" }
+	if has_answer {
+		assistant: journal.Assistant
+		if journal.payload_decode(answer.data, &assistant, context.temp_allocator) != nil { return "", "the child's last Assistant text could not be decoded" }
+		fmt.sbprintf(&block, "Assistant%s:\n%s\n", " (partial)" if assistant.partial else "", string(answer.body))
+	}
+	delivered, delivered_error := journal.last_delivered_message(store, child_session)
+	if delivered_error != nil { return "", "the child's delivered messages could not be read" }
+	unread, inbox_error := journal.read_inbox(store, child_session, delivered, context.temp_allocator)
+	if inbox_error != nil { return "", "the child's unread messages could not be read" }
+	fmt.sbprintf(&block, "unread messages: %d\n", len(unread))
+	if target.finished && target.outcome != .Not_Executed && target.program == "" {
+		fmt.sbprintf(&block, "resume: agent_send(%s\"agent\":%q,\"message\":\"Continue your task.\"%s)\n", "{", name, "}")
+	}
+	return strings.to_string(block), ""
 }
 
 // subagent_stop asks a subagent to stop. Its outcome reaches the orchestrator like any other.

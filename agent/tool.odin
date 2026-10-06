@@ -84,6 +84,8 @@ Tool_Context :: struct {
 	// session. call is the id of the call being run, which is how such a tool names
 	// the boundary it was called at.
 	compact:          ^Compact_Control,
+	status_store:     ^journal.Journal, // borrowed by owner-placed agent_status
+	status_session:   journal.Session_Id,
 	call:             journal.Call_Id,
 	// repairs collects what reading the arguments changed in their values, which the owner
 	// records with the call and writes back into the arguments the call runs with.
@@ -555,6 +557,7 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_AGENT_SPAWN_DEFINITION,
 	TOOL_AGENT_SEND_DEFINITION,
 	TOOL_AGENT_STOP_DEFINITION,
+	TOOL_AGENT_STATUS_DEFINITION,
 }
 
 // TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,

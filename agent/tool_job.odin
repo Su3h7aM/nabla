@@ -408,9 +408,13 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// changes the context is owner-placed.
 	if definition.placement == .Owner { job.exec.compact = &chat.compact }
 	switch definition.kind {
-	case .Agent_Spawn, .Agent_Send, .Agent_Stop:
+	case .Agent_Spawn, .Agent_Send, .Agent_Stop, .Agent_Status:
 		job.exec.agents = chat.team if chat.member == nil else nil
 		job.exec.member = chat.member
+		if definition.kind == .Agent_Status {
+			job.exec.status_store = chat.store
+			job.exec.status_session = chat.session
+		}
 		// A blocking subagent holds its worker for its whole run, so each has a lane of its
 		// own and several run side by side.
 		if definition.kind == .Agent_Spawn { job.lane = job }
@@ -933,7 +937,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		opened = delegation.subagent != {}
 	case Agent_Send_Args:
 		opened = args.resume.name != ""
-	case Read_Args, Write_Args, Patch_Args, Shell_Args, List_Skills_Args, Load_Skill_Args, Codemode_Args, Agent_Stop_Args:
+	case Read_Args, Write_Args, Patch_Args, Shell_Args, List_Skills_Args, Load_Skill_Args, Codemode_Args, Agent_Stop_Args, Agent_Status_Args:
 	case nil:
 	}
 	if opened && !job.exec.subagent_started {

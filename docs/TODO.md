@@ -17,8 +17,8 @@ Provider error classification mostly matches the Anthropic and OpenAI documentat
 
 A subagent is a session like any other: the orchestrator can bring it back, inspect it, compact it, switch its model, and continue it.
 
-- Remaining recovery steps: `agent_status` and status acknowledgements (step 6), ACP status and resume through `session/resume` (step 7). The live-child and ACP refusals of `compact` have no test.
-- Liveness: the journal already records `request.sent`, `retry.scheduled`, and `provider.observed` per child. An `agent_send` acknowledgement can report the age and kind of the child's last record, so a stalled child is distinguishable from a slow one.
+- Live control of a running child (model switch, compaction, mid-turn messages) through the main session's own procedures.
+- ACP status and resume through `session/resume` (step 7). The ACP refusal of `compact` has no test.
 - An interrupted tool call can carry the output it produced so far. Writing shell streams to their kept file as they arrive would let recovery name that file in the `Unknown` result.
 
 ## Tool descriptions

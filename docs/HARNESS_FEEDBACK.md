@@ -7,15 +7,6 @@
 - Gap: the combined result was truncated, leaving relevant code out of the visible result.
 - Workaround: search for the specific procedures and read their bounded line ranges. The initial batch was too broad.
 
-## 2026-10-06 Recovering a subagent after provider quota exhaustion
-
-- Goal: finish an ACP multi-session change started by a subagent after its provider quota was exhausted, using an available model instead.
-- Attempt: sent the subagent a request to stop at a safe point and report its progress. The user observed no requests through the proxy, despite the harness listing the subagent as running. A stalled agent cannot produce the requested handoff.
-- Gap: the tools cannot resume a subagent with a different model or export its current conversation and progress for a replacement. Running status does not establish that requests are progressing. File edits survive in the shared workspace, but unreported reasoning, investigation, and decisions may be lost.
-- Workaround: stop the old subagent, preserve its existing edits, and start a replacement on an available model with the approved design and instructions to inspect and finish those edits. Add recover/resume with a model change and an accessible progress checkpoint, with explicit status when provider exhaustion prevents progress.
-
-The replacement also failed after exhausting its request retries because its WebSocket response ended before a terminal event. Its last reported checkpoint and shared-file edits could be handed to another replacement, but its unreported progress could not. Recovery should support transport/provider failures as well as quota exhaustion, and preserve the conversation without requiring a manual reconstruction from earlier reports.
-
 This file collects cases where Nabla's tools did not support what an agent or a person was trying to do. Each report becomes input for new features and fixes, and reports are consolidated and removed once their improvement lands.
 
 Add a report whenever you fall back to something the harness should have handled, above all a script run through the shell (Python, Perl, awk, sed) where Code Mode should have served. Code Mode runs Lua and calls the harness tools directly; it is meant to remove the need for any other scripting language.
