@@ -1,6 +1,7 @@
 package mcp
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 
@@ -132,11 +133,15 @@ ERROR_CODE_HEADER_MISMATCH :: -32020
 ERROR_CODE_MISSING_CLIENT_CAPABILITY :: -32021
 ERROR_CODE_UNSUPPORTED_PROTOCOL_VERSION :: -32022
 
-// MAX_MESSAGE_DEPTH is how deep a received message may nest. It protects the stack
-// rather than capping what a server may send: the parser recurses once per level, so a
-// deeper document would reach the stack before any later check could refuse it. The
-// bound is the operating system's stack, and nothing else about a message is bounded.
-MAX_MESSAGE_DEPTH :: 64
+// MAX_MESSAGE_DEPTH is how deep a received message may nest. Neither JSON-RPC 2.0 nor
+// MCP sets a limit, and RFC 8259 section 9 lets a receiver set one. This one is a stack
+// guard: core:encoding/json parses by recursing once per level with no bound of its
+// own, so a peer could overflow the thread's stack with a deep enough line. A tool's
+// input schema sits about four levels down in a tools/list reply and each schema level
+// can cost two or three (properties, items, anyOf), so the bound is set well above the
+// schemas real servers publish; at a few hundred bytes of frame per level, 256 levels
+// stay far inside the default thread stack.
+MAX_MESSAGE_DEPTH :: 256
 
 // MAX_STDERR_TAIL_BYTES is how much of a server's standard error the transport
 // keeps. It sizes the memory for a diagnostic stream: a stdio server can live for
@@ -432,7 +437,7 @@ message_decode :: proc(line: string, allocator := context.allocator) -> (message
 	switch problem := document_admit(line, MAX_MESSAGE_DEPTH, true); problem {
 	case .None:
 	case .Too_Deep:
-		return {}, error_make(.Malformed_Message, "it nests more than 64 levels deep", allocator = allocator)
+		return {}, error_make(.Malformed_Message, fmt.tprintf("it nests more than %d levels deep", MAX_MESSAGE_DEPTH), allocator = allocator)
 	case .Duplicate_Key:
 		return {}, error_make(.Malformed_Message, "it repeats a field name", allocator = allocator)
 	case .Not_Object, .Syntax:
