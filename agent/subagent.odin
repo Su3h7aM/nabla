@@ -11,11 +11,17 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 
+// SUBAGENTS_MAX_RUNNING is how many subagents run at once, native and ACP together. It is a
+// concurrency default, not a refusal: a background subagent started past it queues and starts
+// when a running one finishes, and a blocking subagent always runs on its caller's worker.
+SUBAGENTS_MAX_RUNNING :: 4
+
 Subagent_Status :: enum {
 	Running,
 	Completed,
 	Failed,
 	Stopped,
+	Queued,
 }
 
 subagent_status_names := [Subagent_Status]string {
@@ -23,6 +29,7 @@ subagent_status_names := [Subagent_Status]string {
 	.Completed = "completed",
 	.Failed    = "failed",
 	.Stopped   = "stopped",
+	.Queued    = "queued",
 }
 
 // The shared harness instructions precede this role and the caller-provided instruction.
@@ -56,6 +63,7 @@ Subagent :: struct {
 	// no more, so a message is either recorded by the subagent or refused to its sender.
 	inbox:                        Steer_Queue,
 	closed:                       bool,
+	admitted:                     bool, // holds one of team.running's slots; guarded by team.mutex
 	abandoned:                    bool,
 	// stop ends the subagent's work. It chains to the call that waits for it, or to the
 	// process interrupt for a background subagent.
@@ -78,6 +86,8 @@ Agent_Team :: struct {
 	members:   [dynamic]^Subagent,
 	started:   int,
 	starting:  int,
+	running:   int, // slots in use: running children, which a blocking child may take past SUBAGENTS_MAX_RUNNING
+	waiting:   [dynamic]^Subagent, // background children queued for a slot, oldest first
 	closing:   bool,
 	abandoned: bool,
 	inbox:     Steer_Queue,
@@ -114,6 +124,13 @@ agent_team_make :: proc(allocator: mem.Allocator) -> ^Agent_Team {
 		return nil
 	}
 	team.members = members
+	waiting, waiting_error := make([dynamic]^Subagent, allocator)
+	if waiting_error != nil {
+		delete(members)
+		free(team, allocator)
+		return nil
+	}
+	team.waiting = waiting
 	team.inbox = steer_queue_init(allocator)
 	return team
 }
@@ -265,7 +282,7 @@ subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 		detail, body = "", member.answer
 	case .Stopped:
 		outcome = .Cancelled
-	case .Failed, .Running:
+	case .Failed, .Running, .Queued:
 	}
 	chat_record(
 		chat,
@@ -285,6 +302,7 @@ agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := fal
 	team.closing = true
 	for member in team.members { subagent_request_stop(member) }
 	sync.mutex_unlock(&team.mutex)
+	subagent_stop_waiting(team)
 	owner_wake_signal()
 	began := time.tick_now()
 	deadline := time.tick_add(began, TOOL_JOBS_STOP_PATIENCE)
@@ -302,6 +320,7 @@ agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := fal
 	if retain || sync.atomic_load(&team.abandoned) { return false }
 	steer_queue_destroy(&team.inbox)
 	delete(team.members)
+	delete(team.waiting)
 	agent_parent_destroy(&team.parent, team.allocator)
 	free(team, team.allocator)
 	return true
@@ -512,11 +531,45 @@ subagent_select :: proc(
 	return selection, effort, ""
 }
 
-// subagent_launch starts a background subagent on a thread of its own. The watched signals are
-// blocked across creation, so the process handler never runs there.
+// subagent_launch starts a background subagent on a thread of its own, or queues it when
+// SUBAGENTS_MAX_RUNNING slots are in use. It returns false when the subagent neither started nor
+// queued; a failed thread creation leaves the slot held, which subagent_finish releases.
+// queued says the subagent waits for a slot: it may start, finish, and be released at any
+// moment after, so the caller must not touch member again.
 @(require_results)
-subagent_launch :: proc(member: ^Subagent) -> bool {
+subagent_launch :: proc(member: ^Subagent) -> (queued, ok: bool) {
+	team := member.team
 	member.stop.parent = &process_interrupt
+	sync.mutex_lock(&team.mutex)
+	// A closing team has already asked every member to stop, so this one starts only to end.
+	if team.running >= SUBAGENTS_MAX_RUNNING && !team.closing {
+		member.status = .Queued
+		_, append_error := append(&team.waiting, member)
+		sync.mutex_unlock(&team.mutex)
+		return append_error == nil, append_error == nil
+	}
+	team.running += 1
+	member.admitted = true
+	sync.mutex_unlock(&team.mutex)
+	return false, subagent_thread_start(member)
+}
+
+// subagent_take_slot counts a blocking subagent among the running ones, past the bound if need
+// be, until subagent_finish releases it.
+@(private)
+subagent_take_slot :: proc(member: ^Subagent) {
+	sync.mutex_guard(&member.team.mutex)
+	member.team.running += 1
+	member.admitted = true
+}
+
+// subagent_thread_start runs a subagent on a thread of its own. The watched signals are
+// blocked across creation, so the process handler never runs there. The thread is allocated
+// with the member's allocator because the caller may be a worker whose own allocator is
+// short-lived.
+@(private, require_results)
+subagent_thread_start :: proc(member: ^Subagent) -> bool {
+	context.allocator = member.allocator
 	previous := chat_signal_block_watched()
 	worker := thread.create(subagent_thread, name = "nabla-subagent")
 	chat_signal_restore(previous)
@@ -535,12 +588,37 @@ subagent_thread :: proc(worker: ^thread.Thread) {
 	subagent_finish(member, report = true)
 }
 
-// subagent_finish closes the subagent's inbox, reports its outcome to the orchestrator's inbox
-// when asked, and marks it done. It touches nothing after that.
+// subagent_finish closes the subagent's inbox, releases its slot, reports its outcome to the
+// orchestrator's inbox when asked, and marks it done. It then starts the queued subagents the
+// slot admits. A queued subagent whose thread cannot be created fails and is finished the same
+// way. It touches nothing of member after done.
 subagent_finish :: proc(member: ^Subagent, report: bool) {
+	next := subagent_conclude(member, report)
+	for next != nil {
+		if subagent_thread_start(next) { return }
+		subagent_fail(next, .Failed, "its thread could not be created")
+		next = subagent_conclude(next, report = true)
+	}
+}
+
+// subagent_conclude is subagent_finish without starting anything. It returns the queued
+// subagent the released slot now belongs to, or nil when there is none or the team is closing.
+@(private)
+subagent_conclude :: proc(member: ^Subagent, report: bool) -> (next: ^Subagent) {
 	team := member.team
 	sync.mutex_lock(&team.mutex)
 	member.closed = true
+	if member.admitted {
+		member.admitted = false
+		team.running -= 1
+		if len(team.waiting) > 0 && !team.closing {
+			next = team.waiting[0]
+			ordered_remove(&team.waiting, 0)
+			next.status = .Running
+			next.admitted = true
+			team.running += 1
+		}
+	}
 	sync.mutex_unlock(&team.mutex)
 	if report {
 		text: string
@@ -549,7 +627,7 @@ subagent_finish :: proc(member: ^Subagent, report: bool) {
 			text = fmt.tprintf("Subagent %s completed. Its answer:\n\n%s", member.name, member.answer)
 		case .Stopped:
 			text = fmt.tprintf("Subagent %s was stopped before it finished.", member.name)
-		case .Failed, .Running:
+		case .Failed, .Running, .Queued:
 			text = fmt.tprintf("Subagent %s failed: %s", member.name, member.answer)
 		}
 		// A report the inbox cannot take leaves the outcome in member, which the orchestrator's
@@ -558,6 +636,7 @@ subagent_finish :: proc(member: ^Subagent, report: bool) {
 	}
 	sync.atomic_store(&member.done, true)
 	owner_wake_signal()
+	return next
 }
 
 // Subagent_Answer keeps the text of the latest response, which is the final answer once the
@@ -758,15 +837,69 @@ subagent_send :: proc(team: ^Agent_Team, name, text: string) -> (session: journa
 }
 
 // subagent_stop asks a subagent to stop. Its outcome reaches the orchestrator like any other.
+// A queued subagent never starts: it is reported stopped at once.
 @(require_results)
 subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 	defer owner_wake_signal()
-	sync.mutex_guard(&team.mutex)
+	sync.mutex_lock(&team.mutex)
 	member := subagent_find(team, name)
-	if member == nil { return subagent_unknown(team, name) }
-	if member.closed { return fmt.tprintf("%s has already finished", name) }
+	if member == nil {
+		problem = subagent_unknown(team, name)
+		sync.mutex_unlock(&team.mutex)
+		return problem
+	}
+	if member.closed {
+		sync.mutex_unlock(&team.mutex)
+		return fmt.tprintf("%s has already finished", name)
+	}
+	if member.status == .Queued {
+		subagent_unqueue(team, member)
+		sync.mutex_unlock(&team.mutex)
+		subagent_end_unstarted(member)
+		return ""
+	}
 	subagent_request_stop(member)
+	sync.mutex_unlock(&team.mutex)
 	return ""
+}
+
+// subagent_unqueue takes a queued member out of team.waiting and marks it stopped, so no
+// release admits it. The caller holds team.mutex and then calls subagent_end_unstarted.
+@(private)
+subagent_unqueue :: proc(team: ^Agent_Team, member: ^Subagent) {
+	for waiting, index in team.waiting {
+		if waiting == member {
+			ordered_remove(&team.waiting, index)
+			break
+		}
+	}
+	member.status = .Stopped
+	member.closed = true
+}
+
+// subagent_end_unstarted reports a member that was unqueued. It had no thread and holds no
+// slot, so finishing it starts nothing.
+@(private)
+subagent_end_unstarted :: proc(member: ^Subagent) {
+	subagent_fail(member, .Stopped, "stopped before it started; not executed")
+	subagent_finish(member, report = true)
+}
+
+// subagent_stop_waiting ends every queued member as stopped. It is for a team that is closing,
+// where nothing queued may start.
+@(private)
+subagent_stop_waiting :: proc(team: ^Agent_Team) {
+	for {
+		sync.mutex_lock(&team.mutex)
+		if len(team.waiting) == 0 {
+			sync.mutex_unlock(&team.mutex)
+			return
+		}
+		member := team.waiting[0]
+		subagent_unqueue(team, member)
+		sync.mutex_unlock(&team.mutex)
+		subagent_end_unstarted(member)
+	}
 }
 
 // subagent_request_stop asks a subagent to stop and wakes it. The caller holds team.mutex.

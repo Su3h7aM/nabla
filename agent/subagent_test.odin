@@ -373,6 +373,100 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 	testing.expect(test, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
+// subagent_test_full_team points the orchestrator at catalog's one model and fills every
+// slot with children the test finishes itself.
+subagent_test_full_team :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Catalog, endpoint: string) {
+	subagent_test_catalog_add(catalog, "test-provider", "test-model", endpoint, nil)
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
+	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = strings.clone("test-provider", chat.allocator)
+	delete(chat.model_id, chat.allocator)
+	chat.model_id = strings.clone("test-model", chat.allocator)
+	agent_team_note_parent(chat)
+	chat.team.running = SUBAGENTS_MAX_RUNNING
+}
+
+// With every slot taken a background subagent queues instead of starting, and a slot freed by a
+// finishing child admits the oldest queued one first.
+@(test)
+test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	// The provider never answers, so an admitted child stays running until teardown.
+	if !agent_provider_start(test, &provider, {}) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_full_team(chat, &catalog, endpoint)
+	team := chat.team
+	tool_context := Tool_Context {
+		allocator = context.allocator,
+		agents    = team,
+	}
+	for _ in 0 ..< 2 {
+		started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "wait for instructions"})
+		defer tool_result_destroy(&started)
+		testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success)
+		testing.expect(test, strings.contains(started.content, "queued"), started.content)
+	}
+	first, second := team.members[0], team.members[1]
+	testing.expect(test, first.status == .Queued && first.thread == nil && second.status == .Queued && second.thread == nil)
+
+	holder := Subagent {
+		team     = team,
+		admitted = true,
+	}
+	subagent_finish(&holder, report = false)
+	testing.expect(test, first.status == .Running && first.thread != nil, "the oldest queued child takes the freed slot")
+	testing.expect(test, second.status == .Queued && second.thread == nil, "the next one keeps waiting")
+	testing.expect_value(test, team.running, SUBAGENTS_MAX_RUNNING)
+	holder.admitted = true
+	subagent_finish(&holder, report = false)
+	testing.expect(test, second.status == .Running && second.thread != nil, "the next freed slot admits the next child")
+}
+
+// A queued subagent that is stopped is reported stopped and never gets a thread.
+@(test)
+test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, {}) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_full_team(chat, &catalog, endpoint)
+	tool_context := Tool_Context {
+		allocator = context.allocator,
+		agents    = chat.team,
+	}
+	started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "never runs"})
+	defer tool_result_destroy(&started)
+	if !testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success) { return }
+	stopped := tool_agent_stop_execute(&tool_context, Agent_Stop_Args{agent = "agent-1"})
+	defer tool_result_destroy(&stopped)
+	testing.expect_value(test, stopped.outcome, journal.Tool_Outcome.Success)
+	member := chat.team.members[0]
+	testing.expect(test, member.status == .Stopped && member.thread == nil && len(chat.team.waiting) == 0)
+	testing.expect_value(test, member.answer, "stopped before it started; not executed")
+	message, queued := steer_pop(chat.inbox)
+	defer steer_line_free(chat.inbox, message)
+	testing.expect(test, queued && strings.contains(message, "agent-1 was stopped"))
+	testing.expect_value(test, agent_provider_request_count(&provider), 0)
+	testing.expect_value(test, chat.team.running, SUBAGENTS_MAX_RUNNING)
+}
+
 @(test)
 test_acp_next_reports_a_malformed_json_rpc_frame :: proc(test: ^testing.T) {
 	member := Subagent {

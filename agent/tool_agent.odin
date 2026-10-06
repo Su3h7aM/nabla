@@ -166,22 +166,36 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	}
 	if !args.wait {
 		// Copy the reply before launch: a fast child can finish and be reaped immediately.
+		// The texts that borrow from member are copied too, for the queued reply below.
+		output.agent = fmt.tprintf("%s", member.name)
+		output.effort = fmt.tprintf("%s", output.effort)
+		output.model = fmt.tprintf("%s", output.model)
 		result := tool_result_success(ctx, output, fmt.tprintf("%s started", output.agent))
 		if result.allocation_failed {
 			subagent_fail(member, .Failed, "the start result could not be allocated; nothing ran")
 			subagent_finish(member, report = false)
 			return result
 		}
-		if !subagent_launch(member) {
+		queued_summary := fmt.tprintf("%s queued", output.agent)
+		queued, launched := subagent_launch(member)
+		if !launched {
 			tool_result_destroy(&result)
 			subagent_fail(member, .Failed, "its thread could not be created")
 			subagent_finish(member, report = false)
 			return tool_result_failure(ctx, .Tool_Failed, "the subagent's thread could not be created", "not started")
 		}
+		// member may be gone by now, so the reply of a child that waits for a slot is rebuilt
+		// from the copies.
+		if queued {
+			tool_result_destroy(&result)
+			output.status = subagent_status_names[.Queued]
+			return tool_result_success(ctx, output, queued_summary)
+		}
 		return result
 	}
 
 	// A blocking subagent stops with this call.
+	subagent_take_slot(member)
 	member.stop.parent = ctx.control.interrupt
 	member.parent_wake = ctx.control.wake
 	subagent_run(member)
@@ -194,7 +208,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		result = tool_result_success(ctx, output, fmt.tprintf("%s completed", output.agent))
 	case .Stopped:
 		result = tool_result_of(ctx, .Cancelled, member.answer, output, "stopped")
-	case .Failed, .Running:
+	case .Failed, .Running, .Queued:
 		result = tool_result_of(ctx, .Tool_Failed, member.answer, output, "failed")
 	}
 	// The result owns its copies, so the member may be released once it is done.
