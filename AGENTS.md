@@ -63,7 +63,9 @@ Before committing a code change, run `mise run fmt`, `mise run check`, and the t
 
 Run tests only through `mise run test [package] [--debug-only | --release-only] [--sanitize <kind>]`, never through `odin test` directly. The task runs each suite in its own PID namespace, so every process a test starts ends with the suite, whether it passed, failed, or timed out.
 
-Read, search, and edit through the dedicated tools; use the shell for builds, tests, scripts, and pipelines.
+Read, search, and edit through the dedicated tools; use the shell for builds, tests, version control, and pipelines.
+
+For computation, file processing, and multi-tool workflows, use Code Mode (Lua) instead of Python, Perl, or another scripting language run through the shell. When Code Mode or another harness tool cannot do what you need and you fall back, add a report to `docs/HARNESS_FEEDBACK.md`: what you tried to do, why the tool fell short, and how you did it instead.
 
 ## Version control
 
