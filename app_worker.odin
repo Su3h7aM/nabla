@@ -1,7 +1,9 @@
 #+build linux
 package main
 
+import "base:runtime"
 import "core:fmt"
+import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
@@ -134,17 +136,65 @@ work_destroy :: proc(app: ^App, work: Work) {
 	}
 }
 
+// Listed_Session is one row of the /resume menu before it is copied into the snapshot: a
+// main session, or a subagent session under the one that started it. The summary and the name
+// are borrowed.
+Listed_Session :: struct {
+	summary: ^journal.Session_Summary,
+	name:    string, // the child's name from its parent's subagent.started; "" for a main session
+	child:   bool,
+}
+
+// session_listing orders sessions for the /resume menu: each main session, newest activity
+// first, followed by the subagent sessions it started, each with the name its parent's
+// subagent.started gave it. A name that cannot be read leaves the child unnamed. The result
+// and the names live in temporary memory and borrow sessions.
+session_listing :: proc(store: ^journal.Journal, sessions: []journal.Session_Summary) -> []Listed_Session {
+	listed := make([dynamic]Listed_Session, context.temp_allocator)
+	for &entry in sessions {
+		if entry.role != .Main { continue }
+		append(&listed, Listed_Session{summary = &entry})
+		starts: []journal.Record
+		loaded := false
+		for &child in sessions {
+			if child.role != .Subagent || child.parent_session != entry.id { continue }
+			if !loaded {
+				loaded = true
+				read_error: journal.Error
+				starts, _, read_error = journal.read_records(store, {session = entry.id, kinds = {.Subagent_Started}}, 0, 0, context.temp_allocator)
+				if read_error != nil { starts = nil }
+			}
+			name := ""
+			for start in starts {
+				if start.subagent != child.id { continue }
+				started: journal.Subagent_Started
+				if journal.payload_decode(start.data, &started, context.temp_allocator) == nil { name = started.name }
+			}
+			append(&listed, Listed_Session{summary = &child, name = name, child = true})
+		}
+	}
+	return listed[:]
+}
+
+// session_row_title is the text a menu row shows for entry: a main session's title, or a
+// child's name with its title. The title is owned by allocator.
+session_row_title :: proc(entry: Listed_Session, allocator: mem.Allocator) -> (string, mem.Allocator_Error) {
+	title := entry.summary.title
+	if !entry.child { return strings.clone(title, allocator) }
+	name := entry.name if entry.name != "" else "subagent"
+	if title == "" { return strings.clone(name, allocator) }
+	return strings.concatenate({name, ": ", title}, allocator)
+}
+
 // session_refresh_rows rebuilds the list the /resume menu shows. Only the worker
 // calls it, so the store is never read from two threads.
 session_refresh_rows :: proc(app: ^App) {
 	if app.setup.session.store == nil { return }
-	filter := journal.Session_Filter {
-		workspace = app.setup.workspace,
-		role      = .Main,
-	}
-	sessions, list_error := journal.list_sessions(app.setup.store, filter, app.run.alloc)
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	sessions, list_error := journal.list_sessions(app.setup.store, {workspace = app.setup.workspace}, app.run.alloc)
 	if list_error != nil { return }
 	defer journal.session_summaries_destroy(sessions, app.run.alloc)
+	listed := session_listing(app.setup.store, sessions)
 
 	sync.mutex_lock(&app.run.mu)
 	defer sync.mutex_unlock(&app.run.mu)
@@ -152,15 +202,15 @@ session_refresh_rows :: proc(app: ^App) {
 		delete(row.title, app.run.alloc)
 	}
 	clear(&app.run.snap.sessions)
-	for &entry in sessions {
-		title, title_error := strings.clone(entry.title, app.run.alloc)
+	for entry in listed {
+		title, title_error := session_row_title(entry, app.run.alloc)
 		if title_error != nil {
 			// A row without its title would read as a session that has none, so
 			// the row is left out rather than mislabeled.
 			snap_report_dropped_locked(app)
 			continue
 		}
-		if _, append_error := append(&app.run.snap.sessions, Session_Row{id = entry.id, title = title}); append_error != nil {
+		if _, append_error := append(&app.run.snap.sessions, Session_Row{id = entry.summary.id, title = title, child = entry.child}); append_error != nil {
 			delete(title, app.run.alloc)
 			snap_report_dropped_locked(app)
 			break
@@ -236,7 +286,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			if record_error != nil {
 				detail := journal.error_text(record_error, context.temp_allocator)
 				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", detail))
-			} else if session_record_error := selection_applied_record(
+			} else if session_record_error := agent.chat_selection_record(
 				&app.setup.session,
 				app.setup.api,
 				app.setup.provider_id,
@@ -443,8 +493,8 @@ app_takeover :: proc(app: ^App, observer: agent.Chat_Observer) {
 	_ = app_follow_poll(app, observer)
 	recovery := opened.recovery
 	own_queued := opened.own_queued
-	if !session_install(setup, &opened) {
-		app_takeover_abort(app, "the tool registry could not be allocated")
+	if problem := session_install(setup, &opened); problem != "" {
+		app_takeover_abort(app, problem)
 		return
 	}
 	snap_append(app, .Notice, "the session's process ended; this one runs it now")
@@ -488,8 +538,8 @@ app_catalog_ref :: proc(app: ^App) -> agent.Catalog_Ref {
 	return {catalog = &app.setup.catalog, mutex = &app.catalog_mu}
 }
 
-// session_resume switches to the session a full id or an unambiguous prefix
-// names, then shows the tail of its conversation. The menu always names a whole
+// session_resume switches to the session, a main session or a subagent's, a full id or an
+// unambiguous prefix names, then shows the tail of its conversation. The menu always names a whole
 // id; the prefix form exists for typing, and an ambiguous one is refused rather
 // than guessed.
 session_resume :: proc(app: ^App, reference: string) {
@@ -497,7 +547,7 @@ session_resume :: proc(app: ^App, reference: string) {
 		snap_append(app, .Notice, "usage: /resume <session id or prefix>")
 		return
 	}
-	sessions, list_error := journal.list_sessions(app.setup.store, {workspace = app.setup.workspace, role = .Main}, app.run.alloc)
+	sessions, list_error := journal.list_sessions(app.setup.store, {workspace = app.setup.workspace}, app.run.alloc)
 	if list_error != nil {
 		detail := journal.error_text(list_error, context.temp_allocator)
 		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", detail))
@@ -545,8 +595,8 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 		return false
 	}
 	recovery := opened.recovery
-	if !session_install(setup, &opened) {
-		snap_append(app, .Error, "the tool registry could not be allocated")
+	if problem := session_install(setup, &opened); problem != "" {
+		snap_append(app, .Error, problem)
 		_ = app_watch_sync(setup)
 		return false
 	}

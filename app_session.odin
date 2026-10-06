@@ -304,8 +304,8 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		return false
 	}
 	report_recovery(opened.recovery, opened.queued)
-	if !session_install(setup, &opened) {
-		fmt.wprintln(stderr, "nabla: the tool registry could not be allocated")
+	if problem := session_install(setup, &opened); problem != "" {
+		fmt.wprintln(stderr, "nabla:", problem)
 		return false
 	}
 	return true
@@ -572,15 +572,23 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 
 // session_install makes opened the running session in place of the one running,
 // whose chat and journal it releases after the target chat initializes. It takes
-// everything opened owns and leaves it zero. False leaves the running session intact.
-// An opened session that carries the running store, as a takeover does, keeps it open.
+// everything opened owns and leaves it zero. A problem, static text, leaves the running session
+// intact. An opened session that carries the running store, as a takeover does, keeps it open.
+// The new session takes the instructions and tools of its role, so a subagent session opened
+// here is the agent its orchestrator ran.
 @(require_results)
-session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
+session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem: string) {
 	new_session, tool_error := agent.chat_session_init(opened.store, opened.id, opened.branch, opened.head, opened.workspace, setup.alloc)
 	if tool_error.kind != .None {
 		if opened.store == setup.store { opened.store = nil }
 		opened_session_destroy(opened, setup.alloc)
-		return false
+		return "the tool registry could not be allocated"
+	}
+	if role_problem := agent.chat_session_role_setup(&new_session, &new_session.tools); role_problem != "" {
+		agent.chat_session_destroy(&new_session)
+		if opened.store == setup.store { opened.store = nil }
+		opened_session_destroy(opened, setup.alloc)
+		return role_problem
 	}
 
 	if setup.store != nil {
@@ -613,7 +621,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> bool {
 	if watch_error := app_watch_sync(setup); watch_error != nil {
 		agent.chat_runtime_message(&setup.session, .Warning, "the session cannot be watched, so lines other processes send it wait for the next prompt")
 	}
-	return true
+	return ""
 }
 
 // app_following reports whether the running session is one another process runs. Owner
@@ -729,21 +737,6 @@ report_recovery :: proc(recovery: journal.Recovery, queued: int) {
 @(require_results)
 selection_record :: proc(store: ^journal.Journal, provider, model, effort: string) -> journal.Error {
 	journal.append_record(store, {kind = .Selection_Changed}, journal.Selection_Changed{provider = provider, model = model, effort = effort})
-	_, commit_error := journal.commit(store)
-	return commit_error
-}
-
-@(require_results)
-selection_applied_record :: proc(chat: ^agent.Chat_Session, api: ai.API_Kind, provider, model, effort: string) -> journal.Error {
-	// A session nobody prompted is created by its first prompt, so there is nowhere to keep
-	// what it would say yet; its first turn records the selection instead.
-	if !agent.chat_journal_writable(chat) { return nil }
-	store := chat.store
-	journal.append_record(
-		store,
-		{session = chat.session, kind = .Selection_Applied, provider = provider, model = model},
-		journal.Selection_Applied{version = 1, api = agent.chat_api_name(api), provider = provider, model = model, effort = effort},
-	)
 	_, commit_error := journal.commit(store)
 	return commit_error
 }
@@ -941,10 +934,6 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 	api := target.connection.API
 
 	running := &app.setup.session
-	same_identity := app.setup.provider_id == target.provider_id && app.setup.model_id == target.model_id && app.setup.api == api
-	selection_changed := !same_identity
-	connection_changed :=
-		app.run.connection.API != api || app.run.connection.Endpoint != target.connection.Endpoint || running.provider_transport != target.transport
 	// The level to carry over: an explicit one, or the one already in effect, which
 	// a model switch keeps whenever the new model allows it. It may alias the session's
 	// stored effort, which selecting replaces, so it is copied first.
@@ -973,9 +962,7 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 		selection_fail(app, "the model selection could not be stored")
 		return false
 	}
-	refused_features := running.refused_features
-	omitted_features := running.compact.omitted_features
-	installed, applied := agent.chat_session_select(running, target, carried)
+	installed, applied, record_error := agent.chat_selection_install(running, target, carried, app.run.connection)
 	if !installed {
 		delete(setup_provider, app.setup.alloc)
 		delete(setup_model, app.setup.alloc)
@@ -984,22 +971,8 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 		selection_fail(app, "the model selection could not be stored")
 		return false
 	}
-	if same_identity {
-		running.refused_features = refused_features
-		running.compact.omitted_features = omitted_features
-	}
-	// A different serving identity invalidates a pending summary. A metadata-only refresh of
-	// the same identity does not: it updates the facts used by the next request while
-	// preserving compaction already in flight.
-	if selection_changed { agent.chat_compact_cancel(running) }
-	if running.provider_websocket != nil && (selection_changed || connection_changed) {
-		ai.Provider_WebSocket_Session_Destroy(running.provider_websocket)
-		running.provider_websocket = nil
-	}
-	running.last_estimate = 0
-	running.last_input_measured = nil
 	if !applied { snap_append(app, .Warning, "the reasoning effort could not be applied") }
-	if record_error := selection_applied_record(running, api, target.provider_id, target.model_id, running.effort); record_error != nil {
+	if record_error != nil {
 		running.storage_failed = true
 		selection_fail(app, "the selected model was installed but its session record could not be committed")
 		return false
@@ -1038,7 +1011,7 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 	// A follower never records a selection: it would rewrite the user's default model
 	// for a session whose model it does not choose.
 	if app.setup.owns_selection && announce && !app_following(app) {
-		if record_error := selection_record(app.setup.store, target.provider_id, target.model_id, running.effort); record_error != nil {
+		if default_error := selection_record(app.setup.store, target.provider_id, target.model_id, running.effort); default_error != nil {
 			running.storage_failed = true
 			selection_fail(app, "the selected model was installed but its default could not be committed")
 			return false

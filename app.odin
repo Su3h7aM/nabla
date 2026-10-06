@@ -266,7 +266,8 @@ menu_destroy :: proc(menu: ^Menu, allocator: mem.Allocator) {
 // list; the front-end only renders it.
 Session_Row :: struct {
 	id:    journal.Session_Id,
-	title: string, // owned
+	title: string, // owned; a child's is its name and title
+	child: bool, // a subagent session, listed under the main session that started it
 }
 
 // Pending_Selection is the selection the user asked for and the worker has not installed

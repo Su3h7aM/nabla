@@ -739,8 +739,8 @@ acp_session_open :: proc(session: ^Acp_Session, workspace: string, start: Sessio
 	opened, open_message, opened_ok := session_open(&app.setup, start, workspace)
 	if !opened_ok { return open_message, false }
 	report_recovery(opened.recovery, opened.queued)
-	if !session_install(&app.setup, &opened) {
-		return acp_open_message("the tool registry could not be allocated", app.setup.alloc), false
+	if problem := session_install(&app.setup, &opened); problem != "" {
+		return acp_open_message(problem, app.setup.alloc), false
 	}
 	return "", true
 }

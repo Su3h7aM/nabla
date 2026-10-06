@@ -17,9 +17,6 @@ Provider error classification mostly matches the Anthropic and OpenAI documentat
 
 A subagent is a session like any other: the orchestrator can bring it back, inspect it, compact it, switch its model, and continue it.
 
-- `subagent_steer_install` (`agent/subagent.odin`) repeats the agent-side half of the root package's `selection_install`; one agent procedure should serve both.
-- `agent_send` requires `message` unless `compact` is set, so a model switch alone cannot be sent.
-- A live switch resolved at dispatch leaks its selection if the dispatch commit fails.
 - The live compaction test installs the summary only if the child makes more requests after compaction starts.
 - ACP status and resume through `session/resume` (step 7). The ACP refusal of `compact` has no test.
 - An interrupted tool call can carry the output it produced so far. Writing shell streams to their kept file as they arrive would let recovery name that file in the `Unknown` result.

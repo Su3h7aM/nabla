@@ -734,6 +734,8 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	// The recipient wakes only after the commit that holds its message.
 	if sends && committed && job.exec.subagent != {} { owner_wake_signal() }
 	if !committed {
+		// The call never runs, so the switch resolved for the child is not handed over.
+		if send, is_send := &job.arguments.(Agent_Send_Args); is_send { subagent_control_destroy(&send.control) }
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}

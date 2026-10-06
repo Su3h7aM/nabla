@@ -595,8 +595,11 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 		agents    = team,
 	}
 	for _ in 0 ..< 2 {
-		// Dispatch names each child's session before it starts, so the test does too.
+		// Dispatch names each child's session and records its start before it runs, so the
+		// test does too.
 		tool_context.subagent = journal.session_id_create()
+		chat_record(chat, {kind = .Subagent_Started, subagent = tool_context.subagent}, journal.Subagent_Started{background = true})
+		_test_commit(test, chat)
 		started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "wait for instructions"})
 		defer tool_result_destroy(&started)
 		testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success)
@@ -1147,6 +1150,46 @@ test_agent_send_switches_a_running_subagent_to_another_provider :: proc(test: ^t
 	testing.expect_value(test, applied.provider, "other-provider")
 	testing.expect_value(test, applied.model, "other-model")
 	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 1)
+}
+
+// A switch needs no message: agent_send with only a model switches the running child at its
+// next request, which reaches the other provider, and records no message.
+@(test)
+test_agent_send_with_only_a_model_switches_a_running_subagent :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	first, second: Agent_Provider
+	if !subagent_test_hold(test, &first, {agent_provider_call("builtin_codemode", `{"code":"return 1"}`)}, 1) { return }
+	defer agent_provider_stop(&first)
+	if !agent_provider_start(test, &second, {agent_provider_reply("second")}) { return }
+	defer agent_provider_stop(&second)
+	first_endpoint := agent_provider_endpoint(&first)
+	defer delete(first_endpoint)
+	second_endpoint := agent_provider_endpoint(&second)
+	defer delete(second_endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", first_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "other-provider", "other-model", second_endpoint, nil)
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"first task"}`), success)
+	child := subagent_test_wait_request(test, chat)
+	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","model":"other-model"}`), success)
+	testing.expect(test, strings.contains(subagent_test_result(test, chat), "a switch to other-provider/other-model"), subagent_test_result(test, chat))
+	sync.sema_post(&first.release)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "second"), "the child answered from the second provider")
+
+	testing.expect_value(test, agent_provider_request_count(&first), 1)
+	testing.expect_value(test, agent_provider_request_count(&second), 1)
+	applied, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Selection_Applied}}, context.temp_allocator)
+	testing.expect(test, read_error == nil && found)
+	testing.expect_value(test, applied.model, "other-model")
+	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 0)
 }
 
 // While a child's request is held, agent_send with a message delivers it into the running

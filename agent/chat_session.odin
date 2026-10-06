@@ -243,6 +243,9 @@ Chat_Session :: struct {
 	// role_instructions are appended after everything else the instructions hold, so a
 	// subagent's requests share its orchestrator's instruction prefix. Owned.
 	role_instructions:            string,
+	// role is what the session's journal row says it is, set by chat_session_role_setup. A
+	// Subagent session never holds the tools that manage subagents.
+	role:                         journal.Session_Role,
 	// team is the subagents this session started, heap-allocated so they may outlive a
 	// session that could not stop them. member is set only in a subagent's own session: the
 	// record its orchestrator keeps of it, which outlives this session.
@@ -412,7 +415,8 @@ Tool_Registry_Replace_Error :: enum {
 // Replacement is refused unless the chat is idle. Idle implies no turn is in
 // flight, so no request preparation or tool execution can still borrow the
 // old registry when it is destroyed. Each registry frees with its own
-// allocator, so the replacement may come from any allocator.
+// allocator, so the replacement may come from any allocator. A Subagent session's
+// replacement loses agent_spawn, agent_stop, and agent_status first.
 //
 // Whether a failed external refresh keeps the previous registry, removes
 // unavailable tools, or blocks the next turn is the root package's policy
@@ -420,6 +424,7 @@ Tool_Registry_Replace_Error :: enum {
 @(require_results)
 chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Registry) -> Tool_Registry_Replace_Error {
 	if chat.state != .Idle { return .Busy }
+	if chat.role == .Subagent { tool_registry_remove_agent_management(replacement) }
 	tool_registry_destroy(&chat.tools)
 	chat.tools = replacement^
 	replacement^ = {}

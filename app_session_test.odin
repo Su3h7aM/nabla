@@ -1752,7 +1752,7 @@ test_follower_attachment_replays_captured_pending_input_once :: proc(t: ^testing
 		transmute([]u8)string("captured pending line"),
 	)
 	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "delivery failed") }
-	if !testing.expect(t, session_install(&app.setup, &opened)) { return }
+	if !testing.expect(t, session_install(&app.setup, &opened) == "") { return }
 	session_replay(&app, &app.setup.session)
 	_ = app_follow_poll(&app, run_observer(&app))
 	testing.expect_value(t, app_entries_count(&app, "captured pending line"), 1)
@@ -1849,4 +1849,55 @@ test_takeover_shows_input_first_committed_by_recovery :: proc(t: ^testing.T) {
 	app_takeover(&app, observer)
 	testing.expect(t, !app_following(&app))
 	testing.expect_value(t, app_entries_count(&app, "first committed in recovery"), 1)
+}
+
+// A subagent's session opened by its id is the agent its orchestrator ran: it takes the role
+// instructions with the instruction its parent recorded, and the tools without the ones that
+// manage subagents. The menu lists it under its parent with the name the parent gave it.
+@(test)
+test_opening_a_child_session_installs_the_subagent_role :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	parent := app.setup.session.session
+	child := journal.session_id_create()
+	journal.append_record(
+		app.setup.store,
+		{kind = .Subagent_Started, session = parent, branch = journal.INITIAL_BRANCH, call = 1, subagent = child},
+		journal.Subagent_Started{name = "agent-1", background = true},
+		transmute([]u8)string("Review the parser."),
+	)
+	if _, commit_error := journal.commit(app.setup.store); commit_error != nil { testing.fail_now(t, "the delegation could not be committed") }
+	child_store: journal.Journal
+	if open_error := journal.open(&child_store, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
+		testing.fail_now(t, "the child's journal could not be opened")
+	}
+	_, create_error := journal.create_session(&child_store, {id = child, workspace = app.setup.workspace, role = .Subagent, parent_session = parent, parent_call = 1})
+	if create_error != nil { testing.fail_now(t, "the child's session could not be created") }
+	if _, commit_error := journal.commit(&child_store); commit_error != nil { testing.fail_now(t, "the child's session could not be committed") }
+	_ = journal.close(&child_store)
+
+	snapshot_clear(&app)
+	session_refresh_rows(&app)
+	if !testing.expect_value(t, len(app.run.snap.sessions), 2) { return }
+	testing.expect_value(t, app.run.snap.sessions[0].id, parent)
+	testing.expect_value(t, app.run.snap.sessions[1].id, child)
+	testing.expect(t, app.run.snap.sessions[1].child)
+	testing.expect_value(t, app.run.snap.sessions[1].title, "agent-1")
+
+	// A prefix of the child's id resumes it like any session's.
+	snapshot_clear(&app)
+	session_resume(&app, app_session_id_text(child)[:8])
+	if !testing.expect_value(t, app.setup.session.session, child) { return }
+	session := &app.setup.session
+	testing.expect_value(t, session.role, journal.Session_Role.Subagent)
+	testing.expect(t, strings.has_prefix(session.role_instructions, agent.SUBAGENT_ROLE), "the child has the subagent role")
+	testing.expect(t, strings.has_suffix(session.role_instructions, "Review the parser."), "the child has the instruction its parent gave it")
+	testing.expect(t, session.team == nil, "a subagent starts no subagents")
+	readable := false
+	for definition in session.tools.definitions {
+		testing.expect(t, definition.kind != .Agent_Spawn && definition.kind != .Agent_Stop && definition.kind != .Agent_Status, definition.name)
+		if definition.name == agent.TOOL_READ_NAME { readable = true }
+	}
+	testing.expect(t, readable, "the child keeps the parent's other tools")
 }

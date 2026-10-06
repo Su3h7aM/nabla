@@ -13,8 +13,8 @@ TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type"
 TOOL_AGENT_SPAWN_FIELDS :: []string{"instruction", "prompt", "model", "provider", "effort", "wait", "acp_agent"}
 
 TOOL_AGENT_SEND_NAME :: "agent_send"
-TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it. You control a running subagent as the user controls you, while it runs: model, provider, and effort switch its next request, as the user's model change does for you (a switch that does not fit its conversation compacts first when the configuration allows it, and otherwise the child tells you it was refused), and compact true starts a compaction of its context that installs at a request boundary. Name only what you change; message is required unless compact is true. The newest switch you send replaces an earlier one it has not applied yet.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. With compact true, a finished subagent compacts its context before it continues; with a message it works while the summary runs and the summary installs at its next request boundary, and without a message it ends once the summary is installed, however long that takes, and its completion reaches you. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
-TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message. Required unless compact is true."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, for the reopened run of a finished subagent. Refused for a running subagent. Default: the model its last turn used."},"provider":{"type":["string","null"],"description":"Id of a configured provider, not a vendor name, for the reopened run of a finished subagent; needed only when several providers serve model. Refused for a running subagent. Default: the provider its last turn used."},"effort":{"type":["string","null"],"description":"Reasoning effort level for the reopened run of a finished subagent. Refused for a running subagent. Default: the effort its last turn used, or the nearest level the model states."},"compact":{"type":"boolean","description":"Compact the finished subagent's context when it is reopened. Refused for a running subagent and for an ACP agent. Orchestrator only."}},"additionalProperties":false}`
+TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it. You control a running subagent as the user controls you, while it runs: model, provider, and effort switch its next request, as the user's model change does for you (a switch that does not fit its conversation compacts first when the configuration allows it, and otherwise the child tells you it was refused), and compact true starts a compaction of its context that installs at a request boundary. Name only what you change; message is required unless compact is true or model, provider, or effort is given. The newest switch you send replaces an earlier one it has not applied yet.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. With compact true, a finished subagent compacts its context before it continues; with a message it works while the summary runs and the summary installs at its next request boundary, and without a message it ends once the summary is installed, however long that takes, and its completion reaches you. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
+TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message. Required unless compact is true or model, provider, or effort is given."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, to switch to: the next request of a running subagent, or the reopened run of a finished one, which then needs a message. Default: the model it runs or its last turn used."},"provider":{"type":["string","null"],"description":"Id of a configured provider, not a vendor name, to switch to, as for model; needed only when several providers serve model. Default: the provider it runs or its last turn used."},"effort":{"type":["string","null"],"description":"Reasoning effort level to switch to, as for model. Default: the effort it runs or its last turn used, or the nearest level the model states."},"compact":{"type":"boolean","description":"Compact the subagent's context: a running one at its next request boundary, a finished one when it is reopened. Refused for an ACP agent. Orchestrator only."}},"additionalProperties":false}`
 TOOL_AGENT_SEND_FIELDS :: []string{"agent", "message", "model", "provider", "effort", "compact"}
 
 TOOL_AGENT_STOP_NAME :: "agent_stop"
@@ -79,7 +79,8 @@ Agent_Send_Args :: struct {
 	// returns.
 	resume:   Subagent_Resume,
 	// control is set by the owner, with the message, when the call changes a running child: the
-	// switch already resolved and the compaction asked for. The executor hands it to the child.
+	// switch already resolved and the compaction asked for. The job owns it until the executor
+	// hands it to the child; a dispatch that cannot commit releases it.
 	control:  Subagent_Control,
 }
 
@@ -137,15 +138,15 @@ tool_agent_send_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (arg
 	tool_fields_known(arguments, TOOL_AGENT_SEND_FIELDS, allocator = ctx.allocator) or_return
 	args.agent = tool_field_optional_string(arguments, "agent", allocator = ctx.allocator) or_return
 	args.compact = tool_field_optional_bool(arguments, "compact", allocator = ctx.allocator) or_return
-	if args.compact {
+	args.model = tool_field_optional_string(arguments, "model", allocator = ctx.allocator) or_return
+	args.provider = tool_field_optional_string(arguments, "provider", allocator = ctx.allocator) or_return
+	args.effort = tool_field_optional_string(arguments, "effort", allocator = ctx.allocator) or_return
+	if args.compact || args.model != "" || args.provider != "" || args.effort != "" {
 		args.message = tool_field_optional_string(arguments, "message", allocator = ctx.allocator) or_return
 	} else {
 		args.message = tool_field_string(arguments, "message", allocator = ctx.allocator) or_return
 		if strings.trim_space(args.message) == "" { return {}, tool_argument_error(.Invalid_Value, "message", "a non-empty message", ctx.allocator) }
 	}
-	args.model = tool_field_optional_string(arguments, "model", allocator = ctx.allocator) or_return
-	args.provider = tool_field_optional_string(arguments, "provider", allocator = ctx.allocator) or_return
-	args.effort = tool_field_optional_string(arguments, "effort", allocator = ctx.allocator) or_return
 	return
 }
 
@@ -190,6 +191,18 @@ tool_agent_description_parts :: proc(parts: ^[dynamic]string, agents: []ACP_Agen
 		if agent.description != "" { append(parts, ": ", agent.description) or_return }
 	}
 	return nil
+}
+
+// tool_registry_remove_agent_management removes the tools that start, stop, and inspect
+// subagents, which only an orchestrator holds.
+tool_registry_remove_agent_management :: proc(registry: ^Tool_Registry) {
+	for index := len(registry.definitions) - 1; index >= 0; index -= 1 {
+		definition := &registry.definitions[index]
+		if definition.kind == .Agent_Spawn || definition.kind == .Agent_Stop || definition.kind == .Agent_Status {
+			tool_definition_destroy(definition, registry.allocator)
+			ordered_remove(&registry.definitions, index)
+		}
+	}
 }
 
 // TOOL_AGENT_ORCHESTRATOR_ONLY is what a subagent is told when it tries to manage subagents.

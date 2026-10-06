@@ -522,13 +522,6 @@ subagent_start :: proc(
 	tools, tools_error := tool_registry_clone(&parent.tools, allocator)
 	defer tool_registry_destroy(&tools)
 	if tools_error.kind != .None { return nil, "the subagent tools could not be copied" }
-	for index := len(tools.definitions) - 1; index >= 0; index -= 1 {
-		definition := &tools.definitions[index]
-		if definition.kind == .Agent_Spawn || definition.kind == .Agent_Stop || definition.kind == .Agent_Status {
-			tool_definition_destroy(definition, tools.allocator)
-			ordered_remove(&tools.definitions, index)
-		}
-	}
 	selection: Model_Selection
 	program: Subagent_Program
 	effort := args.effort
@@ -831,6 +824,11 @@ subagent_session_open :: proc(member: ^Subagent, store: ^journal.Journal) -> (br
 		if create_error != nil {
 			return 0, 0, fmt.tprintf("the subagent's session could not be created: %s", journal.error_text(create_error, context.temp_allocator))
 		}
+		// The session's role is read from its row, so the row is committed before the session
+		// is set up.
+		if _, commit_error := journal.commit(store); commit_error != nil {
+			return 0, 0, fmt.tprintf("the subagent's session could not be created: %s", journal.error_text(commit_error, context.temp_allocator))
+		}
 		return journal.INITIAL_BRANCH, 0, ""
 	}
 	if _, claim_error := journal.claim(store, member.session); claim_error != nil {
@@ -845,6 +843,52 @@ subagent_session_open :: proc(member: ^Subagent, store: ^journal.Journal) -> (br
 		return 0, 0, fmt.tprintf("the subagent's session history could not be read: %s", journal.error_text(head_error, context.temp_allocator))
 	}
 	return branch, head, ""
+}
+
+// chat_session_role_setup gives chat the instructions and tools of the role its journal row
+// names, so a subagent session is the same agent whoever opens it: the orchestrator that runs it
+// or a person who resumes it. A Main session, and one the journal has no row for yet, keeps what
+// chat_session_init built and ignores base. A Subagent session gets SUBAGENT_ROLE followed by
+// the instruction in its parent's newest subagent.started for it, a copy of base without the
+// tools that manage subagents, and no team, because a subagent starts none. base is borrowed
+// and may be chat's own registry. problem is static text, "" when the role is set up. Owner
+// only, with chat idle.
+@(require_results)
+chat_session_role_setup :: proc(chat: ^Chat_Session, base: ^Tool_Registry) -> (problem: string) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	summaries, list_error := journal.list_sessions(chat.store, {session = chat.session, limit = 1}, context.temp_allocator)
+	if list_error != nil { return "the session's role could not be read" }
+	if len(summaries) == 0 || summaries[0].role != .Subagent {
+		chat.role = .Main
+		return ""
+	}
+	filter := journal.Filter {
+		session  = summaries[0].parent_session,
+		subagent = chat.session,
+		kinds    = {.Subagent_Started},
+	}
+	start, found, read_error := journal.read_latest(chat.store, filter, context.temp_allocator)
+	if read_error != nil { return "the subagent's instruction could not be read from its parent's journal" }
+	if !found { return "the subagent's definition is not in its parent's journal" }
+	instructions, instructions_error := strings.concatenate({SUBAGENT_ROLE, "\n\n", string(start.body)}, chat.allocator)
+	if instructions_error != nil { return "the subagent's instructions could not be held" }
+	tools, tools_error := tool_registry_clone(base, chat.allocator)
+	if tools_error.kind != .None {
+		delete(instructions, chat.allocator)
+		return "the subagent's tools could not be copied"
+	}
+	chat.role = .Subagent
+	if chat_session_replace_tools(chat, &tools) != .None {
+		chat.role = .Main
+		delete(instructions, chat.allocator)
+		tool_registry_destroy(&tools)
+		return "the subagent's tools could not be installed"
+	}
+	delete(chat.role_instructions, chat.allocator)
+	chat.role_instructions = instructions
+	agent_team_destroy(chat.team, chat)
+	chat.team = nil
+	return ""
 }
 
 // subagent_compact_wait services the child's compaction as an idle session does, until no
@@ -908,20 +952,11 @@ subagent_run :: proc(member: ^Subagent) {
 			sync.atomic_store(&member.team.abandoned, true)
 		}
 	}
-	// A subagent starts no subagents, so its session has no team.
-	agent_team_destroy(chat.team, &chat)
-	chat.team = nil
 	chat.member = member
 	chat.stop_parent = &member.stop
 	chat.disable_project_instructions = member.disable_project_instructions
-	role_instructions, role_error := strings.concatenate({SUBAGENT_ROLE, "\n\n", member.instruction}, allocator)
-	if role_error != nil {
-		subagent_fail(member, .Failed, "the subagent's instructions could not be held")
-		return
-	}
-	chat.role_instructions = role_instructions
-	if replace_error := chat_session_replace_tools(&chat, &member.tools); replace_error != .None {
-		subagent_fail(member, .Failed, "the subagent's tools could not be installed")
+	if role_problem := chat_session_role_setup(&chat, &member.tools); role_problem != "" {
+		subagent_fail(member, .Failed, role_problem)
 		return
 	}
 	installed, _ := chat_session_select(&chat, member.selection, member.effort)
@@ -1149,53 +1184,25 @@ subagent_steer_service :: proc(state: ^Subagent_Steer) {
 	}
 }
 
-// subagent_steer_install installs the fitted switch on the child's session the way the main
-// session's selection_install does, then makes it the member's selection. The selection it
-// replaces is retired, not released: a request or summary in flight may still read its
-// connection.
+// subagent_steer_install installs the fitted switch on the child's session through the same
+// procedure the main session's selection uses, then makes it the member's selection. The
+// selection it replaces is retired, not released: a request or summary in flight may still
+// read its connection.
 @(private)
 subagent_steer_install :: proc(state: ^Subagent_Steer) {
 	chat, member, pending := state.chat, state.member, &state.pending
-	selection := &pending.selection
-	identity_changed := selection.provider_id != chat.provider_id || selection.model_id != chat.model_id || selection.connection.API != chat.model_api
-	connection_changed :=
-		state.connection.API != selection.connection.API || state.connection.Endpoint != selection.connection.Endpoint || chat.provider_transport != selection.transport
-	refused_features, omitted_features := chat.refused_features, chat.compact.omitted_features
-	installed, _ := chat_session_select(chat, selection^, pending.effort)
+	installed, _, record_error := chat_selection_install(chat, pending.selection, pending.effort, state.connection)
 	if !installed {
 		subagent_steer_refuse(state, "the model could not be held")
 		return
 	}
-	if identity_changed {
-		chat_compact_cancel(chat)
-	} else {
-		chat.refused_features, chat.compact.omitted_features = refused_features, omitted_features
-	}
-	if chat.provider_websocket != nil && (identity_changed || connection_changed) {
-		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
-		chat.provider_websocket = nil
-	}
-	chat.last_estimate = 0
-	chat.last_input_measured = nil
-	if chat_journal_writable(chat) {
-		chat_record(
-			chat,
-			{kind = .Selection_Applied, provider = selection.provider_id, model = selection.model_id},
-			journal.Selection_Applied {
-				version = 1,
-				api = chat_api_name(selection.connection.API),
-				provider = selection.provider_id,
-				model = selection.model_id,
-				effort = chat.effort,
-			},
-		)
-		_ = chat_commit(chat, "the selected model was installed but its session record could not be committed")
-	}
+	// The request in flight must not continue from a selection whose record did not land.
+	if record_error != nil { chat_session_record_failure(chat, "the selected model was installed but its session record could not be committed", record_error) }
 	sync.mutex_lock(&member.team.mutex)
 	member.retired.allocator = member.allocator
 	// A selection that cannot be listed is left unreleased rather than freed under a reader.
 	_, _ = append(&member.retired, member.selection)
-	member.selection = selection^
+	member.selection = pending.selection
 	delete(member.effort, member.allocator)
 	member.effort = pending.effort
 	sync.mutex_unlock(&member.team.mutex)
@@ -1335,6 +1342,9 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	}
 	ended, finished := target.outcome, target.finished
 	if !finished { return {}, fmt.tprintf("%s has not finished", name) }
+	if send.message == "" && !send.compact {
+		return {}, fmt.tprintf("%s has finished, so a switch alone does not continue it; send a message to reopen it on the model", name)
+	}
 	if ended == .Not_Executed {
 		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
 	}

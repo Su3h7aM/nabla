@@ -285,7 +285,7 @@ menu_open_session :: proc(app: ^App) {
 		label := row.title if row.title != "" else "(untitled)"
 		hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
 		hex := journal.session_id_to_hex(row.id, hex_text[:])
-		row_label, label_error := strings.clone(label, app.run.alloc)
+		row_label, label_error := strings.concatenate({"  " if row.child else "", label}, app.run.alloc)
 		row_detail, detail_error := strings.clone(hex[:SESSION_ID_SHORT_LENGTH], app.run.alloc)
 		if label_error != nil || detail_error != nil {
 			delete(row_label, app.run.alloc)

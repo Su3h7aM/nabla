@@ -221,3 +221,65 @@ chat_selection_check :: proc(
 	}
 	return .Pending, "", nil
 }
+
+// chat_selection_record commits the selection.applied record of the model a session now
+// runs. A session nobody prompted is created by its first prompt, so there is nowhere to
+// keep the record yet; its first turn records the selection instead, and this returns nil.
+// The error is the journal's commit failure; the caller decides what it stops.
+@(require_results)
+chat_selection_record :: proc(chat: ^Chat_Session, api: ai.API_Kind, provider, model, effort: string) -> journal.Error {
+	if !chat_journal_writable(chat) { return nil }
+	chat_record(
+		chat,
+		{kind = .Selection_Applied, provider = provider, model = model},
+		journal.Selection_Applied{version = 1, api = chat_api_name(api), provider = provider, model = model, effort = effort},
+	)
+	_, commit_error := journal.commit(chat.store)
+	return commit_error
+}
+
+// chat_selection_install makes target, which fits the session, the model its next request
+// runs: the session takes its own copy, a compaction in flight for another serving identity
+// is canceled, the provider WebSocket is dropped when the identity or the connection changed,
+// the token estimates restart, and the selection.applied record is committed. effort is one of
+// the target's levels or "". current_connection is the connection the session's requests have
+// used until now. Owner only, with the session idle or at a request boundary; target is
+// borrowed.
+//
+// installed is false when the session could not hold the selection, and then nothing changed.
+// applied is false when the effort was not applied. record_error is the failure to commit the
+// record, which leaves the model installed; the caller decides what it stops.
+@(require_results)
+chat_selection_install :: proc(
+	chat: ^Chat_Session,
+	target: Model_Selection,
+	effort: string,
+	current_connection: ai.Provider_Connection,
+) -> (
+	installed: bool,
+	applied: bool,
+	record_error: journal.Error,
+) {
+	identity_changed := target.provider_id != chat.provider_id || target.model_id != chat.model_id || target.connection.API != chat.model_api
+	connection_changed :=
+		current_connection.API != target.connection.API || current_connection.Endpoint != target.connection.Endpoint || chat.provider_transport != target.transport
+	refused_features, omitted_features := chat.refused_features, chat.compact.omitted_features
+	installed, applied = chat_session_select(chat, target, effort)
+	if !installed { return false, false, nil }
+	// A different serving identity invalidates a pending summary and what the provider
+	// refused. A metadata-only refresh of the same identity keeps both, so a summary in
+	// flight and a feature the provider already refused stay as they are.
+	if identity_changed {
+		chat_compact_cancel(chat)
+	} else {
+		chat.refused_features, chat.compact.omitted_features = refused_features, omitted_features
+	}
+	if chat.provider_websocket != nil && (identity_changed || connection_changed) {
+		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
+		chat.provider_websocket = nil
+	}
+	chat.last_estimate = 0
+	chat.last_input_measured = nil
+	record_error = chat_selection_record(chat, target.connection.API, target.provider_id, target.model_id, chat.effort)
+	return
+}
