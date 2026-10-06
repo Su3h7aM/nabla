@@ -112,6 +112,13 @@ chat_chain_release :: proc(chat: ^Chat_Session) {
 	chain := &chat.chain
 	chat_session_retire_operation(chat)
 	if attempt := chain.attempt; attempt != nil && attempt.worker.phase == .Running {
+		if !job_published(&attempt.worker) {
+			// A worker that honours the stop publishes within the patience, and joining it then
+			// costs less than keeping everything it can reach until process exit.
+			ai.interrupt_request(chain.options.interrupt)
+			job_note_stop(&attempt.worker, true, time.tick_now())
+			_ = job_wait_published(&attempt.worker, job_stop_deadline(&attempt.worker))
+		}
 		if job_published(&attempt.worker) {
 			// One a release finds here belongs to a send whose outcome is already recorded, and
 			// its terminal is dropped rather than waited on.
@@ -119,7 +126,6 @@ chat_chain_release :: proc(chat: ^Chat_Session) {
 			chat_request_worker_free(attempt)
 			chain.attempt = nil
 		} else {
-			ai.interrupt_request(chain.options.interrupt)
 			chat_chain_abandon(chat)
 		}
 	}
