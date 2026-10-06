@@ -203,6 +203,10 @@ V2_Client_Auth_Capabilities :: struct {
 
 V2_Support :: struct {}
 
+V1_Session_List_Capabilities :: struct {
+	list: V2_Support `json:"list"`,
+}
+
 V2_Prompt_Capabilities :: struct {
 	embedded_context: V2_Support `json:"embeddedContext"`,
 }
@@ -403,9 +407,10 @@ Mcp_Capabilities :: struct {
 }
 
 Agent_Capabilities :: struct {
-	load_session:        bool `json:"loadSession"`,
-	prompt_capabilities: Prompt_Capabilities `json:"promptCapabilities"`,
-	mcp_capabilities:    Mcp_Capabilities `json:"mcpCapabilities"`,
+	load_session:         bool `json:"loadSession"`,
+	session_capabilities: V1_Session_List_Capabilities `json:"sessionCapabilities"`,
+	prompt_capabilities:  Prompt_Capabilities `json:"promptCapabilities"`,
+	mcp_capabilities:     Mcp_Capabilities `json:"mcpCapabilities"`,
 }
 
 Initialize_Result :: struct {

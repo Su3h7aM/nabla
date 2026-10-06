@@ -301,6 +301,7 @@ acp_request_initialize :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 			// A session can be reopened by the id it was given, with its conversation
 			// replayed as updates.
 			load_session = true,
+			session_capabilities = {list = {}},
 			prompt_capabilities = {
 				// Prompts are text, resource links, and embedded text: no images or audio.
 				embedded_context = true,
@@ -501,10 +502,6 @@ acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope)
 }
 
 acp_request_session_list :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
-	if !acp_is_v2(server) {
-		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, "session/list requires ACP v2")
-		return
-	}
 	if !server.initialized {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before sessions are listed")
 		return

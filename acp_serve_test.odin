@@ -681,7 +681,13 @@ test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
 	hello := acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered")
 	if hello == "" { return }
 	testing.expectf(t, strings.contains(hello, `"loadSession":true`), "initialize did not announce loadSession: %s", hello)
+	testing.expectf(t, strings.contains(hello, `"sessionCapabilities":{"list":{}}`), "initialize did not announce session/list: %s", hello)
 	testing.expectf(t, strings.contains(hello, `"embeddedContext":true`), "initialize did not announce embedded context: %s", hello)
+	listing := strings.builder_make(context.temp_allocator)
+	strings.write_string(&listing, `{"jsonrpc":"2.0","id":6,"method":"session/list","params":{}}`)
+	strings.write_byte(&listing, '\n')
+	acp_test_client_send(&client, strings.to_string(listing))
+	if acp_test_client_expect(t, &client, `"sessions":[]`, "v1 session/list was not answered") == "" { return }
 
 	// session/new: the client gets the id it will name from then on, with the model
 	// selector it may switch.
