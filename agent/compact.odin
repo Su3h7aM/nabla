@@ -457,11 +457,8 @@ chat_compact_reason :: proc(job: ^Compact_Job) -> string {
 
 // --- owner-side lifecycle ----------------------------------------------------
 
-// compact_request_intent records an intent to compact without starting anything. A
-// job is frozen at a request boundary, where the context is a closed execution and
-// the bytes about to be sent are the bytes the summary will cover. Every trigger
-// meets here, so the automatic path, the tool, and the command cannot disagree
-// about what a request means.
+// compact_request_intent coalesces triggers without starting work. The owner freezes
+// a committed prefix when it observes the intent; the foreground keeps running.
 compact_request_intent :: proc(control: ^Compact_Control, trigger: Compact_Trigger, source: journal.Call_Id = 0) -> Compact_Request_Result {
 	if control.state == .Retiring { return .Unavailable }
 	if control.state == .Running || control.state == .Ready {
@@ -480,6 +477,28 @@ compact_request_intent :: proc(control: ^Compact_Control, trigger: Compact_Trigg
 chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, source: journal.Call_Id = 0) -> Compact_Request_Result {
 	if chat.storage_failed { return .Unavailable }
 	return compact_request_intent(&chat.compact, trigger, source)
+}
+
+// chat_compact_start_pending freezes committed history for a recorded intent without
+// waiting for the foreground or installing a ready summary. Streaming text and
+// unpublished tool results are not part of the projection.
+@(private)
+chat_compact_start_pending :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) {
+	control := &chat.compact
+	if chat.storage_failed || control.state != .Idle || control.pending == .None { return }
+	if control.pending != .Model_Switch && !chat_compact_retry_allowed(control, control.pending) { return }
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
+		_observer_message(observer, .Warning, "the context could not be prepared")
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
+	if prep_error != nil {
+		chat_session_record_failure(chat, "the context could not be read", prep_error)
+		return
+	}
+	chat_compact_consider(chat, observer, connection, &prep)
 }
 
 // chat_compact_retry_allowed keeps a failed summarization from being retried at every
@@ -1037,10 +1056,9 @@ chat_compact_service :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 	return chat_compact_install(chat, observer)
 }
 
-// chat_compact_consider freezes the request about to be admitted when pressure
-// calls for it, or when a caller has already asked for compaction. It is called
-// with the exact preparation the foreground will send, so the frozen prefix is the
-// one the provider has warm.
+// chat_compact_consider freezes a committed prefix when pressure calls for it or
+// a caller has asked for compaction. Automatic starts use the foreground request's
+// preparation; explicit starts may prepare history while that request runs.
 chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection, prep: ^Chat_Request_Prep) {
 	control := &chat.compact
 	control.checkpoint = prep.projection.checkpoint
@@ -1068,8 +1086,8 @@ chat_compact_consider :: proc(chat: ^Chat_Session, observer: Chat_Observer, conn
 }
 
 // chat_compact_idle_service is what an idle session does about its context: it polls a
-// finished summary, installs one that is ready and due, and starts the work a boundary
-// recorded but the turn never reached. It never waits, and it starts a prep only when a
+// finished summary, installs one that is ready and due, and starts recorded work.
+// It never waits, and it starts a prep only when a
 // recorded intent is waiting for one.
 //
 // A session that has capacity again is said so out loud: the user asked for nothing here,
@@ -1082,21 +1100,7 @@ chat_compact_idle_service :: proc(chat: ^Chat_Session, observer: Chat_Observer, 
 	}
 	// An intent is consumed by the attempt to start it, so one that cannot start here is
 	// not retried at every tick: the boundary that recorded it asked once.
-	if chat.compact.state == .Idle && chat.compact.pending != .None {
-		arena: virtual.Arena
-		if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
-			_observer_message(observer, .Warning, "the context could not be prepared")
-			return changed
-		}
-		defer virtual.arena_destroy(&arena)
-		prep, prep_err := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
-		if prep_err != nil {
-			chat_session_record_failure(chat, "the context could not be read", prep_err)
-			return changed
-		}
-
-		chat_compact_consider(chat, observer, connection, &prep)
-	}
+	chat_compact_start_pending(chat, observer, connection)
 	return changed
 }
 
@@ -1268,8 +1272,8 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 
 // --- manual trigger ----------------------------------------------------------
 
-// chat_command_compact starts the same compaction the automatic path starts, at a
-// settled turn or a request boundary. It reports that compaction is under way, not
+// chat_command_compact starts the same compaction the automatic path starts, including
+// while foreground work runs. It reports that compaction is under way, not
 // that a summary exists: nothing about it blocks the caller.
 @(require_results)
 chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> bool {
@@ -1289,28 +1293,12 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 		return true
 	case .Scheduled:
 	}
-	// Idle is the only place a job can start immediately, because only there is
-	// there no request boundary to wait for. Inside a turn, the next boundary
-	// freezes the request the summary will cover.
-	if chat.state == .Idle {
-		arena: virtual.Arena
-		if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
-			_observer_message(observer, .Warning, "the context could not be prepared")
-			return false
-		}
-		defer virtual.arena_destroy(&arena)
-		prep, prep_err := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
-		if prep_err != nil {
-			chat_session_record_failure(chat, "the context could not be read", prep_err)
-			return false
-		}
-
-		chat_compact_consider(chat, observer, connection, &prep)
-	}
+	chat_compact_start_pending(chat, observer, connection)
+	if chat.storage_failed { return false }
 	// A job that started has already said so; the rest is the outcome the caller
 	// cannot see from here.
 	if chat.compact.state != .Running && chat.compact.pending != .None {
-		_observer_message(observer, .Notice, "compaction will start at the next request boundary")
+		_observer_message(observer, .Notice, "compaction is waiting for the retry cooldown")
 	} else if chat.compact.state != .Running {
 		_observer_message(observer, .Notice, "nothing to compact")
 	}

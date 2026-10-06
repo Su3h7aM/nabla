@@ -327,19 +327,6 @@ chat_retry_deadline :: proc(delay: time.Duration) -> Maybe(time.Tick) {
 	return time.tick_add(now, delay)
 }
 
-// chat_retry_wait waits out a backoff and reports whether it elapsed without a cancel.
-@(private, require_results)
-chat_retry_wait :: proc(chat: ^Chat_Session, delay: time.Duration) -> bool {
-	deadline := chat_retry_deadline(delay)
-	for {
-		seen := owner_wake_seen()
-		chat_session_observe_stop(chat)
-		if chat_session_cancelled(chat) { return false }
-		if due, timed := deadline.?; timed && time.tick_diff(time.tick_now(), due) <= 0 { return true }
-		owner_wake_wait(seen, deadline)
-	}
-}
-
 // chat_session_clear_attempt forgets the failed attempt and everything it produced, so
 // the next attempt starts as if it were the first. Only a resend that is about to happen
 // calls it, and only while the operation is still running.
@@ -427,13 +414,16 @@ chat_turn_drive :: proc(
 		// The session keeps only heap- or chain-owned data between effects. Scratch from
 		// one effect is released before the next request or tool step begins.
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		seen := owner_wake_seen()
 		// External facts are applied before the state is read, so the selection below is
 		// a pure read of state. The owner observes the clock once and both steps use it.
 		now := time.tick_now()
 		chat_session_observe_at(chat, now)
+		if steer != nil && steer.observe != nil { steer.observe(steer, observer) }
+		chat_compact_start_pending(chat, observer, current)
 		// A summarizer that finished is adopted here, where its completion is read, so the job's
 		// storage and its thread are released without waiting for a request boundary. The summary
-		// itself still installs at a boundary, because a frozen prefix is chosen there.
+		// itself still installs at a boundary, so it cannot change a request already in flight.
 		chat_compact_poll(chat, observer)
 		// Input that reached the session while the turn ran is accepted and delivered
 		// before the state is read, so the selector sees a turn that still has a message
@@ -459,11 +449,11 @@ chat_turn_drive :: proc(
 			chat_chain_claim_send(chat)
 			chat_chain_launch_send(chat)
 		case .Await_Provider:
-			chat_chain_await(chat, &usages)
+			chat_chain_await(chat, &usages, seen)
 		case .Wait_Retry:
-			chat_chain_wait(chat)
+			chat_chain_wait(chat, seen)
 		case .Repair_Context:
-			chat_chain_repair(chat)
+			chat_chain_repair(chat, seen)
 		case .Commit_Response:
 			chat_chain_commit(chat, &usages)
 		case .Run_Tools:
@@ -480,7 +470,7 @@ chat_turn_drive :: proc(
 			tool_effect := effect.tool
 			chat_tool_jobs_step(chat, observer, tool_effect)
 		case .Wait_Tools:
-			chat_tool_jobs_wait(chat)
+			chat_tool_jobs_wait(chat, seen)
 		case .Finish_Tools:
 			turn_id := effect.turn_id
 			if !chat_tool_jobs_finish(chat, turn_id) {

@@ -187,12 +187,12 @@ Compact_Setup :: struct {
 	big_prompt: string,
 }
 
-compact_setup_begin :: proc(test: ^testing.T, setup: ^Compact_Setup) -> bool {
+compact_setup_begin :: proc(test: ^testing.T, setup: ^Compact_Setup, foreground_stall := false) -> bool {
 	chat_test_begin(test, &setup.chat, tool_loop_workspace(test))
 	started := false
 	defer if !started { compact_setup_end(test, setup) }
 	if !compact_provider_start(test, &setup.background, COMPACT_TEST_BODY, true) { return false }
-	if !compact_provider_start(test, &setup.foreground, FOREGROUND_TEST_BODY, false) { return false }
+	if !compact_provider_start(test, &setup.foreground, FOREGROUND_TEST_BODY, foreground_stall) { return false }
 	chat := &setup.chat.chat
 	chat_test_capacity(chat, 500_000)
 	setup.big_prompt = strings.repeat("context ", 4000) or_else ""
@@ -425,8 +425,8 @@ test_the_compact_tool_records_an_intent_and_returns :: proc(test: ^testing.T) {
 	testing.expect_value(test, result.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
 	testing.expect(test, strings.contains(string(results[0].body), `state: scheduled`), "the result says the work was queued")
 
-	// The intent is recorded, and nothing has started: a job starts at the next
-	// request boundary, where the prefix it covers is a closed execution.
+	// The standalone tool executor records the intent. The turn driver starts it
+	// at its next collection step, without waiting for the rest of the batch.
 	testing.expect_value(test, chat.compact.pending, Compact_Trigger.Agent_Tool)
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
 }
@@ -455,6 +455,80 @@ test_the_compact_command_starts_a_job_while_idle :: proc(test: ^testing.T) {
 	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
 		testing.fail_now(test, "the summarizer was never asked")
 	}
+}
+
+@(test)
+test_the_compact_command_starts_before_a_running_provider_finishes :: proc(test: ^testing.T) {
+	setup: Compact_Setup
+	if !compact_setup_begin(test, &setup, true) { return }
+	defer compact_setup_end(test, &setup)
+	chat := &setup.chat.chat
+	foreground := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = compact_provider_endpoint(&setup.foreground, context.temp_allocator),
+	}
+	background := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
+	}
+	chat_request_begin(chat, foreground, test_retry_policy(), {})
+	testing.expect(test, chat_chain_claim_send(chat))
+	chat_chain_launch_send(chat)
+	if !sync.sema_wait_with_timeout(&setup.foreground.reached, COMPACT_TEST_BOUND) {
+		testing.fail_now(test, "the foreground request never started")
+	}
+	foreground_request := chat.chain.request
+	testing.expect(test, chat_command_compact(chat, {}, background))
+	testing.expect_value(test, chat.compact.state, Compact_State.Running)
+	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
+		testing.fail_now(test, "compaction waited for the foreground response")
+	}
+	testing.expect_value(test, chat.chain.request, foreground_request)
+	testing.expect(test, !job_published(&chat.chain.attempt.worker), "the foreground is still blocked")
+	compaction_request := chat.compact.job.request
+	testing.expect(test, chat_command_compact(chat, {}, background))
+	testing.expect_value(test, chat.compact.job.request, compaction_request)
+
+	sync.sema_post(&setup.background.release)
+	if !compact_await_state(test, chat, .Ready) { return }
+	testing.expect_value(test, len(_test_records(test, chat, {.Checkpoint_Installed})), 0)
+	testing.expect(test, !job_published(&chat.chain.attempt.worker), "a ready summary did not wait for or stop the foreground")
+	sync.sema_post(&setup.foreground.release)
+	testing.expect(test, chat_turn_drive(chat, foreground, test_retry_policy(), {}, nil, nil))
+	testing.expect(test, chat_compact_idle_service(chat, {}, background))
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection := _test_projection(test, chat, &arena)
+	found := false
+	for entry in projection.items {
+		if assistant, is_assistant := entry.payload.(Projected_Assistant); is_assistant && assistant.text == "foreground-ok" { found = true }
+	}
+	testing.expect(test, found, "installing the frozen summary preserved the foreground response")
+}
+
+@(test)
+test_compaction_intent_starts_while_a_tool_batch_is_unfinished :: proc(test: ^testing.T) {
+	setup: Compact_Setup
+	if !compact_setup_begin(test, &setup) { return }
+	defer compact_setup_end(test, &setup)
+	chat := &setup.chat.chat
+	_test_stage_call(test, chat, "unfinished_call", `{}`, TOOL_COMPACT_NAME)
+	chat.state = .Executing_Tools
+	unfinished := chat.head
+	background := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
+	}
+	testing.expect_value(test, chat_compact_request(chat, .Agent_Tool), Compact_Request_Result.Scheduled)
+	chat_compact_start_pending(chat, {}, background)
+	testing.expect_value(test, chat.compact.state, Compact_State.Running)
+	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
+		testing.fail_now(test, "compaction waited for the unfinished tool batch")
+	}
+	testing.expect(test, chat.compact.job.snapshot.covers < unfinished)
+	testing.expect(test, !strings.contains(chat.compact.job.snapshot.body, "unfinished_call"), "the open call was not summarized")
+	testing.expect_value(test, chat.state, Chat_State.Executing_Tools)
 }
 
 // Pressure alone starts the work, before any request has been refused and before

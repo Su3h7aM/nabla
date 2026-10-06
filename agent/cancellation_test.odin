@@ -239,7 +239,7 @@ test_an_attempt_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	defer delete(usages)
 	// The owner stops waiting for it: the attempt is abandoned instead of joined, and its send
 	// is recorded as the cancellation that asked it to stop.
-	chat_chain_await(chat, &usages)
+	chat_chain_await(chat, &usages, owner_wake_seen())
 	testing.expect_value(test, chat.chain.stage, Chat_Request_Stage.Committing)
 	testing.expect_value(test, chat.chain.attempt.worker.phase, Job_Phase.Abandoned)
 	request := chat.chain.request

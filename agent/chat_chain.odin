@@ -97,6 +97,7 @@ Chat_Request_Chain :: struct {
 	// decision is what the harness decided about the last send, and, once the chain has
 	// stopped, why it stopped.
 	decision:                  Chat_Recovery_Decision,
+	backoff_until:             Maybe(time.Tick),
 }
 
 // chat_chain_release frees everything the chain owns, retiring a worker that published. The
@@ -490,11 +491,10 @@ chat_chain_launch_send :: proc(chat: ^Chat_Session) {
 // is abandoned instead: the wait ends there, and the owner's next observation abandons it. An
 // attempt nothing asked to stop keeps waiting, because model deliberation has no deadline.
 @(private)
-chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) {
+chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage, seen: u32) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Sending { return }
 	attempt := chain.attempt
-	seen := owner_wake_seen()
 	// The publication is taken first: the worker publishes after its last event.
 	published := job_published(&attempt.worker)
 	events := mailbox_take_all(chain.mailbox)
@@ -661,6 +661,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 			delay = chain.decision.delay,
 		},
 	)
+	chain.backoff_until = chat_retry_deadline(chain.decision.delay)
 	chain.stage = .Backoff
 	chat_retry_record_scheduled(chat, chain.request, chain.attempts, .Response, chain.decision.reason, chain.attempts + 1, chain.decision.delay)
 }
@@ -669,18 +670,17 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 // chain, and it wins over the failure the wait was for: the send that would have followed
 // never happened, so the chain stopped because the turn was cancelled.
 @(private)
-chat_chain_wait :: proc(chat: ^Chat_Session) {
+chat_chain_wait :: proc(chat: ^Chat_Session, seen: u32) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Backoff { return }
-	if !chat_retry_wait(chat, chain.decision.delay) {
+	chat_session_observe_stop(chat)
+	if chat_session_cancelled(chat) {
 		chat_retry_record_completed(chat, chain.request, chain.attempts, .Response, .Cancelled)
 		chat_chain_stop(chat, .Cancelled)
 		return
 	}
-	// Cancellation can arrive between the last slice of a delay and the send that follows.
-	if chat_session_cancelled(chat) {
-		chat_retry_record_completed(chat, chain.request, chain.attempts, .Response, .Cancelled)
-		chat_chain_stop(chat, .Cancelled)
+	if due, timed := chain.backoff_until.?; !timed || time.tick_diff(time.tick_now(), due) > 0 {
+		owner_wake_wait(seen, chain.backoff_until)
 		return
 	}
 	chat_retry_record_completed(chat, chain.request, chain.attempts + 1, .Response, .Resent)
@@ -694,10 +694,9 @@ chat_chain_wait :: proc(chat: ^Chat_Session) {
 // chat_chain_repair waits for a summary or starts one for the refused request, then rebuilds
 // the frozen payload. The next attempt sends the rebuilt bytes under the same bound.
 @(private)
-chat_chain_repair :: proc(chat: ^Chat_Session) {
+chat_chain_repair :: proc(chat: ^Chat_Session, seen: u32) {
 	chain := &chat.chain
 	if !chain.active || chain.stage != .Repairing { return }
-	seen := owner_wake_seen()
 	chat_session_observe_stop(chat)
 	if chat_session_cancelled(chat) {
 		chat_chain_stop(chat, .Cancelled)

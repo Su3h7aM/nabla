@@ -214,7 +214,7 @@ _test_perform_request :: proc(
 			chat_chain_launch_send(chat)
 		case .Await_Provider:
 			// The attempt runs on a worker, so this is a real wait for its terminal outcome.
-			chat_chain_await(chat, usages)
+			chat_chain_await(chat, usages, owner_wake_seen())
 		case .Commit_Response:
 			chat_chain_commit(chat, usages)
 			return
@@ -355,7 +355,7 @@ chat_run_tools :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 		case .Dispatch:
 			tool_jobs_dispatch(&jobs, chat)
 		case .Wait:
-			tool_jobs_await(&jobs, tool_jobs_deadline(&jobs))
+			tool_jobs_await(&jobs, tool_jobs_deadline(&jobs), owner_wake_seen())
 		case .Done:
 			committed := tool_jobs_committed(&jobs)
 			if !chat_commit_results(chat, jobs.committed_roots) { return 0 }

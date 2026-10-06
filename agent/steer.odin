@@ -136,6 +136,9 @@ steer_line_free :: proc(queue: ^Steer_Queue, line: string) {
 // a turn the caller gives no input passes none at all.
 Steer_Context :: struct {
 	queue:      ^Steer_Queue,
+	// observe runs on the session owner at every collection step, including while
+	// provider and tool jobs are running. It must not wait for those jobs.
+	observe:    proc(steer: ^Steer_Context, observer: Chat_Observer),
 	// apply, when not nil, is the caller's request-boundary hook: it installs any
 	// selection the user asked for since the last request and returns the connection
 	// the next request must use. Resolving a selection is the caller's business, so the

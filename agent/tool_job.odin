@@ -975,8 +975,7 @@ tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 // tool_jobs_await blocks until a worker publishes, the deadline arrives, or a signal
 // interrupts the wait.
 @(private)
-tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick)) {
-	seen := owner_wake_seen()
+tool_jobs_await :: proc(jobs: ^Tool_Jobs, deadline: Maybe(time.Tick), seen: u32) {
 	if tool_jobs_published(jobs) != nil { return }
 	if tool_jobs_next(jobs, time.tick_now()) != .Wait { return }
 	owner_wake_wait(seen, deadline)

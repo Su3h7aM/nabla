@@ -559,7 +559,10 @@ dispatch_command :: proc(app: ^App, text: string) {
 	case .Resume:
 		enqueue(app, .Resume_Session, argument)
 	case .Compact:
-		enqueue(app, .Compact)
+		if !runtime_stopping(app) {
+			sync.atomic_store(&app.run.compact_pending, true)
+			agent.owner_wake_signal()
+		}
 	case .Status:
 		enqueue(app, .Status)
 	case .Effort:

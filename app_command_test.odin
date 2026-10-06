@@ -3,9 +3,11 @@
 package main
 
 import "core:strings"
+import "core:sync"
 import "core:sync/chan"
 import "core:testing"
 
+import "nabla:agent"
 import "nabla:agent/journal"
 import "nabla:tui/widgets"
 
@@ -38,6 +40,39 @@ command_app_end :: proc(app: ^App) {
 	chan.destroy(&app.run.work)
 	history_destroy(app)
 	widgets.input_destroy(&app.input)
+}
+
+@(test)
+test_compact_is_observed_during_a_turn_without_draining_work :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+	set_running(&app, true)
+	app.setup.session.state = .Requesting
+	app.setup.session.compact.state = .Retiring
+	for index in 0 ..< WORK_CAPACITY {
+		if !testing.expect(t, work_send(&app, {kind = .Status})) { return }
+	}
+	dispatch_command(&app, "/compact")
+	testing.expect(t, sync.atomic_load(&app.run.compact_pending))
+	testing.expect(t, len(app.run.snap.entries) == 0, "dispatch must not run a session command on the frontend")
+	steer := agent.Steer_Context {
+		apply_data = &app,
+		observe    = app_steer_observe,
+	}
+	steer.observe(&steer, run_observer(&app))
+	testing.expect(t, !sync.atomic_load(&app.run.compact_pending))
+	if testing.expect_value(t, len(app.run.snap.entries), 1) {
+		testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "compaction is not available right now")
+	}
+	steer.observe(&steer, run_observer(&app))
+	testing.expect(t, len(app.run.snap.entries) == 1, "a request is consumed once")
+	testing.expect(t, runtime_busy(&app), "observing compaction must not stop the active turn")
+	for index in 0 ..< WORK_CAPACITY {
+		work, received := chan.try_recv(app.run.work)
+		if !testing.expect(t, received, "observation must leave ordinary work queued") { break }
+		testing.expect_value(t, work.kind, Work_Kind.Status)
+	}
 }
 
 @(test)

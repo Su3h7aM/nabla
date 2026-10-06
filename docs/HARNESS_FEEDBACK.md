@@ -1,5 +1,26 @@
 # Harness feedback
 
+## 2026-10-06 Diagnosing a stalled test suite
+
+- Goal: identify the tests still running when the progress bar stopped at 298 of 300.
+- Attempt: the normal test task displayed only the last completed test. Exporting a Bash compiler function to add test-state logging did not work because the task launches the compiler through an external timeout. Attaching a debugger was denied by the operating system's ptrace restriction.
+- Gap: the test task accepts neither test-name filters nor compiler logging defines, so the progress line cannot identify an outstanding test.
+- Workaround: create a temporary compiler launcher under `/tmp` that forwards to `$ODIN_ROOT/odin` with `ODIN_TEST_LOG_STATE_CHANGES=true` and debug logging, put it first on PATH for one normal `mise run test agent --debug-only`, then compare Running and Successful records in Code Mode. Repository scripts and toolchain configuration were unchanged. The outstanding tests exposed a reversed deadline comparison, which was corrected before validation continued.
+
+## 2026-10-06 Provider spelling when starting a subagent
+
+- Goal: delegate a bounded investigation to the requested model.
+- Attempt: `agent_spawn` with provider `openai` and model `gpt-6.1-sol` returned `provider not found: openai`.
+- Gap: the tool schema does not list configured provider names or explain how model aliases resolve.
+- Workaround: omit provider and pass the full model name `openai/gpt-6.1-sol`; the harness resolved it to the configured provider and started the agent.
+
+## 2026-10-06 Oversized batched source inspection
+
+- Goal: inspect compaction architecture and its owner-loop call sites together.
+- Attempt: read the architecture document and several large source files in one Code Mode batch with a 2,000-line limit for each.
+- Gap: the combined result was truncated, leaving relevant code out of the visible result.
+- Workaround: search for the specific procedures and read their bounded line ranges. The initial batch was too broad.
+
 ## 2026-10-06 Recovering a subagent after provider quota exhaustion
 
 - Goal: finish an ACP multi-session change started by a subagent after its provider quota was exhausted, using an available model instead.

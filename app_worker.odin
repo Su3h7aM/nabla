@@ -30,6 +30,7 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	session_refresh_rows(app)
 	for {
 		seen := agent.owner_wake_seen()
+		if !runtime_stopping(app) { app_compact_observe(app, observer) }
 		work, ok := chan.try_recv(app.run.work)
 		if !ok {
 			// A stop that arrived with nothing queued leaves through the drain loop
@@ -213,16 +214,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// so they are not part of its history. Its end is still the caller's to report, and
 	// the front-end returns them to the prompt when it sees the runtime stop running.
 	case .Compact:
-		if app_following(app) {
-			follower_refuse(app, "compaction")
-			break
-		}
-		set_running(app, true)
-		// Compaction reports why the model side stopped, but a durable write that
-		// failed only latches the session: the reason the user needs is there.
-		if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {
-			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
-		}
+		app_command_compact(app, observer)
 	case .Status:
 		agent.chat_notice_status(&app.setup.session, observer, time.to_unix_nanoseconds(time.now()) / i64(time.Millisecond))
 	case .Effort:
@@ -302,11 +294,33 @@ run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
 	steer := agent.Steer_Context {
 		queue      = &app.run.steer,
 		apply      = app_steer_apply,
+		observe    = app_steer_observe,
 		apply_data = app,
 	}
 	// How the turn ended reaches the front-end through the observer, which reports the
 	// terminal status, so the worker has nothing of its own to do with the return.
 	_ = agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
+}
+
+app_command_compact :: proc(app: ^App, observer: agent.Chat_Observer) {
+	if app_following(app) {
+		follower_refuse(app, "compaction")
+		return
+	}
+	if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {
+		snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
+	}
+}
+
+app_compact_observe :: proc(app: ^App, observer: agent.Chat_Observer) {
+	if runtime_stopping(app) { return }
+	if !sync.atomic_exchange(&app.run.compact_pending, false) { return }
+	app_command_compact(app, observer)
+	refresh_status(app)
+}
+
+app_steer_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Observer) {
+	app_compact_observe(cast(^App)steer.apply_data, observer)
 }
 
 // app_agent_report_turn runs a turn for the oldest message a subagent sent while no turn ran,

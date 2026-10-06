@@ -305,6 +305,8 @@ Runtime :: struct {
 	// by the front-end and consumed by the worker, so it is guarded by mu like the
 	// snapshot the same boundary is published into.
 	pending:                  Pending_Selection,
+	// compact_pending crosses queue and turn boundaries until the owner consumes it.
+	compact_pending:          bool,
 	// pending_target is owner-thread state retained while the target model is being fit.
 	pending_target:           Pending_Target,
 	// steer carries lines typed while a turn is running. The front-end pushes

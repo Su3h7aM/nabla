@@ -137,7 +137,7 @@ tool_job_test_step_at :: proc(tool_test: ^Tool_Test, jobs: ^Tool_Jobs, now: time
 		// A stepped test advances its own clock, so the wait is bounded by the real one: what
 		// it is waiting for is a worker's publication, not a deadline its own simulation has
 		// already moved past.
-		tool_jobs_await(jobs, time.tick_add(time.tick_now(), time.Millisecond))
+		tool_jobs_await(jobs, time.tick_add(time.tick_now(), time.Millisecond), owner_wake_seen())
 	case .Done:
 	}
 	return effect
@@ -988,7 +988,7 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(test: ^testing.T) {
 		case .Step_Tools:
 			chat_tool_jobs_step(chat, {}, effect.tool)
 		case .Wait_Tools:
-			chat_tool_jobs_wait(chat)
+			chat_tool_jobs_wait(chat, owner_wake_seen())
 		case .Finish_Tools:
 			turn_id := effect.turn_id
 			testing.expect(test, chat_tool_jobs_finish(chat, turn_id), "the settled batch should close")
@@ -1065,7 +1065,7 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(test: ^testing.T) {
 		case .Step_Tools:
 			chat_tool_jobs_step(chat, {}, effect.tool)
 		case .Wait_Tools:
-			chat_tool_jobs_wait(chat)
+			chat_tool_jobs_wait(chat, owner_wake_seen())
 		case .Finish_Tools:
 			turn_id := effect.turn_id
 			testing.expect(test, chat_tool_jobs_finish(chat, turn_id), "the cancelled batch should close")
