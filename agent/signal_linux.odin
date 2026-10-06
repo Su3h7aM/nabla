@@ -32,7 +32,10 @@ signal_handler :: proc "c" (signal: linux.Signal) {
 @(private)
 signal_wake_write :: proc "contextless" (fd: int) {
 	one := u64(1)
-	_, _ = linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+	for {
+		_, error := linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+		if error != .EINTR { return }
+	}
 }
 
 // signal_action_install routes signal to signal_interrupt_latch and saves the disposition it

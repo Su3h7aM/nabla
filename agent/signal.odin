@@ -27,11 +27,19 @@ Signal :: enum {
 @(private)
 signal_wake: i32 = -1
 
+@(private)
+signal_wake_readers: sync.Futex
+
 // signal_set_wake registers a non-blocking eventfd that the latch writes a u64 1 to, so a
 // frontend polling it wakes at once. -1 clears the registration, which the caller does
-// before it closes the descriptor. The latch stays the source of truth: the write only
-// wakes the caller.
+// before it closes the descriptor. Clearing waits for handlers that borrowed the old fd
+// to finish writing, so it may then be closed safely. Calls must be serialized and must
+// not run from a signal handler. The latch stays the source of truth.
 signal_set_wake :: proc(fd: int) {
+	sync.atomic_store(&signal_wake, -1)
+	for readers := sync.atomic_load(&signal_wake_readers); readers != 0; readers = sync.atomic_load(&signal_wake_readers) {
+		sync.futex_wait(&signal_wake_readers, u32(readers))
+	}
 	sync.atomic_store(&signal_wake, i32(fd))
 }
 
@@ -40,9 +48,11 @@ signal_set_wake :: proc(fd: int) {
 signal_interrupt_latch :: proc "contextless" () {
 	ai.interrupt_request(&process_interrupt)
 	owner_wake_signal()
+	sync.atomic_add(&signal_wake_readers, 1)
 	if fd := sync.atomic_load(&signal_wake); fd >= 0 {
 		signal_wake_write(int(fd))
 	}
+	if sync.atomic_sub(&signal_wake_readers, 1) == 1 { sync.futex_broadcast(&signal_wake_readers) }
 }
 
 // chat_signal_arm installs the handler only while a turn is in flight, so a headless

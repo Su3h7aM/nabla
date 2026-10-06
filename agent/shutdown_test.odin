@@ -169,6 +169,50 @@ test_signal_handler_outlives_sessions :: proc(test: ^testing.T) {
 
 // --- post-fork child path -----------------------------------------------------
 
+@(test)
+test_signal_wake_can_be_closed_and_its_descriptor_reused :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	previous: Signal_Action
+	chat_signal_arm(&previous)
+	defer chat_signal_disarm(&previous)
+	defer signal_set_wake(-1)
+	for round in 0 ..< 24 {
+		fd, open_error := linux.eventfd(0, {.NONBLOCK, .CLOEXEC})
+		if !testing.expect_value(test, open_error, linux.Errno.NONE) { return }
+		owned_fd := fd
+		defer if owned_fd >= 0 {
+			signal_set_wake(-1)
+			_ = linux.close(owned_fd)
+		}
+		signal_set_wake(int(fd))
+		if !testing.expect_value(test, linux.kill(linux.Pid(os.get_pid()), .SIGINT), linux.Errno.NONE) { return }
+		poll := [1]linux.Poll_Fd{{fd = fd, events = {.IN}}}
+		deadline := time.tick_add(time.tick_now(), SHELL_TEST_BOUND)
+		for {
+			remaining := -time.tick_since(deadline)
+			if !testing.expect(test, remaining > 0, "the signal never woke the descriptor") { return }
+			ready, poll_error := linux.poll(poll[:], i32((remaining + time.Millisecond - 1) / time.Millisecond))
+			if poll_error == .EINTR { continue }
+			if !testing.expect_value(test, poll_error, linux.Errno.NONE) { return }
+			if !testing.expect_value(test, ready, 1) { return }
+			break
+		}
+		signal_set_wake(-1)
+		_ = linux.close(fd)
+		owned_fd = -1
+
+		// Reusing the descriptor must not let a previous handler write into a new resource.
+		reused, reuse_error := linux.eventfd(0, {.NONBLOCK, .CLOEXEC})
+		if !testing.expect_value(test, reuse_error, linux.Errno.NONE) { return }
+		defer _ = linux.close(reused)
+		if !testing.expect_value(test, reused, fd) { return }
+		if !testing.expect_value(test, linux.kill(linux.Pid(os.get_pid()), .SIGINT), linux.Errno.NONE) { return }
+		count: u64
+		_, read_error := linux.read(reused, ([^]u8)(&count)[:size_of(count)])
+		testing.expect_value(test, read_error, linux.Errno.EAGAIN)
+	}
+}
+
 Shell_Spin :: struct {
 	stop:       ^bool, // accessed atomically by the owner
 	allocator:  mem.Allocator,

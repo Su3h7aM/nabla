@@ -15,12 +15,14 @@ wake_make :: proc() -> (fd: int, err: Error) {
 }
 
 // wake_signal makes the descriptor readable, so a read_events call polling it returns.
-// It never blocks and is async-signal-safe. A failed write is not an error: the only
-// failure of a non-blocking eventfd add is a counter that is already full, which means
-// the descriptor is readable.
+// It never blocks and is async-signal-safe. fd must remain open until it returns.
+// A full counter is already readable; an interrupted write is retried.
 wake_signal :: proc "contextless" (fd: int) {
 	one := u64(1)
-	_, _ = linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+	for {
+		_, error := linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+		if error != .EINTR { return }
+	}
 }
 
 // wake_drain clears a signalled descriptor so the next poll waits again. The caller
@@ -28,7 +30,10 @@ wake_signal :: proc "contextless" (fd: int) {
 // after the drain is never lost. An empty descriptor is not an error.
 wake_drain :: proc(fd: int) {
 	count: u64
-	_, _ = linux.read(linux.Fd(fd), ([^]u8)(&count)[:size_of(count)])
+	for {
+		_, error := linux.read(linux.Fd(fd), ([^]u8)(&count)[:size_of(count)])
+		if error != .EINTR { return }
+	}
 }
 
 // wake_destroy closes the descriptor. A failed close of an eventfd leaves nothing to

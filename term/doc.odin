@@ -63,7 +63,7 @@
 //   iteration, and a change invalidates width-dependent text measurements,
 //   supplies the new root extent to layout, and forces a complete redraw.
 //   set_resize_wake only wakes a caller blocked in poll on another
-//   descriptor; the private SIGWINCH flag behind viewport stays the truth.
+//   descriptor; viewport remains authoritative.
 // - Viewport has no pixel field in the v1 surface.
 //
 // Terminal mode contract:

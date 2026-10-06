@@ -76,19 +76,20 @@ Linux_Window_Size :: struct {
 @(private = "file")
 session_active: bool
 
-// sigwinch_pending is set by the SIGWINCH handler; the handler does no I/O.
-// Applications re-read the viewport every frame, so nothing consumes the flag
-// yet — it is the resize-notification seam.
-@(private = "file")
-sigwinch_pending: bool
-
 // sigwinch_wake is the descriptor the SIGWINCH handler writes to, or -1. The handler
 // can run on any thread, so without the write a resize would not end a poll that
 // another thread is blocked in.
 @(private = "file")
 sigwinch_wake: i32 = -1
 
+@(private = "file")
+sigwinch_wake_readers: sync.Futex
+
 _session_set_resize_wake :: proc(fd: int) {
+	sync.atomic_store(&sigwinch_wake, -1)
+	for readers := sync.atomic_load(&sigwinch_wake_readers); readers != 0; readers = sync.atomic_load(&sigwinch_wake_readers) {
+		sync.futex_wait(&sigwinch_wake_readers, u32(readers))
+	}
 	sync.atomic_store(&sigwinch_wake, i32(fd))
 }
 
@@ -614,13 +615,17 @@ _session_restore_at_fini :: proc "contextless" () {
 }
 
 _session_sigwinch_handler :: proc "c" (sig: linux.Signal) {
-	sigwinch_pending = true
+	sync.atomic_add(&sigwinch_wake_readers, 1)
 	if fd := sync.atomic_load(&sigwinch_wake); fd >= 0 {
 		// A full counter means the descriptor is already readable, so a failed write
 		// loses nothing.
 		one := u64(1)
-		_, _ = linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+		for {
+			_, error := linux.write(linux.Fd(fd), ([^]u8)(&one)[:size_of(one)])
+			if error != .EINTR { break }
+		}
 	}
+	if sync.atomic_sub(&sigwinch_wake_readers, 1) == 1 { sync.futex_broadcast(&sigwinch_wake_readers) }
 }
 
 _session_install_sigwinch :: proc(impl: ^Session_Impl) {
