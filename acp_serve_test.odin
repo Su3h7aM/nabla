@@ -324,7 +324,7 @@ test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 	server: Acp_Server
 	server.alloc = context.allocator
 	server.session_id = "session-stalled"
-	sync.atomic_store(&server.busy, true)
+	server.pending_work = 1
 	writer, writer_error := acp.writer_init(acp_test_stalled_output(&state), server.alloc)
 	if writer_error != nil { testing.fail_now(t, "the writer could not be created") }
 	server.writer = writer

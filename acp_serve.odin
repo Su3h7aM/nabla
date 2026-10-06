@@ -271,7 +271,6 @@ acp_request_initialize :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 	} else if negotiated > acp.PROTOCOL_VERSION {
 		negotiated = acp.PROTOCOL_VERSION
 	}
-	server.protocol_version = negotiated
 	server.profile = .V2 if negotiated == acp.PROTOCOL_VERSION_V2 else .V1
 	server.initialized = true
 	auth_methods, auth_error := make([]json.Value, 0, server.alloc)
@@ -344,31 +343,17 @@ acp_request_session_new :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the working directory does not exist: %s", params.cwd))
 		return
 	}
-	workspace, reference, system_prompt, title, strings_ok := acp_clone_open_strings(
+	acp_enqueue_open_session(
+		server,
+		envelope,
+		.New,
 		params.cwd,
 		"",
 		acp_session_prompt_text(params.system_prompt, &params.meta),
 		params.meta.session_title,
-		server.alloc,
+		params.mcp_servers,
+		false,
 	)
-	if !strings_ok {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session parameters could not be allocated")
-		return
-	}
-	client_mcp, mcp_ok := acp_mcp_servers_make(params.mcp_servers, server.alloc)
-	if !mcp_ok {
-		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "a client-provided MCP server could not be prepared")
-		return
-	}
-	id, id_ok := acp_work_id(envelope.id, server.alloc)
-	if !id_ok {
-		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
-		agent.MCP_Server_Configs_Destroy(&client_mcp, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
-		return
-	}
-	acp_enqueue_open_session(server, envelope, id, {kind = .New}, workspace, reference, system_prompt, title, client_mcp, false)
 }
 
 acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
@@ -403,31 +388,17 @@ acp_request_session_load :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the load working directory does not match the session")
 		return
 	}
-	workspace, reference, system_prompt, title, strings_ok := acp_clone_open_strings(
+	acp_enqueue_open_session(
+		server,
+		envelope,
+		.Resume_Id,
 		"",
 		params.session_id,
 		acp_session_prompt_text(params.system_prompt, &params.meta),
 		params.meta.session_title,
-		server.alloc,
+		params.mcp_servers,
+		true,
 	)
-	if !strings_ok {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session parameters could not be allocated")
-		return
-	}
-	client_mcp, mcp_ok := acp_mcp_servers_make(params.mcp_servers, server.alloc)
-	if !mcp_ok {
-		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "a client-provided MCP server could not be prepared")
-		return
-	}
-	id, id_ok := acp_work_id(envelope.id, server.alloc)
-	if !id_ok {
-		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
-		agent.MCP_Server_Configs_Destroy(&client_mcp, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
-		return
-	}
-	acp_enqueue_open_session(server, envelope, id, {kind = .Resume_Id, id = reference}, workspace, reference, system_prompt, title, client_mcp, true)
 }
 
 acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
@@ -474,31 +445,17 @@ acp_request_session_resume :: proc(server: ^Acp_Server, envelope: ^acp.Envelope)
 		}
 		replay = true
 	}
-	workspace, reference, system_prompt, title, strings_ok := acp_clone_open_strings(
+	acp_enqueue_open_session(
+		server,
+		envelope,
+		.Resume_Id,
 		"",
 		params.session_id,
 		acp_session_prompt_text(params.system_prompt, &params.meta),
 		params.meta.session_title,
-		server.alloc,
+		params.mcp_servers,
+		replay,
 	)
-	if !strings_ok {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session parameters could not be allocated")
-		return
-	}
-	client_mcp, mcp_ok := acp_mcp_servers_make(params.mcp_servers, server.alloc)
-	if !mcp_ok {
-		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "a client-provided MCP server could not be prepared")
-		return
-	}
-	id, id_ok := acp_work_id(envelope.id, server.alloc)
-	if !id_ok {
-		acp_destroy_open_strings(workspace, reference, system_prompt, title, server.alloc)
-		agent.MCP_Server_Configs_Destroy(&client_mcp, server.alloc)
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
-		return
-	}
-	acp_enqueue_open_session(server, envelope, id, {kind = .Resume_Id, id = reference}, workspace, reference, system_prompt, title, client_mcp, replay)
 }
 
 acp_request_session_list :: proc(server: ^Acp_Server, envelope: ^acp.Envelope) {
@@ -721,19 +678,41 @@ acp_stored_session :: proc(server: ^Acp_Server, envelope: ^acp.Envelope, session
 	return loaded, true
 }
 
-// acp_enqueue_open_session hands a validated open request to the worker. The strings
-// change owners here: on success the worker releases them, on failure the queue does,
-// so the caller keeps nothing.
+// acp_enqueue_open_session clones the validated open parameters and hands them to
+// the worker, or answers the request with an error. The caller keeps ownership of
+// every argument.
 acp_enqueue_open_session :: proc(
 	server: ^Acp_Server,
 	envelope: ^acp.Envelope,
-	id: acp.Jsonrpc_Id,
-	start: Session_Start,
-	workspace, session_ref, system_prompt, title: string,
-	mcp_servers: [dynamic]agent.MCP_Server_Config,
+	kind: Session_Start_Kind,
+	cwd, session_id, prompt, session_title: string,
+	client_servers: []acp.Mcp_Server,
 	replay: bool,
 ) {
-	// start.id aliases session_ref; the work item releases session_ref only.
+	workspace, session_ref, system_prompt, title, strings_ok := acp_clone_open_strings(cwd, session_id, prompt, session_title, server.alloc)
+	if !strings_ok {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session parameters could not be allocated")
+		return
+	}
+	mcp_servers, mcp_ok := acp_mcp_servers_make(client_servers, server.alloc)
+	if !mcp_ok {
+		acp_destroy_open_strings(workspace, session_ref, system_prompt, title, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "a client-provided MCP server could not be prepared")
+		return
+	}
+	id, id_ok := acp_work_id(envelope.id, server.alloc)
+	if !id_ok {
+		acp_destroy_open_strings(workspace, session_ref, system_prompt, title, server.alloc)
+		agent.MCP_Server_Configs_Destroy(&mcp_servers, server.alloc)
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
+		return
+	}
+	// start.id aliases session_ref; the work item releases session_ref only. A new
+	// session has an empty reference.
+	start := Session_Start {
+		kind = kind,
+		id   = session_ref,
+	}
 	work := Acp_Work {
 		kind          = .Open_Session,
 		id            = id,

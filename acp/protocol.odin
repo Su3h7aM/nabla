@@ -62,7 +62,7 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	defer json.destroy_value(value, allocator)
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, .Invalid_Envelope }
-	version, version_ok := object_string(object, "jsonrpc")
+	version, _, version_ok := object_string_present(object, "jsonrpc")
 	if !version_ok || version != "2.0" { return {}, .Invalid_Version }
 	parsed_id, parsed_id_present, id_error := object_id(object, "id", allocator)
 	if id_error != .None { return {}, id_error }
@@ -219,14 +219,6 @@ object_string_present :: proc(object: json.Object, key: string) -> (string, bool
 	text, is_string := value.(json.String)
 	if !is_string { return "", true, false }
 	return string(text), true, true
-}
-@(require_results)
-object_string :: proc(object: json.Object, key: string) -> (string, bool) {
-	value, present := object[key]
-	if !present { return "", false }
-	text, is_string := value.(json.String)
-	if !is_string { return "", false }
-	return string(text), true
 }
 @(require_results)
 object_id :: proc(object: json.Object, key: string, allocator := context.allocator) -> (id: Jsonrpc_Id, present: bool, err: Envelope_Error) {

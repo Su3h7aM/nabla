@@ -109,7 +109,6 @@ acp_is_v2 :: proc(server: ^Acp_Server) -> bool {
 
 @(require_results)
 acp_server_has_work :: proc(server: ^Acp_Server) -> bool {
-	if sync.atomic_load(&server.busy) { return true }
 	sync.mutex_lock(&server.queue_mu)
 	pending := server.pending_work > 0
 	sync.mutex_unlock(&server.queue_mu)
@@ -119,7 +118,6 @@ acp_server_has_work :: proc(server: ^Acp_Server) -> bool {
 acp_queue_add :: proc(server: ^Acp_Server) {
 	sync.mutex_lock(&server.queue_mu)
 	server.pending_work += 1
-	sync.atomic_store(&server.busy, true)
 	sync.mutex_unlock(&server.queue_mu)
 }
 
@@ -128,7 +126,6 @@ acp_queue_remove :: proc(server: ^Acp_Server) {
 	server.pending_work -= 1
 	if server.pending_work <= 0 {
 		server.pending_work = 0
-		sync.atomic_store(&server.busy, false)
 	}
 	sync.mutex_unlock(&server.queue_mu)
 }
@@ -453,16 +450,12 @@ Acp_Server :: struct {
 	writer:             acp.Writer,
 	work:               Acp_Work_Chan,
 	worker:             ^thread.Thread,
-	// queue_mu guards pending_work and the busy flag. v2 can have a short bounded
-	// queue, so the count and flag must change as one state transition.
+	// queue_mu guards pending_work.
 	queue_mu:           sync.Mutex,
-	busy:               bool, // atomic mirror, read by teardown and tests
 	pending_work:       int,
 	// initialized is set once initialize has been answered. Only the reader writes it.
 	initialized:        bool,
-	// protocol_version is the number agreed with the client. profile is the
-	// corresponding wire surface.
-	protocol_version:   int,
+	// profile is the wire surface agreed with the client.
 	profile:            Acp_Wire_Profile,
 	// mu guards session_id, which the reader matches a cancellation against and the
 	// worker replaces after opening a session.
@@ -708,21 +701,13 @@ acp_work_open_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 	v1_options_ok: bool
 	v2_options: []acp.V2_Config_Option
 	v2_options_ok: bool
-	if work.start.kind == .Resume_Id {
-		if acp_is_v2(server) {
-			v2_options, v2_options_ok = acp_model_config_options_v2(server)
-			if !v2_options_ok {
-				_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
-				return
-			}
-		}
-	} else if acp_is_v2(server) {
+	if acp_is_v2(server) {
 		v2_options, v2_options_ok = acp_model_config_options_v2(server)
 		if !v2_options_ok {
 			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
 			return
 		}
-	} else {
+	} else if work.start.kind != .Resume_Id {
 		v1_options, v1_options_ok = acp_model_config_options_v1(server)
 		if !v1_options_ok {
 			_ = acp.writer_write_error(&server.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
