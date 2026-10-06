@@ -2,14 +2,22 @@
 
 Open work found in reviews. Each item names where the problem lives and the simplest fix known so far. Remove an item when its change lands; move a decision into `docs/ARCHITECTURE.md` once it is made.
 
-## Limits to verify or remove
+## Limits and provider errors
 
 Each limit stays only if a protocol, API, provider, model, or the OS imposes it, and then its comment names the source.
 
-- `OPENAI_TOOL_SCHEMA_DEPTH = 16` (`ai/openai.odin`). Check against the OpenAI documentation; strict structured outputs document a nesting limit, which applies only when strict mode is used.
-- `MAX_MESSAGE_DEPTH = 64` (`mcp/protocol.odin`), with the number repeated in its error text. Neither MCP nor JSON-RPC sets a depth; if the guard protects the recursive JSON parser from hostile input, say so in the comment.
-- `db/error.odin` truncates backend messages to 128 bytes, against "report in full".
-- Check that the provider error codes treated as retryable, repairable, or fatal match the providers' documentation.
+- `OPENAI_TOOL_SCHEMA_DEPTH = 16` (`ai/openai.odin`) is harness-invented. Nabla never sends `strict`, and neither OpenAI nor Anthropic documents a depth limit for non-strict tool schemas. Remove it. If strict mode is added later, apply OpenAI's strict-mode limits only when `strict` is sent.
+- `MAX_MESSAGE_DEPTH = 64` (`mcp/protocol.odin`): no protocol sets it, but RFC 8259 §9 permits a nesting limit, and `core:encoding/json` recurses without bound on peer input. Keep the guard, name that reason, and derive the error text from the constant.
+- The same unbounded recursion is unguarded where provider and ACP input is parsed: `acp/protocol.odin`, `ai/anthropic.odin`, `ai/openai_chat.odin`, `ai/openai_responses.odin`, `ai/classify.odin`, `mcp/tools.odin`. One shared guard, or an iterative parse, would cover all of them.
+- `db/error.odin` stores backend messages in a 128-byte inline buffer. SQLite has no such limit. Own the full message.
+
+Provider error classification mostly matches the Anthropic and OpenAI documentation. Open points:
+
+- `x-should-retry` (`ai/classify.odin`, `agent/retry.odin`) overrides the class table in both directions, but no API document in the reference set describes the header; only SDK code uses it. Source it or demote it to a hint that cannot turn a stop into a retry.
+- Anthropic `conflict_error` (409) and status 408 are resent unchanged. The Anthropic documentation says to resolve the conflict before retrying, so an identical resend cannot succeed.
+- Anthropic models from 4.5 on return `stop_reason: "model_context_window_exceeded"` instead of an error on context overflow. Check that it is handled as overflow; `"prompt is too long"` is not in the documentation.
+- OpenRouter can turn a Responses API context overflow into a successful `finish_reason: "length"`, which is not classified as overflow.
+- Several OpenAI codes in `ai/openai.odin` (`insufficient_quota`, `invalid_api_key`, `model_not_found`, the spend-limit codes) are not in the reference documents. Add the OpenAI error-code guide to the references and re-check.
 
 ## Subagents
 
@@ -27,6 +35,7 @@ Each description states what the tool does, why it exists, and how to use it, pr
 
 - Code Mode: state the result shape. `output` is a table of the tool's fields: `output.content` for `builtin_read`, `output.stdout` and `output.stderr` for `builtin_shell`.
 - Shell: say to create files with `builtin_write` instead of heredocs, and name common fish syntax differences. Replace "bounded stdout and stderr" with the kept output file, since output is never discarded.
+- Patch parsing: a mistyped header such as `*** Updat File:` inside a section becomes hunk content instead of an error naming the line.
 - Patch: a hunk of only `-old` and `+new` lines is enough when the line is unique.
 - Read: when a result is cut to the preview, the notice gives the shown line count and the next `offset`. The 2000-line default can exceed the preview size.
 - `agent_spawn`: "provider not found" lists the configured providers, and the schema says which model id form is expected.
