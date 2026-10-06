@@ -535,10 +535,11 @@ tui_run :: proc(
 
 	read_failed := false
 	for !app.quit {
-		// The drain comes before the loop reads any state a wake announces, so a
-		// signal that arrives after it leaves the descriptor readable for the next poll.
-		input.wake_drain(wake)
 		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, tui_wait_ms(app), wake)
+		// The drain comes after the poll and before the loop reads any state a wake
+		// announces. A change published while this pass runs then leaves the descriptor
+		// readable, so the next poll returns at once instead of sleeping past it.
+		input.wake_drain(wake)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
 			read_failed = true
