@@ -166,6 +166,34 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	return record, true, nil
 }
 
+// read_last_node returns the node of the given kind with the highest id in session,
+// false when the session has none. It reads every branch, so it names the newest node
+// a session committed of that kind, partial ones included: an Assistant node's payload
+// says whether its text is partial. The result is owned by allocator; release it with
+// node_destroy.
+@(require_results)
+read_last_node :: proc(journal: ^Journal, session: Session_Id, kind: Node_Kind, allocator: mem.Allocator) -> (node: Node, found: bool, error: Error) {
+	assert(journal.open)
+	session := session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
+	db.query(&journal.connection, &rows, NODE_LAST_QUERY, {db.Value(session[:]), NODE_KIND_NAMES[kind]}) or_return
+	values, has_row := db.rows_next(&rows) or_return
+	if !has_row { return {}, false, nil }
+	row := Row {
+		values    = values,
+		allocator = allocator,
+	}
+	node = scan_node(&row)
+	if row.error != nil {
+		node_session := node.session
+		node_seq := node.seq
+		node_destroy(&node, allocator)
+		return {}, false, corrupt(journal, row.error, node_session, node_seq)
+	}
+	return node, true, nil
+}
+
 // read_ancestry returns the nodes a projection walks to head, oldest first. At
 // the first Checkpoint K on the way, covering F, it returns K, then the nodes
 // after F through K's parent, then the nodes after K; nodes up to F are not
@@ -435,6 +463,9 @@ RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn
 NODE_QUERY :: "SELECT session, node, parent, branch, kind, turn, covers, seq, data, body FROM nodes WHERE session = ? AND node = ?"
 
 @(private)
+NODE_LAST_QUERY :: "SELECT session, node, parent, branch, kind, turn, covers, seq, data, body FROM nodes WHERE session = ? AND kind = ? ORDER BY node DESC LIMIT 1"
+
+@(private)
 SESSION_LIST_QUERY :: `SELECT * FROM (
 	SELECT session, created_ms, workspace, role, parent_session, parent_call,
 		COALESCE((SELECT json_extract(data, '$.title') FROM records AS titled
@@ -516,16 +547,7 @@ read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator
 		values    = values,
 		allocator = allocator,
 	}
-	node.session = Session_Id(row_id(&row))
-	node.id = Node_Id(row_int(&row))
-	node.parent = Node_Id(row_int(&row))
-	node.branch = Branch_Id(row_int(&row))
-	node.kind = row_enum(&row, NODE_KIND_NAMES)
-	node.turn = Turn_Id(row_int(&row))
-	node.covers = Node_Id(row_int(&row))
-	node.seq = Journal_Seq(row_int(&row))
-	node.data = row_text(&row)
-	node.body = row_bytes(&row)
+	node = scan_node(&row)
 	if row.error != nil {
 		node_session := node.session
 		node_seq := node.seq
@@ -533,6 +555,22 @@ read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator
 		return {}, corrupt(journal, row.error, node_session, node_seq)
 	}
 	return node, nil
+}
+
+// scan_node scans a row of NODE_QUERY's columns.
+@(private)
+scan_node :: proc(row: ^Row) -> (node: Node) {
+	node.session = Session_Id(row_id(row))
+	node.id = Node_Id(row_int(row))
+	node.parent = Node_Id(row_int(row))
+	node.branch = Branch_Id(row_int(row))
+	node.kind = row_enum(row, NODE_KIND_NAMES)
+	node.turn = Turn_Id(row_int(row))
+	node.covers = Node_Id(row_int(row))
+	node.seq = Journal_Seq(row_int(row))
+	node.data = row_text(row)
+	node.body = row_bytes(row)
+	return
 }
 
 @(private)

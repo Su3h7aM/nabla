@@ -86,15 +86,17 @@ Compact_Output :: struct {
 }
 
 // Agent_Output is what an agent tool did to one subagent. answer is the subagent's final
-// answer, present once it finished.
+// answer once it finished, or the last text it wrote when it failed or was stopped.
+// session is the child's Nabla session; acp_session is an ACP agent's own session id.
 Agent_Output :: struct {
-	agent:   string,
-	status:  string,
-	model:   string,
-	effort:  string,
-	session: string,
-	notice:  string, // a repair of the call, such as an effort the model does not state
-	answer:  string,
+	agent:       string,
+	status:      string,
+	model:       string,
+	effort:      string,
+	session:     string,
+	acp_session: string,
+	notice:      string, // a repair of the call, such as an effort the model does not state
+	answer:      string,
 }
 
 // Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
@@ -216,6 +218,7 @@ tool_result_render :: proc(
 		if value.model != "" { render_field(&head, "model", value.model) or_return }
 		if value.effort != "" { render_field(&head, "effort", value.effort) or_return }
 		if value.session != "" { render_field(&head, "session", value.session) or_return }
+		if value.acp_session != "" { render_field(&head, "acp_session", value.acp_session) or_return }
 		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
 		render_text(&body, value.answer) or_return
 	case Codemode_Output:
@@ -457,6 +460,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.model = strings.clone(borrowed.model, allocator) or_return
 		value.effort = strings.clone(borrowed.effort, allocator) or_return
 		value.session = strings.clone(borrowed.session, allocator) or_return
+		value.acp_session = strings.clone(borrowed.acp_session, allocator) or_return
 		value.notice = strings.clone(borrowed.notice, allocator) or_return
 		value.answer = strings.clone(borrowed.answer, allocator) or_return
 	case Codemode_Output:
@@ -535,6 +539,7 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.model, allocator)
 		delete(value.effort, allocator)
 		delete(value.session, allocator)
+		delete(value.acp_session, allocator)
 		delete(value.notice, allocator)
 		delete(value.answer, allocator)
 	case Codemode_Output:

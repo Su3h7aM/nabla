@@ -438,6 +438,55 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 	testing.expect(test, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
+// A background child whose provider cuts the stream after part of an answer fails, and its
+// report to the orchestrator names the child's session, the cause, and the text it had
+// committed, so the orchestrator knows what was lost and where to look.
+@(test)
+test_a_failed_background_subagent_reports_its_session_cause_and_partial_text :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	// The provider says a resend is pointless, so the cut stream ends the child's turn with
+	// what it had streamed instead of resending on the production schedule.
+	cut := "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-should-retry: false\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"The parser lives in\"},\"finish_reason\":null}]}\n\n"
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, {cut}) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, nil)
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
+	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = strings.clone("test-provider", chat.allocator)
+	delete(chat.model_id, chat.allocator)
+	chat.model_id = strings.clone("test-model", chat.allocator)
+	agent_team_note_parent(chat)
+	_test_accept(test, chat, "start one")
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"find the parser"}`),
+		journal.TOOL_OUTCOME_NAMES[.Success],
+	)
+	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	records, read_ok := chat_inbox_read(chat)
+	if !testing.expect(test, read_ok && len(records) == 1) { return }
+	report, _ := inbox_text(records[0])
+	session_hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	testing.expect(test, strings.contains(report, "Subagent agent-1 failed"), report)
+	testing.expect(test, strings.contains(report, journal.session_id_to_hex(records[0].subagent, session_hex[:])), report)
+	testing.expect(test, strings.contains(report, "The parser lives in"), report)
+	completion: journal.Subagent_Completed
+	if journal.payload_decode(records[0].data, &completion, context.temp_allocator) != nil { testing.fail_now(test, "the completion could not be read") }
+	testing.expect_value(test, completion.outcome, journal.TOOL_OUTCOME_NAMES[.Tool_Failed])
+	testing.expect(test, completion.detail != "" && strings.contains(report, completion.detail), report)
+	testing.expect_value(test, string(records[0].body), "The parser lives in")
+}
+
 // subagent_test_full_team points the orchestrator at catalog's one model and fills every
 // slot with children the test finishes itself.
 subagent_test_full_team :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Catalog, endpoint: string) {
@@ -530,7 +579,7 @@ test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	testing.expect_value(test, stopped.outcome, journal.Tool_Outcome.Success)
 	member := chat.team.members[0]
 	testing.expect(test, member.status == .Stopped && member.thread == nil && len(chat.team.waiting) == 0)
-	testing.expect_value(test, member.answer, "stopped before it started; not executed")
+	testing.expect_value(test, member.cause, "stopped before it started; not executed")
 	agent_team_reap(chat.team, chat)
 	records, read_ok := chat_inbox_read(chat)
 	if !testing.expect(test, read_ok && len(records) == 1) { return }

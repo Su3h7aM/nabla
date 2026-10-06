@@ -264,7 +264,8 @@ chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
 // inbox_text is the text a User node carries for one inbox record, and the origin the
 // node names. The text matches what the model knows: a child is named as the spawn call
 // named it, and a record that has no name, such as one recovery wrote, names the child's
-// session. Text is in temp memory.
+// session. A completion report names the child's session and, for a child that did not
+// complete, the cause and the last text the child committed. Text is in temp memory.
 @(private)
 inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.User_Origin) {
 	hex: [journal.SESSION_ID_HEX_LENGTH]u8
@@ -281,13 +282,14 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		// A payload that cannot be read still reports that the child ended.
 		_ = journal.payload_decode(record.data, &completed, context.temp_allocator)
 		name := completed.name if completed.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
+		session := journal.session_id_to_hex(record.subagent, hex[:])
 		switch completed.outcome {
 		case journal.TOOL_OUTCOME_NAMES[.Success]:
-			return fmt.tprintf("Subagent %s completed. Its answer:\n\n%s", name, body), .Agent
+			return fmt.tprintf("Subagent %s completed (session %s). Its answer:\n\n%s", name, session, body), .Agent
 		case journal.TOOL_OUTCOME_NAMES[.Cancelled]:
-			return fmt.tprintf("Subagent %s was stopped before it finished.", name), .Agent
+			return fmt.tprintf("Subagent %s was stopped before it finished (session %s).%s", name, session, inbox_last_text(body)), .Agent
 		}
-		return fmt.tprintf("Subagent %s failed: %s", name, completed.detail), .Agent
+		return fmt.tprintf("Subagent %s failed (session %s): %s%s", name, session, completed.detail, inbox_last_text(body)), .Agent
 	case .Subagent_Message:
 		if record.session != record.subagent { return fmt.tprintf("Message from the orchestrator:\n%s", body), .Agent }
 		message: journal.Subagent_Message
@@ -296,6 +298,14 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		return fmt.tprintf("Message from subagent %s, which is still working (reply with agent_send if it asks something):\n%s", name, body), .Agent
 	}
 	return body, .Agent
+}
+
+// inbox_last_text is the paragraph a report of a child that did not complete adds for the
+// last text the child committed, "" when it committed none. Text is in temp memory.
+@(private)
+inbox_last_text :: proc(body: string) -> string {
+	if body == "" { return "" }
+	return fmt.tprintf("\n\nThe last text it committed, which may be cut off:\n\n%s", body)
 }
 
 // chat_steering_observe is the driver's collection step for input that reached the

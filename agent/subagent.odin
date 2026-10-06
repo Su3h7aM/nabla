@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -79,9 +80,10 @@ Subagent :: struct {
 	wake:                         Tool_Wake,
 	parent_wake:                  ^os.File,
 	thread:                       ^thread.Thread, // background only
-	session_id:                   string,
+	acp_session:                  string, // the ACP agent's own session id; "" for a native subagent, whose session is session
 	status:                       Subagent_Status,
-	answer:                       string, // the final answer, or why there is none
+	cause:                        string, // why the subagent did not complete; "" once it completed
+	answer:                       string, // the text of its last committed answer, partial when it failed or was stopped mid-answer
 	done:                         bool, // atomic; set last
 }
 
@@ -275,16 +277,15 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) {
 }
 
 // subagent_record_completion buffers the subagent.completed that closes a member's
-// delegation, with its final answer in the body when it completed.
+// delegation: the outcome, the cause in detail, and the text of its last committed answer
+// in the body, partial when it did not complete.
 @(private)
 subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 	if member.session == {} { return }
 	outcome := journal.Tool_Outcome.Tool_Failed
-	detail, body := member.answer, ""
 	switch member.status {
 	case .Completed:
 		outcome = .Success
-		detail, body = "", member.answer
 	case .Stopped:
 		outcome = .Cancelled
 	case .Failed, .Running, .Queued:
@@ -292,8 +293,8 @@ subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 	chat_record(
 		chat,
 		{kind = .Subagent_Completed, call = member.parent_call, subagent = member.session},
-		journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[outcome], detail = detail, name = member.name},
-		transmute([]u8)body,
+		journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[outcome], detail = member.cause, name = member.name},
+		transmute([]u8)member.answer,
 	)
 }
 
@@ -376,7 +377,8 @@ subagent_destroy :: proc(member: ^Subagent) {
 	delete(member.workspace, allocator)
 	delete(member.store_directory, allocator)
 	delete(member.lock_directory, allocator)
-	delete(member.session_id, allocator)
+	delete(member.acp_session, allocator)
+	delete(member.cause, allocator)
 	delete(member.answer, allocator)
 	free(member, allocator)
 }
@@ -636,35 +638,35 @@ subagent_conclude :: proc(member: ^Subagent) -> (next: ^Subagent) {
 	return next
 }
 
-// Subagent_Answer keeps the text of the latest response, which is the final answer once the
-// subagent's turn ends. failed says the text it holds is not all of it.
-@(private)
-Subagent_Answer :: struct {
-	text:   [dynamic]u8,
-	failed: bool,
-}
-
-@(private)
-subagent_answer_restart :: proc(user_data: rawptr) {
-	answer := cast(^Subagent_Answer)user_data
-	clear(&answer.text)
-}
-
-@(private)
-subagent_answer_text :: proc(user_data: rawptr, text: string) {
-	answer := cast(^Subagent_Answer)user_data
-	if _, append_error := append(&answer.text, text); append_error != nil { answer.failed = true }
-}
-
 // subagent_fail records why a subagent ended. The status is the outcome either way; a reason
 // that cannot be kept leaves the status as the whole outcome.
 @(private)
 subagent_fail :: proc(member: ^Subagent, status: Subagent_Status, reason: string) {
 	member.status = status
-	delete(member.answer, member.allocator)
+	delete(member.cause, member.allocator)
 	clone_error: mem.Allocator_Error
-	member.answer, clone_error = strings.clone(reason, member.allocator)
-	if clone_error != nil { member.answer = "" }
+	member.cause, clone_error = strings.clone(reason, member.allocator)
+	if clone_error != nil { member.cause = "" }
+}
+
+// subagent_keep_answer sets member.answer to the text of the last Assistant node the
+// subagent's session committed, whatever the outcome: the answer of a completed subagent,
+// the partial text a failed or stopped one had streamed, or the last text it wrote before
+// it ended. A completed subagent whose answer cannot be read or held is not the answer the
+// orchestrator asked for, so its outcome becomes failed rather than reporting a short one.
+@(private)
+subagent_keep_answer :: proc(member: ^Subagent, store: ^journal.Journal) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	node, found, read_error := journal.read_last_node(store, member.session, .Assistant, context.temp_allocator)
+	if read_error == nil && !found { return }
+	answer: string
+	clone_error: mem.Allocator_Error
+	if read_error == nil { answer, clone_error = strings.clone(string(node.body), member.allocator) }
+	if read_error != nil || clone_error != nil {
+		if member.status == .Completed { subagent_fail(member, .Failed, "the subagent's answer could not be recorded") }
+		return
+	}
+	member.answer = answer
 }
 
 // subagent_run runs the subagent's session until it answers its task and every message its
@@ -709,13 +711,9 @@ subagent_run :: proc(member: ^Subagent) {
 		)
 		return
 	}
-	session_hex: [journal.SESSION_ID_HEX_LENGTH]u8
-	session_text, session_error := strings.clone(journal.session_id_to_hex(session_id, session_hex[:]), allocator)
-	if session_error != nil {
-		subagent_fail(member, .Failed, "the subagent's session id could not be held")
-		return
-	}
-	member.session_id = session_text
+	// The answer is read after the session is destroyed and before the store closes, whatever
+	// the outcome.
+	defer subagent_keep_answer(member, &store)
 
 	chat, init_error := chat_session_init(&store, session_id, journal.INITIAL_BRANCH, 0, member.workspace, allocator)
 	if init_error.kind != .None {
@@ -752,15 +750,6 @@ subagent_run :: proc(member: ^Subagent) {
 		return
 	}
 
-	answer := Subagent_Answer {
-		text = make([dynamic]u8, allocator),
-	}
-	defer delete(answer.text)
-	observer := Chat_Observer {
-		user_data        = &answer,
-		request_prepared = subagent_answer_restart,
-		assistant_text   = subagent_answer_text,
-	}
 	// The task is the first message, so what the orchestrator sent while this subagent
 	// waited for a slot is delivered after it, at the first settled point.
 	text, origin, inbox_first := member.prompt, journal.User_Origin.Prompt, false
@@ -770,7 +759,7 @@ subagent_run :: proc(member: ^Subagent) {
 			subagent_fail(member, .Failed, chat.last_error if chat.last_error != "" else "the task could not be recorded")
 			return
 		}
-		if !chat_turn_drive(&chat, member.selection.connection, chat_retry_policy_default(), observer, nil, nil) {
+		if !chat_turn_drive(&chat, member.selection.connection, chat_retry_policy_default(), {}, nil, nil) {
 			if chat.terminal_status == .Cancelled {
 				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
 			} else {
@@ -789,20 +778,7 @@ subagent_run :: proc(member: ^Subagent) {
 		if next == .Closed { break }
 		text, origin, inbox_first = "", .Agent, true
 	}
-	// An answer that was not kept whole, or cannot be held at all, is not the answer the
-	// orchestrator asked for, so the outcome says the delegation failed rather than
-	// reporting a short one as a completion.
-	if answer.failed {
-		subagent_fail(member, .Failed, "the subagent's answer could not be recorded")
-		return
-	}
-	answer_text, answer_error := strings.clone(string(answer.text[:]), allocator)
-	if answer_error != nil {
-		subagent_fail(member, .Failed, "the subagent's answer could not be recorded")
-		return
-	}
 	member.status = .Completed
-	member.answer = answer_text
 }
 
 // Subagent_Next says what a subagent does after its turn: take the messages that wait,

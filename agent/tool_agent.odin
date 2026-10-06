@@ -5,6 +5,8 @@ import "core:fmt"
 import "core:mem"
 import "core:strings"
 
+import "nabla:agent/journal"
+
 TOOL_AGENT_SPAWN_NAME :: "agent_spawn"
 TOOL_AGENT_SPAWN_DESCRIPTION :: "Start a subagent: a separate agent in a new session that works on one task in parallel with you and sends back only its answer. Delegate to keep your context small and to spend less: the subagent reads the files, runs the searches and commands, and works through the details, and you receive only the result you asked for. It usually runs cheaper than you, so give it bounded work such as investigating one area, tracing one behavior, or making one well-specified edit.\n\nScope each subagent narrowly. It sees none of your conversation, so prompt must state one specific task, every fact, decision, and path it needs (or exactly where to find them), what is out of scope, and exactly what to return. Write \"find where the session cache key is computed and report the file, line, and every caller\", not \"fix the caching bug\": a broad goal makes it wander and do work you did not need. instruction is its system prompt: how to work and the form of its answer. Split broad work into several focused subagents that run at once.\n\nA task you delegate is no longer yours: do not do it, or any part of it, yourself while the subagent runs. Work on something else or wait for the answer; doing the same work twice wastes what delegation saves, and your edits can collide with its edits.\n\nYou and every subagent share one workspace with no isolation, so an agent can overwrite or undo another agent's changes. Subagents cannot talk to each other, so coordinating them is your job. When several run at once, give each a task that touches files no other agent edits, and tell each in its prompt that other agents are working in the same workspace, which files are its own, and which it must leave alone. Do not edit a subagent's files yourself while it runs. When one subagent's work affects another's, relay what matters with agent_send.\n\nNormally pass only instruction and prompt. The defaults run your model at one effort level below yours, in the background. Set model, provider, or effort only when the user or your instruction files name the ones to use. model is a catalog model id with its vendor prefix, exactly as listed, such as anthropic/claude-sonnet-5-5; a short name like claude-sonnet-5-5 is not an alias and fails, and the error lists the models of your provider. provider is the id of a configured provider, not a vendor name, needed only when several providers serve the model; an unknown one fails and the error lists the configured providers.\n\nThe call returns the agent id at once. Keep working on anything that does not need the answer; the answer arrives later as a message, and if you have nothing else to do, end your turn and the answer starts a new one. While it runs, steer it with agent_send when you learn something that changes its task, answer its questions the same way, and stop it with agent_stop when its work is no longer needed. Set wait to true only when your very next step needs the answer and nothing else can proceed meanwhile; the call then blocks and returns the answer.\n\nWith acp_agent set, the subagent is that configured agent program, driven over the Agent Client Protocol, and model and effort are chosen among what it offers. Only the orchestrator can start subagents."
 TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type":["string","null"],"description":"The subagent's system prompt: how to work and what its answer must contain."},"prompt":{"type":"string","description":"One narrowly scoped task with every fact the subagent needs and exactly what it must return."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, such as anthropic/claude-sonnet-5-5; no alias or short name resolves. Leave out unless the user or your instructions name one. Default: your model."},"provider":{"type":["string","null"],"description":"Id of a configured provider (one with base_url, api, and api_key), not a vendor name such as openai. Needed only when several providers serve model. Default: your provider if it serves model, else the only provider that does."},"effort":{"type":["string","null"],"description":"Reasoning effort level. Leave out unless the user or your instructions name one. Default: one level below yours."},"wait":{"type":["boolean","null"],"description":"Block until the subagent finishes and return its answer. Default: false, run in the background and deliver the answer later as a message."},"acp_agent":{"type":["string","null"],"description":"Name of a configured ACP agent program to run as the subagent. Default: a native subagent."}},"required":["prompt"],"additionalProperties":false}`
@@ -152,11 +154,13 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not started") }
 	ctx.subagent_started = true
 
+	session_hex: [journal.SESSION_ID_HEX_LENGTH]u8
 	output := Agent_Output {
-		agent  = member.name,
-		status = subagent_status_names[.Running],
-		model  = fmt.tprintf("%s/%s", member.selection.provider_id, member.selection.model_id),
-		effort = member.effort if member.effort != "" else "default",
+		agent   = member.name,
+		status  = subagent_status_names[.Running],
+		model   = fmt.tprintf("%s/%s", member.selection.provider_id, member.selection.model_id),
+		effort  = member.effort if member.effort != "" else "default",
+		session = journal.session_id_to_hex(member.session, session_hex[:]),
 	}
 	if args.effort != "" && args.effort != member.effort {
 		output.notice = fmt.tprintf("effort %q is not a level of this model, so it runs as if effort were left out", args.effort)
@@ -203,16 +207,16 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	member.parent_wake = ctx.control.wake
 	subagent_run(member)
 	output.status = subagent_status_names[member.status]
-	output.session = member.session_id
+	output.acp_session = member.acp_session
+	output.answer = member.answer
 	result: Tool_Result
 	switch member.status {
 	case .Completed:
-		output.answer = member.answer
 		result = tool_result_success(ctx, output, fmt.tprintf("%s completed", output.agent))
 	case .Stopped:
-		result = tool_result_of(ctx, .Cancelled, member.answer, output, "stopped")
+		result = tool_result_of(ctx, .Cancelled, member.cause, output, "stopped")
 	case .Failed, .Running, .Queued:
-		result = tool_result_of(ctx, .Tool_Failed, member.answer, output, "failed")
+		result = tool_result_of(ctx, .Tool_Failed, member.cause, output, "failed")
 	}
 	// The result owns its copies, so the member may be released once it is done.
 	subagent_finish(member)

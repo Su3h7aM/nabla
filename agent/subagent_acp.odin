@@ -214,7 +214,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		subagent_fail(member, .Failed, "the agent's session id could not be held")
 		return
 	}
-	member.session_id = session_text
+	member.acp_session = session_text
 
 	// The program has no Nabla session, so what the orchestrator sends it is read from the
 	// orchestrator's journal records, through a connection of its own.
