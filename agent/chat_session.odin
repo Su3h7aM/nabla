@@ -123,13 +123,10 @@ Chat_Session :: struct {
 	// closes its proposed calls before the next turn projects the history.
 	recovery_pending:             bool,
 
-	// abandoned_attempts are provider attempts whose workers ignored their stop. Each is
-	// released once its worker publishes; until then nothing that worker can reach is freed.
-	abandoned_attempts:           [dynamic]^Chat_Abandoned_Attempt,
-	// abandoned are the jobs that have moved onto Job (compaction and tool calls so far) whose
-	// workers ignored their stop. The session keeps working; job_reclaim releases each once its
-	// worker publishes, and until then nothing the worker can reach (the workspace, the skill
-	// catalog, the tool backends) is freed.
+	// abandoned are the jobs that have moved onto Job (compaction, tool calls, and provider
+	// attempts so far) whose workers ignored their stop. The session keeps working; job_reclaim
+	// releases each once its worker publishes, and until then nothing the worker can reach (the
+	// workspace, the skill catalog, the tool backends) is freed.
 	abandoned:                    [dynamic]^Job,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
@@ -318,7 +315,6 @@ chat_session_init :: proc(
 	chat.partial_assistant.allocator = allocator
 	chat.pending_calls.allocator = allocator
 	chat.effort_levels.allocator = allocator
-	chat.abandoned_attempts.allocator = allocator
 	chat.abandoned.allocator = allocator
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
 	chat.team = agent_team_make(os.heap_allocator())
@@ -392,15 +388,8 @@ chat_session_tool_jobs_abandoned :: proc(chat: ^Chat_Session) -> bool {
 // releases the workers that finished, which it records in the journal, so only the thread
 // that owns the journal may call it.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
-	chat_chain_attempts_reclaim(chat)
 	job_reclaim(chat)
-	return(
-		chat.workers_retained ||
-		len(chat.abandoned_attempts) > 0 ||
-		len(chat.abandoned) > 0 ||
-		agent_team_running(chat.team) ||
-		(chat.team != nil && sync.atomic_load(&chat.team.abandoned)) \
-	)
+	return chat.workers_retained || len(chat.abandoned) > 0 || agent_team_running(chat.team) || (chat.team != nil && sync.atomic_load(&chat.team.abandoned))
 }
 
 // Tool_Registry_Replace_Error names why a registry replacement was refused.
@@ -462,9 +451,8 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	if !outstanding { delete(chat.workspace, chat.allocator) }
 	chat_chain_release(chat)
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
-	// A worker that ignored its stop may still be running a WebSocket request through this
-	// session, so the session it borrowed is left allocated rather than destroyed under it.
-	if chat.provider_websocket != nil && !chat_chain_websocket_retained(chat) {
+	// An abandoned attempt took over the WebSocket it was using, so this one is unshared.
+	if chat.provider_websocket != nil {
 		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
 		chat.provider_websocket = nil
 	}
@@ -484,9 +472,8 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.tool_output_directory, chat.allocator)
 	delete(chat.provider_id, chat.allocator)
 	delete(chat.model_id, chat.allocator)
-	// An abandoned attempt and an abandoned job are released only when their workers
-	// publish, which nothing here waits for: the records stay allocated for the process.
-	delete(chat.abandoned_attempts)
+	// An abandoned job is released only when its worker publishes, which nothing here waits
+	// for: the records stay allocated for the process.
 	delete(chat.abandoned)
 	tool_registry_destroy(&chat.tools)
 	chat^ = {
@@ -826,7 +813,10 @@ chat_session_cancelled :: proc(chat: ^Chat_Session) -> bool {
 chat_session_observe_stop :: proc(chat: ^Chat_Session) {
 	if !chat_session_cancelled(chat) { return }
 	chat_session_note_cancel(chat)
-	chat_chain_note_stop(chat, time.tick_now())
+	chain := &chat.chain
+	if chain.attempt != nil && chain.active && chain.stage == .Sending {
+		job_note_stop(&chain.attempt.worker, true, time.tick_now())
+	}
 }
 
 // chat_stop_parent is the token a turn's stop chains to: the front-end's control while

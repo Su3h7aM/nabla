@@ -1,26 +1,45 @@
 package agent
 
 import "core:mem"
+import "core:mem/virtual"
+import "core:os"
 import "core:strings"
-import "core:thread"
 
 import "nabla:ai"
 
+// Chat_Attempt_Terminal is a request worker's last word: the operation error, owned by the
+// process heap, and the provider's stop reason.
+Chat_Attempt_Terminal :: struct {
+	error:         ai.Provider_Operation_Error,
+	finish_reason: ai.Provider_Finish_Reason,
+}
+
 // Chat_Request_Worker is one request attempt running off the owner thread. The owner
-// allocates it, launches it, and frees it only after the join, so every borrowed field
-// (mailbox, interrupt, connection, encoded) outlives the thread. It borrows the frozen
-// request rather than owning it: the bytes belong to the chain, and reusing or releasing
-// them is what the join before the next stage makes safe.
+// allocates it from the process heap, launches it, and frees it only once its worker has
+// published or the session is gone, so every borrowed field (mailbox, interrupt, connection,
+// encoded) outlives the thread. It borrows the frozen request rather than owning it: the
+// bytes belong to the chain, and reusing or releasing them is what retiring the worker
+// before the next stage makes safe.
+//
+// The worker writes terminal and then publishes through its Job; the owner reads terminal
+// only after job_published. An abandoned attempt keeps the chain's scratch arena in arena,
+// because the frozen bytes and the mailbox live there.
 Chat_Request_Worker :: struct {
-	allocator:         mem.Allocator, // safe from a worker thread; payloads come from here
+	// worker is the shared lifecycle, and its allocator is where the worker's payloads come
+	// from. It is not embedded with using, because the record's own fields share its names.
+	worker:            Job,
 	mailbox:           ^Owner_Mailbox,
 	interrupt:         ^ai.Interrupt,
 	source:            Chat_Event_Source,
 	connection:        ai.Provider_Connection,
+	// websocket is the session's WebSocket when this attempt sends through it, else nil. An
+	// abandoned attempt takes it over from the session, and its reclaim destroys it.
 	websocket:         ^ai.Provider_WebSocket_Session,
 	websocket_request: bool,
 	encoded:           ai.Provider_Encoded_Request,
 	options:           ai.Provider_Operation_Options,
+	terminal:          Chat_Attempt_Terminal,
+	arena:             virtual.Arena,
 }
 
 // Chat_Worker_Runtime is the callback's user data: the worker fact sink, the identity every
@@ -31,13 +50,28 @@ Chat_Worker_Runtime :: struct {
 	finish_reason: ai.Provider_Finish_Reason,
 }
 
-// chat_request_worker_main is the thread body. Odin gives a new thread a fresh managed temp
-// allocator but nothing else, so the allocator the worker uses is set here.
-chat_request_worker_main :: proc(thread: ^thread.Thread) {
-	worker := cast(^Chat_Request_Worker)thread.data
-	if worker == nil { return }
-	context.allocator = worker.allocator
-	mailbox_publish_terminal(worker.mailbox, chat_request_worker_attempt(worker))
+// chat_request_worker_run is the job body. It stores the terminal and nothing more: job_main
+// publishes it.
+chat_request_worker_run :: proc(job: ^Job) {
+	worker := cast(^Chat_Request_Worker)job
+	worker.terminal = chat_request_worker_attempt(worker)
+}
+
+// chat_request_worker_free releases an attempt record whose worker has published, together
+// with a terminal the owner did not take. Owner only.
+chat_request_worker_free :: proc(worker: ^Chat_Request_Worker) {
+	ai.Provider_Operation_Error_Destroy(&worker.terminal.error, worker.worker.allocator)
+	free(worker, os.heap_allocator())
+}
+
+// chat_request_worker_reclaim releases an abandoned attempt whose worker has published: the
+// record, its terminal, its mailbox, and the arena that held the frozen bytes. The mailbox
+// lives in that arena, so it is destroyed first. Owner only.
+chat_request_worker_reclaim :: proc(worker: ^Chat_Request_Worker) {
+	if worker.mailbox != nil { mailbox_destroy(worker.mailbox) }
+	if worker.websocket != nil { ai.Provider_WebSocket_Session_Destroy(worker.websocket) }
+	virtual.arena_destroy(&worker.arena)
+	chat_request_worker_free(worker)
 }
 
 // chat_request_worker_attempt runs the blocking send and returns what the owner needs to
@@ -59,7 +93,7 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 			&runtime,
 			chat_worker_event,
 			worker.options,
-			worker.allocator,
+			worker.worker.allocator,
 		)
 	}
 	return {error = operation_error, finish_reason = runtime.finish_reason}
@@ -74,9 +108,10 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 	runtime := cast(^Chat_Worker_Runtime)user_data
 	worker := runtime.worker
+	allocator := worker.worker.allocator
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
-		text, clone_error := strings.clone(value.Text, worker.allocator)
+		text, clone_error := strings.clone(value.Text, allocator)
 		if clone_error != nil {
 			mailbox_mark_lost(worker.mailbox)
 			return
@@ -94,7 +129,7 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 		}
 		chat_worker_deliver(worker, completion)
 	case ai.Provider_Error_Event:
-		message, clone_error := strings.clone(value.Message, worker.allocator)
+		message, clone_error := strings.clone(value.Message, allocator)
 		if clone_error != nil {
 			mailbox_mark_lost(worker.mailbox)
 			return
@@ -124,20 +159,21 @@ chat_worker_completion :: proc(
 	completion.source = source
 	completion.reason = value.Reason
 	kept := false
-	defer if !kept { chat_completion_destroy(&completion, worker.allocator) }
+	allocator := worker.worker.allocator
+	defer if !kept { chat_completion_destroy(&completion, allocator) }
 	clone_error: mem.Allocator_Error
-	if completion.reason_text, clone_error = strings.clone(value.Reason_Text, worker.allocator); clone_error != nil { return {}, false }
-	if completion.output, clone_error = strings.clone(value.Raw_Output, worker.allocator); clone_error != nil { return {}, false }
+	if completion.reason_text, clone_error = strings.clone(value.Reason_Text, allocator); clone_error != nil { return {}, false }
+	if completion.output, clone_error = strings.clone(value.Raw_Output, allocator); clone_error != nil { return {}, false }
 	if len(value.Tool_Calls) > 0 {
-		if completion.calls, clone_error = make([]ai.Provider_Tool_Call, len(value.Tool_Calls), worker.allocator); clone_error != nil { return {}, false }
+		if completion.calls, clone_error = make([]ai.Provider_Tool_Call, len(value.Tool_Calls), allocator); clone_error != nil { return {}, false }
 		for call, index in value.Tool_Calls {
-			completion.calls[index].ID, clone_error = strings.clone(call.ID, worker.allocator)
+			completion.calls[index].ID, clone_error = strings.clone(call.ID, allocator)
 			if clone_error != nil { return {}, false }
-			completion.calls[index].Item_ID, clone_error = strings.clone(call.Item_ID, worker.allocator)
+			completion.calls[index].Item_ID, clone_error = strings.clone(call.Item_ID, allocator)
 			if clone_error != nil { return {}, false }
-			completion.calls[index].Name, clone_error = strings.clone(call.Name, worker.allocator)
+			completion.calls[index].Name, clone_error = strings.clone(call.Name, allocator)
 			if clone_error != nil { return {}, false }
-			completion.calls[index].Arguments, clone_error = strings.clone(call.Arguments, worker.allocator)
+			completion.calls[index].Arguments, clone_error = strings.clone(call.Arguments, allocator)
 			if clone_error != nil { return {}, false }
 		}
 	}
@@ -151,6 +187,6 @@ chat_worker_completion :: proc(
 chat_worker_deliver :: proc(worker: ^Chat_Request_Worker, event: Chat_Event) {
 	if mailbox_push(worker.mailbox, event) { return }
 	owned := event
-	chat_event_destroy(&owned, worker.allocator)
+	chat_event_destroy(&owned, worker.worker.allocator)
 	mailbox_mark_lost(worker.mailbox)
 }

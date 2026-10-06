@@ -3,26 +3,16 @@ package agent
 import "core:mem"
 import "core:sync"
 
-import "nabla:ai"
-
-// Chat_Attempt_Terminal is a request worker's last word: the operation error, owned by the
-// mailbox allocator, and the provider's stop reason.
-Chat_Attempt_Terminal :: struct {
-	error:         ai.Provider_Operation_Error,
-	finish_reason: ai.Provider_Finish_Reason,
-}
-
-// Owner_Mailbox carries a request worker's events to the owner in order, plus one terminal
-// published after every event. A push never blocks. Payloads and the queue use allocator,
-// which must be safe to use from a worker thread. lost is atomic: the producer sets it for a
-// fact it could not hand over, which needs no allocation, and the owner takes it.
+// Owner_Mailbox carries a request worker's events to the owner in order. A push never
+// blocks. Payloads and the queue use allocator, which must be safe to use from a worker
+// thread. lost is atomic: the producer sets it for a fact it could not hand over, which
+// needs no allocation, and the owner takes it. The worker's terminal is not here: it is in
+// the attempt record, read after the worker publishes.
 Owner_Mailbox :: struct {
-	allocator:        mem.Allocator,
-	mutex:            sync.Mutex,
-	events:           [dynamic]Chat_Event,
-	terminal:         Chat_Attempt_Terminal,
-	terminal_present: bool,
-	lost:             bool,
+	allocator: mem.Allocator,
+	mutex:     sync.Mutex,
+	events:    [dynamic]Chat_Event,
+	lost:      bool,
 }
 
 mailbox_init :: proc(mailbox: ^Owner_Mailbox, allocator: mem.Allocator) {
@@ -50,7 +40,7 @@ mailbox_mark_lost :: proc(mailbox: ^Owner_Mailbox) {
 }
 
 // mailbox_take_lost reports whether a fact was lost since the last call, and clears the
-// report. Take it after the terminal: the worker marks a loss before it publishes.
+// report. Take it after the worker's publication: the worker marks a loss before it publishes.
 @(require_results)
 mailbox_take_lost :: proc(mailbox: ^Owner_Mailbox) -> bool {
 	return sync.atomic_exchange(&mailbox.lost, false)
@@ -69,35 +59,12 @@ mailbox_take_all :: proc(mailbox: ^Owner_Mailbox) -> [dynamic]Chat_Event {
 	return events
 }
 
-mailbox_publish_terminal :: proc(mailbox: ^Owner_Mailbox, terminal: Chat_Attempt_Terminal) {
-	sync.mutex_lock(&mailbox.mutex)
-	mailbox.terminal = terminal
-	mailbox.terminal_present = true
-	sync.mutex_unlock(&mailbox.mutex)
-	owner_wake_signal()
-}
-
-@(require_results)
-mailbox_take_terminal :: proc(mailbox: ^Owner_Mailbox) -> (terminal: Chat_Attempt_Terminal, ok: bool) {
-	sync.mutex_guard(&mailbox.mutex)
-	if !mailbox.terminal_present { return }
-	terminal, ok = mailbox.terminal, true
-	mailbox.terminal = {}
-	mailbox.terminal_present = false
-	return
-}
-
 // mailbox_reset releases what the mailbox holds. Owner only, after the producer was joined.
 mailbox_reset :: proc(mailbox: ^Owner_Mailbox) {
 	for &event in mailbox.events {
 		chat_event_destroy(&event, mailbox.allocator)
 	}
 	clear(&mailbox.events)
-	if mailbox.terminal_present {
-		ai.Provider_Operation_Error_Destroy(&mailbox.terminal.error, mailbox.allocator)
-		mailbox.terminal = {}
-		mailbox.terminal_present = false
-	}
 }
 
 mailbox_destroy :: proc(mailbox: ^Owner_Mailbox) {

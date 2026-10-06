@@ -172,14 +172,17 @@ job_abandon :: proc(chat: ^Chat_Session, job: ^Job) {
 // job_reclaim releases every abandoned job whose worker has published since. The result is
 // dropped, because the job's outcome was recorded when it was abandoned, and the thread is
 // destroyed only now, when the join cannot block. A tool job is left alone while its batch's
-// table still holds it, because the table reads the job until it is destroyed. Owner only: it
-// records each release in the session's journal.
+// table still holds it, because the table reads the job until it is destroyed, and a provider
+// attempt while the chain that abandoned it still holds it, because the chain's release is
+// what moves the scratch arena into it. Owner only: it records each release in the session's
+// journal.
 job_reclaim :: proc(chat: ^Chat_Session) {
 	jobs := &chat.abandoned
 	for index := len(jobs) - 1; index >= 0; index -= 1 {
 		job := jobs[index]
 		if !job_published(job) { continue }
 		if job.kind == .Tool && (cast(^Tool_Job)job).tabled { continue }
+		if job.kind == .Provider_Attempt && cast(^Chat_Request_Worker)job == chat.chain.attempt { continue }
 		thread.destroy(job.thread)
 		job.thread = nil
 		chat_record_job_reclaimed(chat, job.record, job.kind)
@@ -188,8 +191,10 @@ job_reclaim :: proc(chat: ^Chat_Session) {
 			chat_compact_job_destroy(cast(^Compact_Job)job)
 		case .Tool:
 			tool_job_release(cast(^Tool_Job)job)
-		case .Provider_Attempt, .Subagent:
-			// These kinds keep their own lists until they move onto Job, so none is listed here.
+		case .Provider_Attempt:
+			chat_request_worker_reclaim(cast(^Chat_Request_Worker)job)
+		case .Subagent:
+			// Subagents keep their own list until they move onto Job, so none is listed here.
 			assert(false, "an abandoned job of a kind that has not moved onto Job")
 		}
 		unordered_remove(jobs, index)

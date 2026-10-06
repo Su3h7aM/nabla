@@ -5,7 +5,6 @@ import "core:mem/virtual"
 import "core:os"
 import "core:sync"
 import "core:testing"
-import "core:thread"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -159,13 +158,12 @@ test_turn_finalizes_exactly_once :: proc(test: ^testing.T) {
 // --- an attempt whose worker ignores its stop ---------------------------------
 
 // Chain_Attempt_Hold stands in for the attempt's worker: it ignores the stop it is given until
-// the test releases it, and then publishes the terminal a worker that finally returned would.
-// A real attempt's worker is a transport that observes cancellation, so only a hold like this
-// can outlive its stop. A test allocates one on the process heap: the worker reaches it after
-// the test's frame may be gone, and the owner releases the thread handle, never the test.
+// the test releases it, and then returns as a worker that finally finished would. A real
+// attempt's worker is a transport that observes cancellation, so only a hold like this can
+// outlive its stop. The attempt is the first field, so the hold is the attempt record's own
+// heap allocation and the owner's release of the attempt frees it: a test never does.
 Chain_Attempt_Hold :: struct {
-	worker:  ^Chat_Request_Worker,
-	thread:  ^thread.Thread,
+	attempt: Chat_Request_Worker,
 	release: sync.Sema,
 }
 
@@ -173,10 +171,9 @@ Chain_Attempt_Hold :: struct {
 // test that abandons one never waits for the hold to give up by itself.
 CHAIN_HOLD_BOUND :: time.Minute
 
-chain_attempt_hold_serve :: proc(thread: ^thread.Thread) {
-	hold := cast(^Chain_Attempt_Hold)thread.data
+chain_attempt_hold_serve :: proc(job: ^Job) {
+	hold := cast(^Chain_Attempt_Hold)job
 	_ = sync.sema_wait_with_timeout(&hold.release, CHAIN_HOLD_BOUND)
-	mailbox_publish_terminal(hold.worker.mailbox, {})
 }
 
 // chain_attempt_hold_start runs hold as the claimed attempt's worker. It stands in for
@@ -190,17 +187,17 @@ chain_attempt_hold_start :: proc(chat: ^Chat_Session, hold: ^Chain_Attempt_Hold)
 		mailbox_init(box, os.heap_allocator())
 		chain.mailbox = box
 	}
-	worker, worker_error := new(Chat_Request_Worker, virtual.arena_allocator(&chain.scratch))
-	if worker_error != nil { return false }
-	worker^ = {
-		allocator = chain.mailbox.allocator,
-		mailbox   = chain.mailbox,
+	hold.attempt = {
+		worker = {
+			kind = .Provider_Attempt,
+			run = chain_attempt_hold_serve,
+			allocator = os.heap_allocator(),
+			record = {request = chain.request, attempt = journal.Attempt_No(chain.attempts)},
+		},
+		mailbox = chain.mailbox,
 	}
-	hold.worker = worker
-	hold.thread = test_thread_start(chain_attempt_hold_serve, hold, "nabla-stuck-attempt")
-	if hold.thread == nil { return false }
-	chain.worker = hold.thread
-	chain.worker_data = worker
+	if !job_launch(&hold.attempt.worker) { return false }
+	chain.attempt = &hold.attempt
 	return true
 }
 
@@ -236,7 +233,7 @@ test_an_attempt_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	// The turn is cancelled, and the owner's patience for the worker starts where it first saw
 	// the stop: this observation is past the end of it.
 	testing.expect(test, chat_session_request_cancel(chat))
-	chat_chain_note_stop(chat, time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond)))
+	job_note_stop(&chat.chain.attempt.worker, true, time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond)))
 
 	usages := make([dynamic]Chat_Request_Usage, 0, chat.allocator)
 	defer delete(usages)
@@ -244,12 +241,12 @@ test_an_attempt_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	// is recorded as the cancellation that asked it to stop.
 	chat_chain_await(chat, &usages)
 	testing.expect_value(test, chat.chain.stage, Chat_Request_Stage.Committing)
-	testing.expect(test, chat.chain.abandoned, "an attempt past its patience must be abandoned")
+	testing.expect_value(test, chat.chain.attempt.worker.phase, Job_Phase.Abandoned)
 	request := chat.chain.request
 	chat_chain_commit(chat, &usages)
 
-	testing.expect_value(test, chat.chain.worker, nil)
-	testing.expect_value(test, len(chat.abandoned_attempts), 1)
+	testing.expect_value(test, chat.chain.attempt, nil)
+	testing.expect_value(test, len(chat.abandoned), 1)
 	interrupted := _test_records(test, chat, {.Request_Interrupted})
 	if !testing.expect_value(test, len(interrupted), 1) { return }
 	testing.expect_value(test, interrupted[0].request, request)
@@ -269,10 +266,10 @@ test_an_attempt_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	sync.sema_post(&hold.release)
 	released = true
 	deadline := time.tick_add(time.tick_now(), SHELL_TEST_BOUND)
-	for len(chat.abandoned_attempts) > 0 && time.tick_since(deadline) < 0 {
+	for len(chat.abandoned) > 0 && time.tick_since(deadline) < 0 {
 		chat_session_observe_at(chat, time.tick_now())
 		time.sleep(time.Millisecond)
 	}
-	testing.expect_value(test, len(chat.abandoned_attempts), 0)
+	testing.expect_value(test, len(chat.abandoned), 0)
 	testing.expect(test, !chat_session_workers_outstanding(chat))
 }

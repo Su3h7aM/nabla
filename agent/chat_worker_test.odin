@@ -25,9 +25,9 @@ test_lost_worker_fact_sets_the_lost_flag :: proc(test: ^testing.T) {
 		mailbox_init(&mailbox, context.allocator)
 		defer mailbox_destroy(&mailbox)
 		worker := Chat_Request_Worker {
-			allocator = failing,
-			mailbox   = &mailbox,
-			source    = source,
+			worker = {allocator = failing},
+			mailbox = &mailbox,
+			source = source,
 		}
 		worker_runtime := Chat_Worker_Runtime {
 			worker = &worker,
@@ -44,9 +44,9 @@ test_lost_worker_fact_sets_the_lost_flag :: proc(test: ^testing.T) {
 		mailbox: Owner_Mailbox
 		mailbox_init(&mailbox, failing)
 		worker := Chat_Request_Worker {
-			allocator = context.allocator,
-			mailbox   = &mailbox,
-			source    = source,
+			worker = {allocator = context.allocator},
+			mailbox = &mailbox,
+			source = source,
 		}
 		worker_runtime := Chat_Worker_Runtime {
 			worker = &worker,
