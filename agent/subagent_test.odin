@@ -249,6 +249,10 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 	answered: journal.Session_Id
 	for record in records {
 		if record.kind != .Subagent_Started { continue }
+		started: journal.Subagent_Started
+		if journal.payload_decode(record.data, &started, context.temp_allocator) != nil { testing.fail_now(test, "a start could not be read") }
+		testing.expect_value(test, started.name, fmt.tprintf("agent-%d", record.call))
+		testing.expect_value(test, string(record.body), "Answer with one word.")
 		completions := 0
 		for other in records {
 			if other.kind != .Subagent_Completed || other.subagent != record.subagent { continue }

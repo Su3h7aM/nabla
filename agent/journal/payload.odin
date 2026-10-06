@@ -387,9 +387,13 @@ Retry_Completed :: struct {
 // call's dispatch before the child starts. The record's call is the parent's call,
 // and its subagent column the child's session id, chosen here so the child creates
 // that session. The fields are what the call asked for, "" where it inherits;
-// program names the ACP agent, "" for a native child.
+// program names the ACP agent, "" for a native child. name is the id the parent's model
+// knows the child by, and the body is the child's instruction, so the record alone
+// defines the child. A record written before these existed reads name as "" and an
+// empty body.
 Subagent_Started :: struct {
 	version:    int,
+	name:       string,
 	program:    string,
 	provider:   string,
 	model:      string,

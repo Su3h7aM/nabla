@@ -90,7 +90,6 @@ Subagent :: struct {
 Agent_Team :: struct {
 	mutex:     sync.Mutex,
 	members:   [dynamic]^Subagent,
-	started:   int,
 	starting:  int,
 	running:   int, // slots in use: running children, which a blocking child may take past the configured bound
 	waiting:   [dynamic]^Subagent, // background children queued for a slot, oldest first
@@ -382,6 +381,14 @@ subagent_destroy :: proc(member: ^Subagent) {
 	free(member, allocator)
 }
 
+// subagent_name is the id the orchestrator's model knows the child by: it names the
+// spawn call, so the same call has the same name in every process. The result is
+// allocated with allocator.
+@(require_results)
+subagent_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string {
+	return fmt.aprintf("agent-%d", call, allocator = allocator)
+}
+
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
 // the model, the orchestrator's by default, and the effort, one level below the orchestrator's
 // by default. problem, temp-allocated, says why nothing started. Worker thread.
@@ -482,8 +489,7 @@ subagent_start :: proc(
 		sync.mutex_unlock(&team.mutex)
 		return nil, "the orchestrator is closing; nothing started"
 	}
-	team.started += 1
-	created.name = fmt.aprintf("agent-%d", team.started, allocator = allocator)
+	created.name = subagent_name(call, allocator)
 	if _, append_error := append(&team.members, created); append_error != nil {
 		sync.mutex_unlock(&team.mutex)
 		return nil, "the subagent could not be allocated"

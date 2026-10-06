@@ -706,12 +706,14 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 			chat,
 			{kind = .Subagent_Started, node = node, request = chat.request, call = job.call.call, parent_call = parent_call, subagent = job.exec.subagent},
 			journal.Subagent_Started {
+				name = subagent_name(job.call.call, context.temp_allocator),
 				program = spawn.acp_agent,
 				provider = spawn.provider,
 				model = spawn.model,
 				effort = spawn.effort,
 				background = !spawn.wait,
 			},
+			transmute([]u8)spawn.instruction,
 		)
 	}
 	reserved: ^Subagent
