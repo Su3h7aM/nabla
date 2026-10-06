@@ -1241,8 +1241,8 @@ chat_compact_cancel :: proc(chat: ^Chat_Session) {
 }
 
 // chat_compact_destroy stops the session's compaction and releases everything it owns. It
-// joins a worker that published and abandons one that did not: the owner frees nothing a
-// worker can still reach, and teardown never waits on a worker that ignores its stop.
+// gives a stopped worker the rest of its stop patience to publish, joins one that did, and
+// abandons one that did not: the owner frees nothing a worker can still reach.
 chat_compact_destroy :: proc(chat: ^Chat_Session) {
 	control := &chat.compact
 	job_reclaim(chat)
@@ -1252,7 +1252,8 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 			chat_retry_record_completed(chat, job.request, job.attempts, .Compaction, .Cancelled)
 		}
 		ai.interrupt_request(&job.interrupt)
-		if job.phase == .Running && job_published(job) { job_retire(job) }
+		job_note_stop(job, true, time.tick_now())
+		if job.phase == .Running && job_wait_published(job, job_stop_deadline(job)) { job_retire(job) }
 		if job.phase == .Running {
 			// The worker ignored its stop. The job, its frozen snapshot, and its thread handle
 			// stay where they are: they are what the worker may still be reading.

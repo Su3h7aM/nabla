@@ -746,8 +746,9 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(test: ^testi
 	defer tool_jobs_destroy(&jobs)
 	tool_jobs_submit(&jobs, chat, {})
 
-	// The owner's clock is supplied, so the stop patience passes without waiting it out.
-	started := time.tick_now()
+	// The owner's clock is supplied, so the stop patience passes without waiting it out: the
+	// stop is first seen a whole patience ago, and the abandonment's own clock read is past it.
+	started := time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond))
 	testing.expect_value(test, tool_job_test_step_at(&tool_test, &jobs, started), Tool_Job_Effect.Dispatch)
 	tool_job_test_hold_until(test, &hold, 1)
 
@@ -757,10 +758,10 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(test: ^testi
 	// The stop is observed at the tick it was asked for, and the call is still running, so
 	// there is nothing to do but wait for it.
 	testing.expect_value(test, tool_job_test_step_at(&tool_test, &jobs, started), Tool_Job_Effect.Wait)
-	testing.expect(test, jobs.jobs[0].stopping, "the batch should have observed that the call must stop")
+	testing.expect(test, jobs.jobs[0].worker.stop_at != nil, "the batch should have observed that the call must stop")
 
 	// Past the patience the call is answered with what the harness can say about it.
-	late := time.tick_add(started, TOOL_JOBS_STOP_PATIENCE + time.Millisecond)
+	late := time.tick_now()
 	testing.expect_value(test, tool_job_test_step_at(&tool_test, &jobs, late), Tool_Job_Effect.Abandon)
 	testing.expect_value(test, jobs.jobs[0].phase, Tool_Job_Phase.Abandoned)
 	testing.expect_value(test, jobs.active, 0)
@@ -1021,7 +1022,7 @@ test_advance_does_not_adopt_a_published_result :: proc(test: ^testing.T) {
 	tool_job_test_hold_until(test, &hold, 1)
 
 	tool_job_hold_release_all(&hold)
-	for !sync.atomic_load(&chat.tool_jobs.jobs[0].published) {  }
+	for !job_published(&chat.tool_jobs.jobs[0].worker) {  }
 
 	// The result exists in the job but has not been observed, so selection still proposes
 	// a wait and the phase is untouched.

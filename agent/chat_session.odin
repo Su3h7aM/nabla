@@ -123,15 +123,13 @@ Chat_Session :: struct {
 	// closes its proposed calls before the next turn projects the history.
 	recovery_pending:             bool,
 
-	// abandoned_jobs are tool jobs whose workers ignored their stop. The session keeps
-	// working; each job is released once its worker publishes, and until then nothing the
-	// worker can reach (the workspace, the skill catalog, the tool backends) is freed.
-	abandoned_jobs:               [dynamic]^Tool_Job,
 	// abandoned_attempts are provider attempts whose workers ignored their stop. Each is
 	// released once its worker publishes; until then nothing that worker can reach is freed.
 	abandoned_attempts:           [dynamic]^Chat_Abandoned_Attempt,
-	// abandoned are the jobs that have moved onto Job (compaction so far) whose workers ignored
-	// their stop. job_reclaim releases each once its worker publishes.
+	// abandoned are the jobs that have moved onto Job (compaction and tool calls so far) whose
+	// workers ignored their stop. The session keeps working; job_reclaim releases each once its
+	// worker publishes, and until then nothing the worker can reach (the workspace, the skill
+	// catalog, the tool backends) is freed.
 	abandoned:                    [dynamic]^Job,
 
 	// tools is the set of tools a turn may dispatch, owned by the chat. It is
@@ -320,7 +318,6 @@ chat_session_init :: proc(
 	chat.partial_assistant.allocator = allocator
 	chat.pending_calls.allocator = allocator
 	chat.effort_levels.allocator = allocator
-	chat.abandoned_jobs.allocator = allocator
 	chat.abandoned_attempts.allocator = allocator
 	chat.abandoned.allocator = allocator
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
@@ -379,18 +376,26 @@ chat_skill_catalog_release :: proc(chat: ^Chat_Session) {
 	chat.skill_catalog = nil
 }
 
+// chat_session_tool_jobs_abandoned reports whether a tool call's worker ignored its stop and
+// has not published since. Such a worker may still reach the team its call used.
+@(private, require_results)
+chat_session_tool_jobs_abandoned :: proc(chat: ^Chat_Session) -> bool {
+	for job in chat.abandoned {
+		if job.kind == .Tool { return true }
+	}
+	return false
+}
+
 // chat_session_workers_outstanding reports whether an abandoned worker may still be running.
 // While one is, what it can reach (the workspace, the skill catalog, the session's own stop
 // token, the WebSocket, and the tool backends the caller owns) must stay allocated. It
 // releases the workers that finished, which it records in the journal, so only the thread
 // that owns the journal may call it.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
-	tool_jobs_reclaim(chat)
 	chat_chain_attempts_reclaim(chat)
 	job_reclaim(chat)
 	return(
 		chat.workers_retained ||
-		len(chat.abandoned_jobs) > 0 ||
 		len(chat.abandoned_attempts) > 0 ||
 		len(chat.abandoned) > 0 ||
 		agent_team_running(chat.team) ||
@@ -444,7 +449,7 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false
 	}
-	retained := !agent_team_destroy(chat.team, chat, len(chat.abandoned_jobs) > 0)
+	retained := !agent_team_destroy(chat.team, chat, chat_session_tool_jobs_abandoned(chat))
 	chat.team = nil
 	chat.workers_retained = retained
 	// Compaction's worker borrows this session's id for its logging correlation, so
@@ -455,7 +460,6 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	outstanding := chat_session_workers_outstanding(chat)
 	chat_skill_catalog_release(chat)
 	if !outstanding { delete(chat.workspace, chat.allocator) }
-	delete(chat.abandoned_jobs)
 	chat_chain_release(chat)
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
 	// A worker that ignored its stop may still be running a WebSocket request through this

@@ -6,8 +6,6 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:sync"
-import "core:thread"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -105,6 +103,10 @@ Tool_Job_Effect :: enum {
 
 // Tool_Job is one admitted call.
 Tool_Job :: struct {
+	// worker is the shared worker lifecycle: the thread, its publication, and the stop
+	// patience. It is the first field, so a pointer to the call is a pointer to its Job. It
+	// is not embedded with using, because the call's own phase has the same name.
+	worker:         Job,
 	// identity, owned by the table and stable for the job's life
 	id:             u64,
 	turn_id:        u64,
@@ -146,17 +148,9 @@ Tool_Job :: struct {
 	// wake is a worker job's stop pipe: the owner signals it with the stop request,
 	// which wakes a worker sleeping in poll, and closes it when it releases the job.
 	wake:           Tool_Wake,
-	// published is atomic. The worker sets it after writing result, and the owner reads result
-	// only after seeing it.
-	published:      bool,
-	// launched says a worker thread runs this call; otherwise the job is the owner's alone.
-	launched:       bool,
-	// thread is created and destroyed by the owner, after the worker published.
-	thread:         ^thread.Thread,
-	// stopping and stop_at are the owner's observation that this job should have stopped and
-	// when that was first seen, which is what the stop patience is measured from.
-	stopping:       bool,
-	stop_at:        time.Tick,
+	// tabled says a batch's table holds this job. An abandoned job is already listed in the
+	// session's abandoned jobs, but job_reclaim leaves it alone until its table is destroyed.
+	tabled:         bool,
 
 	// outcome
 	result:         Tool_Result,
@@ -183,10 +177,9 @@ Tool_Jobs :: struct {
 	// budget decides what each result may put into the model's context. It is taken in
 	// submission order, so a batch spends the window in the order the model asked.
 	budget:           Tool_Budget,
-	// abandoned is the session's list of jobs whose workers ignored their stop, borrowed.
-	// Destroying the table moves its abandoned jobs there, and they block only their own
-	// external lane.
-	abandoned:        ^[dynamic]^Tool_Job,
+	// chat is the session the batch runs in, borrowed. An abandoned job is recorded in its
+	// journal and listed in its abandoned jobs, where it blocks only its own external lane.
+	chat:             ^Chat_Session,
 }
 
 // --- lifetime ------------------------------------------------------------------
@@ -195,7 +188,7 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 	jobs.allocator = chat.allocator
 	jobs.worker_allocator = worker_allocator
 	jobs.max_active = max(TOOL_JOBS_MAX_ACTIVE, os.get_processor_core_count())
-	jobs.abandoned = &chat.abandoned_jobs
+	jobs.chat = chat
 	table, table_error := make([dynamic]^Tool_Job, 0, capacity, chat.allocator)
 	jobs.jobs = table
 	if table_error != nil {
@@ -206,19 +199,28 @@ tool_jobs_init :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, capacity: int, wor
 	jobs.budget = chat_tool_budget_open(chat, len(chat.pending_calls))
 }
 
-// tool_jobs_destroy releases the table and every job no worker can still reach. A job whose
-// worker is still running is asked to stop and moves to the session's abandoned list.
+// tool_jobs_destroy releases the table and every job no worker can still reach. A running
+// worker is asked to stop, together with the others, and is given the stop patience to
+// publish; one that does not is abandoned and stays listed in the session's abandoned jobs.
 tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) {
-	tool_jobs_collect(jobs)
+	now := time.tick_now()
 	for job in jobs.jobs {
-		if job.phase == .Running && job.launched {
-			tool_job_request_stop(job)
-			tool_jobs_mark_abandoned(jobs, job)
+		if job.worker.phase != .Running { continue }
+		tool_job_request_stop(job)
+		job_note_stop(&job.worker, true, now)
+	}
+	for job in jobs.jobs {
+		if job.worker.phase != .Running { continue }
+		if job_wait_published(&job.worker, job_stop_deadline(&job.worker)) {
+			job_retire(&job.worker)
+		} else {
+			tool_job_abandon(jobs, job)
 		}
+	}
+	for job in jobs.jobs {
 		if job.phase == .Abandoned {
-			// A job that cannot be listed stays with its worker, which is a leak: its
-			// abandonment is already recorded, and the session is ending.
-			if jobs.abandoned != nil { _ = append(jobs.abandoned, job) }
+			// The session's list owns the job from here, and job_reclaim may now release it.
+			job.tabled = false
 			continue
 		}
 		tool_job_release(job)
@@ -227,41 +229,21 @@ tool_jobs_destroy :: proc(jobs: ^Tool_Jobs) {
 	jobs^ = {}
 }
 
-// tool_jobs_reclaim releases every abandoned job whose worker has since published. Its call
-// already has its recorded outcome, so the late result is dropped. Owner only: it records
-// each release in the session's journal.
-tool_jobs_reclaim :: proc(chat: ^Chat_Session) {
-	abandoned := &chat.abandoned_jobs
-	for index := len(abandoned) - 1; index >= 0; index -= 1 {
-		job := abandoned[index]
-		if !sync.atomic_load(&job.published) { continue }
-		thread.destroy(job.thread)
-		job.thread = nil
-		chat_record_job_reclaimed(chat, {call = job.exec.call}, .Tool)
-		tool_job_release(job)
-		unordered_remove(abandoned, index)
-	}
-}
-
-// tool_jobs_mark_abandoned gives up waiting for a worker. The job keeps what the worker can
-// reach, and gives back its worker slot so the batch can keep running calls.
+// tool_job_abandon gives up waiting for a job's worker and records it. The job keeps what the
+// worker can reach, and gives back its worker slot so the batch can keep running calls. Owner
+// only.
 @(private)
-tool_jobs_mark_abandoned :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) {
-	job.phase = .Abandoned
-	if job.placement == .Worker { jobs.active -= 1 }
-}
-
-// tool_job_record_abandoned buffers the fact that the owner stopped waiting for a job's
-// worker, now being the owner's observation of the clock. Owner only.
-@(private)
-tool_job_record_abandoned :: proc(chat: ^Chat_Session, job: ^Tool_Job, now: time.Tick) {
+tool_job_abandon :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) {
+	chat := jobs.chat
 	_, parent_call := tool_job_record_placement(chat, job)
-	header := journal.Record {
+	job.worker.record = {
 		request     = chat.request,
 		call        = job.call.call,
 		parent_call = parent_call,
 	}
-	chat_record_job_abandoned(chat, header, .Tool, time.tick_diff(job.stop_at, now))
+	job.phase = .Abandoned
+	if job.placement == .Worker { jobs.active -= 1 }
+	job_abandon(chat, &job.worker)
 }
 
 @(private)
@@ -341,6 +323,7 @@ tool_jobs_publish :: proc(jobs: ^Tool_Jobs, job: ^Tool_Job) -> bool {
 		if jobs.stop == .None { jobs.stop = .Storage_Failed }
 		return false
 	}
+	job.tabled = true
 	jobs.next_id += 1
 	return true
 }
@@ -499,9 +482,19 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 // call that should have stopped. It is the only place those facts enter the table, so
 // tool_jobs_next can read the table without changing it.
 tool_jobs_observe :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, now: time.Tick) {
-	tool_jobs_collect(jobs)
+	// A published worker's join is the proof that nothing else reaches the job.
+	for job in jobs.jobs {
+		if job.worker.phase != .Running || !job_published(&job.worker) { continue }
+		job_retire(&job.worker)
+		job.phase = .Result_Ready
+		if job.placement == .Worker { jobs.active -= 1 }
+	}
 	tool_jobs_latch_stop(jobs, chat)
-	tool_jobs_note_stops(jobs, now)
+	// Only a call a worker owns can outlive its stop, and the patience is measured from the
+	// owner's first sight of the stop, which the job's own timeout or the turn asked for.
+	for job in jobs.jobs {
+		if job.worker.phase == .Running { job_note_stop(&job.worker, tool_control_cancelled(job.exec.control), now) }
+	}
 }
 
 // tool_jobs_next is the batch's readiness order: answer what ignored its stop, settle what
@@ -530,41 +523,13 @@ tool_jobs_next :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> Tool_Job_Effect {
 	return .Done
 }
 
-// tool_job_under_executor reports whether a call is in one of the two phases where the owner
-// still watches for a stop it asked for: the dispatch write, or an executor running the call.
-
-@(private, require_results)
-tool_job_under_executor :: proc(job: ^Tool_Job) -> bool {
-	switch job.phase {
-	case .Dispatching, .Running:
-		return true
-	case .Queued, .Waiting, .Result_Ready, .Committing, .Retiring, .Retired, .Unrecorded, .Abandoned:
-	}
-	return false
-}
-
-// tool_jobs_note_stops records when the owner first saw that a job should have stopped.
-// The stop itself was requested by tool_jobs_latch_stop or by the job's own timeout; this
-// is what makes the patience measurable without a clock read inside a transition's
-// decision. Only a call a worker owns can outlive its stop.
-@(private)
-tool_jobs_note_stops :: proc(jobs: ^Tool_Jobs, now: time.Tick) {
-	for job in jobs.jobs {
-		if job.stopping || !job.launched || !tool_job_under_executor(job) { continue }
-		if !tool_control_cancelled(job.exec.control) { continue }
-		job.stopping = true
-		job.stop_at = now
-	}
-}
-
-// tool_jobs_overdue returns the earliest running job that was asked to stop and has not. It
-// is the call the owner can no longer wait for.
+// tool_jobs_overdue returns the earliest running job whose worker was asked to stop and has
+// not published within the patience. It is the call the owner can no longer wait for.
 @(private)
 tool_jobs_overdue :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	found: ^Tool_Job
 	for job in jobs.jobs {
-		if !tool_job_under_executor(job) { continue }
-		if !job.launched || !job.stopping || time.tick_diff(job.stop_at, now) < TOOL_JOBS_STOP_PATIENCE { continue }
+		if job.worker.phase != .Running || !job_overdue(&job.worker, now) { continue }
 		if found == nil || job.ordinal < found.ordinal { found = job }
 	}
 	return found
@@ -578,43 +543,26 @@ tool_jobs_retirable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 	found: ^Tool_Job
 	for job in jobs.jobs {
 		if job.phase not_in phases { continue }
-		if !tool_job_releasable(job) && !tool_jobs_stopped_long_enough(job, now) { continue }
+		if !tool_job_releasable(job) && !job_overdue(&job.worker, now) { continue }
 		if found == nil || job.ordinal < found.ordinal { found = job }
 	}
 	return found
 }
 
 // tool_job_releasable reports whether no worker can still reach the job. A launched job
-// leaves Running only when collection joined its worker or when it is abandoned.
+// leaves Running only when the owner joined its worker or abandoned it.
 @(private, require_results)
 tool_job_releasable :: proc(job: ^Tool_Job) -> bool {
-	return !job.launched || job.phase != .Running
-}
-
-@(private, require_results)
-tool_jobs_stopped_long_enough :: proc(job: ^Tool_Job, now: time.Tick) -> bool {
-	return job.stopping && time.tick_diff(job.stop_at, now) >= TOOL_JOBS_STOP_PATIENCE
+	return job.worker.phase != .Running
 }
 
 // tool_jobs_published returns the earliest running job whose worker has published.
 @(private)
 tool_jobs_published :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 	for job in jobs.jobs {
-		if job.phase == .Running && sync.atomic_load(&job.published) { return job }
+		if job.worker.phase == .Running && job_published(&job.worker) { return job }
 	}
 	return nil
-}
-
-// tool_jobs_collect adopts published results and joins their workers, which is the proof
-// that nothing else reaches the job.
-@(private)
-tool_jobs_collect :: proc(jobs: ^Tool_Jobs) {
-	for job := tool_jobs_published(jobs); job != nil; job = tool_jobs_published(jobs) {
-		thread.destroy(job.thread)
-		job.thread = nil
-		job.phase = .Result_Ready
-		if job.placement == .Worker { jobs.active -= 1 }
-	}
 }
 
 // tool_jobs_runnable returns the earliest queued job or an expired Code Mode parent.
@@ -668,9 +616,8 @@ tool_jobs_lane_abandoned :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 		for other in jobs.jobs {
 			if other.phase == .Abandoned && other.lane == job.lane { return job }
 		}
-		if jobs.abandoned == nil { continue }
-		for other in jobs.abandoned {
-			if other.lane == job.lane { return job }
+		for other in jobs.chat.abandoned {
+			if other.kind == .Tool && (cast(^Tool_Job)other).lane == job.lane { return job }
 		}
 	}
 	return nil
@@ -863,7 +810,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	job := tool_jobs_overdue(jobs, now)
 	if job == nil { return }
 
-	if sync.atomic_load(&job.published) { return }
+	if job_published(&job.worker) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
 	result := tool_result_failure(&job.exec, .Unknown, message, "did not stop")
 	recorded := false
@@ -873,13 +820,14 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 		recorded = chat_record_tool_result(chat, job.call.call, node, parent_call, &result)
 	}
 
-	tool_jobs_mark_abandoned(jobs, job)
 	if recorded {
 		job.committed = true
 		jobs.committed += 1
 		if !job.nested { jobs.committed_roots += 1 }
 	}
-	tool_job_record_abandoned(chat, job, now)
+	// The unknown outcome is recorded before the abandonment, so recovery never sees an
+	// abandoned call that still has no answer.
+	tool_job_abandon(jobs, job)
 	if recorded { _observer_tool_result(observer, job.name, &result) }
 	tool_result_destroy(&result)
 	if !recorded {
@@ -994,8 +942,7 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, now: time.Tick) 
 	if job == nil { return }
 
 	if !tool_job_releasable(job) {
-		tool_jobs_mark_abandoned(jobs, job)
-		tool_job_record_abandoned(chat, job, now)
+		tool_job_abandon(jobs, job)
 		return
 	}
 	if job.result_present {
@@ -1016,8 +963,10 @@ tool_jobs_deadline :: proc(jobs: ^Tool_Jobs) -> Maybe(time.Tick) {
 			due := job.lua.deadline
 			if existing, has := earliest.?; !has || time.tick_diff(due, existing) < 0 { earliest = due }
 		}
-		if !job.launched || !job.stopping || !tool_job_under_executor(job) { continue }
-		due := time.tick_add(job.stop_at, TOOL_JOBS_STOP_PATIENCE)
+		if job.worker.phase != .Running { continue }
+		stop_at, stopped := job.worker.stop_at.?
+		if !stopped { continue }
+		due := time.tick_add(stop_at, TOOL_JOBS_STOP_PATIENCE)
 		if existing, has := earliest.?; !has || time.tick_diff(due, existing) < 0 { earliest = due }
 	}
 	return earliest
@@ -1041,20 +990,18 @@ tool_job_execute :: proc(job: ^Tool_Job) -> Tool_Result {
 	return job.execute(&job.exec, job.arguments)
 }
 
-// tool_job_launch starts one worker-placed job. The watched signals are blocked across
-// creation so the worker inherits a mask that keeps it from running the process handler.
+// tool_job_launch opens the job's stop pipe and starts its worker on the shared Job. It
+// returns the pipe's error, or out of memory when the thread could not be created.
 @(private, require_results)
 tool_job_launch :: proc(job: ^Tool_Job) -> os.Error {
 	job.wake = tool_wake_open() or_return
 	job.exec.control.wake = job.wake.read
-	previous := chat_signal_block_watched()
-	worker := thread.create(tool_job_worker, name = "nabla-tool")
-	chat_signal_restore(previous)
-	if worker == nil { return mem.Allocator_Error.Out_Of_Memory }
-	worker.data = job
-	job.thread = worker
-	thread.start(worker)
-	job.launched = true
+	job.worker = Job {
+		kind      = .Tool,
+		run       = tool_job_run,
+		allocator = job.allocator,
+	}
+	if !job_launch(&job.worker) { return mem.Allocator_Error.Out_Of_Memory }
 	return nil
 }
 
@@ -1066,14 +1013,10 @@ tool_job_request_stop :: proc(job: ^Tool_Job) {
 	tool_wake_signal(&job.wake)
 }
 
-// tool_job_worker runs one call and publishes its result. It touches nothing after the wake.
+// tool_job_run executes one call on the job's thread. job_main publishes after it returns.
 @(private)
-tool_job_worker :: proc(worker: ^thread.Thread) {
-	job := cast(^Tool_Job)worker.data
-	context.allocator = job.allocator
-
+tool_job_run :: proc(worker: ^Job) {
+	job := cast(^Tool_Job)worker
 	job.result = tool_job_execute(job)
 	job.result_present = true
-	sync.atomic_store(&job.published, true)
-	owner_wake_signal()
 }

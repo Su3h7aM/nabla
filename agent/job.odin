@@ -103,12 +103,34 @@ job_published :: proc(job: ^Job) -> bool {
 	return sync.atomic_load(&job.published)
 }
 
+// job_wait_published waits on the owner wake until the worker publishes or the deadline
+// passes, and reports whether it published. A wake that is not this worker's, or a signal,
+// only makes it look again. Owner only.
+@(require_results)
+job_wait_published :: proc(job: ^Job, deadline: time.Tick) -> bool {
+	for {
+		seen := owner_wake_seen()
+		if job_published(job) { return true }
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { return false }
+		owner_wake_wait(seen, deadline)
+	}
+}
+
 // job_note_stop records when the owner first saw that a running worker should have stopped,
 // which is where its patience is measured from. requested is the owner's own observation of
 // the stop. Only the first sight counts, and only the owner's clock starts the patience.
 job_note_stop :: proc(job: ^Job, requested: bool, now: time.Tick) {
 	if !requested || job.phase != .Running || job.stop_at != nil { return }
 	job.stop_at = now
+}
+
+// job_stop_deadline is when a stopped worker becomes overdue. The caller has already passed
+// the stop to job_note_stop on a running job.
+@(require_results)
+job_stop_deadline :: proc(job: ^Job) -> time.Tick {
+	at, stopped := job.stop_at.?
+	assert(stopped)
+	return time.tick_add(at, TOOL_JOBS_STOP_PATIENCE)
 }
 
 // job_overdue reports whether the worker has ignored its stop for the whole
@@ -149,20 +171,24 @@ job_abandon :: proc(chat: ^Chat_Session, job: ^Job) {
 
 // job_reclaim releases every abandoned job whose worker has published since. The result is
 // dropped, because the job's outcome was recorded when it was abandoned, and the thread is
-// destroyed only now, when the join cannot block. Owner only: it records each release in the
-// session's journal.
+// destroyed only now, when the join cannot block. A tool job is left alone while its batch's
+// table still holds it, because the table reads the job until it is destroyed. Owner only: it
+// records each release in the session's journal.
 job_reclaim :: proc(chat: ^Chat_Session) {
 	jobs := &chat.abandoned
 	for index := len(jobs) - 1; index >= 0; index -= 1 {
 		job := jobs[index]
 		if !job_published(job) { continue }
+		if job.kind == .Tool && (cast(^Tool_Job)job).tabled { continue }
 		thread.destroy(job.thread)
 		job.thread = nil
 		chat_record_job_reclaimed(chat, job.record, job.kind)
 		switch job.kind {
 		case .Compaction:
 			chat_compact_job_destroy(cast(^Compact_Job)job)
-		case .Tool, .Provider_Attempt, .Subagent:
+		case .Tool:
+			tool_job_release(cast(^Tool_Job)job)
+		case .Provider_Attempt, .Subagent:
 			// These kinds keep their own lists until they move onto Job, so none is listed here.
 			assert(false, "an abandoned job of a kind that has not moved onto Job")
 		}

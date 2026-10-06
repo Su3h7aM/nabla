@@ -10,6 +10,39 @@ import "nabla:agent/journal"
 
 job_test_noop :: proc(job: ^Job) {  }
 
+Job_Test_Hold :: struct {
+	using job: Job,
+	release:   sync.Sema,
+}
+
+job_test_hold_run :: proc(job: ^Job) {
+	hold := cast(^Job_Test_Hold)job
+	_ = sync.sema_wait_with_timeout(&hold.release, COMPACT_HOLD_BOUND)
+}
+
+// Waiting for a worker returns false at the deadline while it runs and true once it has
+// published, without the owner polling.
+@(test)
+test_waiting_for_a_job_ends_at_its_publication_or_its_deadline :: proc(test: ^testing.T) {
+	hold := new(Job_Test_Hold, os.heap_allocator())
+	hold.job = {
+		kind      = .Compaction,
+		run       = job_test_hold_run,
+		allocator = os.heap_allocator(),
+	}
+	if !testing.expect(test, job_launch(hold), "the job could not be started") {
+		free(hold, os.heap_allocator())
+		return
+	}
+	published := job_wait_published(hold, time.tick_add(time.tick_now(), 20 * time.Millisecond))
+	sync.sema_post(&hold.release)
+	testing.expect(test, !published, "a worker that was still running was reported as published")
+
+	testing.expect(test, job_wait_published(hold, time.tick_add(time.tick_now(), COMPACT_TEST_BOUND)), "the worker never published")
+	job_retire(hold)
+	free(hold, os.heap_allocator())
+}
+
 // A job that published is retired: its thread is joined and released, and the owner reads
 // its results afterwards.
 @(test)

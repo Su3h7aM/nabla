@@ -1176,14 +1176,22 @@ compact_summary_hold_run :: proc(job: ^Job) {
 	_ = sync.sema_wait_with_timeout(&hold.release, COMPACT_HOLD_BOUND)
 }
 
+// COMPACT_SLOW_STOP is how long a slow worker takes to publish once it runs: more than a
+// teardown that abandons at once would wait, and far less than the stop patience.
+COMPACT_SLOW_STOP :: 100 * time.Millisecond
+
+compact_summary_slow_run :: proc(job: ^Job) {
+	time.sleep(COMPACT_SLOW_STOP)
+}
+
 // compact_hold_job_start builds the summary a running job is: its frozen request, the row of
 // the send it made, and a worker that ignores its stop. It stands in for chat_compact_start,
 // which starts the real transport instead.
 @(private)
-compact_hold_job_start :: proc(test: ^testing.T, chat: ^Chat_Session, hold: ^Compact_Summary_Hold) -> ^Compact_Job {
+compact_hold_job_start :: proc(test: ^testing.T, chat: ^Chat_Session, hold: ^Compact_Summary_Hold, run := compact_summary_hold_run) -> ^Compact_Job {
 	job := &hold.compact
 	job^ = {
-		job = {kind = .Compaction, run = compact_summary_hold_run, allocator = os.heap_allocator()},
+		job = {kind = .Compaction, run = run, allocator = os.heap_allocator()},
 		attempts = 1,
 	}
 	job.output = make([dynamic]u8, 0, job.allocator)
@@ -1263,8 +1271,9 @@ test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	testing.expect_value(test, abandoned.patience_ms, i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond))
 }
 
-// Teardown asks a summary's worker to stop and abandons it when it does not: nothing the worker
-// can reach is released under it, and teardown never waits for it.
+// Teardown asks a summary's worker to stop and abandons it when it does not publish within the
+// patience: nothing the worker can reach is released under it. This worker was first seen
+// stopping a whole patience ago, so teardown does not wait for it again.
 @(test)
 test_teardown_abandons_a_summary_that_ignores_its_stop :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -1279,8 +1288,9 @@ test_teardown_abandons_a_summary_that_ignores_its_stop :: proc(test: ^testing.T)
 	if job == nil { testing.fail_now(test, "the stuck summary job could not be started") }
 
 	started := time.tick_now()
+	job_note_stop(job, true, time.tick_add(started, -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond)))
 	chat_compact_destroy(chat)
-	testing.expect(test, time.tick_since(started) < TOOL_JOBS_STOP_PATIENCE, "teardown waited for a worker that ignores its stop")
+	testing.expect(test, time.tick_since(started) < TOOL_JOBS_STOP_PATIENCE, "teardown waited past the patience of a worker that ignores its stop")
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
 	testing.expect_value(test, chat.compact.job, nil)
 	// The worker is still parked, and the job it reads was not released under it.
@@ -1300,4 +1310,26 @@ test_teardown_abandons_a_summary_that_ignores_its_stop :: proc(test: ^testing.T)
 	if !testing.expect(test, job_published(job), "the abandoned worker never published") { return }
 	job_retire(job)
 	chat_compact_job_destroy(job)
+}
+
+// Teardown gives a stopped worker its patience, so one that publishes shortly after the stop is
+// joined and released instead of being reported as one that did not stop in time.
+@(test)
+test_teardown_joins_a_summary_that_stops_within_its_patience :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+
+	hold := new(Compact_Summary_Hold, os.heap_allocator())
+	if compact_hold_job_start(test, chat, hold, compact_summary_slow_run) == nil {
+		testing.fail_now(test, "the slow summary job could not be started")
+	}
+
+	chat_compact_destroy(chat)
+	testing.expect_value(test, chat.compact.job, nil)
+	testing.expect_value(test, len(chat.abandoned), 0)
+	_test_commit(test, chat)
+	testing.expect_value(test, len(_test_records(test, chat, {.Job_Abandoned})), 0)
 }

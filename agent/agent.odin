@@ -55,7 +55,7 @@ chat_effect_none :: proc() -> Chat_Effect { return Chat_Effect{kind = .None} }
 // has already observed time does not read it twice and a test can supply it.
 chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {
 	chat_session_observe_stop(chat)
-	tool_jobs_reclaim(chat)
+	job_reclaim(chat)
 	chat_chain_attempts_reclaim(chat)
 	agent_team_reap(chat.team, chat)
 	if !chat.tool_jobs_active { return }
