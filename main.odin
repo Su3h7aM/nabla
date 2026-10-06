@@ -325,7 +325,7 @@ chat_main :: proc() -> int {
 	// A missing config file is a valid setup, not an error: the run proceeds
 	// with no providers and default options. Only a config that exists but
 	// cannot be used stops the launch.
-	sources, harness_options, mcp_servers, config_err, config_detail := agent.load_lua_config_full(options.config_path)
+	sources, harness_options, mcp_servers, config_err, config_detail := agent.load_lua_config(options.config_path)
 	defer if config_detail != "" { delete(config_detail) }
 	if config_err != .None && config_err != .Missing {
 		fmt.eprintln(config_error_display_text(options.config_path, config_err, config_detail))

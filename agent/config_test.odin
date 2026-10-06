@@ -36,7 +36,7 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, write_err == nil)
 
-	sources, _, servers, err, detail := load_lua_config_full(path)
+	sources, _, servers, err, detail := load_lua_config(path)
 	testing.expect_value(t, err, Config_Error.None)
 	defer mcp_servers_destroy(&servers)
 	defer if detail != "" { delete(detail) }
@@ -89,10 +89,10 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 
 	// A missing config is a valid empty setup, not an error; a path that exists
 	// but cannot be read as a file still is.
-	_, _, _, missing_err, missing_detail := load_lua_config_full("/tmp/nabla-config-test-missing.lua")
+	_, _, _, missing_err, missing_detail := load_lua_config("/tmp/nabla-config-test-missing.lua")
 	defer if missing_detail != "" { delete(missing_detail) }
 	testing.expect_value(t, missing_err, Config_Error.Missing)
-	_, _, _, unreadable_err, unreadable_detail := load_lua_config_full("/tmp")
+	_, _, _, unreadable_err, unreadable_detail := load_lua_config("/tmp")
 	defer if unreadable_detail != "" { delete(unreadable_detail) }
 	testing.expect_value(t, unreadable_err, Config_Error.Read)
 }
@@ -173,7 +173,7 @@ test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 		path := fmt.aprintf("/tmp/nabla-config-test-fail-%d-%d.lua", os.get_pid(), i, allocator = context.temp_allocator)
 		defer os.remove(path)
 		testing.expect(t, os.write_entire_file(path, transmute([]u8)config) == nil)
-		sources, _, servers, err, detail := load_lua_config_full(path)
+		sources, _, servers, err, detail := load_lua_config(path)
 		testing.expectf(t, err != .None, "case %d loaded without error", i)
 		testing.expect_value(t, len(sources), 0)
 		if detail != "" { delete(detail) }
@@ -189,7 +189,7 @@ test_lua_config_validates_disabled_models_and_reports_the_field :: proc(t: ^test
 	body := `return { providers = { acme = { models = { chat = { disabled = true, tools = "yes" } } } } }`
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
 
-	sources, _, servers, err, detail := load_lua_config_full(path)
+	sources, _, servers, err, detail := load_lua_config(path)
 	defer catalog_sources_destroy(&sources)
 	defer mcp_servers_destroy(&servers)
 	testing.expect_value(t, err, Config_Error.Invalid)
@@ -217,7 +217,7 @@ test_lua_config_loads_compact_on_switch :: proc(t: ^testing.T) {
 	for entry, index in cases {
 		path := fmt.aprintf("%s/%d.lua", directory, index, allocator = context.temp_allocator)
 		testing.expect(t, os.write_entire_file(path, transmute([]u8)entry.value) == nil)
-		sources, options, servers, err, detail := load_lua_config_full(path)
+		sources, options, servers, err, detail := load_lua_config(path)
 		defer catalog_sources_destroy(&sources)
 		defer mcp_servers_destroy(&servers)
 		defer if detail != "" { delete(detail) }
@@ -228,7 +228,7 @@ test_lua_config_loads_compact_on_switch :: proc(t: ^testing.T) {
 	path := fmt.aprintf("%s/invalid.lua", directory, allocator = context.temp_allocator)
 	body := `return { compact_on_switch = "yes" }`
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
-	_, _, servers, err, detail := load_lua_config_full(path)
+	_, _, servers, err, detail := load_lua_config(path)
 	defer mcp_servers_destroy(&servers)
 	defer if detail != "" { delete(detail) }
 	testing.expect_value(t, err, Config_Error.Invalid)
@@ -241,7 +241,7 @@ test_lua_config_preserves_the_parser_message_and_line :: proc(t: ^testing.T) {
 	defer os.remove(path)
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("return {\n")) == nil)
 
-	sources, _, servers, err, detail := load_lua_config_full(path)
+	sources, _, servers, err, detail := load_lua_config(path)
 	defer catalog_sources_destroy(&sources)
 	defer mcp_servers_destroy(&servers)
 	testing.expect_value(t, err, Config_Error.Lua)
@@ -285,7 +285,7 @@ test_configuration_of_any_size_loads_whole :: proc(t: ^testing.T) {
 	defer os.remove(path)
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)strings.to_string(body)) == nil)
 
-	sources, _, servers, err, detail := load_lua_config_full(path)
+	sources, _, servers, err, detail := load_lua_config(path)
 	defer delete(detail)
 	defer catalog_sources_destroy(&sources)
 	defer mcp_servers_destroy(&servers)

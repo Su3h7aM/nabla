@@ -52,10 +52,6 @@ chat_effect_none :: proc() -> Chat_Effect { return Chat_Effect{kind = .None} }
 // published result, a stop the session asked for, and the first sight of a call that
 // should have stopped. It is the driver's collection step, so the state can be read
 // without changing it.
-chat_session_observe :: proc(chat: ^Chat_Session) {
-	chat_session_observe_at(chat, time.tick_now())
-}
-
 // chat_session_observe_at is the same with the owner's clock supplied, so a driver that
 // has already observed time does not read it twice and a test can supply it.
 chat_session_observe_at :: proc(chat: ^Chat_Session, now: time.Tick) {

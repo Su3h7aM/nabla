@@ -511,10 +511,10 @@ load_harness_options :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.
 	return options, .None, ""
 }
 
-// load_lua_config_full returns the loaded sources and options. On failure, detail is empty
+// load_lua_config returns the loaded sources and options. On failure, detail is empty
 // or owned by allocator; the caller releases a non-empty detail with that allocator.
 @(require_results)
-load_lua_config_full :: proc(
+load_lua_config :: proc(
 	path: string,
 	allocator := context.allocator,
 ) -> (

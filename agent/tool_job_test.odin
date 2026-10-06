@@ -981,7 +981,7 @@ test_chat_advance_drives_session_owned_tool_jobs :: proc(test: ^testing.T) {
 
 	tool_job_hold_release_all(&hold)
 	for _ in 0 ..< 100_000 {
-		chat_session_observe(chat)
+		chat_session_observe_at(chat, time.tick_now())
 		effect := chat_session_advance(chat)
 		switch effect.kind {
 		case .Step_Tools:
@@ -1030,7 +1030,7 @@ test_advance_does_not_adopt_a_published_result :: proc(test: ^testing.T) {
 	testing.expect_value(test, chat.tool_jobs.jobs[0].phase, Tool_Job_Phase.Running)
 
 	// Observing adopts it, and the next selection is the commit.
-	chat_session_observe(chat)
+	chat_session_observe_at(chat, time.tick_now())
 	commit := chat_session_advance(chat)
 	testing.expect_value(test, commit.kind, Chat_Effect_Kind.Step_Tools)
 	testing.expect_value(test, commit.tool, Tool_Job_Effect.Commit)
@@ -1058,7 +1058,7 @@ test_cancelling_chat_drains_session_owned_jobs :: proc(test: ^testing.T) {
 	testing.expect_value(test, chat.state, Chat_State.Cancelling)
 
 	for _ in 0 ..< 100_000 {
-		chat_session_observe(chat)
+		chat_session_observe_at(chat, time.tick_now())
 		effect := chat_session_advance(chat)
 		switch effect.kind {
 		case .Step_Tools:

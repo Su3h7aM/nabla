@@ -54,9 +54,6 @@ Error :: enum {
 // section 5.4), so no message is refused for being large.
 SEND_CHUNK :: 16 * 1024
 
-// RECV_CHUNK is how much of a frame's payload one read asks the transport for.
-RECV_CHUNK :: 16 * 1024
-
 // Conn is one WebSocket connection. It is a client: it masks what it sends, and it
 // refuses what a server may not send.
 //
@@ -67,7 +64,6 @@ Conn :: struct {
 	allocator:       mem.Allocator,
 	send:            []u8,
 	header:          [HEADER_MAX_SIZE]u8,
-	recv:            []u8,
 
 	// The frame being read: how much of its payload is left, and where the masking
 	// key has reached. A payload larger than a chunk is read in pieces, so the key
@@ -102,11 +98,6 @@ init :: proc(transport: Transport, allocator: mem.Allocator) -> (connection: ^Co
 		destroy(self)
 		return nil, .No_Room
 	}
-	self.recv, alloc_error = make([]u8, RECV_CHUNK, allocator)
-	if alloc_error != nil {
-		destroy(self)
-		return nil, .No_Room
-	}
 	return self, .None
 }
 
@@ -123,7 +114,6 @@ abort :: proc(connection: ^Conn) {
 connection_release :: proc(connection: ^Conn, aborted: bool) {
 	if connection == nil { return }
 	delete(connection.send, connection.allocator)
-	delete(connection.recv, connection.allocator)
 	if aborted && connection.transport.abort != nil {
 		connection.transport.abort(connection.transport.user_data)
 	} else if connection.transport.release != nil {

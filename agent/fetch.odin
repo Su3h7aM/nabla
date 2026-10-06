@@ -50,11 +50,3 @@ fetch_control_probe :: proc(user_data: rawptr) -> client.Wait_Status {
 	if ai.deadline_expired(control.deadline) { return .Timed_Out }
 	return .Ready
 }
-
-// fetch_probe stops a request once its deadline passes, so a peer that accepts
-// the connection and then stalls cannot hold up the harness.
-fetch_probe :: proc(user_data: rawptr) -> client.Wait_Status {
-	deadline := cast(^ai.Deadline)user_data
-	if deadline != nil && ai.deadline_expired(deadline^) { return .Timed_Out }
-	return .Ready
-}
