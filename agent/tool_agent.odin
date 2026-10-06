@@ -13,9 +13,9 @@ TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type"
 TOOL_AGENT_SPAWN_FIELDS :: []string{"instruction", "prompt", "model", "provider", "effort", "wait", "acp_agent"}
 
 TOOL_AGENT_SEND_NAME :: "agent_send"
-TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. A running subagent refuses them: agent_stop it first. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
-TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, for the reopened run of a finished subagent. Refused for a running subagent. Default: the model its last turn used."},"provider":{"type":["string","null"],"description":"Id of a configured provider, not a vendor name, for the reopened run of a finished subagent; needed only when several providers serve model. Refused for a running subagent. Default: the provider its last turn used."},"effort":{"type":["string","null"],"description":"Reasoning effort level for the reopened run of a finished subagent. Refused for a running subagent. Default: the effort its last turn used, or the nearest level the model states."}},"required":["message"],"additionalProperties":false}`
-TOOL_AGENT_SEND_FIELDS :: []string{"agent", "message", "model", "provider", "effort"}
+TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. A running subagent refuses them and compact: agent_stop it first. With compact true, a finished subagent compacts its context before it continues; with a message it works while the summary runs and the summary installs at its next request boundary, and without a message it ends once the summary is installed, however long that takes, and its completion reaches you. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
+TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message. Required unless compact is true."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, for the reopened run of a finished subagent. Refused for a running subagent. Default: the model its last turn used."},"provider":{"type":["string","null"],"description":"Id of a configured provider, not a vendor name, for the reopened run of a finished subagent; needed only when several providers serve model. Refused for a running subagent. Default: the provider its last turn used."},"effort":{"type":["string","null"],"description":"Reasoning effort level for the reopened run of a finished subagent. Refused for a running subagent. Default: the effort its last turn used, or the nearest level the model states."},"compact":{"type":"boolean","description":"Compact the finished subagent's context when it is reopened. Refused for a running subagent and for an ACP agent. Orchestrator only."}},"additionalProperties":false}`
+TOOL_AGENT_SEND_FIELDS :: []string{"agent", "message", "model", "provider", "effort", "compact"}
 
 TOOL_AGENT_STOP_NAME :: "agent_stop"
 TOOL_AGENT_STOP_DESCRIPTION :: "Stop a running or queued subagent when its work is no longer needed or has gone wrong. The call returns at once with status stopping; the subagent's work ends at its next step and a notice that it stopped arrives as a message. A queued subagent never starts. Files it already changed stay as they are. A subagent that has finished cannot be stopped. Only the orchestrator can stop subagents."
@@ -70,6 +70,7 @@ Agent_Send_Args :: struct {
 	model:    string,
 	provider: string,
 	effort:   string,
+	compact:  bool, // compact the finished child's context as it reopens; message may then be empty
 	// refusal is why dispatch did not record the message, set by the owner just before the
 	// executor runs; "" when the message was recorded or the executor judges the call itself.
 	refusal:  string,
@@ -101,8 +102,13 @@ tool_agent_spawn_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (ar
 tool_agent_send_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Agent_Send_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_AGENT_SEND_FIELDS, allocator = ctx.allocator) or_return
 	args.agent = tool_field_optional_string(arguments, "agent", allocator = ctx.allocator) or_return
-	args.message = tool_field_string(arguments, "message", allocator = ctx.allocator) or_return
-	if strings.trim_space(args.message) == "" { return {}, tool_argument_error(.Invalid_Value, "message", "a non-empty message", ctx.allocator) }
+	args.compact = tool_field_optional_bool(arguments, "compact", allocator = ctx.allocator) or_return
+	if args.compact {
+		args.message = tool_field_optional_string(arguments, "message", allocator = ctx.allocator) or_return
+	} else {
+		args.message = tool_field_string(arguments, "message", allocator = ctx.allocator) or_return
+		if strings.trim_space(args.message) == "" { return {}, tool_argument_error(.Invalid_Value, "message", "a non-empty message", ctx.allocator) }
+	}
 	args.model = tool_field_optional_string(arguments, "model", allocator = ctx.allocator) or_return
 	args.provider = tool_field_optional_string(arguments, "provider", allocator = ctx.allocator) or_return
 	args.effort = tool_field_optional_string(arguments, "effort", allocator = ctx.allocator) or_return
@@ -256,6 +262,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 tool_agent_resume :: proc(ctx: ^Tool_Context, args: Agent_Send_Args) -> Tool_Result {
 	spawn := Agent_Spawn_Args {
 		instruction = args.resume.instruction,
+		prompt      = args.message, // empty only for a compaction that continues with no message
 		model       = args.model,
 		provider    = args.provider,
 		effort      = args.effort,
@@ -274,7 +281,7 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 			refused := tool_argument_error(.Invalid_Value, "agent", "nothing: a subagent can message only its orchestrator", ctx.allocator)
 			return tool_result_refused(ctx, &refused)
 		}
-		if args.model != "" || args.provider != "" || args.effort != "" {
+		if args.model != "" || args.provider != "" || args.effort != "" || args.compact {
 			refused := tool_argument_error(.Invalid_Value, "model", "nothing: only an orchestrator chooses a model for a subagent", ctx.allocator)
 			return tool_result_refused(ctx, &refused)
 		}

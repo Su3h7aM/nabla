@@ -928,7 +928,11 @@ test_agent_send_reopens_a_failed_subagent_on_another_model :: proc(test: ^testin
 		test,
 		subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Continue.","provider":"nowhere"}`) != success,
 	)
-	testing.expect(test, strings.contains(subagent_test_result(test, chat), "configured providers: test-provider, other-provider"), subagent_test_result(test, chat))
+	testing.expect(
+		test,
+		strings.contains(subagent_test_result(test, chat), "configured providers: test-provider, other-provider"),
+		subagent_test_result(test, chat),
+	)
 	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 0)
 
 	testing.expect_value(
@@ -949,4 +953,68 @@ test_agent_send_reopens_a_failed_subagent_on_another_model :: proc(test: ^testin
 	testing.expect(test, turn_error == nil && found)
 	testing.expect_value(test, turn.provider, "other-provider")
 	testing.expect_value(test, turn.model, "other-model")
+}
+
+// agent_send with compact and no message reopens a finished child only to compact it: the
+// child's journal gets the summary and its checkpoint, and the orchestrator gets a completion.
+// A later send names an effort, which the child's next turn runs with.
+@(test)
+test_agent_send_compacts_a_finished_subagent_and_continues_with_an_effort :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	// The child holds more than the newest messages a summary keeps verbatim, and the
+	// oldest are longer than the summary, so there is something to summarize.
+	bulk, _ := strings.repeat("forty-two ", 1000, context.temp_allocator)
+	responses := make([dynamic]string, context.temp_allocator)
+	append(&responses, agent_provider_reply(bulk))
+	for _ in 0 ..< 5 { append(&responses, agent_provider_reply("again")) }
+	append(&responses, agent_provider_reply(COMPACT_TEST_SUMMARY), agent_provider_reply("eighty-four"))
+	if !agent_provider_start(test, &provider, responses[:]) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, {"low", "high"})
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"what is six times seven"}`), success)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "forty-two"), "the child answered")
+	children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	if !testing.expect(test, children_error == nil && len(children) == 1) { return }
+	child := children[0].id
+	for index in 0 ..< 5 {
+		call := fmt.tprintf("more_%d", index)
+		testing.expect_value(test, subagent_test_call(test, chat, call, TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Again."}`), success)
+		testing.expect(test, strings.contains(subagent_test_report(test, chat), "again"), "the child answered")
+	}
+
+	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","compact":true}`), success)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "agent-1 completed"), "the compaction ended with a completion")
+	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 5)
+
+	for kind in ([]journal.Record_Kind{.Compaction_Completed, .Checkpoint_Installed}) {
+		records, _, read_error := journal.read_records(chat.store, {session = child, kinds = {kind}}, 0, 0, context.temp_allocator)
+		testing.expect(test, read_error == nil && len(records) == 1, "the child's journal holds the compaction")
+	}
+
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Now double it.","effort":"high"}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "eighty-four"), "the reopened child answered")
+	turn, found, turn_error := journal.read_latest(chat.store, {session = child, kinds = {.Turn_Started}}, context.temp_allocator)
+	testing.expect(test, turn_error == nil && found)
+	started: journal.Turn_Started
+	testing.expect(test, journal.payload_decode(turn.data, &started, context.temp_allocator) == nil)
+	testing.expect_value(test, started.effort, "high")
+
+	// Neither a message nor compact is not a call.
+	testing.expect(test, subagent_test_call(test, chat, "send_3", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1"}`) != success)
 }

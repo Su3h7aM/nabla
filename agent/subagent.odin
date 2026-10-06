@@ -61,6 +61,7 @@ Subagent :: struct {
 	disable_project_instructions: bool,
 	background:                   bool, // delivers its outcome to the orchestrator's inbox rather than as a call's result
 	resumed:                      bool, // its session exists: subagent_run claims and continues it instead of creating it
+	compact:                      bool, // a resumed child compacts its context first; with no prompt it ends once the summary is installed
 	team:                         ^Agent_Team, // the orchestrator's, which outlives every member
 	allocator:                    mem.Allocator,
 	admitted:                     bool, // holds one of team.running's slots; guarded by team.mutex
@@ -450,6 +451,7 @@ Subagent_Resume :: struct {
 	provider_id: string,
 	model_id:    string,
 	effort:      string,
+	compact:     bool,
 }
 
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
@@ -524,6 +526,7 @@ subagent_start :: proc(
 		disable_project_instructions = parent.disable_project_instructions,
 		background                   = !args.wait,
 		resumed                      = resume.name != "",
+		compact                      = resume.compact,
 		team                         = team,
 		allocator                    = allocator,
 	}
@@ -813,6 +816,20 @@ subagent_session_open :: proc(member: ^Subagent, store: ^journal.Journal) -> (br
 	return branch, head, ""
 }
 
+// subagent_compact_wait services the child's compaction as an idle session does, until no
+// summary is running, waiting or recorded, or the child is stopped.
+@(private)
+subagent_compact_wait :: proc(member: ^Subagent, chat: ^Chat_Session) {
+	for {
+		seen := owner_wake_seen()
+		chat_session_observe_stop(chat)
+		if chat_session_cancelled(chat) { return }
+		_ = chat_compact_idle_service(chat, {}, member.selection.connection)
+		if chat.compact.state == .Idle { return }
+		owner_wake_wait(seen, chat_compact_deadline(chat))
+	}
+}
+
 // subagent_run runs the subagent's session until it answers its task and every message its
 // orchestrator sent after that, and records the outcome in member. A member that continues a
 // session starts from the message its orchestrator sent instead of a task. Runs on the
@@ -887,6 +904,19 @@ subagent_run :: proc(member: ^Subagent) {
 	// session has had its task, so its first message is what waits in its inbox.
 	text, origin, inbox_first := member.prompt, journal.User_Origin.Prompt, false
 	if member.resumed { text, origin, inbox_first = "", .Agent, true }
+	if member.compact {
+		if chat_compact_request(&chat, .User_Command) == .Unavailable {
+			subagent_fail(member, .Failed, "the subagent's context could not be compacted")
+			return
+		}
+		if member.prompt == "" {
+			// Nothing was sent to continue it, so it ends once the summary is installed. A
+			// summary may take many minutes, so nothing but a stop ends the wait.
+			subagent_compact_wait(member, &chat)
+			if chat_session_cancelled(&chat) { subagent_fail(member, .Stopped, "the subagent was stopped before it finished") } else { member.status = .Completed }
+			return
+		}
+	}
 	for {
 		accepted := chat_session_accept_message(&chat, text, origin, {}, inbox_first)
 		if accepted != .Accepted {
@@ -1036,6 +1066,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	}
 	target := known[found]
 	if target.program != "" {
+		if send.compact { return {}, "ACP agents manage their own context" }
 		return {}, fmt.tprintf("%s is an ACP agent (%s), and continuing an ACP agent is not supported; start a new one with agent_spawn", name, target.program)
 	}
 	ended, finished := subagent_outcome(completions, target.start)
@@ -1049,6 +1080,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	continued := Subagent_Resume {
 		name        = name,
 		instruction = string(target.start.body),
+		compact     = send.compact,
 	}
 	if latest_found {
 		turn: journal.Turn_Started

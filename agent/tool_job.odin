@@ -784,7 +784,7 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent
 	}
 	if member := job.exec.member; member != nil {
 		// A subagent can message only its orchestrator; the executor refuses the rest.
-		if send.agent != "" && send.agent != "orchestrator" { return }
+		if (send.agent != "" && send.agent != "orchestrator") || send.compact { return }
 		header.subagent = member.session
 		job.exec.subagent = member.session
 		chat_record(chat, header, journal.Subagent_Message{name = member.name}, transmute([]u8)send.message)
@@ -793,7 +793,7 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent
 	if job.exec.agents == nil || send.agent == "" { return }
 	session, live := subagent_live(job.exec.agents, send.agent)
 	if live {
-		if send.model != "" || send.provider != "" || send.effort != "" {
+		if send.model != "" || send.provider != "" || send.effort != "" || send.compact {
 			send.refusal = SUBAGENT_RUNNING_REFUSAL
 			return
 		}
@@ -818,6 +818,8 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent
 		chat_record(chat, start, started, transmute([]u8)send.resume.instruction)
 	}
 	job.exec.subagent = session
+	// A compaction with no message continues the child with nothing to deliver.
+	if send.message == "" { return }
 	chat_record(chat, header, journal.Subagent_Message{name = send.agent}, transmute([]u8)send.message)
 }
 
