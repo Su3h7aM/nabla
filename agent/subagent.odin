@@ -37,10 +37,11 @@ subagent_status_names := [Subagent_Status]string {
 // The shared harness instructions precede this role and the caller-provided instruction.
 SUBAGENT_ROLE :: "You are a subagent. An orchestrator agent started you for one task, stated in the first message, and it reads only your final answer. You do not see the orchestrator's conversation: the task message and what your tools find are all you have.\n\nStay inside the task. Do what it asks and return what it asks for; do not fix, refactor, or investigate beyond it, even when you notice something nearby, and mention such things in one line of your answer instead. Work with your tools until the task is done, then answer concisely with exactly what the task asked you to return: findings, decisions, and exact paths, line numbers, and identifiers. Do not narrate your process or paste file contents the task did not ask for.\n\nThe orchestrator may message you while you work. Its messages start with \"Message from the orchestrator\" and override the original task where they conflict. Use agent_send, leaving agent out, to reach the orchestrator before you finish when information you need is missing or ambiguous, when the task rests on a wrong premise, or when you find something it should act on now. Ask rather than guess on a decision that would change the result. After sending, keep working on what does not depend on the reply; the reply arrives as a message between your steps. If nothing is left that you can do without it, finish with an answer that states what you found and what is missing. You cannot start subagents or reach other subagents; the orchestrator relays between you when needed.\n\nYou share the workspace with the orchestrator and possibly other subagents working at the same time. Edit only the files your task covers. Do not revert, reformat, or overwrite changes you did not make, and do not run commands that discard work you did not do, such as resetting version control, checking out files, or deleting files you did not create. If a change you did not make is in your way, or your task needs a file outside its scope, ask the orchestrator with agent_send instead of acting."
 
-// Subagent is the orchestrator's record of one subagent. Everything above reserved is fixed
-// before the subagent starts and owned by allocator. The subagent's thread writes the outcome
-// fields and then done; the orchestrator reads them only after it sees done, and frees the
-// record after that, joining the thread first when there is one.
+// Subagent is the orchestrator's record of one running or just finished subagent. Everything
+// above admitted is fixed before the subagent starts and owned by allocator. The subagent's
+// thread writes the outcome fields and then done; the orchestrator reads them only after it
+// sees done, and then frees the record, joining the thread first when there is one, or runs
+// the same record again when a message arrived too late for the run that just ended.
 Subagent :: struct {
 	name:                         string,
 	instruction:                  string,
@@ -58,18 +59,10 @@ Subagent :: struct {
 	parent_session_hex:           [journal.SESSION_ID_HEX_LENGTH]u8, // read through chat_parent_session
 	run:                          journal.Run_Id, // the run the subagent's own journal writes under
 	disable_project_instructions: bool,
+	background:                   bool, // delivers its outcome to the orchestrator's inbox rather than as a call's result
+	resumed:                      bool, // its session exists: subagent_run claims and continues it instead of creating it
 	team:                         ^Agent_Team, // the orchestrator's, which outlives every member
 	allocator:                    mem.Allocator,
-
-	// closed, guarded by team.mutex, says the subagent takes no more messages, so a message
-	// is either answered by the subagent or refused to its sender. reserved counts the
-	// senders that have checked closed and not yet committed their message, and
-	// reservations counts every sender that ever did: the subagent closes only while none
-	// is reserved and none has reserved since it last read its inbox. Both are guarded by
-	// team.mutex.
-	closed:                       bool,
-	reserved:                     int,
-	reservations:                 int,
 	admitted:                     bool, // holds one of team.running's slots; guarded by team.mutex
 	abandoned:                    bool,
 	// stop ends the subagent's work. It chains to the call that waits for it, or to the
@@ -245,15 +238,19 @@ agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -
 }
 
 // agent_team_reap releases every subagent that is done and, given the orchestrator's
-// session, commits each one's subagent.completed there first. Owner only.
-agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) {
-	if team == nil { return }
+// session, commits each one's subagent.completed there first. A background child that
+// completed while a message to it still waits unread is run again instead, with no
+// completion (see subagent_reopen), and reopened says so. A child whose workers are still
+// outstanding is recorded and removed but not freed, because they may still reach it.
+// Owner only.
+agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bool) {
+	if team == nil { return false }
 	finished: [dynamic]^Subagent
 	finished.allocator = context.temp_allocator
 	sync.mutex_lock(&team.mutex)
 	for index := 0; index < len(team.members); {
 		member := team.members[index]
-		if !sync.atomic_load(&member.done) || member.abandoned {
+		if !sync.atomic_load(&member.done) {
 			index += 1
 			continue
 		}
@@ -264,16 +261,66 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) {
 		ordered_remove(&team.members, index)
 	}
 	sync.mutex_unlock(&team.mutex)
-	if chat != nil && chat.store != nil && len(finished) > 0 {
-		for member in finished { subagent_record_completion(chat, member) }
-		// A commit that fails records the failure on the session, which is what the next
-		// turn reports; there is nothing this reap can do with it here.
-		_ = chat_commit(chat, "a subagent's outcome could not be recorded")
+	if chat != nil && chat.store != nil {
+		for index := 0; index < len(finished); {
+			if subagent_reopen(chat, finished[index]) {
+				ordered_remove(&finished, index)
+				reopened = true
+				continue
+			}
+			index += 1
+		}
+		if len(finished) > 0 {
+			for member in finished { subagent_record_completion(chat, member) }
+			// A commit that fails records the failure on the session, which is what the next
+			// turn reports; there is nothing this reap can do with it here.
+			_ = chat_commit(chat, "a subagent's outcome could not be recorded")
+		}
 	}
 	for member in finished {
-		if member.thread != nil { thread.destroy(member.thread) }
-		subagent_destroy(member)
+		if member.thread != nil {
+			thread.destroy(member.thread)
+			member.thread = nil
+		}
+		if !member.abandoned { subagent_destroy(member) }
 	}
+	return reopened
+}
+
+// subagent_reopen runs member again, on the same record, when it completed in the
+// background while a message to it waits unread in its inbox: the message arrived after the
+// run's last read, and a child that finished is otherwise never read again. It reports
+// whether it did. A child that failed, was stopped, answered a call as a blocking one, is an
+// ACP agent, or left workers outstanding is not reopened; its message stays in the journal
+// for its next resume. Owner only.
+@(private, require_results)
+subagent_reopen :: proc(chat: ^Chat_Session, member: ^Subagent) -> bool {
+	if member.status != .Completed || !member.background || member.abandoned || member.program.name != "" { return false }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	delivered, delivered_error := journal.last_delivered_message(chat.store, member.session)
+	if delivered_error != nil { return false }
+	waiting, read_error := journal.read_inbox(chat.store, member.session, delivered, context.temp_allocator)
+	if read_error != nil || len(waiting) == 0 { return false }
+	team := member.team
+	{
+		sync.mutex_guard(&team.mutex)
+		if _, append_error := append(&team.members, member); append_error != nil { return false }
+	}
+	if member.thread != nil {
+		thread.destroy(member.thread)
+		member.thread = nil
+	}
+	delete(member.answer, member.allocator)
+	member.answer = ""
+	member.resumed = true
+	member.stop = {}
+	member.status = .Running
+	sync.atomic_store(&member.done, false)
+	if _, launched := subagent_launch(member); !launched {
+		subagent_fail(member, .Failed, "its thread could not be created")
+		subagent_finish(member)
+	}
+	return true
 }
 
 // subagent_record_completion buffers the subagent.completed that closes a member's
@@ -391,9 +438,25 @@ subagent_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string
 	return fmt.aprintf("agent-%d", call, allocator = allocator)
 }
 
+// Subagent_Resume says which finished child a start continues. name is its id, which is also
+// what tells a start from a continuation, and the instruction it was defined with goes in the
+// start's args. provider_id, model_id, and effort are what its last turn ran with, which a
+// continuation keeps unless the call names others; model_id is "" for a child that ran no
+// turn, which then starts from the orchestrator's selection as a new child does. The strings
+// are borrowed and valid until the start returns.
+Subagent_Resume :: struct {
+	name:        string,
+	instruction: string,
+	provider_id: string,
+	model_id:    string,
+	effort:      string,
+}
+
 // subagent_start defines one subagent from a start call and adds it to the team. It resolves
 // the model, the orchestrator's by default, and the effort, one level below the orchestrator's
-// by default. problem, temp-allocated, says why nothing started. Worker thread.
+// by default. With resume it continues the child resume names in session instead, keeping the
+// selection its last turn used by default. problem, temp-allocated, says why nothing started.
+// Worker thread or owner.
 @(require_results)
 subagent_start :: proc(
 	team: ^Agent_Team,
@@ -401,6 +464,7 @@ subagent_start :: proc(
 	call: journal.Call_Id,
 	session: journal.Session_Id,
 	allocator: mem.Allocator,
+	resume := Subagent_Resume{},
 ) -> (
 	member: ^Subagent,
 	problem: string,
@@ -439,7 +503,7 @@ subagent_start :: proc(
 		program, problem = subagent_program(args, &parent, allocator)
 	} else {
 		if len(tools.definitions) == 0 { return nil, "subagents are not available in this session" }
-		selection, effort, problem = subagent_select(args, &parent, allocator)
+		selection, effort, problem = subagent_select(args.provider, args.model, args.effort, subagent_defaults(&parent, resume), parent.catalog, allocator)
 	}
 	if problem != "" { return nil, problem }
 
@@ -458,6 +522,8 @@ subagent_start :: proc(
 		session                      = session,
 		run                          = parent.run,
 		disable_project_instructions = parent.disable_project_instructions,
+		background                   = !args.wait,
+		resumed                      = resume.name != "",
 		team                         = team,
 		allocator                    = allocator,
 	}
@@ -473,6 +539,12 @@ subagent_start :: proc(
 	if clone_error != nil { return nil, "the subagent could not be allocated" }
 	created.effort, clone_error = strings.clone(effort, allocator)
 	if clone_error != nil { return nil, "the subagent could not be allocated" }
+	if resume.name != "" {
+		created.name, clone_error = strings.clone(resume.name, allocator)
+		if clone_error != nil { return nil, "the subagent could not be allocated" }
+	} else {
+		created.name = subagent_name(call, allocator)
+	}
 	created.workspace, clone_error = strings.clone(parent.workspace, allocator)
 	if clone_error != nil { return nil, "the subagent could not be allocated" }
 	created.store_directory, clone_error = strings.clone(parent.store_directory, allocator)
@@ -491,7 +563,6 @@ subagent_start :: proc(
 		sync.mutex_unlock(&team.mutex)
 		return nil, "the orchestrator is closing; nothing started"
 	}
-	created.name = subagent_name(call, allocator)
 	if _, append_error := append(&team.members, created); append_error != nil {
 		sync.mutex_unlock(&team.mutex)
 		return nil, "the subagent could not be allocated"
@@ -502,42 +573,80 @@ subagent_start :: proc(
 	return member, ""
 }
 
-// subagent_select resolves the model and effort a native subagent runs. problem, temp-allocated,
-// says why it cannot run; selection is then empty.
+// Subagent_Defaults is what a selection falls back to for what its call leaves out. A new child
+// defaults to its orchestrator's model and, with step_down, to the level one below the
+// orchestrator's effort in effort_levels; a continued child keeps what its last turn ran with.
+Subagent_Defaults :: struct {
+	provider_id:   string,
+	model_id:      string,
+	effort:        string,
+	effort_levels: []string, // the levels effort is one of; read only with step_down
+	step_down:     bool,
+}
+
+// subagent_defaults is what a start falls back to: the selection of a continued child's last
+// turn, else the orchestrator's with the effort stepped down.
+@(private)
+subagent_defaults :: proc(parent: ^Agent_Parent, resume: Subagent_Resume) -> Subagent_Defaults {
+	if resume.model_id != "" { return {provider_id = resume.provider_id, model_id = resume.model_id, effort = resume.effort} }
+	return {
+		provider_id = parent.provider_id,
+		model_id = parent.model_id,
+		effort = parent.effort,
+		effort_levels = parent.effort_levels,
+		step_down = true,
+	}
+}
+
+// subagent_select resolves the model and effort a native subagent runs from what its call
+// named, provider, model, and requested_effort, each "" when left out, and defaults. problem,
+// temp-allocated, says why it cannot run, naming the configured providers or the provider's
+// models when the call named one that does not exist; selection is then empty.
 @(private, require_results)
 subagent_select :: proc(
-	args: Agent_Spawn_Args,
-	parent: ^Agent_Parent,
+	provider, model, requested_effort: string,
+	defaults: Subagent_Defaults,
+	catalog: Catalog_Ref,
 	allocator: mem.Allocator,
 ) -> (
 	selection: Model_Selection,
 	effort: string,
 	problem: string,
 ) {
-	if parent.catalog.catalog == nil { return {}, "", "subagents are not available in this session" }
+	if catalog.catalog == nil { return {}, "", "subagents are not available in this session" }
 	{
-		if parent.catalog.mutex != nil { sync.mutex_lock(parent.catalog.mutex) }
-		defer if parent.catalog.mutex != nil { sync.mutex_unlock(parent.catalog.mutex) }
-		provider_id, model_id := args.provider, args.model
+		if catalog.mutex != nil { sync.mutex_lock(catalog.mutex) }
+		defer if catalog.mutex != nil { sync.mutex_unlock(catalog.mutex) }
+		provider_id, model_id := provider, model
 		switch {
-		case model_id == "" && (provider_id == "" || provider_id == parent.provider_id):
-			provider_id, model_id = parent.provider_id, parent.model_id
+		case model_id == "" && (provider_id == "" || provider_id == defaults.provider_id):
+			provider_id, model_id = defaults.provider_id, defaults.model_id
 		case model_id == "":
-			return {}, "", fmt.tprintf("name a model of provider %s: %s", provider_id, catalog_model_names(parent.catalog.catalog, provider_id))
+			if _, found := catalog_find_provider(catalog.catalog, provider_id); !found {
+				return {}, "", fmt.tprintf("provider not found: %s; configured providers: %s", provider_id, catalog_provider_names(catalog.catalog))
+			}
+			return {}, "", fmt.tprintf("name a model of provider %s: %s", provider_id, catalog_model_names(catalog.catalog, provider_id))
 		case provider_id == "":
-			provider_id, problem = catalog_model_provider(parent.catalog.catalog, model_id, parent.provider_id)
+			provider_id, problem = catalog_model_provider(catalog.catalog, model_id, defaults.provider_id)
 			if problem != "" { return {}, "", problem }
 		}
-		if model_id == "" { return {}, "", "the orchestrator has no model selected, so name one in model" }
-		selection, problem = model_selection_resolve(parent.catalog.catalog, provider_id, model_id, allocator)
+		if model_id == "" { return {}, "", "no model is selected to default to, so name one in model" }
+		selection, problem = model_selection_resolve(catalog.catalog, provider_id, model_id, allocator)
 		if problem != "" { return {}, "", problem }
 	}
 	// An effort the model does not state is treated as one left out.
-	effort = args.effort
+	effort = requested_effort
 	if effort_level_index(selection.effort_levels, effort) < 0 {
-		effort = effort_step_down(parent.effort_levels, selection.effort_levels, parent.effort)
-		// A model with other level names still thinks when its orchestrator does.
-		if effort == "" && parent.effort != "" && len(selection.effort_levels) > 0 { effort = selection.effort_levels[0] }
+		switch {
+		case defaults.effort == "":
+			effort = ""
+		case defaults.step_down:
+			effort = effort_step_down(defaults.effort_levels, selection.effort_levels, defaults.effort)
+			// A model with other level names still thinks when its orchestrator does.
+			if effort == "" && len(selection.effort_levels) > 0 { effort = selection.effort_levels[0] }
+		case:
+			effort = model_selection_effort(selection, defaults.effort)
+		}
 	}
 	return selection, effort, ""
 }
@@ -600,9 +709,9 @@ subagent_thread :: proc(worker: ^thread.Thread) {
 	subagent_finish(member)
 }
 
-// subagent_finish closes the subagent's inbox, releases its slot, and marks it done, which
-// wakes the orchestrator to reap it: the reap commits the outcome the orchestrator reads
-// from its journal. It then starts the queued subagents the slot admits. A queued subagent
+// subagent_finish releases the subagent's slot and marks it done, which wakes the
+// orchestrator to reap it: the reap commits the outcome the orchestrator reads from its
+// journal. It then starts the queued subagents the slot admits. A queued subagent
 // whose thread cannot be created fails and is finished the same way. It touches nothing of
 // member after done.
 subagent_finish :: proc(member: ^Subagent) {
@@ -620,7 +729,6 @@ subagent_finish :: proc(member: ^Subagent) {
 subagent_conclude :: proc(member: ^Subagent) -> (next: ^Subagent) {
 	team := member.team
 	sync.mutex_lock(&team.mutex)
-	member.closed = true
 	if member.admitted {
 		member.admitted = false
 		team.running -= 1
@@ -669,9 +777,46 @@ subagent_keep_answer :: proc(member: ^Subagent, store: ^journal.Journal) {
 	member.answer = answer
 }
 
+// subagent_session_open creates the member's session, or claims and recovers it when the
+// member continues one, and returns the branch and head the session runs from. The claim is
+// the same as any session's, so a session another process runs is refused. problem,
+// temp-allocated, says why the session cannot be opened.
+@(private)
+subagent_session_open :: proc(member: ^Subagent, store: ^journal.Journal) -> (branch: journal.Branch_Id, head: journal.Node_Id, problem: string) {
+	if !member.resumed {
+		_, create_error := journal.create_session(
+			store,
+			journal.New_Session {
+				id = member.session,
+				workspace = member.workspace,
+				role = .Subagent,
+				parent_session = member.parent_session,
+				parent_call = member.parent_call,
+			},
+		)
+		if create_error != nil {
+			return 0, 0, fmt.tprintf("the subagent's session could not be created: %s", journal.error_text(create_error, context.temp_allocator))
+		}
+		return journal.INITIAL_BRANCH, 0, ""
+	}
+	if _, claim_error := journal.claim(store, member.session); claim_error != nil {
+		return 0, 0, fmt.tprintf("the subagent's session could not be claimed to continue it: %s", journal.error_text(claim_error, context.temp_allocator))
+	}
+	if _, recover_error := journal.recover(store); recover_error != nil {
+		return 0, 0, fmt.tprintf("the subagent's session could not be recovered: %s", journal.error_text(recover_error, context.temp_allocator))
+	}
+	head_error: journal.Error
+	branch, head, head_error = journal.session_head(store, member.session)
+	if head_error != nil {
+		return 0, 0, fmt.tprintf("the subagent's session history could not be read: %s", journal.error_text(head_error, context.temp_allocator))
+	}
+	return branch, head, ""
+}
+
 // subagent_run runs the subagent's session until it answers its task and every message its
-// orchestrator sent after that, and records the outcome in member. Runs on the subagent's own
-// thread and reaches nothing of the orchestrator's except the team.
+// orchestrator sent after that, and records the outcome in member. A member that continues a
+// session starts from the message its orchestrator sent instead of a task. Runs on the
+// subagent's own thread and reaches nothing of the orchestrator's except the team.
 subagent_run :: proc(member: ^Subagent) {
 	allocator := member.allocator
 
@@ -693,29 +838,16 @@ subagent_run :: proc(member: ^Subagent) {
 	// changes nothing about that.
 	defer _ = journal.close(&store)
 
-	session_id, create_error := journal.create_session(
-		&store,
-		journal.New_Session {
-			id = member.session,
-			workspace = member.workspace,
-			role = .Subagent,
-			parent_session = member.parent_session,
-			parent_call = member.parent_call,
-		},
-	)
-	if create_error != nil {
-		subagent_fail(
-			member,
-			.Failed,
-			fmt.tprintf("the subagent's session could not be created: %s", journal.error_text(create_error, context.temp_allocator)),
-		)
+	branch, head, problem := subagent_session_open(member, &store)
+	if problem != "" {
+		subagent_fail(member, .Failed, problem)
 		return
 	}
 	// The answer is read after the session is destroyed and before the store closes, whatever
 	// the outcome.
 	defer subagent_keep_answer(member, &store)
 
-	chat, init_error := chat_session_init(&store, session_id, journal.INITIAL_BRANCH, 0, member.workspace, allocator)
+	chat, init_error := chat_session_init(&store, member.session, branch, head, member.workspace, allocator)
 	if init_error.kind != .None {
 		subagent_fail(member, .Failed, "the subagent's session could not be initialized")
 		return
@@ -751,8 +883,10 @@ subagent_run :: proc(member: ^Subagent) {
 	}
 
 	// The task is the first message, so what the orchestrator sent while this subagent
-	// waited for a slot is delivered after it, at the first settled point.
+	// waited for a slot is delivered after it, at the first settled point. A continued
+	// session has had its task, so its first message is what waits in its inbox.
 	text, origin, inbox_first := member.prompt, journal.User_Origin.Prompt, false
+	if member.resumed { text, origin, inbox_first = "", .Agent, true }
 	for {
 		accepted := chat_session_accept_message(&chat, text, origin, {}, inbox_first)
 		if accepted != .Accepted {
@@ -768,63 +902,17 @@ subagent_run :: proc(member: ^Subagent) {
 			return
 		}
 		// Steering answers every message taken before the turn settled. One that arrived
-		// after its last check starts the next turn, which delivers it, and the inbox closes
-		// only when nothing waits.
-		_, next := subagent_next_messages(member, &store, chat.delivered)
-		if next == .Failed {
+		// after its last check starts the next turn, which delivers it. One that arrives
+		// after this read is found when the orchestrator reaps the child, which runs it again.
+		waiting, read_error := journal.read_inbox(&store, member.session, chat.delivered, context.temp_allocator)
+		if read_error != nil {
 			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
 			return
 		}
-		if next == .Closed { break }
+		if len(waiting) == 0 { break }
 		text, origin, inbox_first = "", .Agent, true
 	}
 	member.status = .Completed
-}
-
-// Subagent_Next says what a subagent does after its turn: take the messages that wait,
-// finish because its inbox is closed, or fail because it could not be read.
-Subagent_Next :: enum {
-	Closed,
-	Messages,
-	Failed,
-}
-
-// subagent_next_messages returns the messages the orchestrator committed to member's inbox
-// after seq after, in temp memory, or closes the inbox when there are none. A sender
-// reserves the inbox before it commits its message and releases it after, and the inbox
-// closes only while no sender holds it and none reserved it since the read: a message
-// sent at the same moment is either returned here or refused to its sender.
-@(private, require_results)
-subagent_next_messages :: proc(member: ^Subagent, store: ^journal.Journal, after: journal.Journal_Seq) -> (records: []journal.Record, next: Subagent_Next) {
-	team := member.team
-	for {
-		seen := owner_wake_seen()
-		sync.mutex_lock(&team.mutex)
-		if member.reserved > 0 {
-			// The sender is between its check and its commit; its release wakes this wait.
-			sync.mutex_unlock(&team.mutex)
-			owner_wake_wait(seen, nil)
-			continue
-		}
-		reservations := member.reservations
-		sync.mutex_unlock(&team.mutex)
-
-		read, read_error := journal.read_inbox(store, member.session, after, context.temp_allocator)
-		if read_error != nil {
-			sync.mutex_guard(&team.mutex)
-			member.closed = true
-			return nil, .Failed
-		}
-		if len(read) > 0 { return read, .Messages }
-
-		sync.mutex_lock(&team.mutex)
-		if member.reserved == 0 && member.reservations == reservations {
-			member.closed = true
-			sync.mutex_unlock(&team.mutex)
-			return nil, .Closed
-		}
-		sync.mutex_unlock(&team.mutex)
-	}
 }
 
 // subagent_find returns the running member named name. The caller holds team.mutex.
@@ -836,29 +924,142 @@ subagent_find :: proc(team: ^Agent_Team, name: string) -> ^Subagent {
 	return nil
 }
 
-// subagent_reserve holds the inbox of the subagent named name open for one message, and
-// returns it. The sender records the message, commits, and calls subagent_release, so the
-// subagent cannot close between the check and the commit. problem, temp-allocated, says
-// why the message cannot be sent.
-@(require_results)
-subagent_reserve :: proc(team: ^Agent_Team, name: string) -> (member: ^Subagent, problem: string) {
+// SUBAGENT_RUNNING_REFUSAL is what a call that would change a running child's model, provider,
+// or effort is told. There is no path that switches a request already in flight.
+SUBAGENT_RUNNING_REFUSAL :: "running: agent_stop it first"
+
+// subagent_live returns the session of the member of team named name. A member stays in the
+// team until the orchestrator reaps it, so a child that has just finished is still found here
+// and its message waits in its inbox for the reap to read.
+@(private, require_results)
+subagent_live :: proc(team: ^Agent_Team, name: string) -> (session: journal.Session_Id, found: bool) {
 	sync.mutex_guard(&team.mutex)
-	member = subagent_find(team, name)
-	if member == nil { return nil, subagent_unknown(team, name) }
-	if member.closed { return nil, fmt.tprintf("%s has finished and takes no more messages", name) }
-	member.reserved += 1
-	member.reservations += 1
-	return member, ""
+	member := subagent_find(team, name)
+	if member == nil { return {}, false }
+	return member.session, true
 }
 
-// subagent_release ends a reservation after the message's commit, whether it landed or
-// not, and wakes the subagent to read it.
-subagent_release :: proc(member: ^Subagent) {
-	{
-		sync.mutex_guard(&member.team.mutex)
-		member.reserved -= 1
+// subagent_outcome_status names how a delegation ended, as the model reads it, from the
+// outcome its subagent.completed recorded; finished is false while none is recorded.
+@(private)
+subagent_outcome_status :: proc(outcome: journal.Tool_Outcome, finished: bool) -> string {
+	if !finished { return "running" }
+	switch outcome {
+	case .Success:
+		return "completed"
+	case .Cancelled:
+		return "stopped"
+	case .Unknown:
+		return "interrupted"
+	case .Not_Executed:
+		return "never started"
+	case .Tool_Failed, .Invalid_Arguments, .Denied, .Unavailable, .Transport_Failed, .Timed_Out:
+		return "failed"
 	}
-	owner_wake_signal()
+	return "failed"
+}
+
+// subagent_outcome reads how the delegation that start opened ended, from the
+// subagent.completed records of the orchestrator's session. finished is false while none
+// names it. A record that cannot be read still says the delegation ended, with an unknown
+// outcome.
+@(private)
+subagent_outcome :: proc(completions: []journal.Record, start: journal.Record) -> (outcome: journal.Tool_Outcome, finished: bool) {
+	for completion in completions {
+		if completion.call != start.call || completion.subagent != start.subagent { continue }
+		completed: journal.Subagent_Completed
+		if journal.payload_decode(completion.data, &completed, context.temp_allocator) != nil { return .Unknown, true }
+		named, named_ok := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completed.outcome)
+		return named if named_ok else .Unknown, true
+	}
+	return .Unknown, false
+}
+
+// subagent_resume_plan finds the child send names among the delegations the orchestrator's
+// journal records, and fills send.resume with what continuing it needs: its instruction from
+// its newest start and the selection of its last turn. It returns the child's session, and
+// has checked that the selection the call names resolves, so a refused call records nothing.
+// problem, temp-allocated, says why the child cannot be continued; for a name the journal
+// does not know it lists the children it does, with how each ended. send.resume stays empty on
+// a problem. Owner only.
+@(private)
+subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agent_Send_Args) -> (child: journal.Session_Id, problem: string) {
+	name := send.agent
+	if !chat_journal_writable(chat) { return {}, "subagents are not available in this session" }
+	filter := journal.Filter {
+		session = chat.session,
+		kinds   = {.Subagent_Started},
+	}
+	starts, _, starts_error := journal.read_records(chat.store, filter, 0, 0, context.temp_allocator)
+	filter.kinds = {.Subagent_Completed}
+	completions, _, completions_error := journal.read_records(chat.store, filter, 0, 0, context.temp_allocator)
+	if starts_error != nil || completions_error != nil { return {}, "the delegations could not be read from the journal" }
+
+	// The newest start of a name says what the child is and how its last run began. A
+	// continuation that never started leaves the child as it was.
+	Known :: struct {
+		name:    string,
+		program: string,
+		start:   journal.Record,
+	}
+	known := make([dynamic]Known, context.temp_allocator)
+	for record in starts {
+		started: journal.Subagent_Started
+		if journal.payload_decode(record.data, &started, context.temp_allocator) != nil { continue }
+		entry := Known {
+			name    = started.name,
+			program = started.program,
+			start   = record,
+		}
+		ended, finished := subagent_outcome(completions, record)
+		never_started := finished && ended == .Not_Executed
+		replaced := false
+		for &candidate in known {
+			if candidate.name != started.name { continue }
+			replaced = true
+			if !never_started { candidate = entry }
+		}
+		if !replaced { append(&known, entry) }
+	}
+	found := -1
+	for candidate, index in known {
+		if candidate.name == name { found = index }
+	}
+	if found < 0 {
+		listed := make([dynamic]string, 0, len(known), context.temp_allocator)
+		for candidate in known {
+			ended, finished := subagent_outcome(completions, candidate.start)
+			append(&listed, fmt.tprintf("%s (%s)", candidate.name, subagent_outcome_status(ended, finished)))
+		}
+		joined, _ := strings.join(listed[:], ", ", context.temp_allocator)
+		return {}, fmt.tprintf("no subagent named %q; the subagents of this session: %s", name, joined if len(listed) > 0 else "none")
+	}
+	target := known[found]
+	if target.program != "" {
+		return {}, fmt.tprintf("%s is an ACP agent (%s), and continuing an ACP agent is not supported; start a new one with agent_spawn", name, target.program)
+	}
+	ended, finished := subagent_outcome(completions, target.start)
+	if !finished { return {}, fmt.tprintf("%s has not finished", name) }
+	if ended == .Not_Executed {
+		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
+	}
+
+	latest, latest_found, latest_error := journal.read_latest(chat.store, {session = target.start.subagent, kinds = {.Turn_Started}}, context.temp_allocator)
+	if latest_error != nil { return {}, fmt.tprintf("the last selection of %s could not be read", name) }
+	continued := Subagent_Resume {
+		name        = name,
+		instruction = string(target.start.body),
+	}
+	if latest_found {
+		turn: journal.Turn_Started
+		if journal.payload_decode(latest.data, &turn, context.temp_allocator) == nil { continued.effort = turn.effort }
+		continued.provider_id, continued.model_id = latest.provider, latest.model
+	}
+	// The orchestrator is the only writer of team.parent, so reading it here needs no lock.
+	_, _, problem = subagent_select(send.provider, send.model, send.effort, subagent_defaults(&team.parent, continued), team.parent.catalog, context.temp_allocator)
+	if problem != "" { return {}, problem }
+	send.resume = continued
+	return target.start.subagent, ""
 }
 
 // subagent_stop asks a subagent to stop. Its outcome reaches the orchestrator like any other.
@@ -873,7 +1074,7 @@ subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 		sync.mutex_unlock(&team.mutex)
 		return problem
 	}
-	if member.closed {
+	if sync.atomic_load(&member.done) {
 		sync.mutex_unlock(&team.mutex)
 		return fmt.tprintf("%s has already finished", name)
 	}
@@ -899,7 +1100,6 @@ subagent_unqueue :: proc(team: ^Agent_Team, member: ^Subagent) {
 		}
 	}
 	member.status = .Stopped
-	member.closed = true
 }
 
 // subagent_end_unstarted reports a member that was unqueued. It had no thread and holds no
@@ -964,8 +1164,8 @@ chat_agents_pending :: proc(chat: ^Chat_Session) -> bool {
 	// Running is read before the reap: a subagent that finishes between the two is still
 	// counted, and its wake brings the owner back to reap it.
 	running := agent_team_running(chat.team)
-	agent_team_reap(chat.team, chat)
-	return chat_inbox_reports_pending(chat) || running
+	reopened := agent_team_reap(chat.team, chat)
+	return chat_inbox_reports_pending(chat) || running || reopened
 }
 
 // chat_agents_wait blocks until an agent's report or message waits, and reports false
@@ -976,9 +1176,9 @@ chat_agents_wait :: proc(chat: ^Chat_Session, stop: ^ai.Interrupt) -> bool {
 	for {
 		seen := owner_wake_seen()
 		running := agent_team_running(chat.team)
-		agent_team_reap(chat.team, chat)
+		reopened := agent_team_reap(chat.team, chat)
 		if chat_inbox_reports_pending(chat) { return true }
-		if !running || ai.interrupt_requested(stop) || ai.interrupt_requested(&process_interrupt) { return false }
+		if !(running || reopened) || ai.interrupt_requested(stop) || ai.interrupt_requested(&process_interrupt) { return false }
 		owner_wake_wait(seen, nil)
 	}
 }

@@ -31,8 +31,8 @@ subagent_test_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, name, argu
 
 // A message is a journal record committed before its recipient hears of it, and its
 // recipient reads it from there: an orchestrator's message to a child is found in the
-// child's inbox, a closed child refuses it and leaves no record, and a child's message to its
-// orchestrator is delivered as a User node at the next settled boundary and not before.
+// child's inbox, and a child's message to its orchestrator is delivered as a User node at the
+// next settled boundary and not before.
 @(test)
 test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -54,7 +54,6 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 		subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Inspect the parser instead."}`),
 		success,
 	)
-	testing.expect_value(test, member.reserved, 0)
 	sent := _test_records(test, chat, {.Subagent_Message})
 	if !testing.expect_value(test, len(sent), 1) { return }
 	testing.expect_value(test, sent[0].subagent, member.session)
@@ -64,16 +63,6 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	text, origin := inbox_text(inbox[0])
 	testing.expect(test, strings.contains(text, "Message from the orchestrator") && strings.contains(text, "Inspect the parser instead."), text)
 	testing.expect_value(test, origin, journal.User_Origin.Agent)
-
-	// A child that closed takes no more messages, and a refused message leaves no record.
-	member.closed = true
-	testing.expect(
-		test,
-		subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Too late."}`) != success,
-		"a closed child refuses the message",
-	)
-	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 1)
-	testing.expect_value(test, member.reserved, 0)
 
 	// A subagent can message only its orchestrator.
 	child_context := Tool_Context {
@@ -526,6 +515,8 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 		agents    = team,
 	}
 	for _ in 0 ..< 2 {
+		// Dispatch names each child's session before it starts, so the test does too.
+		tool_context.subagent = journal.session_id_create()
 		started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "wait for instructions"})
 		defer tool_result_destroy(&started)
 		testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success)
@@ -802,4 +793,160 @@ test_a_crash_with_a_running_and_a_queued_child_reports_both_outcomes_once :: pro
 	request := agent_provider_request(&answering, 0)
 	testing.expect_value(test, strings.count(request, "the subagent never started"), 1)
 	testing.expect_value(test, strings.count(request, "it may have taken effect"), 1)
+}
+
+// subagent_test_parent points the orchestrator at catalog's provider test-provider, which
+// its children default to.
+subagent_test_parent :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Catalog) {
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
+	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = strings.clone("test-provider", chat.allocator)
+	delete(chat.model_id, chat.allocator)
+	chat.model_id = strings.clone("test-model", chat.allocator)
+	agent_team_note_parent(chat)
+}
+
+// subagent_test_report waits for the one report a child's end leaves in the orchestrator's
+// inbox, marks it delivered, and returns its text.
+subagent_test_report :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
+	if !chat_agents_wait(chat, nil) { testing.fail_now(test, "no report arrived") }
+	records, read_ok := chat_inbox_read(chat)
+	if !read_ok || len(records) != 1 { testing.fail_now(test, "the inbox does not hold exactly one report") }
+	chat.delivered = records[0].seq
+	text, _ := inbox_text(records[0])
+	return text
+}
+
+// subagent_test_result is the text of the newest tool result the orchestrator recorded.
+subagent_test_result :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
+	completed := _test_records(test, chat, {.Tool_Completed})
+	if len(completed) == 0 { testing.fail_now(test, "no call has a result") }
+	return string(completed[len(completed) - 1].body)
+}
+
+// agent_send to a child that has finished reopens its session. The child's second request
+// carries its task, its answer, and the new message in the same session, and a message that
+// could not be delivered because another process held the session is delivered with the next.
+@(test)
+test_agent_send_reopens_a_finished_subagent_in_its_own_session :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, {agent_provider_reply("forty-two"), agent_provider_reply("eighty-four")}) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, nil)
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"what is six times seven"}`), success)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "forty-two"), "the child answered")
+	children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	if !testing.expect(test, children_error == nil && len(children) == 1) { return }
+	child := children[0].id
+
+	// A session another process runs is refused by the claim, and the child's failure says so.
+	holder: journal.Journal
+	if open_error := journal.open(&holder, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+		testing.fail_now(test, "the second journal could not be opened")
+	}
+	if _, claim_error := journal.claim(&holder, child); claim_error != nil { testing.fail_now(test, "the second journal could not claim the child") }
+	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Try this."}`), success)
+	refused := subagent_test_report(test, chat)
+	testing.expect(test, strings.contains(refused, "agent-1 failed") && strings.contains(refused, "another process holds the session"), refused)
+	holder_error := journal.close(&holder)
+	testing.expect(test, holder_error == nil, "the second journal closed")
+
+	testing.expect_value(test, subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Now double it."}`), success)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "eighty-four"), "the reopened child answered")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	request := agent_provider_request(&provider, 1)
+	for expected in ([]string{"what is six times seven", "forty-two", "Try this.", "Now double it."}) {
+		testing.expect(test, strings.contains(request, expected), expected)
+	}
+
+	// It is the same session: no second child exists, and it holds both answers.
+	children, children_error = journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	testing.expect(test, children_error == nil && len(children) == 1 && children[0].id == child, "no second session was made")
+	_, head, head_error := journal.session_head(chat.store, child)
+	if !testing.expect(test, head_error == nil) { return }
+	nodes, nodes_error := journal.read_ancestry(chat.store, child, head, context.temp_allocator)
+	if !testing.expect(test, nodes_error == nil) { return }
+	answers := 0
+	for node in nodes { if node.kind == .Assistant { answers += 1 } }
+	testing.expect_value(test, answers, 2)
+}
+
+// A child that failed is reopened by agent_send on a model of another provider, and the
+// request that reaches it carries the whole conversation. Calls that cannot reopen it are
+// refused with what the model needs to correct them, and leave no message behind.
+@(test)
+test_agent_send_reopens_a_failed_subagent_on_another_model :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	cut := "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-should-retry: false\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"The parser lives in\"},\"finish_reason\":null}]}\n\n"
+	failing: Agent_Provider
+	if !agent_provider_start(test, &failing, {cut}) { return }
+	defer agent_provider_stop(&failing)
+	other: Agent_Provider
+	if !agent_provider_start(test, &other, {agent_provider_reply("parser.odin")}) { return }
+	defer agent_provider_stop(&other)
+	failing_endpoint := agent_provider_endpoint(&failing)
+	defer delete(failing_endpoint)
+	other_endpoint := agent_provider_endpoint(&other)
+	defer delete(other_endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", failing_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "other-provider", "other-model", other_endpoint, nil)
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"instruction":"Report file names only.","prompt":"find the parser"}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "agent-1 failed"), "the child failed")
+
+	// A name that is not a child of this session lists the ones that are, with how each ended.
+	testing.expect(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-9","message":"Hello."}`) != success)
+	testing.expect(test, strings.contains(subagent_test_result(test, chat), "agent-1 (failed)"), subagent_test_result(test, chat))
+	// A provider that does not exist lists the ones that do, and a refused call leaves no message.
+	testing.expect(
+		test,
+		subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Continue.","provider":"nowhere"}`) != success,
+	)
+	testing.expect(test, strings.contains(subagent_test_result(test, chat), "configured providers: test-provider, other-provider"), subagent_test_result(test, chat))
+	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 0)
+
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "send_3", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Continue.","model":"other-model"}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "parser.odin"), "the reopened child answered")
+	testing.expect_value(test, agent_provider_request_count(&failing), 1)
+	if !testing.expect_value(test, agent_provider_request_count(&other), 1) { return }
+	request := agent_provider_request(&other, 0)
+	for expected in ([]string{"Report file names only.", "find the parser", "Continue."}) {
+		testing.expect(test, strings.contains(request, expected), expected)
+	}
+	children, _ := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	if !testing.expect_value(test, len(children), 1) { return }
+	turn, found, turn_error := journal.read_latest(chat.store, {session = children[0].id, kinds = {.Turn_Started}}, context.temp_allocator)
+	testing.expect(test, turn_error == nil && found)
+	testing.expect_value(test, turn.provider, "other-provider")
+	testing.expect_value(test, turn.model, "other-model")
 }

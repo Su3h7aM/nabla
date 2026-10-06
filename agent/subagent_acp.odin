@@ -249,15 +249,12 @@ subagent_acp_run :: proc(member: ^Subagent) {
 			subagent_fail(member, .Failed, reason)
 			return
 		}
-		records, next := subagent_next_messages(member, &store, after)
-		switch next {
-		case .Closed:
-			break loop
-		case .Failed:
+		records, read_error := journal.read_inbox(&store, member.session, after, context.temp_allocator)
+		if read_error != nil {
 			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
 			return
-		case .Messages:
 		}
+		if len(records) == 0 { break loop }
 		after = records[len(records) - 1].seq
 		lines := make([]string, len(records), context.temp_allocator)
 		for record, index in records { lines[index], _ = inbox_text(record) }

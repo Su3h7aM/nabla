@@ -8,14 +8,14 @@ import "core:strings"
 import "nabla:agent/journal"
 
 TOOL_AGENT_SPAWN_NAME :: "agent_spawn"
-TOOL_AGENT_SPAWN_DESCRIPTION :: "Start a subagent: a separate agent in a new session that works on one task in parallel with you and sends back only its answer. Delegate to keep your context small and to spend less: the subagent reads the files, runs the searches and commands, and works through the details, and you receive only the result you asked for. It usually runs cheaper than you, so give it bounded work such as investigating one area, tracing one behavior, or making one well-specified edit.\n\nScope each subagent narrowly. It sees none of your conversation, so prompt must state one specific task, every fact, decision, and path it needs (or exactly where to find them), what is out of scope, and exactly what to return. Write \"find where the session cache key is computed and report the file, line, and every caller\", not \"fix the caching bug\": a broad goal makes it wander and do work you did not need. instruction is its system prompt: how to work and the form of its answer. Split broad work into several focused subagents that run at once.\n\nA task you delegate is no longer yours: do not do it, or any part of it, yourself while the subagent runs. Work on something else or wait for the answer; doing the same work twice wastes what delegation saves, and your edits can collide with its edits.\n\nYou and every subagent share one workspace with no isolation, so an agent can overwrite or undo another agent's changes. Subagents cannot talk to each other, so coordinating them is your job. When several run at once, give each a task that touches files no other agent edits, and tell each in its prompt that other agents are working in the same workspace, which files are its own, and which it must leave alone. Do not edit a subagent's files yourself while it runs. When one subagent's work affects another's, relay what matters with agent_send.\n\nNormally pass only instruction and prompt. The defaults run your model at one effort level below yours, in the background. Set model, provider, or effort only when the user or your instruction files name the ones to use. model is a catalog model id with its vendor prefix, exactly as listed, such as anthropic/claude-sonnet-5-5; a short name like claude-sonnet-5-5 is not an alias and fails, and the error lists the models of your provider. provider is the id of a configured provider, not a vendor name, needed only when several providers serve the model; an unknown one fails and the error lists the configured providers.\n\nThe call returns the agent id at once. Keep working on anything that does not need the answer; the answer arrives later as a message, and if you have nothing else to do, end your turn and the answer starts a new one. While it runs, steer it with agent_send when you learn something that changes its task, answer its questions the same way, and stop it with agent_stop when its work is no longer needed. Set wait to true only when your very next step needs the answer and nothing else can proceed meanwhile; the call then blocks and returns the answer.\n\nWith acp_agent set, the subagent is that configured agent program, driven over the Agent Client Protocol, and model and effort are chosen among what it offers. Only the orchestrator can start subagents."
+TOOL_AGENT_SPAWN_DESCRIPTION :: "Start a subagent: a separate agent in a new session that works on one task in parallel with you and sends back only its answer. Delegate to keep your context small and to spend less: the subagent reads the files, runs the searches and commands, and works through the details, and you receive only the result you asked for. It usually runs cheaper than you, so give it bounded work such as investigating one area, tracing one behavior, or making one well-specified edit.\n\nScope each subagent narrowly. It sees none of your conversation, so prompt must state one specific task, every fact, decision, and path it needs (or exactly where to find them), what is out of scope, and exactly what to return. Write \"find where the session cache key is computed and report the file, line, and every caller\", not \"fix the caching bug\": a broad goal makes it wander and do work you did not need. instruction is its system prompt: how to work and the form of its answer. Split broad work into several focused subagents that run at once.\n\nA task you delegate is no longer yours: do not do it, or any part of it, yourself while the subagent runs. Work on something else or wait for the answer; doing the same work twice wastes what delegation saves, and your edits can collide with its edits.\n\nYou and every subagent share one workspace with no isolation, so an agent can overwrite or undo another agent's changes. Subagents cannot talk to each other, so coordinating them is your job. When several run at once, give each a task that touches files no other agent edits, and tell each in its prompt that other agents are working in the same workspace, which files are its own, and which it must leave alone. Do not edit a subagent's files yourself while it runs. When one subagent's work affects another's, relay what matters with agent_send.\n\nNormally pass only instruction and prompt. The defaults run your model at one effort level below yours, in the background. Set model, provider, or effort only when the user or your instruction files name the ones to use. model is a catalog model id with its vendor prefix, exactly as listed, such as anthropic/claude-sonnet-5-5; a short name like claude-sonnet-5-5 is not an alias and fails, and the error lists the models of your provider. provider is the id of a configured provider, not a vendor name, needed only when several providers serve the model; an unknown one fails and the error lists the configured providers.\n\nThe call returns the agent id at once. Keep working on anything that does not need the answer; the answer arrives later as a message, and if you have nothing else to do, end your turn and the answer starts a new one. While it runs, steer it with agent_send when you learn something that changes its task, answer its questions the same way, and stop it with agent_stop when its work is no longer needed. Set wait to true only when your very next step needs the answer and nothing else can proceed meanwhile; the call then blocks and returns the answer.\n\nA subagent that has finished is not gone, whether it completed, failed, was stopped, or was cut off by a crash: its session is kept, and agent_send to its id reopens it with its task, everything it did, and its last answer. Send a follow-up, a correction, or a retry there instead of spawning a new subagent and repeating the task. The id stays the same after a restart.\n\nWith acp_agent set, the subagent is that configured agent program, driven over the Agent Client Protocol, and model and effort are chosen among what it offers. A finished ACP agent cannot be reopened. Only the orchestrator can start subagents."
 TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type":["string","null"],"description":"The subagent's system prompt: how to work and what its answer must contain."},"prompt":{"type":"string","description":"One narrowly scoped task with every fact the subagent needs and exactly what it must return."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, such as anthropic/claude-sonnet-5-5; no alias or short name resolves. Leave out unless the user or your instructions name one. Default: your model."},"provider":{"type":["string","null"],"description":"Id of a configured provider (one with base_url, api, and api_key), not a vendor name such as openai. Needed only when several providers serve model. Default: your provider if it serves model, else the only provider that does."},"effort":{"type":["string","null"],"description":"Reasoning effort level. Leave out unless the user or your instructions name one. Default: one level below yours."},"wait":{"type":["boolean","null"],"description":"Block until the subagent finishes and return its answer. Default: false, run in the background and deliver the answer later as a message."},"acp_agent":{"type":["string","null"],"description":"Name of a configured ACP agent program to run as the subagent. Default: a native subagent."}},"required":["prompt"],"additionalProperties":false}`
 TOOL_AGENT_SPAWN_FIELDS :: []string{"instruction", "prompt", "model", "provider", "effort", "wait", "acp_agent"}
 
 TOOL_AGENT_SEND_NAME :: "agent_send"
-TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent while it works. It reaches the recipient between its model requests, like a line the user types, and returns at once. The orchestrator names a running subagent in agent, which is required, to steer it: correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it. A subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. A subagent that has finished takes no more messages, and subagents cannot message each other."
-TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message."}},"required":["message"],"additionalProperties":false}`
-TOOL_AGENT_SEND_FIELDS :: []string{"agent", "message"}
+TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. A running subagent refuses them: agent_stop it first. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
+TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, for the reopened run of a finished subagent. Refused for a running subagent. Default: the model its last turn used."},"provider":{"type":["string","null"],"description":"Id of a configured provider, not a vendor name, for the reopened run of a finished subagent; needed only when several providers serve model. Refused for a running subagent. Default: the provider its last turn used."},"effort":{"type":["string","null"],"description":"Reasoning effort level for the reopened run of a finished subagent. Refused for a running subagent. Default: the effort its last turn used, or the nearest level the model states."}},"required":["message"],"additionalProperties":false}`
+TOOL_AGENT_SEND_FIELDS :: []string{"agent", "message", "model", "provider", "effort"}
 
 TOOL_AGENT_STOP_NAME :: "agent_stop"
 TOOL_AGENT_STOP_DESCRIPTION :: "Stop a running or queued subagent when its work is no longer needed or has gone wrong. The call returns at once with status stopping; the subagent's work ends at its next step and a notice that it stopped arrives as a message. A queued subagent never starts. Files it already changed stay as they are. A subagent that has finished cannot be stopped. Only the orchestrator can stop subagents."
@@ -65,11 +65,18 @@ Agent_Spawn_Args :: struct {
 }
 
 Agent_Send_Args :: struct {
-	agent:   string,
-	message: string,
+	agent:    string,
+	message:  string,
+	model:    string,
+	provider: string,
+	effort:   string,
 	// refusal is why dispatch did not record the message, set by the owner just before the
 	// executor runs; "" when the message was recorded or the executor judges the call itself.
-	refusal: string,
+	refusal:  string,
+	// resume is set by the owner, with refusal, when the message continues a finished child:
+	// resume.name borrows agent, and the other strings live in temp memory until the executor
+	// returns.
+	resume:   Subagent_Resume,
 }
 
 Agent_Stop_Args :: struct {
@@ -96,6 +103,9 @@ tool_agent_send_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (arg
 	args.agent = tool_field_optional_string(arguments, "agent", allocator = ctx.allocator) or_return
 	args.message = tool_field_string(arguments, "message", allocator = ctx.allocator) or_return
 	if strings.trim_space(args.message) == "" { return {}, tool_argument_error(.Invalid_Value, "message", "a non-empty message", ctx.allocator) }
+	args.model = tool_field_optional_string(arguments, "model", allocator = ctx.allocator) or_return
+	args.provider = tool_field_optional_string(arguments, "provider", allocator = ctx.allocator) or_return
+	args.effort = tool_field_optional_string(arguments, "effort", allocator = ctx.allocator) or_return
 	return
 }
 
@@ -145,6 +155,59 @@ tool_agent_description_parts :: proc(parts: ^[dynamic]string, agents: []ACP_Agen
 // TOOL_AGENT_ORCHESTRATOR_ONLY is what a subagent is told when it tries to manage subagents.
 TOOL_AGENT_ORCHESTRATOR_ONLY :: "only the orchestrator manages subagents; a subagent cannot start or stop one. If the task needs one, tell the orchestrator with agent_send"
 
+// tool_agent_started_output describes a child that was just defined and has not run yet.
+// requested_effort is the effort the call named, which the child runs without when its model
+// does not state it, and the output says so. Its texts borrow member, except the temp-allocated
+// ones.
+@(private)
+tool_agent_started_output :: proc(member: ^Subagent, requested_effort: string) -> Agent_Output {
+	session_hex := make([]u8, journal.SESSION_ID_HEX_LENGTH, context.temp_allocator)
+	output := Agent_Output {
+		agent   = member.name,
+		status  = subagent_status_names[.Running],
+		model   = fmt.tprintf("%s/%s", member.selection.provider_id, member.selection.model_id),
+		effort  = member.effort if member.effort != "" else "default",
+		session = journal.session_id_to_hex(member.session, session_hex),
+	}
+	if requested_effort != "" && requested_effort != member.effort {
+		output.notice = fmt.tprintf("effort %q is not a level of this model, so it runs as if effort were left out", requested_effort)
+	}
+	return output
+}
+
+// tool_agent_launch starts member in the background and answers the call at once: output
+// with status running and summary "<name> <verb>", or queued when no slot is free. The texts
+// that borrow member are copied before the launch, after which a quick child may already have
+// been reaped, and the reply of a child that waits for a slot is rebuilt from the copies.
+@(private, require_results)
+tool_agent_launch :: proc(ctx: ^Tool_Context, member: ^Subagent, output: Agent_Output, verb: string) -> Tool_Result {
+	output := output
+	output.agent = fmt.tprintf("%s", output.agent)
+	output.model = fmt.tprintf("%s", output.model)
+	output.effort = fmt.tprintf("%s", output.effort)
+	result := tool_result_success(ctx, output, fmt.tprintf("%s %s", output.agent, verb))
+	if result.allocation_failed {
+		subagent_fail(member, .Failed, "the start result could not be allocated; nothing ran")
+		subagent_finish(member)
+		return result
+	}
+	queued_summary := fmt.tprintf("%s queued", output.agent)
+	queued, launched := subagent_launch(member)
+	if !launched {
+		tool_result_destroy(&result)
+		subagent_fail(member, .Failed, "its thread could not be created")
+		subagent_finish(member)
+		return tool_result_failure(ctx, .Tool_Failed, "the subagent's thread could not be created", "not started")
+	}
+	// member may be gone by now.
+	if queued {
+		tool_result_destroy(&result)
+		output.status = subagent_status_names[.Queued]
+		return tool_result_success(ctx, output, queued_summary)
+	}
+	return result
+}
+
 @(require_results)
 tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Spawn_Args)
@@ -154,52 +217,14 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not started") }
 	ctx.subagent_started = true
 
-	session_hex: [journal.SESSION_ID_HEX_LENGTH]u8
-	output := Agent_Output {
-		agent   = member.name,
-		status  = subagent_status_names[.Running],
-		model   = fmt.tprintf("%s/%s", member.selection.provider_id, member.selection.model_id),
-		effort  = member.effort if member.effort != "" else "default",
-		session = journal.session_id_to_hex(member.session, session_hex[:]),
-	}
-	if args.effort != "" && args.effort != member.effort {
-		output.notice = fmt.tprintf("effort %q is not a level of this model, so it runs as if effort were left out", args.effort)
-	}
+	output := tool_agent_started_output(member, args.effort)
 	if member.program.name != "" {
 		// The agent program states its models and efforts only once it runs.
 		output.model = member.program.model if member.program.model != "" else "the agent's default"
 		output.effort = args.effort if args.effort != "" else "one level below yours, if the agent offers levels"
 		output.notice = ""
 	}
-	if !args.wait {
-		// Copy the reply before launch: a fast child can finish and be reaped immediately.
-		// The texts that borrow from member are copied too, for the queued reply below.
-		output.agent = fmt.tprintf("%s", member.name)
-		output.effort = fmt.tprintf("%s", output.effort)
-		output.model = fmt.tprintf("%s", output.model)
-		result := tool_result_success(ctx, output, fmt.tprintf("%s started", output.agent))
-		if result.allocation_failed {
-			subagent_fail(member, .Failed, "the start result could not be allocated; nothing ran")
-			subagent_finish(member)
-			return result
-		}
-		queued_summary := fmt.tprintf("%s queued", output.agent)
-		queued, launched := subagent_launch(member)
-		if !launched {
-			tool_result_destroy(&result)
-			subagent_fail(member, .Failed, "its thread could not be created")
-			subagent_finish(member)
-			return tool_result_failure(ctx, .Tool_Failed, "the subagent's thread could not be created", "not started")
-		}
-		// member may be gone by now, so the reply of a child that waits for a slot is rebuilt
-		// from the copies.
-		if queued {
-			tool_result_destroy(&result)
-			output.status = subagent_status_names[.Queued]
-			return tool_result_success(ctx, output, queued_summary)
-		}
-		return result
-	}
+	if !args.wait { return tool_agent_launch(ctx, member, output, "started") }
 
 	// A blocking subagent stops with this call.
 	subagent_take_slot(member)
@@ -223,6 +248,24 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	return result
 }
 
+// tool_agent_resume continues the finished child dispatch recorded for this call, in the
+// background, with the model, provider, and effort the call named or else the ones its last
+// turn used. The message was recorded with the call's admission, and the child's first step
+// delivers it.
+@(private, require_results)
+tool_agent_resume :: proc(ctx: ^Tool_Context, args: Agent_Send_Args) -> Tool_Result {
+	spawn := Agent_Spawn_Args {
+		instruction = args.resume.instruction,
+		model       = args.model,
+		provider    = args.provider,
+		effort      = args.effort,
+	}
+	member, problem := subagent_start(ctx.agents, spawn, ctx.call, ctx.subagent, ctx.allocator, args.resume)
+	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not resumed") }
+	ctx.subagent_started = true
+	return tool_agent_launch(ctx, member, tool_agent_started_output(member, args.effort), "resumed")
+}
+
 @(require_results)
 tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Send_Args)
@@ -231,14 +274,19 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 			refused := tool_argument_error(.Invalid_Value, "agent", "nothing: a subagent can message only its orchestrator", ctx.allocator)
 			return tool_result_refused(ctx, &refused)
 		}
+		if args.model != "" || args.provider != "" || args.effort != "" {
+			refused := tool_argument_error(.Invalid_Value, "model", "nothing: only an orchestrator chooses a model for a subagent", ctx.allocator)
+			return tool_result_refused(ctx, &refused)
+		}
 		return tool_result_success(ctx, Agent_Output{agent = "orchestrator", status = "queued"}, "queued")
 	}
 	if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
 	if args.agent == "" {
-		refused := tool_argument_error(.Missing_Field, "agent", "the id of a running subagent", ctx.allocator)
+		refused := tool_argument_error(.Missing_Field, "agent", "the id of a subagent", ctx.allocator)
 		return tool_result_refused(ctx, &refused)
 	}
 	if args.refusal != "" { return tool_result_failure(ctx, .Tool_Failed, args.refusal, "not sent") }
+	if args.resume.name != "" { return tool_agent_resume(ctx, args) }
 	return tool_result_success(ctx, Agent_Output{agent = args.agent, status = "queued"}, "queued")
 }
 

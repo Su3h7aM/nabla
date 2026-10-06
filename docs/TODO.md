@@ -19,15 +19,13 @@ Provider error classification mostly matches the Anthropic and OpenAI documentat
 
 A subagent is a session like any other: the orchestrator can bring it back, inspect it, compact it, switch its model, and continue it.
 
-- Today a child closes when its inbox is empty and refuses later sends (`agent/subagent_test.odin` asserts the refusal). Reports already carry the cause, the child session id and the last committed text.
-- A finished subagent can stay usable as an ordinary conversation. We could let `agent_send` to a closed or failed child reopen its session through the existing claim and recovery path, with an optional `model` argument resolved like `agent_spawn`'s.
+- Remaining recovery steps: `compact` on `agent_send` (step 5), `agent_status` and status acknowledgements (step 6), ACP status and resume through `session/resume` (step 7). Effort on resume has no test yet.
 - Liveness: the journal already records `request.sent`, `retry.scheduled`, and `provider.observed` per child. An `agent_send` acknowledgement can report the age and kind of the child's last record, so a stalled child is distinguishable from a slow one.
 - An interrupted tool call can carry the output it produced so far. Writing shell streams to their kept file as they arrive would let recovery name that file in the `Unknown` result.
 
 ## Tool descriptions
 
 - The read and write descriptions state the 32 KiB preview as a literal; build them from `TOOL_RESULT_PREVIEW_BYTES` as the shell description does.
-- `subagent_select` with an unknown `provider` and no `model` answers `name a model of provider X: none` instead of listing the configured providers.
 - Patch parsing: a mistyped header such as `*** Updat File:` inside a section becomes hunk content instead of an error naming the line.
 - A literal replace with an expected match count is reported three times (Lua patterns need escaping, the patch tool matches whole lines). Decide where it belongs: a Code Mode helper or a substring form of the patch tool.
 
