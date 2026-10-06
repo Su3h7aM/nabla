@@ -96,34 +96,28 @@ read_records :: proc(
 	query_add(&query, " ORDER BY seq ASC") or_return
 	if page > 0 { query_add(&query, " LIMIT ?", i64(page)) or_return }
 
-	rows: db.Rows
-	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
-	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
-
-	list := make([dynamic]Record, allocator) or_return
-	defer if error != nil { records_destroy(list[:], allocator) }
-	for {
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { break }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		record := scan_record(&row)
-		if row.error != nil {
-			session := record.session
-			seq := record.seq
-			record_destroy(&record, allocator)
-			return nil, after, corrupt(journal, row.error, session, seq)
-		}
-		if _, append_error := append(&list, record); append_error != nil {
-			record_destroy(&record, allocator)
-			return nil, after, append_error
-		}
-	}
+	records, error = query_records(journal, strings.to_string(query.sql), query.arguments[:], allocator)
+	if error != nil { return nil, after, error }
 	last = after
-	if len(list) > 0 { last = list[len(list) - 1].seq }
-	return list[:], last, nil
+	if len(records) > 0 { last = records[len(records) - 1].seq }
+	return records, last, nil
+}
+
+// read_inbox returns the records that address session with seq above after, oldest
+// first. Only committed records are visible, so a line whose commit was busy is delivered
+// after it lands, never twice. They are the user.input records of session, the subagent.completed records of
+// its background children (a blocking child's answer is already its call's result, and a
+// call that reported no child started has nothing to report), the subagent.message
+// records its children sent it, and the subagent.message records its parent sent it when
+// it is a child. Whatever process committed them, the seq is the order, so a session
+// delivers them once by remembering the highest seq it delivered
+// (last_delivered_message). The result is owned by allocator; release it with
+// records_destroy.
+@(require_results)
+read_inbox :: proc(journal: ^Journal, session: Session_Id, after: Journal_Seq, allocator: mem.Allocator) -> (records: []Record, error: Error) {
+	assert(journal.open)
+	session := session
+	return query_records(journal, INBOX_QUERY, {db.Value(session[:]), db.Value(i64(after))}, allocator)
 }
 
 // read_latest returns the matching record with the highest seq, false when none
@@ -236,9 +230,9 @@ read_artifact :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocato
 	return bytes, true, nil
 }
 
-// last_delivered_message returns the highest subagent.message seq a User node of
-// session delivered, 0 when none did. Reading the peer's messages after it finds
-// the undelivered ones, across restarts, because delivery commits with the node.
+// last_delivered_message returns the highest inbox record seq a User node of session
+// delivered, 0 when none did. read_inbox after it finds the undelivered records, across
+// restarts, because delivery commits with the node.
 @(require_results)
 last_delivered_message :: proc(journal: ^Journal, session: Session_Id) -> (seq: Journal_Seq, error: Error) {
 	assert(journal.open)
@@ -454,6 +448,26 @@ FROM active`
 @(private)
 LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0) FROM nodes WHERE session = ? AND kind = 'user'`
 
+// The inbox of session ?1 after seq ?2. A completion is reported only for a child that
+// started in the background, and not when the call that started it ended in a failure
+// of its own, which its result already told the model; a call whose outcome is unknown
+// may have started the child, so its completion is still reported.
+@(private)
+INBOX_QUERY ::
+	`SELECT ` +
+	RECORD_COLUMNS +
+	` FROM records AS inbound WHERE inbound.seq > ?2 AND (
+	(inbound.session = ?1 AND inbound.kind = 'user.input')
+	OR (inbound.session = ?1 AND inbound.kind = 'subagent.completed'
+		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started'
+			AND started.call IS inbound.call AND started.subagent IS inbound.subagent AND json_extract(started.data, '$.background') = 1)
+		AND NOT EXISTS (SELECT 1 FROM records AS result WHERE result.session = ?1 AND result.kind = 'tool.completed' AND result.call IS inbound.call
+			AND json_extract(result.data, '$.outcome') NOT IN ('success', 'unknown')))
+	OR (inbound.kind = 'subagent.message' AND inbound.session = inbound.subagent AND inbound.session <> ?1
+		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started' AND started.subagent = inbound.session))
+	OR (inbound.kind = 'subagent.message' AND inbound.subagent = ?1 AND inbound.session <> ?1)
+) ORDER BY inbound.seq ASC`
+
 // A count the provider did not report is JSON null, which SUM and the paired
 // test both skip, so it never enters a total as zero.
 @(private)
@@ -527,6 +541,38 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 	record.data = row_text(row)
 	record.body = row_bytes(row)
 	return
+}
+
+// query_records runs a query that selects RECORD_COLUMNS and scans every row. The result
+// is owned by allocator.
+@(private, require_results)
+query_records :: proc(journal: ^Journal, sql: string, arguments: []db.Value, allocator: mem.Allocator) -> (records: []Record, error: Error) {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
+	db.query(&journal.connection, &rows, sql, arguments) or_return
+
+	list := make([dynamic]Record, allocator) or_return
+	defer if error != nil { records_destroy(list[:], allocator) }
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		record := scan_record(&row)
+		if row.error != nil {
+			session := record.session
+			seq := record.seq
+			record_destroy(&record, allocator)
+			return nil, corrupt(journal, row.error, session, seq)
+		}
+		if _, append_error := append(&list, record); append_error != nil {
+			record_destroy(&record, allocator)
+			return nil, append_error
+		}
+	}
+	return list[:], nil
 }
 
 // corrupt names the damaged row when a read fails on stored data. A lower

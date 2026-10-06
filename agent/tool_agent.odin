@@ -65,6 +65,9 @@ Agent_Spawn_Args :: struct {
 Agent_Send_Args :: struct {
 	agent:   string,
 	message: string,
+	// refusal is why dispatch did not record the message, set by the owner just before the
+	// executor runs; "" when the message was recorded or the executor judges the call itself.
+	refusal: string,
 }
 
 Agent_Stop_Args :: struct {
@@ -173,7 +176,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		result := tool_result_success(ctx, output, fmt.tprintf("%s started", output.agent))
 		if result.allocation_failed {
 			subagent_fail(member, .Failed, "the start result could not be allocated; nothing ran")
-			subagent_finish(member, report = false)
+			subagent_finish(member)
 			return result
 		}
 		queued_summary := fmt.tprintf("%s queued", output.agent)
@@ -181,7 +184,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		if !launched {
 			tool_result_destroy(&result)
 			subagent_fail(member, .Failed, "its thread could not be created")
-			subagent_finish(member, report = false)
+			subagent_finish(member)
 			return tool_result_failure(ctx, .Tool_Failed, "the subagent's thread could not be created", "not started")
 		}
 		// member may be gone by now, so the reply of a child that waits for a slot is rebuilt
@@ -212,7 +215,7 @@ tool_agent_spawn_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		result = tool_result_of(ctx, .Tool_Failed, member.answer, output, "failed")
 	}
 	// The result owns its copies, so the member may be released once it is done.
-	subagent_finish(member, report = false)
+	subagent_finish(member)
 	return result
 }
 
@@ -224,10 +227,6 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 			refused := tool_argument_error(.Invalid_Value, "agent", "nothing: a subagent can message only its orchestrator", ctx.allocator)
 			return tool_result_refused(ctx, &refused)
 		}
-		if !subagent_report_message(member, args.message) {
-			return tool_result_failure(ctx, .Tool_Failed, "the message could not be allocated", "not sent")
-		}
-		ctx.subagent = member.session
 		return tool_result_success(ctx, Agent_Output{agent = "orchestrator", status = "queued"}, "queued")
 	}
 	if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
@@ -235,11 +234,7 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 		refused := tool_argument_error(.Missing_Field, "agent", "the id of a running subagent", ctx.allocator)
 		return tool_result_refused(ctx, &refused)
 	}
-	session, problem := subagent_send(ctx.agents, args.agent, args.message)
-	if problem != "" {
-		return tool_result_failure(ctx, .Tool_Failed, problem, "not sent")
-	}
-	ctx.subagent = session
+	if args.refusal != "" { return tool_result_failure(ctx, .Tool_Failed, args.refusal, "not sent") }
 	return tool_result_success(ctx, Agent_Output{agent = args.agent, status = "queued"}, "queued")
 }
 

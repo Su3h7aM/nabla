@@ -184,7 +184,8 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	// Tools are refreshed between turns, while the session is idle, so the registry a
 	// turn dispatches against is the one it was advertised with.
 	if warning := app_tools_refresh(app); warning != "" { fmt.eprintln("nabla:", warning) }
-	switch agent.chat_session_accept_user(&app.setup.session, prompt) {
+	observer := headless_observer(out)
+	switch agent.chat_session_accept_user(&app.setup.session, prompt, observer) {
 	case .Accepted:
 	case .Storage_Failed:
 		fmt.eprintln("nabla:", agent.chat_session_last_error(&app.setup.session))
@@ -195,7 +196,6 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	}
 	chat := &app.setup.session
 	chat.catalog = app_catalog_ref(app)
-	observer := headless_observer(out)
 	completed := agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
 	// A headless run ends when its work does, so it waits for the subagents it started in the
 	// background and answers each report with a turn of its own.

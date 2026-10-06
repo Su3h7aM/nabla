@@ -101,8 +101,20 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	session, create_error := journal.create_session(&fixture.store, {workspace = workspace, role = .Main})
 	if create_error != nil { testing.fail_now(test, "the session could not be created") }
 
+	chat_test_attach(test, fixture, session, journal.INITIAL_BRANCH, 0, workspace)
+}
+
+// chat_test_attach builds the fixture's chat for session at head, on the fixture's journal.
+chat_test_attach :: proc(
+	test: ^testing.T,
+	fixture: ^Chat_Test,
+	session: journal.Session_Id,
+	branch: journal.Branch_Id,
+	head: journal.Node_Id,
+	workspace: string,
+) {
 	tool_error: Tool_Registry_Error
-	fixture.chat, tool_error = chat_session_init(&fixture.store, session, journal.INITIAL_BRANCH, 0, workspace, context.allocator)
+	fixture.chat, tool_error = chat_session_init(&fixture.store, session, branch, head, workspace, context.allocator)
 	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
@@ -110,9 +122,33 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
 	// Kept outputs go under the fixture's own directory, never the user's cache directory.
 	delete(fixture.chat.tool_output_directory, context.allocator)
-	tool_output_directory, join_error := os.join_path({directory, "tool-output"}, context.allocator)
+	tool_output_directory, join_error := os.join_path({fixture.directory, "tool-output"}, context.allocator)
 	if join_error != nil { testing.fail_now(test, "the tool output directory could not be allocated") }
 	fixture.chat.tool_output_directory = tool_output_directory
+}
+
+// chat_test_reopen is the next process opening a session a fixture left: the fixture's chat
+// and journal are torn down, then the same directory is opened again, the session claimed and
+// recovered, and a chat built at its head. reopened takes the directory over, so
+// chat_test_end on it removes the directory; fixture must not be ended. It returns what
+// recovery recorded.
+chat_test_reopen :: proc(test: ^testing.T, fixture, reopened: ^Chat_Test, workspace: string) -> journal.Recovery {
+	session := fixture.chat.session
+	chat_session_destroy(&fixture.chat)
+	if close_error := journal.close(&fixture.store); close_error != nil { testing.fail_now(test, "the first journal did not close") }
+	reopened.directory = fixture.directory
+	fixture^ = {}
+
+	if open_error := journal.open(&reopened.store, reopened.directory, reopened.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+		testing.fail_now(test, "the journal could not be opened again")
+	}
+	if _, claim_error := journal.claim(&reopened.store, session); claim_error != nil { testing.fail_now(test, "the session could not be claimed again") }
+	recovery, recover_error := journal.recover(&reopened.store)
+	if recover_error != nil { testing.fail_now(test, "the session could not be recovered") }
+	branch, head, head_error := journal.session_head(&reopened.store, session)
+	if head_error != nil { testing.fail_now(test, "the session head could not be read") }
+	chat_test_attach(test, reopened, session, branch, head, workspace)
+	return recovery
 }
 
 test_skill_instructions :: proc(chat: ^Chat_Session) -> string {

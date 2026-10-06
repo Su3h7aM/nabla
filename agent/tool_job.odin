@@ -767,7 +767,18 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 			},
 		)
 	}
-	if !chat_commit(chat, "the tool dispatch could not be recorded") {
+	reserved: ^Subagent
+	sends := false
+	if send, is_send := &job.arguments.(Agent_Send_Args); is_send {
+		sends = true
+		reserved = tool_job_stage_message(chat, job, send, node, parent_call)
+	}
+	committed := chat_commit(chat, "the tool dispatch could not be recorded")
+	// The recipient wakes only after the commit that holds its message, and a message that
+	// did not commit leaves no reservation behind.
+	if reserved != nil { subagent_release(reserved) }
+	if sends && committed && job.exec.subagent != {} { owner_wake_signal() }
+	if !committed {
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}
@@ -800,6 +811,50 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	}
 	job.phase = .Running
 	jobs.active += 1
+}
+
+// tool_job_stage_message buffers the subagent.message record of an agent_send call, so it
+// commits in the barrier of the call's admission and the recipient is woken only after it.
+// From an orchestrator it first reserves the recipient's inbox, and the caller releases the
+// returned subagent after the commit; a recipient that cannot take the message is left in
+// send.refusal for the executor to report, and nothing is recorded. A subagent's message
+// to its orchestrator needs no reservation, because the orchestrator reads its journal at
+// its own settled points.
+@(private)
+tool_job_stage_message :: proc(
+	chat: ^Chat_Session,
+	job: ^Tool_Job,
+	send: ^Agent_Send_Args,
+	node: journal.Node_Id,
+	parent_call: journal.Call_Id,
+) -> (
+	reserved: ^Subagent,
+) {
+	header := journal.Record {
+		kind        = .Subagent_Message,
+		node        = node,
+		request     = chat.request,
+		call        = job.call.call,
+		parent_call = parent_call,
+	}
+	if member := job.exec.member; member != nil {
+		// A subagent can message only its orchestrator; the executor refuses the rest.
+		if send.agent != "" && send.agent != "orchestrator" { return nil }
+		header.subagent = member.session
+		job.exec.subagent = member.session
+		chat_record(chat, header, journal.Subagent_Message{name = member.name}, transmute([]u8)send.message)
+		return nil
+	}
+	if job.exec.agents == nil || send.agent == "" { return nil }
+	member, problem := subagent_reserve(job.exec.agents, send.agent)
+	if member == nil {
+		send.refusal = problem
+		return nil
+	}
+	header.subagent = member.session
+	job.exec.subagent = member.session
+	chat_record(chat, header, journal.Subagent_Message{name = member.name}, transmute([]u8)send.message)
+	return member
 }
 
 // tool_jobs_abandon answers a call that ignored its stop with an unknown outcome and retains
@@ -903,22 +958,15 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		parent_call = parent_call,
 		subagent    = job.exec.subagent,
 	}
-	#partial switch arguments in job.arguments {
-	// Only the agent tools act on a delegation.
-	case Agent_Spawn_Args:
-		if delegation.subagent != {} && !job.exec.subagent_started {
-			delegation.kind = .Subagent_Completed
-			completed := journal.Subagent_Completed {
-				outcome = journal.TOOL_OUTCOME_NAMES[.Not_Executed],
-				detail  = "no subagent started",
-			}
-			chat_record(chat, delegation, completed, transmute([]u8)result.content)
+	// A call that started no child closes its delegation with its result. A message was
+	// recorded with the call's dispatch, before its recipient could hear of it.
+	if _, is_spawn := job.arguments.(Agent_Spawn_Args); is_spawn && delegation.subagent != {} && !job.exec.subagent_started {
+		delegation.kind = .Subagent_Completed
+		completed := journal.Subagent_Completed {
+			outcome = journal.TOOL_OUTCOME_NAMES[.Not_Executed],
+			detail  = "no subagent started",
 		}
-	case Agent_Send_Args:
-		if delegation.subagent != {} && result.outcome == .Success {
-			delegation.kind = .Subagent_Message
-			chat_record(chat, delegation, journal.Subagent_Message{}, transmute([]u8)arguments.message)
-		}
+		chat_record(chat, delegation, completed, transmute([]u8)result.content)
 	}
 	if !chat_record_tool_result(chat, job.call.call, node, parent_call, &result) {
 		// The result cannot be recorded, so it must not be reported as if it were.

@@ -5,12 +5,32 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:ai"
 
+// subagent_test_call runs one call of the orchestrator through the job table, as a model's
+// proposal would be, so its admission, delegation records, and result are the real ones.
+// It returns the call's outcome.
+subagent_test_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, name, arguments: string) -> string {
+	_test_stage_call(test, chat, id, arguments, name)
+	testing.expect_value(test, chat_run_tools(chat, {}), 1)
+	chat_pending_calls_clear(chat)
+	completed, _, read_error := journal.read_records(chat.store, {session = chat.session, kinds = {.Tool_Completed}}, 0, 0, context.temp_allocator)
+	if read_error != nil || len(completed) == 0 { testing.fail_now(test, "the call's result could not be read") }
+	payload: journal.Tool_Completed
+	if journal.payload_decode(completed[len(completed) - 1].data, &payload, context.temp_allocator) !=
+	   nil { testing.fail_now(test, "a result could not be read") }
+	return payload.outcome
+}
+
+// A message is a journal record committed before its recipient hears of it, and its
+// recipient reads it from there: an orchestrator's message to a child is found in the
+// child's inbox, a closed child refuses it and leaves no record, and a child's message to its
+// orchestrator is delivered as a User node at the next settled boundary and not before.
 @(test)
-test_agent_messages_follow_steering_boundaries_and_reject_sibling_delivery :: proc(test: ^testing.T) {
+test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -19,60 +39,92 @@ test_agent_messages_follow_steering_boundaries_and_reject_sibling_delivery :: pr
 		name    = "agent-1",
 		session = journal.session_id_create(),
 		team    = chat.team,
-		inbox   = steer_queue_init(context.allocator),
 	}
-	defer steer_queue_destroy(&member.inbox)
 	append(&chat.team.members, &member)
 	defer clear(&chat.team.members)
-	parent_context := Tool_Context {
-		allocator = context.allocator,
-		agents    = chat.team,
-	}
+	_test_accept(test, chat, "Investigate.")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Inspect the parser instead."}`),
+		success,
+	)
+	testing.expect_value(test, member.reserved, 0)
+	sent := _test_records(test, chat, {.Subagent_Message})
+	if !testing.expect_value(test, len(sent), 1) { return }
+	testing.expect_value(test, sent[0].subagent, member.session)
+	inbox, inbox_error := journal.read_inbox(chat.store, member.session, 0, context.temp_allocator)
+	testing.expect_value(test, inbox_error, nil)
+	if !testing.expect_value(test, len(inbox), 1) { return }
+	text, origin := inbox_text(inbox[0])
+	testing.expect(test, strings.contains(text, "Message from the orchestrator") && strings.contains(text, "Inspect the parser instead."), text)
+	testing.expect_value(test, origin, journal.User_Origin.Agent)
+
+	// A child that closed takes no more messages, and a refused message leaves no record.
+	member.closed = true
+	testing.expect(
+		test,
+		subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Too late."}`) != success,
+		"a closed child refuses the message",
+	)
+	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 1)
+	testing.expect_value(test, member.reserved, 0)
+
+	// A subagent can message only its orchestrator.
 	child_context := Tool_Context {
 		allocator = context.allocator,
 		member    = &member,
 	}
-	to_child := tool_agent_send_execute(&parent_context, Agent_Send_Args{agent = "agent-1", message = "Inspect the parser instead."})
-	defer tool_result_destroy(&to_child)
-	testing.expect_value(test, to_child.outcome, journal.Tool_Outcome.Success)
-	testing.expect_value(test, parent_context.subagent, member.session)
-	line, queued := steer_pop(&member.inbox)
-	defer steer_line_free(&member.inbox, line)
-	testing.expect(test, queued && strings.contains(line, "Inspect the parser instead."))
+	to_sibling := tool_agent_send_execute(&child_context, Agent_Send_Args{agent = "agent-2", message = "Do this."})
+	defer tool_result_destroy(&to_sibling)
+	testing.expect_value(test, to_sibling.outcome, journal.Tool_Outcome.Invalid_Arguments)
 
-	to_parent := tool_agent_send_execute(&child_context, Agent_Send_Args{message = "The parser has a race."})
-	defer tool_result_destroy(&to_parent)
-	testing.expect_value(test, to_parent.outcome, journal.Tool_Outcome.Success)
-	testing.expect_value(test, child_context.subagent, member.session)
-	_test_accept(test, chat, "Investigate.")
+	// The child's own journal carries its message to the orchestrator.
+	chat_record(chat, {kind = .Subagent_Started, subagent = member.session}, journal.Subagent_Started{background = true})
+	_test_commit(test, chat)
+	child_store: journal.Journal
+	if open_error := journal.open(&child_store, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+		testing.fail_now(test, "the child's journal could not be opened")
+	}
+	defer _ = journal.close(&child_store)
+	_, create_error := journal.create_session(
+		&child_store,
+		{id = member.session, workspace = tool_loop_workspace(test), role = .Subagent, parent_session = chat.session},
+	)
+	if create_error != nil { testing.fail_now(test, "the child's session could not be created") }
+	journal.append_record(
+		&child_store,
+		{kind = .Subagent_Message, session = member.session, subagent = member.session},
+		journal.Subagent_Message{name = member.name},
+		transmute([]u8)string("The parser has a race."),
+	)
+	if _, commit_error := journal.commit(&child_store); commit_error != nil { testing.fail_now(test, "the child's message could not be committed") }
+	// The child's message is not the orchestrator's own message to read back.
+	own, _ := journal.read_inbox(chat.store, member.session, 0, context.temp_allocator)
+	testing.expect_value(test, len(own), 1)
+
 	chat.state = .Requesting
 	chat_steering_observe(chat, {}, nil)
-	testing.expect(test, steer_pending(chat.inbox), "an in-flight request must not consume steering")
+	delivered, _ := journal.last_delivered_message(chat.store, chat.session)
+	testing.expect_value(test, delivered, journal.Journal_Seq(0))
 	chat.state = .Preparing
 	chat_steering_observe(chat, {}, nil)
-	testing.expect(test, !steer_pending(chat.inbox), "the next settled boundary consumes steering")
-	// The prompt and the agent's message are the session's user nodes, and the message is
-	// the one the settled boundary recorded for the agent.
 	nodes, read_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
 	if read_error != nil { testing.fail_now(test, "the session's nodes could not be read") }
-	user_nodes := 0
 	agent_message := ""
 	for node in nodes {
 		if node.kind != .User { continue }
-		user_nodes += 1
 		user: journal.User
 		if decode_error := journal.payload_decode(node.data, &user, context.temp_allocator); decode_error != nil {
 			testing.fail_now(test, "a user node could not be read")
 		}
 		if user.origin == journal.USER_ORIGIN_NAMES[.Agent] { agent_message = string(node.body) }
 	}
-	if !testing.expect_value(test, user_nodes, 2) { return }
-	testing.expect(test, strings.contains(agent_message, "The parser has a race."), "the agent's message is recorded as a user node")
-
-	to_sibling := tool_agent_send_execute(&child_context, Agent_Send_Args{agent = "agent-2", message = "Do this."})
-	defer tool_result_destroy(&to_sibling)
-	testing.expect_value(test, to_sibling.outcome, journal.Tool_Outcome.Invalid_Arguments)
-	testing.expect(test, !steer_pending(chat.inbox), "a refused sibling message reaches nobody")
+	testing.expect(test, strings.contains(agent_message, "The parser has a race.") && strings.contains(agent_message, "agent-1"), agent_message)
+	chat_steering_observe(chat, {}, nil)
+	again, _ := journal.read_inbox(chat.store, chat.session, chat.delivered, context.temp_allocator)
+	testing.expect_value(test, len(again), 0)
 }
 
 // agent_provider_call is one response proposing a single tool call.
@@ -356,20 +408,25 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 	delete(chat.model_id, chat.allocator)
 	chat.model_id = strings.clone("test-model", chat.allocator)
 	agent_team_note_parent(chat)
+	_test_accept(test, chat, "start one")
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"wait for instructions"}`),
+		journal.TOOL_OUTCOME_NAMES[.Success],
+	)
 	tool_context := Tool_Context {
 		allocator = context.allocator,
 		agents    = chat.team,
 	}
-	started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "wait for instructions"})
-	defer tool_result_destroy(&started)
-	if !testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success) { return }
 	stopped := tool_agent_stop_execute(&tool_context, Agent_Stop_Args{agent = "agent-1"})
 	defer tool_result_destroy(&stopped)
 	testing.expect_value(test, stopped.outcome, journal.Tool_Outcome.Success)
 	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
-	message, queued := steer_pop(chat.inbox)
-	defer steer_line_free(chat.inbox, message)
-	testing.expect(test, queued && strings.contains(message, "agent-1 was stopped"))
+	records, read_ok := chat_inbox_read(chat)
+	if !testing.expect(test, read_ok && len(records) == 1) { return }
+	message, _ := inbox_text(records[0])
+	testing.expect(test, strings.contains(message, "agent-1 was stopped"), message)
+	chat.delivered = records[0].seq
 	testing.expect(test, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
@@ -423,12 +480,12 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 		team     = team,
 		admitted = true,
 	}
-	subagent_finish(&holder, report = false)
+	subagent_finish(&holder)
 	testing.expect(test, first.status == .Running && first.thread != nil, "the oldest queued child takes the freed slot")
 	testing.expect(test, second.status == .Queued && second.thread == nil, "the next one keeps waiting")
 	testing.expect_value(test, team.running, SUBAGENTS_MAX_RUNNING)
 	holder.admitted = true
-	subagent_finish(&holder, report = false)
+	subagent_finish(&holder)
 	testing.expect(test, second.status == .Running && second.thread != nil, "the next freed slot admits the next child")
 }
 
@@ -447,22 +504,29 @@ test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	catalog: Subagent_Test_Catalog
 	defer subagent_test_catalog_destroy(&catalog)
 	subagent_test_full_team(chat, &catalog, endpoint)
+	_test_accept(test, chat, "start one")
+	if !testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"never runs"}`),
+		journal.TOOL_OUTCOME_NAMES[.Success],
+	) {
+		return
+	}
 	tool_context := Tool_Context {
 		allocator = context.allocator,
 		agents    = chat.team,
 	}
-	started := tool_agent_spawn_execute(&tool_context, Agent_Spawn_Args{prompt = "never runs"})
-	defer tool_result_destroy(&started)
-	if !testing.expect_value(test, started.outcome, journal.Tool_Outcome.Success) { return }
 	stopped := tool_agent_stop_execute(&tool_context, Agent_Stop_Args{agent = "agent-1"})
 	defer tool_result_destroy(&stopped)
 	testing.expect_value(test, stopped.outcome, journal.Tool_Outcome.Success)
 	member := chat.team.members[0]
 	testing.expect(test, member.status == .Stopped && member.thread == nil && len(chat.team.waiting) == 0)
 	testing.expect_value(test, member.answer, "stopped before it started; not executed")
-	message, queued := steer_pop(chat.inbox)
-	defer steer_line_free(chat.inbox, message)
-	testing.expect(test, queued && strings.contains(message, "agent-1 was stopped"))
+	agent_team_reap(chat.team, chat)
+	records, read_ok := chat_inbox_read(chat)
+	if !testing.expect(test, read_ok && len(records) == 1) { return }
+	message, _ := inbox_text(records[0])
+	testing.expect(test, strings.contains(message, "agent-1 was stopped"), message)
 	testing.expect_value(test, agent_provider_request_count(&provider), 0)
 	testing.expect_value(test, chat.team.running, SUBAGENTS_MAX_RUNNING)
 }
@@ -589,4 +653,94 @@ test_effort_steps_down_one_level :: proc(test: ^testing.T) {
 	testing.expect_value(test, effort_step_down(levels, levels, ""), "")
 	testing.expect_value(test, effort_step_down({"medium", "high", "max"}, {"low", "medium", "high"}, "max"), "high")
 	testing.expect_value(test, effort_step_down({"low"}, {"medium", "high"}, "low"), "")
+}
+
+// A process that ends with one child running and one still queued loses neither outcome:
+// recovery settles both delegations from the journal and restarts nothing, and the
+// orchestrator's next request carries each outcome once.
+@(test)
+test_a_crash_with_a_running_and_a_queued_child_reports_both_outcomes_once :: proc(test: ^testing.T) {
+	first: Chat_Test
+	chat_test_begin(test, &first, tool_loop_workspace(test))
+	chat := &first.chat
+	chat.tools_enabled = true
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
+
+	spawn_running := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"prompt":"first task","model":"sub-model"}`)
+	spawn_queued := agent_provider_call(TOOL_AGENT_SPAWN_NAME, `{"prompt":"second task","model":"sub-model"}`)
+	orchestrator: Agent_Provider
+	if !agent_provider_start(test, &orchestrator, {spawn_running, spawn_queued, agent_provider_reply("waiting")}) {
+		chat_test_end(test, &first)
+		return
+	}
+	defer agent_provider_stop(&orchestrator)
+	// The children's provider accepts connections and never answers.
+	hanging: Agent_Provider
+	if !agent_provider_start(test, &hanging, {}) {
+		chat_test_end(test, &first)
+		return
+	}
+	defer agent_provider_stop(&hanging)
+	orchestrator_endpoint := agent_provider_endpoint(&orchestrator)
+	defer delete(orchestrator_endpoint)
+	hanging_endpoint := agent_provider_endpoint(&hanging)
+	defer delete(hanging_endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", orchestrator_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "sub-provider", "sub-model", hanging_endpoint, nil)
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
+	// One slot is free, so the first child runs and the second queues.
+	chat.team.running = SUBAGENTS_MAX_RUNNING - 1
+
+	_test_accept(test, chat, "start two subagents")
+	connection := ai.Provider_Connection {
+		API        = .OpenAI_Chat_Completions,
+		Endpoint   = orchestrator_endpoint,
+		Credential = "test-key",
+	}
+	if !testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed") {
+		chat_test_end(test, &first)
+		return
+	}
+	testing.expect_value(test, len(chat.team.waiting), 1)
+	// The first child has made its session before it blocks on its provider.
+	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+	for {
+		seen := owner_wake_seen()
+		children, _ := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+		if len(children) == 1 || time.tick_diff(time.tick_now(), deadline) <= 0 { break }
+		owner_wake_wait(seen, time.tick_add(time.tick_now(), 10 * time.Millisecond))
+	}
+	sends_before := agent_provider_request_count(&orchestrator)
+
+	reopened: Chat_Test
+	recovery := chat_test_reopen(test, &first, &reopened, tool_loop_workspace(test))
+	defer chat_test_end(test, &reopened)
+	next := &reopened.chat
+	chat_test_capacity(next, CHAT_DEFAULT_CONTEXT_WINDOW)
+	testing.expect_value(test, recovery.calls, 2)
+	testing.expect_value(test, next.state, Chat_State.Idle)
+	testing.expect(test, !agent_team_running(next.team), "nothing was restarted")
+	testing.expect(test, !chat_inbox_reports_pending(next), "outcomes older than the claim start no turn of their own")
+	testing.expect_value(test, agent_provider_request_count(&orchestrator), sends_before)
+
+	answering: Agent_Provider
+	if !agent_provider_start(test, &answering, {agent_provider_reply("understood")}) { return }
+	defer agent_provider_stop(&answering)
+	answering_endpoint := agent_provider_endpoint(&answering)
+	defer delete(answering_endpoint)
+	_test_accept(test, next, "what happened?")
+	next_connection := ai.Provider_Connection {
+		API        = .OpenAI_Chat_Completions,
+		Endpoint   = answering_endpoint,
+		Credential = "test-key",
+	}
+	testing.expect(test, chat_run_turn_steered(next, next_connection, test_retry_policy(), {}, nil), "the next turn completed")
+	if !testing.expect_value(test, agent_provider_request_count(&answering), 1) { return }
+	request := agent_provider_request(&answering, 0)
+	testing.expect_value(test, strings.count(request, "the subagent never started"), 1)
+	testing.expect_value(test, strings.count(request, "it may have taken effect"), 1)
 }

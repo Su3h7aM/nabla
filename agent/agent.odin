@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:mem"
 import "core:time"
 
-import "nabla:agent/journal"
 import "nabla:ai"
 
 Chat_Effect_Kind :: enum {
@@ -328,20 +327,6 @@ chat_session_set_effort :: proc(chat: ^Chat_Session, level: string) -> bool {
 	return false
 }
 
-// Chat_Steer_Result is what recording a steering line did. A line the session did not
-// record was never the session's, which is a different fact from a line it recorded and a
-// request has yet to carry.
-Chat_Steer_Result :: enum {
-	// Recorded at the running turn. The next request built from this history carries it.
-	Recorded,
-	// No turn has run in this session, so there is no request that could carry the line
-	// and nothing to attach it to. It stays with whoever queued it.
-	No_Turn,
-	// The store refused the write, so the line was not recorded and the session recorded
-	// why in last_error. It stays with whoever queued it.
-	Storage_Failed,
-}
-
 // chat_session_repair_refusal is why the last turn could not repair a payload the
 // provider rejected as too large, and None when that is not why it ended.
 chat_session_repair_refusal :: proc(chat: ^Chat_Session) -> Chat_Repair_Refusal {
@@ -360,18 +345,6 @@ chat_session_recovery_reason :: proc(chat: ^Chat_Session) -> Maybe(Request_Recov
 // consumed by the loop that ran it.
 chat_session_terminal_status :: proc(chat: ^Chat_Session) -> Chat_Terminal_Status {
 	return chat.terminal_status
-}
-
-// chat_session_steer commits a queued line as a User node of the running turn. Unlike
-// accept_user it starts no turn and resets no budget: the turn keeps its identity and its
-// counters, so a steering line changes what a later request sends, never work already
-// committed. Committing is what makes the line the session's, and the node follows the
-// head, so the request that follows reads the line after everything committed before it.
-chat_session_steer :: proc(chat: ^Chat_Session, text: string, origin := journal.User_Origin.Steering) -> Chat_Steer_Result {
-	if chat.turn == 0 { return .No_Turn }
-	chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
-	if !chat_commit(chat, "the steering line could not be recorded") { return .Storage_Failed }
-	return .Recorded
 }
 
 // chat_tool_call_clone copies one proposed call. valid is false for a call without the

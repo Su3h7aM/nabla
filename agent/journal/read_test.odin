@@ -691,19 +691,19 @@ test_delegation_messages_are_delivered_once :: proc(test: ^testing.T) {
 	append_record(&parent_journal, Record{session = parent, subagent = child, kind = .Subagent_Message}, Subagent_Message{}, _body("check the tests"))
 	_commit_ok(test, &parent_journal)
 
-	inbox := Filter {
-		session  = parent,
-		subagent = child,
-		kinds    = {.Subagent_Message},
-	}
 	delivered, delivered_error := last_delivered_message(&child_journal, child)
 	_expect_ok(test, delivered_error)
 	testing.expect_value(test, delivered, Journal_Seq(0))
-	messages, _, messages_error := read_records(&child_journal, inbox, delivered, 0, context.allocator)
+	messages, messages_error := read_inbox(&child_journal, child, delivered, context.allocator)
 	_expect_ok(test, messages_error)
 	defer records_destroy(messages, context.allocator)
 	testing.expect_value(test, len(messages), 1)
 	testing.expect_value(test, string(messages[0].body), "check the tests")
+	// The parent's own message to the child is not in the parent's inbox.
+	sent, sent_error := read_inbox(&parent_journal, parent, 0, context.allocator)
+	_expect_ok(test, sent_error)
+	defer records_destroy(sent, context.allocator)
+	testing.expect_value(test, len(sent), 0)
 
 	_ = append_node(
 		&child_journal,
@@ -718,7 +718,7 @@ test_delegation_messages_are_delivered_once :: proc(test: ^testing.T) {
 	resumed, resumed_error := last_delivered_message(&child_journal, child)
 	_expect_ok(test, resumed_error)
 	testing.expect_value(test, resumed, messages[0].seq)
-	pending, _, pending_error := read_records(&child_journal, inbox, resumed, 0, context.allocator)
+	pending, pending_error := read_inbox(&child_journal, child, resumed, context.allocator)
 	_expect_ok(test, pending_error)
 	defer records_destroy(pending, context.allocator)
 	testing.expect_value(test, len(pending), 0)
@@ -726,9 +726,78 @@ test_delegation_messages_are_delivered_once :: proc(test: ^testing.T) {
 	// The child's reply is its own record, which the parent reads from the child's session.
 	append_record(&child_journal, Record{session = child, subagent = child, kind = .Subagent_Message}, Subagent_Message{}, _body("done"))
 	_commit_ok(test, &child_journal)
-	replies, _, replies_error := read_records(&parent_journal, Filter{session = child, subagent = child, kinds = {.Subagent_Message}}, 0, 0, context.allocator)
+	replies, replies_error := read_inbox(&parent_journal, parent, 0, context.allocator)
 	_expect_ok(test, replies_error)
 	defer records_destroy(replies, context.allocator)
 	testing.expect_value(test, len(replies), 1)
 	testing.expect_value(test, string(replies[0].body), "done")
+	// The child does not read its own reply back.
+	own, own_error := read_inbox(&child_journal, child, resumed, context.allocator)
+	_expect_ok(test, own_error)
+	defer records_destroy(own, context.allocator)
+	testing.expect_value(test, len(own), 0)
+}
+
+// A line a session accepted is pending until a User node names its seq. The journal alone
+// carries that fact, so a reopened session finds the same lines, and finds none twice.
+@(test)
+test_accepted_input_stays_pending_until_a_node_delivers_it :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	writer: Journal
+	_open_journal(test, &writer, directory)
+	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
+	append_record(&writer, Record{session = session, kind = .User_Input}, User_Input{origin = USER_ORIGIN_NAMES[.Steering]}, _body("check the logs"))
+	append_record(&writer, Record{session = session, kind = .User_Input}, User_Input{origin = USER_ORIGIN_NAMES[.Steering]}, _body("and the config"))
+	_commit_ok(test, &writer)
+	// The process ends here, before either line was delivered.
+	_expect_ok(test, close(&writer))
+
+	reopened: Journal
+	_open_journal(test, &reopened, directory)
+	_, claim_error := claim(&reopened, session)
+	_expect_ok(test, claim_error)
+	_, recover_error := recover(&reopened)
+	_expect_ok(test, recover_error)
+	delivered, delivered_error := last_delivered_message(&reopened, session)
+	_expect_ok(test, delivered_error)
+	pending, pending_error := read_inbox(&reopened, session, delivered, context.allocator)
+	_expect_ok(test, pending_error)
+	if !testing.expect_value(test, len(pending), 2) {
+		records_destroy(pending, context.allocator)
+		_close_journal(test, &reopened)
+		return
+	}
+	testing.expect_value(test, string(pending[0].body), "check the logs")
+	testing.expect_value(test, string(pending[1].body), "and the config")
+
+	// Delivering both commits their nodes with the seqs they name.
+	for record in pending {
+		_ = append_node(
+			&reopened,
+			Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1},
+			User{origin = USER_ORIGIN_NAMES[.Steering], message = record.seq},
+			record.body,
+		)
+	}
+	last := pending[1].seq
+	records_destroy(pending, context.allocator)
+	_commit_ok(test, &reopened)
+	_close_journal(test, &reopened)
+
+	again: Journal
+	_open_journal(test, &again, directory)
+	defer _close_journal(test, &again)
+	_, again_claim_error := claim(&again, session)
+	_expect_ok(test, again_claim_error)
+	_, again_recover_error := recover(&again)
+	_expect_ok(test, again_recover_error)
+	resumed, resumed_error := last_delivered_message(&again, session)
+	_expect_ok(test, resumed_error)
+	testing.expect_value(test, resumed, last)
+	remaining, remaining_error := read_inbox(&again, session, resumed, context.allocator)
+	_expect_ok(test, remaining_error)
+	defer records_destroy(remaining, context.allocator)
+	testing.expect_value(test, len(remaining), 0)
 }

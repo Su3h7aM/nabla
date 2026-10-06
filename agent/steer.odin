@@ -1,5 +1,7 @@
 package agent
 
+import "base:runtime"
+import "core:fmt"
 import "core:mem"
 import "core:strings"
 import "core:sync"
@@ -7,17 +9,18 @@ import "core:sync"
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// Steering accepts input while a turn is running. A line the user or another agent sends is
-// a message the model has not answered, so the turn makes the request that answers it:
-// recording the line puts it in the next request the turn builds, and a turn that had
-// already answered continues instead of finishing. That is the whole difference from a
-// prompt sent while idle, which starts a turn of its own. Nothing here drops a line: it
-// waits in the queue until the session holds it, and a store that cannot record it leaves
-// it waiting.
+// Steering accepts input while a turn is running. A line the user sends is a message the
+// model has not answered, so the turn makes the request that answers it: delivering the
+// line puts it in the next request the turn builds, and a turn that had already answered
+// continues instead of finishing. That is the whole difference from a prompt sent while
+// idle, which starts a turn of its own. Nothing here drops a line: it waits in the queue
+// until the journal holds it as a user.input record, and a store that cannot record it
+// leaves it waiting. From then on the journal is the mailbox: the record stays pending
+// until a User node names its seq, across a turn's end and a crash.
 //
-// Producers on other threads push lines here: the front-end, and the agents a session
-// talks to. The execution thread remains the only session writer, so the queue is guarded.
-// It holds whatever was sent until it is recorded; a message is never refused for its size.
+// The front-end pushes lines here from its own thread. The execution thread remains the
+// only session writer, so the queue is guarded. It holds whatever was sent until it is
+// recorded; a message is never refused for its size.
 Steer_Queue :: struct {
 	mu:        sync.Mutex,
 	items:     [dynamic]string, // owned FIFO
@@ -141,68 +144,168 @@ Steer_Context :: struct {
 	apply_data: rawptr,
 }
 
-// chat_drain_turn_input records queued user steering and agent messages through one path.
-// It is called at a settled input point or when the turn ends; the caller decides which.
-chat_drain_turn_input :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) -> int {
-	recorded := 0
-	if steer != nil && steer.queue != nil {
-		recorded += chat_drain_queue(chat, observer, steer.queue, .Steering)
-	}
-	if chat.inbox != nil {
-		recorded += chat_drain_queue(chat, observer, chat.inbox, .Agent)
-	}
-	return recorded
-}
+// STEER_ACCEPTED_NOTICE is what the front-end is told for each line once the journal holds it.
+STEER_ACCEPTED_NOTICE :: "queued; the model reads it at the next request"
 
-// chat_drain_queue hands the queued lines to the session, oldest first, and reports how many
-// it recorded. A line leaves the queue only once the session has recorded it: recording is
-// what makes the line the session's, and a store that refuses the write leaves it pending
-// instead of dropping a message. The refusal is reported, so a line that cannot be delivered
-// yet is diagnosable rather than gone.
-chat_drain_queue :: proc(chat: ^Chat_Session, observer: Chat_Observer, queue: ^Steer_Queue, origin: journal.User_Origin) -> int {
-	recorded := 0
-	for {
-		line, ok := steer_pop(queue)
-		if !ok { break }
-		switch chat_session_steer(chat, line, origin) {
-		case .Recorded:
-			_observer_user_text(observer, line)
-			steer_line_free(queue, line)
-			recorded += 1
-		case .No_Turn:
-			// Nothing has run that could carry the line, so it waits for the turn that
-			// will, and the caller is told which condition is holding it up.
-			_observer_message(observer, .Warning, "the steering line is waiting for a turn to carry it")
-			// The line goes back to the front of the queue, or is released when the queue
-			// cannot grow; neither outcome leaves this caller anything to do with it.
-			_ = steer_requeue(queue, line)
-			return recorded
-		case .Storage_Failed:
-			// The store refused it, so the line stays pending: the session's own error says
-			// why, and nothing else may drop a message.
-			_observer_message(observer, .Error, chat.last_error)
-			if !steer_requeue(queue, line) {
-				_observer_message(observer, .Warning, "the steering line could not stay pending")
-			}
-			return recorded
-		}
-	}
-	return recorded
-}
-
-// chat_steering_observe is the driver's collection step for input queued while the turn ran:
-// the user's lines, then the messages other agents sent this session. It records them at a
-// settled point of the turn, and a line recorded for a turn that had finished answering
-// continues that turn: a message is one the model has not answered, so the next request this
-// turn makes is the one that answers it.
+// chat_steering_accept makes every line the front-end queued part of the session's
+// journal: one user.input record per line, committed together. A record is not a node, so
+// the session accepts a line in any phase of the turn, a request in flight included. The
+// front-end hears of a line only after the commit that holds it.
 //
-// That is the whole difference between steering and a prompt sent while idle, which starts a
-// turn of its own. A turn that failed or was cancelled keeps its outcome; its input stays in
-// the record, and the next request built from that history carries it.
+// A commit that fails busy keeps the buffered records for the next commit, so the lines are
+// already pending in the journal: they are not queued again, and nothing is said until a
+// commit lands. Any other failure discards the buffer, and the lines go back to the front
+// of the queue in their order, where the turn's end returns them to the user.
+chat_steering_accept :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
+	if chat.storage_failed || !chat_journal_writable(chat) { return }
+	queue: ^Steer_Queue
+	if steer != nil { queue = steer.queue }
+	taken: [dynamic]string
+	if queue != nil && steer_pending(queue) {
+		lines, taken_ok := steer_take_all(queue)
+		if taken_ok { taken = lines }
+	}
+	for line in taken {
+		chat_record(chat, {kind = .User_Input}, journal.User_Input{origin = journal.USER_ORIGIN_NAMES[.Steering]}, transmute([]u8)line)
+	}
+	chat.unacknowledged += len(taken)
+	if chat.unacknowledged == 0 { return }
+	if _, commit_error := journal.commit(chat.store); commit_error != nil {
+		if journal.error_is_busy(commit_error) {
+			if queue != nil { steer_taken_destroy(queue, taken) }
+			return
+		}
+		chat_session_record_failure(chat, "the steering line could not be recorded", commit_error)
+		chat.unacknowledged -= len(taken)
+		for index := len(taken) - 1; index >= 0; index -= 1 {
+			if !steer_requeue(queue, taken[index]) {
+				_observer_message(observer, .Warning, "a steering line could not stay pending")
+			}
+		}
+		delete(taken)
+		_observer_message(observer, .Error, chat.last_error)
+		return
+	}
+	// One notice per line: the front-end learns of each only now that the journal holds it.
+	for _ in 0 ..< chat.unacknowledged { _observer_message(observer, .Notice, STEER_ACCEPTED_NOTICE) }
+	chat.unacknowledged = 0
+	if queue != nil { steer_taken_destroy(queue, taken) }
+}
+
+// chat_inbox_read returns the records addressed to the session that no User node has
+// delivered, oldest first, in temp memory. False means the journal could not be read; the
+// session recorded why.
+@(require_results)
+chat_inbox_read :: proc(chat: ^Chat_Session) -> (records: []journal.Record, ok: bool) {
+	if !chat_journal_writable(chat) { return nil, true }
+	read_error: journal.Error
+	records, read_error = journal.read_inbox(chat.store, chat.session, chat.delivered, context.temp_allocator)
+	if read_error != nil {
+		chat_session_record_failure(chat, "the session's queued input could not be read", read_error)
+		return nil, false
+	}
+	return records, true
+}
+
+// chat_inbox_stage buffers one User node per record, in seq order, each naming the seq it
+// delivers, and returns the text of each in temp memory. It commits nothing: the caller
+// commits the nodes with whatever else has to land with them. The delivered seq advances
+// with the buffer, because the journal either writes what it holds or stops the session.
+chat_inbox_stage :: proc(chat: ^Chat_Session, records: []journal.Record) -> []string {
+	texts, texts_error := make([]string, len(records), context.temp_allocator)
+	if texts_error != nil { return nil }
+	for record, index in records {
+		text, origin := inbox_text(record)
+		node := chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin], message = record.seq}, transmute([]u8)text)
+		if node == 0 { return texts[:index] }
+		chat.delivered = record.seq
+		texts[index] = text
+	}
+	return texts
+}
+
+// chat_inbox_report tells the front-end what a commit delivered.
+chat_inbox_report :: proc(observer: Chat_Observer, texts: []string) {
+	for text in texts { _observer_user_text(observer, text) }
+}
+
+// chat_inbox_deliver records what the session accepted and other agents sent it, as User
+// nodes in one commit, and reports how many. It is for a settled point of a running turn.
+chat_inbox_deliver :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
+	records, read_ok := chat_inbox_read(chat)
+	if !read_ok || len(records) == 0 { return 0 }
+	texts := chat_inbox_stage(chat, records)
+	if !chat_commit(chat, "the queued input could not be recorded") { return 0 }
+	chat_inbox_report(observer, texts)
+	return len(texts)
+}
+
+// chat_inbox_reports_pending reports whether an agent's report or message is waiting that
+// was committed after this process claimed the session. Lines the user accepted do not
+// count, since only a prompt starts a turn for them, and neither does anything older than
+// the claim: that waits for the next prompt.
+chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
+	if chat.storage_failed || !chat_journal_writable(chat) { return false }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	records, read_error := journal.read_inbox(chat.store, chat.session, max(chat.delivered, chat.claimed_at), context.temp_allocator)
+	if read_error != nil { return false }
+	for record in records {
+		if record.kind != .User_Input { return true }
+	}
+	return false
+}
+
+// inbox_text is the text a User node carries for one inbox record, and the origin the
+// node names. The text matches what the model knows: a child is named as the spawn call
+// named it, and a record that has no name, such as one recovery wrote, names the child's
+// session. Text is in temp memory.
+@(private)
+inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.User_Origin) {
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	body := string(record.body)
+	#partial switch record.kind {
+	case .User_Input:
+		input: journal.User_Input
+		if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
+			if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { return body, named }
+		}
+		return body, .Steering
+	case .Subagent_Completed:
+		completed: journal.Subagent_Completed
+		// A payload that cannot be read still reports that the child ended.
+		_ = journal.payload_decode(record.data, &completed, context.temp_allocator)
+		name := completed.name if completed.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
+		switch completed.outcome {
+		case journal.TOOL_OUTCOME_NAMES[.Success]:
+			return fmt.tprintf("Subagent %s completed. Its answer:\n\n%s", name, body), .Agent
+		case journal.TOOL_OUTCOME_NAMES[.Cancelled]:
+			return fmt.tprintf("Subagent %s was stopped before it finished.", name), .Agent
+		}
+		return fmt.tprintf("Subagent %s failed: %s", name, completed.detail), .Agent
+	case .Subagent_Message:
+		if record.session != record.subagent { return fmt.tprintf("Message from the orchestrator:\n%s", body), .Agent }
+		message: journal.Subagent_Message
+		_ = journal.payload_decode(record.data, &message, context.temp_allocator)
+		name := message.name if message.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
+		return fmt.tprintf("Message from subagent %s, which is still working (reply with agent_send if it asks something):\n%s", name, body), .Agent
+	}
+	return body, .Agent
+}
+
+// chat_steering_observe is the driver's collection step for input that reached the
+// session while the turn ran: the user's queued lines become user.input records, and
+// everything the session accepted and has not delivered becomes User nodes at a settled
+// point of the turn. A delivery for a turn that had finished answering continues that
+// turn: a message is one the model has not answered, so the next request this turn makes
+// is the one that answers it.
+//
+// That is the whole difference between steering and a prompt sent while idle, which starts
+// a turn of its own. A turn that failed or was cancelled keeps its outcome; its input stays
+// pending in the journal, and the next turn delivers it before its prompt.
 chat_steering_observe :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
+	chat_steering_accept(chat, observer, steer)
 	point := chat_session_input_point(chat)
 	if point == .Wait { return }
-	recorded := chat_drain_turn_input(chat, observer, steer)
-	if recorded == 0 { return }
+	if chat_inbox_deliver(chat, observer) == 0 { return }
 	if point == .After_Answer { chat_session_continue_for_input(chat) }
 }

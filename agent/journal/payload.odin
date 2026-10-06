@@ -135,6 +135,15 @@ Completion :: struct {
 Tool_Completed :: Completion
 Call_Completed :: Completion // lua.completed, task.completed
 
+// User_Input is one line a user sent a session, committed before anything acknowledges
+// it. The line is in the body. origin is a USER_ORIGIN_NAMES name, the origin of the
+// User node that delivers it. The record is not a node, so a session accepts it in any
+// phase; a User node whose message names its seq delivers it.
+User_Input :: struct {
+	version: int,
+	origin:  string,
+}
+
 // Turn_Completed ends a turn. reason is why its request chain stopped and cause
 // what kept the context from fitting, both "" when absent.
 Turn_Completed :: struct {
@@ -389,14 +398,22 @@ Subagent_Started :: struct {
 }
 
 // Subagent_Completed ends a delegation in the parent's session; the child's
-// final answer, or why there is none, is in the body.
-Subagent_Completed :: Completion
+// final answer, or why there is none, is in the body. name is the id the parent's
+// model knows the child by, "" when recovery wrote the record.
+Subagent_Completed :: struct {
+	version: int,
+	outcome: string, // TOOL_OUTCOME_NAMES
+	detail:  string,
+	name:    string,
+}
 
 // Subagent_Message carries one message of a delegation in the body. The record's
 // session is the sender's and its subagent column the child's session, so each
-// side reads the other's messages with Filter{session = peer, subagent = child}.
+// side finds the other's messages with read_inbox. name is the id the parent's model
+// knows the child by.
 Subagent_Message :: struct {
 	version: int,
+	name:    string,
 }
 
 // Response_Committed carries the API family that produced the response and the
@@ -503,8 +520,9 @@ Job_Reclaimed :: struct {
 User :: struct {
 	version: int,
 	origin:  string, // USER_ORIGIN_NAMES
-	// message is the seq of the subagent.message this node delivers, 0 for none.
-	// The highest one is where the session's reading of its peer's messages resumes.
+	// message is the seq of the user.input, subagent.completed, or subagent.message
+	// record this node delivers, 0 for none. The highest one is where the session's
+	// reading of its inbox resumes.
 	message: Journal_Seq,
 }
 

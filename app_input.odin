@@ -472,7 +472,8 @@ submit :: proc(app: ^App) {
 				completion_reset(app)
 				return
 			}
-			snap_append(app, .Notice, "queued; the model reads it at the next request")
+			// The notice that the line is queued comes from the worker once the journal
+			// holds it, so the transcript never claims a line the session does not have.
 		} else {
 			enqueue(app, .Prompt, text)
 		}
@@ -483,10 +484,10 @@ submit :: proc(app: ^App) {
 	completion_reset(app)
 }
 
-// restore_steering returns input the turn never recorded. A turn records what it was sent
-// when it ends, so what is left here arrived after that: the text is still the user's, and
-// it goes back to the prompt for an explicit submit. Nothing here starts a turn, and
-// nothing here reads the text as a command.
+// restore_steering returns input the session never accepted. The turn commits the lines
+// it finds queued as it runs, so what is left here arrived after its last look: the text
+// is still the user's, and it goes back to the prompt for an explicit submit. Nothing here
+// starts a turn, and nothing here reads the text as a command.
 restore_steering :: proc(app: ^App) {
 	taken, taken_ok := agent.steer_take_all(&app.run.steer)
 	defer agent.steer_taken_destroy(&app.run.steer, taken)

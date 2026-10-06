@@ -254,9 +254,17 @@ Chat_Session :: struct {
 	workers_retained:             bool,
 	// acp_agents are the ACP agent programs subagents may run, borrowed from the loaded config.
 	acp_agents:                   []ACP_Agent_Config,
-	// inbox is where other agents' messages to this session wait for a settled point:
-	// team.inbox in an orchestrator, member.inbox in a subagent. Borrowed.
-	inbox:                        ^Steer_Queue,
+	// delivered is the highest inbox record seq a User node of this session delivered. It
+	// is read from the journal once, when the session is claimed, and advanced as nodes
+	// are staged: the owner is the only one who delivers.
+	delivered:                    journal.Journal_Seq,
+	// unacknowledged counts accepted lines whose commit was busy: the journal holds them for
+	// its next commit, and the front-end is told of them once it lands.
+	unacknowledged:               int,
+	// claimed_at is the last seq committed when this process claimed the session. An
+	// agent's report at or below it was written before this process ran the session, so
+	// it waits for the next prompt instead of starting a turn of its own.
+	claimed_at:                   journal.Journal_Seq,
 	// catalog is where subagent models are resolved from, borrowed from the front-end. A
 	// zero value lets subagents run only the orchestrator's own model.
 	catalog:                      Catalog_Ref,
@@ -317,7 +325,17 @@ chat_session_init :: proc(
 	chat.abandoned.allocator = allocator
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
 	chat.team = agent_team_make(os.heap_allocator())
-	if chat.team != nil { chat.inbox = &chat.team.inbox }
+	if chat_journal_writable(&chat) {
+		delivered, delivered_error := journal.last_delivered_message(store, session)
+		if delivered_error != nil {
+			// A session that cannot tell what it already delivered would deliver it again,
+			// so it takes no work.
+			chat.storage_failed = true
+			chat_last_error_set(&chat, "the session's delivered input could not be read")
+		}
+		chat.delivered = delivered
+		chat.claimed_at = store.last_seq
+	}
 	return chat, {}
 }
 
@@ -428,7 +446,6 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	}
 	retained := !agent_team_destroy(chat.team, chat, len(chat.abandoned_jobs) > 0)
 	chat.team = nil
-	chat.inbox = nil
 	chat.workers_retained = retained
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
@@ -570,15 +587,26 @@ chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch
 	chat.state = .Finalizing
 }
 
-// chat_session_accept_user admits a prompt: it opens a turn and commits the
-// prompt as that turn's User node before any request is made.
-chat_session_accept_user :: proc(chat: ^Chat_Session, text: string) -> Chat_Accept {
-	return chat_session_accept_message(chat, text, .Prompt)
+// chat_session_accept_user admits a prompt: it opens a turn and commits the input the
+// session accepted but never delivered, then the prompt, as that turn's User nodes before
+// any request is made. observer hears each delivered text once the commit lands.
+chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, observer := Chat_Observer{}) -> Chat_Accept {
+	return chat_session_accept_message(chat, text, .Prompt, observer)
 }
 
 // chat_session_accept_message is chat_session_accept_user for text that did not come from
-// the user, such as a subagent's report that arrived while no turn ran.
-chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: journal.User_Origin) -> Chat_Accept {
+// the user. An empty text opens a turn that only delivers the pending input, such as an
+// agent's report that arrived while no turn ran; the caller has checked that some waits.
+// inbox_first false leaves the pending input for the turn's first settled point, after the
+// text: a subagent's task is its first message, whatever its orchestrator sent while it
+// queued.
+chat_session_accept_message :: proc(
+	chat: ^Chat_Session,
+	text: string,
+	origin: journal.User_Origin,
+	observer := Chat_Observer{},
+	inbox_first := true,
+) -> Chat_Accept {
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
 	if !chat_session_recover_pending(chat) { return .Storage_Failed }
@@ -602,9 +630,22 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 		return .Storage_Failed
 	}
 
+	// Input accepted before this turn goes first, in the order it was accepted, so the
+	// prompt reads after everything the user already said.
+	pending: []journal.Record
+	if inbox_first {
+		pending_ok: bool
+		pending, pending_ok = chat_inbox_read(chat)
+		if !pending_ok {
+			chat.state = .Idle
+			chat.active_failed = false
+			return .Storage_Failed
+		}
+	}
+
 	// The first turn names the session, so a listing says what each session was about
 	// without asking the user to name it.
-	first := chat.store.counters.turn == 0
+	first := chat.store.counters.turn == 0 && text != ""
 	chat.turn = journal.next_turn(chat.store)
 	chat.request = 0
 	if first {
@@ -629,7 +670,8 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 		started.manifest = journal.digest_to_hex(chat.manifest_digest, manifest_hex[:])
 	}
 	chat_record(chat, {kind = .Turn_Started, provider = chat.provider_id, model = chat.model_id}, started)
-	chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
+	delivered := chat_inbox_stage(chat, pending)
+	if text != "" { chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text) }
 	if !chat_commit(chat, "the prompt could not be recorded") {
 		busy_failure := !chat.storage_failed
 		pending_message := "the prompt was not answered because the session store was busy; its records will be saved with the next successful write"
@@ -650,6 +692,7 @@ chat_session_accept_message :: proc(chat: ^Chat_Session, text: string, origin: j
 		return .Storage_Failed
 	}
 
+	chat_inbox_report(observer, delivered)
 	chat.active_turn_id = chat.next_turn_id
 	chat.next_turn_id += 1
 	chat.state = .Preparing

@@ -847,7 +847,7 @@ acp_session_open :: proc(server: ^Acp_Server, workspace: string, start: Session_
 	if start.kind == .Resume_Id && app.setup.store != nil && agent.chat_session_text(&app.setup.session) == start.id { return "", true }
 	opened, open_message, opened_ok := session_open(&app.setup, start, workspace)
 	if !opened_ok { return open_message, false }
-	report_recovery(opened.recovery)
+	report_recovery(opened.recovery, opened.queued)
 	if !session_install(&app.setup, &opened) {
 		return acp_open_message("the tool registry could not be allocated", app.setup.alloc), false
 	}
@@ -1130,7 +1130,7 @@ acp_work_close_session :: proc(server: ^Acp_Server, work: Acp_Work) {
 
 acp_work_prompt :: proc(server: ^Acp_Server, work: Acp_Work) {
 	chat := &server.app.setup.session
-	accepted := agent.chat_session_accept_user(chat, work.text)
+	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(server))
 	switch accepted {
 	case .Accepted:
 	case .Storage_Failed:

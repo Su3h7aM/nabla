@@ -10,6 +10,7 @@ import "core:strings"
 import "core:time"
 
 import "nabla:acp"
+import "nabla:agent/journal"
 import "nabla:ai"
 
 // An ACP subagent is another agent program, driven over the Agent Client Protocol on its
@@ -215,14 +216,27 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	}
 	member.session_id = session_text
 
+	// The program has no Nabla session, so what the orchestrator sends it is read from the
+	// orchestrator's journal records, through a connection of its own.
+	store: journal.Journal
+	if open_error := journal.open(&store, member.store_directory, member.lock_directory, member.run, .Read_Only, allocator); open_error != nil {
+		subagent_fail(member, .Failed, fmt.tprintf("the subagent's inbox could not be opened: %s", journal.error_text(open_error, context.temp_allocator)))
+		return
+	}
+	// Nothing is written through it, so a close that fails changes nothing.
+	defer _ = journal.close(&store)
+
 	text := member.prompt
 	if member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
-	from_inbox := false
-	for {
+	// text is a copy this loop releases once its prompt is answered, after the first.
+	owned := false
+	after: journal.Journal_Seq
+	loop: for {
 		// Each prompt releases the temp memory its answers were decoded into.
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		stop_reason, problem := acp_prompt(&connection, text)
-		if from_inbox { steer_line_free(&member.inbox, text) }
+		if owned { delete(text, allocator) }
+		owned = false
 		switch {
 		case problem != "":
 			subagent_fail(member, acp_stopped(&connection) ? .Stopped : .Failed, problem)
@@ -235,9 +249,24 @@ subagent_acp_run :: proc(member: ^Subagent) {
 			subagent_fail(member, .Failed, reason)
 			return
 		}
-		line, more := subagent_next_message(member)
-		if !more { break }
-		text, from_inbox = line, true
+		records, next := subagent_next_messages(member, &store, after)
+		switch next {
+		case .Closed:
+			break loop
+		case .Failed:
+			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
+			return
+		case .Messages:
+		}
+		after = records[len(records) - 1].seq
+		lines := make([]string, len(records), context.temp_allocator)
+		for record, index in records { lines[index], _ = inbox_text(record) }
+		joined, join_error := strings.join(lines, "\n\n", allocator)
+		if join_error != nil {
+			subagent_fail(member, .Failed, "the orchestrator's message could not be held")
+			return
+		}
+		text, owned = joined, true
 	}
 	// An answer that cannot be held is not the answer the orchestrator asked for, so the
 	// outcome says the delegation failed rather than reporting none as a completion.

@@ -105,7 +105,8 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 			completed_effects += 1
 			payload: Subagent_Completed
 			_decode_payload(test, record.data, &payload)
-			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Unknown])
+			// The child never created its session, so it did not run.
+			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Not_Executed])
 			testing.expect_value(test, record.call, Call_Id(4))
 			testing.expect_value(test, record.subagent, child)
 		case .Session_Recovered:
@@ -232,4 +233,78 @@ test_recovery_that_fails_after_staging_writes_nothing :: proc(test: ^testing.T) 
 	for record in records {
 		testing.expect(test, record.kind != .Turn_Completed && record.kind != .Session_Recovered, "recovery wrote nothing")
 	}
+}
+
+// A delegation the process left open is settled by what is known of its child: a native
+// child with no session never started, and one with a session, like an ACP child, which has
+// none, may have taken effect. A background child's outcome waits in its parent's inbox, a
+// blocking child's does not, and recovering again writes nothing.
+@(test)
+test_recovery_settles_delegations_by_whether_the_child_started :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	writer, child_writer: Journal
+	_open_journal(test, &writer, directory)
+	_open_journal(test, &child_writer, directory)
+	parent := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
+	Child :: struct {
+		id:         Session_Id,
+		call:       Call_Id,
+		program:    string,
+		background: bool,
+	}
+	children := [?]Child {
+		{id = session_id_create(), call = 1, background = true}, // has a session
+		{id = session_id_create(), call = 2, background = true}, // never created one
+		{id = session_id_create(), call = 3, background = false}, // blocking, never created one
+		{id = session_id_create(), call = 4, program = "acp", background = true}, // no Nabla session
+	}
+	for child in children {
+		append_record(&writer, Record{session = parent, call = child.call, kind = .Tool_Admitted}, _Test_Payload{detail = "spawn"})
+		append_record(
+			&writer,
+			Record{session = parent, call = child.call, subagent = child.id, kind = .Subagent_Started},
+			Subagent_Started{program = child.program, background = child.background},
+		)
+		append_record(&writer, Record{session = parent, call = child.call, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
+	}
+	_commit_ok(test, &writer)
+	_ = _create_session(test, &child_writer, {id = children[0].id, workspace = "/tmp/project", role = .Subagent, parent_session = parent, parent_call = 1})
+	_commit_ok(test, &child_writer)
+	_expect_ok(test, close(&writer))
+
+	journal: Journal
+	_open_journal(test, &journal, directory)
+	defer _close_journal(test, &journal)
+	_, claim_error := claim(&journal, parent)
+	_expect_ok(test, claim_error)
+	recovery, recover_error := recover(&journal)
+	_expect_ok(test, recover_error)
+	testing.expect_value(test, recovery.calls, 4)
+
+	expected := [?]string{TOOL_OUTCOME_NAMES[.Unknown], TOOL_OUTCOME_NAMES[.Not_Executed], TOOL_OUTCOME_NAMES[.Not_Executed], TOOL_OUTCOME_NAMES[.Unknown]}
+	records, _, records_error := read_records(&journal, Filter{session = parent, kinds = {.Subagent_Completed}}, 0, 0, context.allocator)
+	_expect_ok(test, records_error)
+	defer records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 4) { return }
+	for record, index in records {
+		payload: Subagent_Completed
+		_decode_payload(test, record.data, &payload)
+		testing.expect_value(test, payload.outcome, expected[index])
+		testing.expect_value(test, record.subagent, children[index].id)
+	}
+
+	inbox, inbox_error := read_inbox(&journal, parent, 0, context.allocator)
+	_expect_ok(test, inbox_error)
+	defer records_destroy(inbox, context.allocator)
+	if !testing.expect_value(test, len(inbox), 3) { return }
+	testing.expect_value(test, inbox[0].subagent, children[0].id)
+	testing.expect_value(test, inbox[1].subagent, children[1].id)
+	testing.expect_value(test, inbox[2].subagent, children[3].id)
+
+	again, again_error := recover(&journal)
+	_expect_ok(test, again_error)
+	testing.expect_value(test, again, Recovery{})
+	_close_journal(test, &child_writer)
 }

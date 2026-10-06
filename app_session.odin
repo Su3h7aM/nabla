@@ -283,7 +283,7 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 		delete(message, setup.alloc)
 		return false
 	}
-	report_recovery(opened.recovery)
+	report_recovery(opened.recovery, opened.queued)
 	if !session_install(setup, &opened) {
 		fmt.wprintln(stderr, "nabla: the tool registry could not be allocated")
 		return false
@@ -304,6 +304,9 @@ Opened_Session :: struct {
 	model:     string,
 	effort:    string,
 	recovery:  journal.Recovery,
+	// queued is how many lines the session accepted and never delivered, which go with the
+	// next prompt.
+	queued:    int,
 }
 
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
@@ -383,6 +386,15 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	head_error: journal.Error
 	opened.branch, opened.head, head_error = journal.session_head(opened.store, summary.id)
 	if head_error != nil { return opened, session_error_message("cannot read the session", head_error, allocator), false }
+
+	delivered, delivered_error := journal.last_delivered_message(opened.store, summary.id)
+	if delivered_error != nil { return opened, session_error_message("cannot read the session", delivered_error, allocator), false }
+	waiting, waiting_error := journal.read_inbox(opened.store, summary.id, delivered, allocator)
+	if waiting_error != nil { return opened, session_error_message("cannot read the session", waiting_error, allocator), false }
+	for record in waiting {
+		if record.kind == .User_Input { opened.queued += 1 }
+	}
+	journal.records_destroy(waiting, allocator)
 
 	selection_record, selection_found, read_error := journal.read_latest(opened.store, {session = summary.id, kinds = {.Selection_Applied}}, allocator)
 	if read_error != nil { return opened, session_error_message("cannot read the session selection", read_error, allocator), false }
@@ -530,10 +542,14 @@ session_error_message :: proc(what: string, error: journal.Error, allocator: mem
 }
 
 // report_recovery says what an earlier run left behind, so a resumed session
-// starts knowing which calls have an outcome the harness never saw.
-report_recovery :: proc(recovery: journal.Recovery) {
+// starts knowing which calls have an outcome the harness never saw and which lines it
+// accepted and never delivered.
+report_recovery :: proc(recovery: journal.Recovery, queued: int) {
 	if recovery.calls > 0 {
 		fmt.eprintf("nabla: %d tool call(s) never reported a result; their results say whether they ran\n", recovery.calls)
+	}
+	if queued > 0 {
+		fmt.eprintf("nabla: %d queued line(s) will go with your next prompt\n", queued)
 	}
 }
 

@@ -32,6 +32,9 @@ Recovery_Rule :: enum {
 	Lua,
 	Task,
 	Subagent,
+	// Subagent_Unstarted is a native child that never created its session, because it was
+	// still queued or its process ended before its first commit.
+	Subagent_Unstarted,
 }
 
 @(private, require_results)
@@ -95,7 +98,11 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 			recovery.calls += 1
 		case .Subagent:
 			header.kind = .Subagent_Completed
-			append_record(journal, header, unknown)
+			append_record(journal, header, Subagent_Completed{outcome = unknown.outcome, detail = unknown.detail})
+			recovery.calls += 1
+		case .Subagent_Unstarted:
+			header.kind = .Subagent_Completed
+			append_record(journal, header, Subagent_Completed{outcome = TOOL_OUTCOME_NAMES[.Not_Executed], detail = "the subagent never started"})
 			recovery.calls += 1
 		}
 	}
@@ -162,7 +169,9 @@ RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call,
 	SELECT 3, * FROM records AS open WHERE session = ?1 AND kind = 'tool.admitted'
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = 'tool.completed')
 	UNION ALL
-	SELECT CASE kind WHEN 'lua.started' THEN 4 WHEN 'task.started' THEN 5 ELSE 6 END, *
+	SELECT CASE kind WHEN 'lua.started' THEN 4 WHEN 'task.started' THEN 5
+		ELSE CASE WHEN COALESCE(json_extract(open.data, '$.program'), '') = ''
+			AND NOT EXISTS (SELECT 1 FROM sessions WHERE session = open.subagent) THEN 7 ELSE 6 END END, *
 		FROM records AS open WHERE session = ?1 AND kind IN ('lua.started', 'task.started', 'subagent.started')
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call
 			AND kind IN ('lua.completed', 'task.completed', 'subagent.completed'))

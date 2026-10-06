@@ -116,19 +116,44 @@ test_taking_the_queue_hands_every_line_over :: proc(test: ^testing.T) {
 	testing.expect(test, !has_line, "the queue is empty after taking its lines")
 }
 
-// A steering line is a message the user sent. Recording it is what makes it the session's,
-// and the next request built from the history carries it. A session with no turn has
-// nothing to attach it to, so the line stays with whoever queued it.
+// A steering line is a message the user sent. Accepting it commits a user.input record in
+// any phase, a request in flight included, and tells the front-end only after that commit.
+// A User node delivers it at the next settled point, and the next request carries it.
 @(test)
-test_recording_a_steering_line_attaches_it_to_the_running_turn :: proc(test: ^testing.T) {
+test_a_steering_line_is_accepted_at_once_and_delivered_at_a_settled_point :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
-
-	testing.expect_value(test, chat_session_steer(chat, "idle"), Chat_Steer_Result.No_Turn)
 	_test_accept(test, chat, "start")
-	testing.expect_value(test, chat_session_steer(chat, "steered"), Chat_Steer_Result.Recorded)
+
+	queue := steer_queue_init(context.temp_allocator)
+	defer steer_queue_destroy(&queue)
+	steer := Steer_Context {
+		queue = &queue,
+	}
+	testing.expect(test, steer_push(&queue, "steered"))
+
+	// A request is in flight: the line is accepted, and nothing delivers it yet.
+	chat.state = .Requesting
+	notices: Chat_Notice_Log
+	observer := chat_notice_log_begin(&notices)
+	defer chat_notice_log_destroy(&notices)
+	chat_steering_observe(chat, observer, &steer)
+	testing.expect_value(test, chat_notice_log_count(&notices, "queued"), 1)
+	testing.expect(test, !steer_pending(&queue), "the accepted line left the queue")
+	accepted := _test_records(test, chat, {.User_Input})
+	if !testing.expect_value(test, len(accepted), 1) { return }
+	testing.expect_value(test, string(accepted[0].body), "steered")
+	delivered_before, delivered_error := journal.last_delivered_message(chat.store, chat.session)
+	testing.expect_value(test, delivered_error, nil)
+	testing.expect_value(test, delivered_before, journal.Journal_Seq(0))
+
+	// The request settles, which is the point a User node delivers it.
+	chat.state = .Preparing
+	chat_steering_observe(chat, observer, &steer)
+	delivered_after, _ := journal.last_delivered_message(chat.store, chat.session)
+	testing.expect_value(test, delivered_after, accepted[0].seq)
 
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
@@ -141,6 +166,9 @@ test_recording_a_steering_line_attaches_it_to_the_running_turn :: proc(test: ^te
 	testing.expect_value(test, user.origin, journal.User_Origin.Steering)
 	// The turn keeps its budgets: steering starts nothing.
 	testing.expect_value(test, chat.requests_made, 0)
+	// Delivered once: a later look finds nothing more to deliver.
+	chat_steering_observe(chat, observer, &steer)
+	testing.expect_value(test, len(_test_projection(test, chat, &arena).items), 2)
 }
 
 // Steering_Probe pushes one line into the queue the first time a request finishes, which is
@@ -422,12 +450,11 @@ test_input_does_not_restart_a_turn_that_failed :: proc(test: ^testing.T) {
 	testing.expect_value(test, effect.status, Chat_Terminal_Status.Failed)
 }
 
-// A turn that ends without proposing another request is the case that lost the line: the
-// queue was empty at its last boundary and the turn took nothing with it. The turn end
-// records what it was sent, so the next request built from this history carries it, and
-// the node is ordered after the answer it followed.
+// A turn that ends without proposing another request keeps what it accepted pending: the
+// line is in the journal, no User node delivered it, and the next turn delivers it before
+// its own prompt, so the line is neither lost nor read twice.
 @(test)
-test_a_turn_that_ends_without_a_request_records_what_it_was_sent :: proc(test: ^testing.T) {
+test_a_line_accepted_by_a_turn_that_ends_goes_with_the_next_prompt :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -443,57 +470,25 @@ test_a_turn_that_ends_without_a_request_records_what_it_was_sent :: proc(test: ^
 	// failed its own request does: the selector goes straight to the terminal effect.
 	chat_session_fail_turn(chat, "the provider refused the request")
 	testing.expect(test, steer_push(&queue, "check the logs"))
-
 	testing.expect(test, !chat_run_turn_steered(chat, {}, test_retry_policy(), {}, &steer), "the turn failed")
+	testing.expect(test, !steer_pending(&queue), "the line left the queue for the journal")
+	testing.expect_value(test, len(_test_records(test, chat, {.User_Input})), 1)
 
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
 	defer virtual.arena_destroy(&arena)
+	testing.expect_value(test, len(_test_projection(test, chat, &arena).items), 1)
+
+	_test_accept(test, chat, "next prompt")
 	projection := _test_projection(test, chat, &arena)
-	if !testing.expect(test, len(projection.items) > 0, "the session has a history") { return }
-	user, is_user := projection.items[len(projection.items) - 1].payload.(Projected_User)
-	if !testing.expect(test, is_user, "the turn end should have recorded the line it was sent") { return }
-	testing.expect_value(test, user.text, "check the logs")
-	testing.expect_value(test, user.origin, journal.User_Origin.Steering)
-	// It left the queue for the record, so no later request can deliver it twice.
-	_, still_queued := steer_pop(&queue)
-	testing.expect(test, !still_queued, "the line should have left the queue")
-}
-
-// A turn-end drain has no front-end steering context for a native subagent, but its agent
-// inbox still needs the same drain path as a user's queue.
-@(test)
-test_turn_end_drain_records_agent_inbox_without_steer_context :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	_test_accept(test, chat, "start")
-	chat_session_fail_turn(chat, "the provider refused the request")
-	effect := chat_session_advance(chat)
-	if !testing.expect_value(test, effect.kind, Chat_Effect_Kind.Turn_Finished) { return }
-	chat_session_claim_finish(chat, effect)
-
-	inbox := steer_queue_init(context.temp_allocator)
-	chat.inbox = &inbox
-	defer {
-		chat.inbox = nil
-		steer_queue_destroy(&inbox)
+	if !testing.expect_value(test, len(projection.items), 3) { return }
+	for expected, index in ([]string{"start", "check the logs", "next prompt"}) {
+		user, is_user := projection.items[index].payload.(Projected_User)
+		if !testing.expect(test, is_user, "the entry should be user text") { return }
+		testing.expect_value(test, user.text, expected)
 	}
-	testing.expect(test, steer_push(&inbox, "check the logs"))
-	chat_drain_turn_input(chat, {}, nil)
-
-	arena: virtual.Arena
-	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
-	defer virtual.arena_destroy(&arena)
-	projection := _test_projection(test, chat, &arena)
-	if !testing.expect(test, len(projection.items) == 2, "the inbox message was recorded") { return }
-	user, is_user := projection.items[1].payload.(Projected_User)
-	if !testing.expect(test, is_user, "the inbox message is user text") { return }
-	testing.expect_value(test, user.text, "check the logs")
-	testing.expect_value(test, user.origin, journal.User_Origin.Agent)
-	_, still_queued := steer_pop(&inbox)
-	testing.expect(test, !still_queued, "the inbox message left its queue")
+	user, _ := projection.items[1].payload.(Projected_User)
+	testing.expect_value(test, user.origin, journal.User_Origin.Steering)
 }
 
 // A steering line reaches the model in the next request the turn makes, which is the
@@ -529,9 +524,10 @@ test_a_steering_line_reaches_the_request_that_follows_it :: proc(test: ^testing.
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "check the logs"), "the request should carry the line the user sent")
 }
 
-// A line the store refuses was never recorded, so the turn that could not record it does
-// not take it: it stays queued, in order, with the failure reported. Nothing the user sent
-// is dropped by a write that did not happen.
+// A line the store refuses was never accepted, so the turn that could not commit it does
+// not take it: it goes back to the queue, in order, with the failure reported, and the
+// front-end is never told it was queued. Nothing the user sent is dropped by a write that
+// did not happen.
 @(test)
 test_a_line_the_store_refuses_stays_pending :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -553,7 +549,7 @@ test_a_line_the_store_refuses_stays_pending :: proc(test: ^testing.T) {
 	notices: Chat_Notice_Log
 	observer := chat_notice_log_begin(&notices)
 	defer chat_notice_log_destroy(&notices)
-	chat_drain_turn_input(chat, observer, &steer)
+	chat_steering_accept(chat, observer, &steer)
 
 	for expected in ([]string{"check the logs", "and the config"}) {
 		line, queued := steer_pop(&queue)
@@ -562,10 +558,11 @@ test_a_line_the_store_refuses_stays_pending :: proc(test: ^testing.T) {
 		steer_line_free(&queue, line)
 	}
 	testing.expect(test, len(notices.lines) > 0, "the refusal is reported")
+	testing.expect_value(test, chat_notice_log_count(&notices, STEER_ACCEPTED_NOTICE), 0)
 }
 
 @(test)
-test_drain_records_queued_lines_in_order :: proc(test: ^testing.T) {
+test_delivery_records_queued_lines_in_order :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -579,7 +576,7 @@ test_drain_records_queued_lines_in_order :: proc(test: ^testing.T) {
 	steer := Steer_Context {
 		queue = &queue,
 	}
-	chat_drain_turn_input(chat, {}, &steer)
+	chat_steering_observe(chat, {}, &steer)
 
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
@@ -593,33 +590,103 @@ test_drain_records_queued_lines_in_order :: proc(test: ^testing.T) {
 	}
 }
 
-// A line the session could not record reports that it is waiting, not a failure that
-// belongs to the turn: the turn's own error is not this line's to repeat, and the line is
-// still pending for the turn that can carry it.
-@(test)
-test_a_refused_steering_line_does_not_repeat_a_turn_error :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	chat_session_fail_turn(chat, "the provider refused the request")
+// Steering_Crash_Probe pushes one line when the turn is about to send its request, and ends
+// the turn once the journal holds the line, so the test leaves a session whose line was
+// accepted while the provider request was blocked and never delivered.
+Steering_Crash_Probe :: struct {
+	queue:   ^Steer_Queue,
+	control: ^Turn_Control,
+	line:    string,
+	pushed:  bool,
+}
 
-	queue := steer_queue_init(context.temp_allocator)
+steering_crash_push :: proc(user_data: rawptr) {
+	probe := cast(^Steering_Crash_Probe)user_data
+	if probe.pushed { return }
+	probe.pushed = steer_push(probe.queue, probe.line)
+}
+
+steering_crash_stop_when_accepted :: proc(user_data: rawptr, kind: Chat_Message_Kind, text: string) {
+	probe := cast(^Steering_Crash_Probe)user_data
+	if text == STEER_ACCEPTED_NOTICE { turn_control_stop(probe.control) }
+}
+
+// A line accepted during a blocked provider request is in the journal before anyone is told
+// so, and the session that held it may go away. The next process to open the session finds
+// the line, and the next prompt's request carries it once, before the prompt itself.
+@(test)
+test_a_line_accepted_before_a_crash_goes_with_the_next_prompt_once :: proc(test: ^testing.T) {
+	first: Chat_Test
+	chat_test_begin(test, &first, tool_loop_workspace(test))
+	chat := &first.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "first prompt")
+
+	// The provider accepts the connection and never answers, so the request stays blocked.
+	blocked: Agent_Provider
+	if !agent_provider_start(test, &blocked, {}) {
+		chat_test_end(test, &first)
+		return
+	}
+	defer agent_provider_stop(&blocked)
+	blocked_connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&blocked),
+	}
+	defer delete(blocked_connection.Endpoint)
+
+	queue := steer_queue_init(chat.allocator)
 	defer steer_queue_destroy(&queue)
+	control: Turn_Control
+	probe := Steering_Crash_Probe {
+		queue   = &queue,
+		control = &control,
+		line    = "check the logs",
+	}
+	observer := Chat_Observer {
+		user_data        = &probe,
+		request_prepared = steering_crash_push,
+		message          = steering_crash_stop_when_accepted,
+	}
 	steer := Steer_Context {
 		queue = &queue,
 	}
-	testing.expect(test, steer_push(&queue, "check the logs"))
-
-	notices: Chat_Notice_Log
-	observer := chat_notice_log_begin(&notices)
-	defer chat_notice_log_destroy(&notices)
-	chat_drain_turn_input(chat, observer, &steer)
-
-	for line in notices.lines {
-		testing.expect(test, line != "the provider refused the request", "a line with no turn must not repeat the turn's failure as its own")
+	completed := chat_run_turn_steered(chat, blocked_connection, test_retry_policy(), observer, &steer, &control)
+	testing.expect(test, !completed, "the turn ended before the blocked request answered")
+	testing.expect(test, probe.pushed, "the line was queued while the request was being sent")
+	accepted := _test_records(test, chat, {.User_Input})
+	if !testing.expect_value(test, len(accepted), 1) {
+		chat_test_end(test, &first)
+		return
 	}
-	testing.expect(test, len(notices.lines) > 0, "a line the session cannot carry is reported")
-	_, queued := steer_pop(&queue)
-	testing.expect(test, queued, "the line stays pending for the turn that can carry it")
+	delivered, _ := journal.last_delivered_message(chat.store, chat.session)
+	testing.expect_value(test, delivered, journal.Journal_Seq(0))
+	accepted_seq := accepted[0].seq
+
+	reopened: Chat_Test
+	_ = chat_test_reopen(test, &first, &reopened, tool_loop_workspace(test))
+	defer chat_test_end(test, &reopened)
+	next := &reopened.chat
+	chat_test_capacity(next, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	testing.expect_value(test, next.state, Chat_State.Idle)
+	testing.expect(test, !chat_inbox_reports_pending(next), "an accepted line starts no turn of its own")
+
+	answering: Agent_Provider
+	if !agent_provider_start(test, &answering, {agent_provider_reply("done")}) { return }
+	defer agent_provider_stop(&answering)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&answering, next.allocator),
+	}
+	defer delete(connection.Endpoint, next.allocator)
+	_test_accept(test, next, "second prompt")
+	testing.expect(test, chat_run_turn_steered(next, connection, test_retry_policy(), {}, nil), "the turn completed")
+	if !testing.expect_value(test, agent_provider_request_count(&answering), 1) { return }
+	request := agent_provider_request(&answering, 0)
+	testing.expect_value(test, strings.count(request, probe.line), 1)
+	line_at := strings.index(request, probe.line)
+	prompt_at := strings.index(request, "second prompt")
+	testing.expect(test, line_at >= 0 && prompt_at > line_at, "the line is read before the prompt that delivered it")
+	delivered, _ = journal.last_delivered_message(next.store, next.session)
+	testing.expect_value(test, delivered, accepted_seq)
 }

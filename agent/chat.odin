@@ -435,8 +435,9 @@ chat_turn_drive :: proc(
 		// storage and its thread are released without waiting for a request boundary. The summary
 		// itself still installs at a boundary, because a frozen prefix is chosen there.
 		chat_compact_poll(chat, observer)
-		// Input queued while the turn ran is applied before the state is read, so the
-		// selector sees a turn that still has a message to answer.
+		// Input that reached the session while the turn ran is accepted and delivered
+		// before the state is read, so the selector sees a turn that still has a message
+		// to answer.
 		chat_steering_observe(chat, observer, steer)
 		effect := chat_session_advance_at(chat, now)
 		switch effect.kind {
@@ -493,20 +494,12 @@ chat_turn_drive :: proc(
 			if chat_session_cancelled(chat) { chat_session_note_cancel(chat) }
 		case .Turn_Finished:
 			// The claim applies the transition the selector proposed, which only read state.
-			// It runs before the line drain so the line still belongs to the turn that was
-			// sent it, while the turn number still names that turn.
 			// A claim refuses only for a turn that already left the state it names.
 			_ = chat_session_claim_finish(chat, effect)
-			// Input the turn never recorded is recorded here, so a turn that ends takes no
-			// message with it: this is input that arrived while a request was in flight, while
-			// a tool batch was settling, or after a failure or cancellation. It is durable, and
-			// the next request built from this history carries it, whether that request belongs
-			// to a later turn or to a resumed session.
-			//
-			// This runs before the turn's own end writes so the line still belongs to the turn
-			// that was sent it. A partial answer is written after it, and that entry is evidence
-			// no model is shown, so the order the next request reads is unaffected.
-			chat_drain_turn_input(chat, observer, steer)
+			// Input the session accepted but did not deliver stays pending in the journal,
+			// and the next turn delivers it before its prompt, so a turn that ends takes no
+			// message with it. A line still in the front-end's queue was never accepted, and
+			// the front-end returns it to the user.
 			// A turn whose outcome did not reach the store reports the storage failure,
 			// not the status the model reached: the session has no record of it. The
 			// session's own error is what the record and the front-end read.
