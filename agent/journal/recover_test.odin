@@ -4,6 +4,8 @@ package journal
 
 import "core:testing"
 
+import "nabla:db"
+
 // Recovery is tested the way it happens: a journal commits a turn's barriers,
 // the process stops without finishing, and the next open of that session closes
 // what was left open.
@@ -195,4 +197,39 @@ test_recovery_records_nothing_after_a_clean_turn :: proc(test: ^testing.T) {
 	defer records_destroy(after, context.allocator)
 	testing.expect_value(test, len(after), len(before) + 1)
 	for record in after { testing.expect(test, record.kind != Record_Kind.Session_Recovered, "nothing was recovered") }
+}
+
+@(test)
+test_recovery_that_fails_after_staging_writes_nothing :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	writer: Journal
+	_open_journal(test, &writer, directory)
+	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
+	append_record(&writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	_commit_ok(test, &writer)
+	_expect_ok(test, close(&writer))
+
+	journal: Journal
+	_open_journal(test, &journal, directory)
+	_, claim_error := claim(&journal, session)
+	_expect_ok(test, claim_error)
+
+	// The open turn is staged first; the query for unanswered calls then fails
+	// because its table is gone.
+	_expect_db_ok(test, db.exec(&journal.connection, "DROP TABLE nodes"))
+	_, recover_error := recover(&journal)
+	testing.expect(test, recover_error != nil, "recovery fails")
+	testing.expect(test, journal.failure != nil, "the failure latches")
+	_expect_ok(test, close(&journal))
+
+	reader: Journal
+	_open_journal(test, &reader, directory, .Read_Only)
+	defer _close_journal(test, &reader)
+	records := _records_of_session(test, &reader, session)
+	defer records_destroy(records, context.allocator)
+	for record in records {
+		testing.expect(test, record.kind != .Turn_Completed && record.kind != .Session_Recovered, "recovery wrote nothing")
+	}
 }

@@ -7,11 +7,13 @@ Recovery :: Session_Recovered
 
 // recover records an outcome for all work the claimed session left open when
 // its process died, in one transaction, and replays nothing. It records nothing
-// when nothing was open, so recovering twice changes nothing.
+// when nothing was open, so recovering twice changes nothing. A failure after
+// outcomes are staged latches the journal, so none of them is written.
 @(require_results)
 recover :: proc(journal: ^Journal) -> (recovery: Recovery, error: Error) {
 	assert(journal.claimed != {}, "recover needs a claimed session")
 	_ = commit(journal) or_return
+	defer if error != nil && journal.failure == nil && !error_is_busy(error) { journal.failure = error }
 	recover_open_work(journal, &recovery) or_return
 	recover_results(journal, &recovery) or_return
 	if recovery == {} { return }
