@@ -82,3 +82,31 @@ Each report has a dated heading with a short name, then four parts:
 - Attempt: `tools.builtin_read(...)` followed by `r.output:match(...)`.
 - Gap: the shape of `output` is not documented in the Code Mode tool description; it was not a string, so the script failed with "attempt to call a nil value (method 'match')". Each tool's result fields need a stated Lua shape, or a helper that returns a file's text.
 - Workaround: the line was read with `sed -n` through the shell and the patch tool was called directly.
+
+## 2026-10-07 Model spelling when starting a subagent
+
+- Goal: start two subagents on Sonnet.
+- Attempt: `agent_spawn` with model `claude-sonnet-5-5` and no provider.
+- Gap: the bare model id did not resolve; only the catalog id with its vendor prefix did. The error listed the valid ids, so the fix was quick, but the schema does not say which form is expected. Related to the provider spelling report above.
+- Workaround: `model = anthropic/claude-sonnet-5-5`, `provider = cliproxyapi`.
+
+## 2026-10-07 Reading a long converted text file
+
+- Goal: read a PDF converted to text with `pdftotext`, about 700 lines per read.
+- Attempt: `builtin_read` with a 700-line limit.
+- Gap: the result was cut at about 32 KB, so the requested range was not all visible, and the notice did not give the next offset to resume from.
+- Workaround: smaller line ranges.
+
+## 2026-10-07 Bash loop syntax in the fish shell tool
+
+- Goal: grep several names across the repository in one shell command.
+- Attempt: a bash `for ...; do ... done` loop and an unquoted `--include=*.odin` glob in `builtin_shell`.
+- Gap: fish rejected both ("Unknown command: do", "No matches for wildcard"). The command ran until exit 124, and the parse error was echoed about 25 times in stderr. The tool description names the shell but not its common syntax differences.
+- Workaround: Code Mode calling `tools.builtin_shell` once per name, with quoted globs.
+
+## 2026-10-07 Overlapping context in grep results
+
+- Goal: see a few lines around close matches with `fff_grep` and `context`.
+- Attempt: `fff_grep` on `catalog_model_provider` and `MAX_MESSAGE_DEPTH` with context lines.
+- Gap: overlapping context blocks were repeated for nearby matches, and leading indentation was lost in `content` output.
+- Workaround: `builtin_read` of the line range.
