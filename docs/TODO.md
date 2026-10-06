@@ -34,13 +34,8 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 
 - Process spawning is written three times: `mcp/stdio_process*`, `agent/tool_process*`, and `agent/subagent_acp_linux.odin`. A small `process` library package would remove about 350 lines. Needs a decision because it adds a package.
 - Clone-and-check ladders (`x, clone_error = strings.clone(...)`, then `if clone_error != nil`) repeat in `subagent.odin`, `model_selection.odin`, `subagent_acp.odin`, `chat_instructions.odin`, `instructions.odin`, `config_mcp.odin`, `tool_skills.odin`. Return `mem.Allocator_Error` and use `or_return`; clone multi-field values into an owning arena so destroy is one call.
-- `tool_drain_pipes` (`agent/tool_process.odin`) has six copies of the same exit sequence. Break out of the loop and clean up once.
-- `tool_spawn_shell_flags` always returns a nil second flag and reimplements `os.base`.
-- `tool_shell_finish` only forwards to `tool_result_of`. The background-terminated message is built three times.
 - `agent_team_make` unwinds two dynamic arrays that could grow lazily.
 - `agent/tool_agent.odin`: `fmt.tprintf("%s", x)` used as a clone; the same `member` and `agents` checks in three executors; one literal error repeated three times.
-- `tool_line_count` reimplements `strings.count`. `tool_write_atomic` repeats `os.close` on every error path. `patch_apply` repeats the update-and-count step in two cases.
-- A spool open failure in `tool_stream_write` falls back to memory on purpose; add a comment saying why.
 
 ## Naming
 

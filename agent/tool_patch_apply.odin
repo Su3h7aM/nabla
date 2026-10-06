@@ -65,6 +65,7 @@ patch_prepare :: proc(
 			}
 		}
 		hunks := args.hunks[file.first_hunk:][:file.hunk_count]
+		original := ""
 
 		switch file.operation {
 		case .Add:
@@ -73,9 +74,6 @@ patch_prepare :: proc(
 			if exists {
 				return nil, "", 0, patch_failure(.File_Exists, allocator, "%s already exists; use %s to change it", file.path, PATCH_HEADERS[.Update])
 			}
-			hunks_repaired: int
-			change.content, hunks_repaired = patch_update(file.path, "", args.lines, hunks, allocator) or_return
-			repaired_hunks += hunks_repaired
 			patch_append(&summary_buffer, "added ", file.path, "\n") or_return
 		case .Delete:
 			exists: bool
@@ -83,7 +81,6 @@ patch_prepare :: proc(
 			if !exists { return nil, "", 0, patch_missing(file.path, allocator) }
 			patch_append(&summary_buffer, "deleted ", file.path, "\n") or_return
 		case .Update:
-			original := ""
 			source_exists: bool
 			change.mode, source_exists = patch_existing_mode(change.source, file.path, allocator) or_return
 			if !source_exists && patch_only_adds(args.lines, hunks) && file.move_to == "" {
@@ -105,6 +102,8 @@ patch_prepare :: proc(
 					patch_append(&summary_buffer, "moved ", file.path, " to ", file.move_to, "\n") or_return
 				}
 			}
+		}
+		if file.operation != .Delete {
 			hunks_repaired: int
 			change.content, hunks_repaired = patch_update(file.path, original, args.lines, hunks, allocator) or_return
 			repaired_hunks += hunks_repaired

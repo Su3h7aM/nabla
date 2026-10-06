@@ -104,10 +104,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 @(private)
 tool_line_count :: proc(text: string) -> int {
 	if text == "" { return 0 }
-	count := 1
-	for i in 0 ..< len(text) {
-		if text[i] == '\n' { count += 1 }
-	}
+	count := strings.count(text, "\n") + 1
 	if text[len(text) - 1] == '\n' { count -= 1 }
 	return count
 }
@@ -263,17 +260,18 @@ tool_write_atomic :: proc(
 	defer delete(pattern, allocator)
 	file, open_error := os.create_temp_file(dir, pattern)
 	if open_error != nil { return open_error, false }
-	// The name belongs to the file and dies with close, while removal runs after it.
-	temp_path, clone_error := strings.clone(os.name(file), allocator)
-	if clone_error != nil {
-		_ = os.close(file)
-		return clone_error, false
+	closed := false
+	temp_path: string
+	defer {
+		if !closed { _ = os.close(file) }
+		if temp_path != "" { _ = os.remove(temp_path) }
+		delete(temp_path, allocator)
 	}
-	defer delete(temp_path, allocator)
-	defer _ = os.remove(temp_path)
+	clone_error: mem.Allocator_Error
+	temp_path, clone_error = strings.clone(os.name(file), allocator)
+	if clone_error != nil { return clone_error, false }
 	if mode != {} {
 		if mode_error := os.fchmod(file, mode); mode_error != nil {
-			_ = os.close(file)
 			return mode_error, false
 		}
 	}
@@ -287,23 +285,21 @@ tool_write_atomic :: proc(
 		}
 		count, chunk_error := os.write(file, content[written:])
 		if chunk_error != nil {
-			// The write already failed, so the cleanup that follows reports nothing more.
-			_ = os.close(file)
 			return chunk_error, false
 		}
 		if count <= 0 {
-			_ = os.close(file)
 			return os.General_Error.Invalid_File, false
 		}
 		written += count
 	}
 	if !cancelled_write {
 		if sync_error := os.sync(file); sync_error != nil {
-			_ = os.close(file)
 			return sync_error, false
 		}
 	}
-	if close_error := os.close(file); close_error != nil {
+	close_error := os.close(file)
+	closed = true
+	if close_error != nil {
 		if cancelled_write { return nil, true }
 		return close_error, false
 	}

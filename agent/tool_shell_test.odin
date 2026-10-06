@@ -191,21 +191,20 @@ test_advertised_description_names_the_running_shell :: proc(test: ^testing.T) {
 // else runs unchanged.
 @(test)
 test_spawn_shell_flags_keep_history_private :: proc(test: ^testing.T) {
-	first, second := tool_spawn_shell_flags("/usr/bin/fish")
-	testing.expect_value(test, string(first), "--private")
-	testing.expect(test, second == nil, "fish takes no second flag")
+	flag := tool_spawn_shell_flags("/usr/bin/fish")
+	testing.expect_value(test, string(flag), "--private")
 
-	first, second = tool_spawn_shell_flags("fish")
-	testing.expect_value(test, string(first), "--private")
+	flag = tool_spawn_shell_flags("fish")
+	testing.expect_value(test, string(flag), "--private")
 
-	first, second = tool_spawn_shell_flags("/bin/bash")
-	testing.expect(test, first == nil && second == nil, "bash runs unchanged")
+	flag = tool_spawn_shell_flags("/bin/bash")
+	testing.expect(test, flag == nil, "bash runs unchanged")
 
-	first, second = tool_spawn_shell_flags(TOOL_SHELL_FALLBACK)
-	testing.expect(test, first == nil && second == nil, "the portable shell runs unchanged")
+	flag = tool_spawn_shell_flags(TOOL_SHELL_FALLBACK)
+	testing.expect(test, flag == nil, "the portable shell runs unchanged")
 
-	first, second = tool_spawn_shell_flags("/usr/bin/zsh")
-	testing.expect(test, first == nil && second == nil, "zsh runs unchanged")
+	flag = tool_spawn_shell_flags("/usr/bin/zsh")
+	testing.expect(test, flag == nil, "zsh runs unchanged")
 }
 
 // A shell named fish receives --private on its command line, so the command

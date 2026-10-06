@@ -6,8 +6,6 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-import "nabla:agent/journal"
-
 TOOL_SHELL_NAME :: "builtin_shell"
 
 // TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the shell it
@@ -171,47 +169,47 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	switch stop {
 	case .Wait_Failed:
 		message := fmt.tprintf("the harness could not wait for the command, so it was stopped: %s", os.error_string(wait_error))
-		return tool_shell_finish(ctx, .Tool_Failed, message, data, "wait failed")
+		return tool_result_of(ctx, .Tool_Failed, message, data, "wait failed")
 	case .Cancelled:
-		return tool_shell_finish(ctx, .Cancelled, "the command was cancelled", data, "cancelled")
+		return tool_result_of(ctx, .Cancelled, "the command was cancelled", data, "cancelled")
 	case .Timed_Out:
-		return tool_shell_finish(ctx, .Timed_Out, "the command exceeded its timeout", data, "timed out")
+		return tool_result_of(ctx, .Timed_Out, "the command exceeded its timeout", data, "timed out")
 	case .None:
 	}
 
 	exited, exit_code, waited := tool_child_reap(&child)
 	if !waited {
 		message := "the command ran, but its exit status could not be read"
-		if background_terminated { message = fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
-		return tool_shell_finish(ctx, .Unknown, message, data, "exit unknown")
+		message = tool_shell_background_message(message, background_terminated)
+		return tool_result_of(ctx, .Unknown, message, data, "exit unknown")
 	}
 	if !exited {
 		message := "the command was ended by a signal"
-		if background_terminated { message = fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
-		return tool_shell_finish(ctx, .Tool_Failed, message, data, "signalled")
+		message = tool_shell_background_message(message, background_terminated)
+		return tool_result_of(ctx, .Tool_Failed, message, data, "signalled")
 	}
 	data.exit_code = exit_code
 	if exit_code != 0 {
 		message := fmt.tprintf("the command exited with status %d", exit_code)
-		if background_terminated { message = fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
-		return tool_shell_finish(ctx, .Tool_Failed, message, data, fmt.tprintf("exited %d", exit_code))
+		message = tool_shell_background_message(message, background_terminated)
+		return tool_result_of(ctx, .Tool_Failed, message, data, fmt.tprintf("exited %d", exit_code))
 	}
 	message := ""
 	if background_terminated { message = TOOL_SHELL_BACKGROUND_NOTICE }
-	return tool_shell_finish(ctx, .Success, message, data, "exited 0")
+	return tool_result_of(ctx, .Success, message, data, "exited 0")
 }
 
 // tool_shell_not_started reports a command that did not start, naming the
 // system's reason.
 @(require_results)
 tool_shell_not_started :: proc(ctx: ^Tool_Context, cause: os.Error, data: Shell_Output) -> Tool_Result {
-	return tool_shell_finish(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
+	return tool_result_of(ctx, .Tool_Failed, fmt.tprintf("the command did not start: %s", os.error_string(cause)), data)
 }
 
-// tool_shell_finish builds a result from the sanitized streams captured by the drain.
-@(require_results)
-tool_shell_finish :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, captured: Shell_Output, reason := "") -> Tool_Result {
-	return tool_result_of(ctx, outcome, message, captured, reason)
+@(private)
+tool_shell_background_message :: proc(message: string, background_terminated: bool) -> string {
+	if background_terminated { return fmt.tprintf("%s. %s", message, TOOL_SHELL_BACKGROUND_NOTICE) }
+	return message
 }
 
 @(require_results)

@@ -111,11 +111,9 @@ TOOL_CHILD_EXEC_FAILED :: 127
 // functionality. Bash and zsh already write no history for `-c`, and their rc
 // files are only read by interactive or login shells, so they run as
 // `shell -c command`, unchanged.
-tool_spawn_shell_flags :: proc(shell: string) -> (first, second: cstring) {
-	name := shell
-	if i := strings.last_index_byte(shell, '/'); i >= 0 { name = shell[i + 1:] }
-	if name == "fish" { return cstring("--private"), nil }
-	return nil, nil
+tool_spawn_shell_flags :: proc(shell: string) -> cstring {
+	if os.base(shell) == "fish" { return cstring("--private") }
+	return nil
 }
 
 // tool_spawn_grouped starts shell in its own process group, running command with
@@ -137,9 +135,7 @@ tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stde
 	arguments, arguments_error := make([dynamic]string, 0, 4, context.temp_allocator)
 	if arguments_error != nil { return {}, .Failed, arguments_error }
 	append(&arguments, shell) or_return
-	flag_first, flag_second := tool_spawn_shell_flags(shell)
-	if flag_first != nil { append(&arguments, string(flag_first)) or_return }
-	if flag_second != nil { append(&arguments, string(flag_second)) or_return }
+	if flag := tool_spawn_shell_flags(shell); flag != nil { append(&arguments, string(flag)) or_return }
 	append(&arguments, "-c", command) or_return
 	return tool_spawn_command(arguments[:], directory, nil, stdout_write, stderr_write)
 }
@@ -479,6 +475,7 @@ tool_stream_incomplete_utf8_suffix :: proc(bytes: []u8) -> int {
 tool_stream_write :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 	if stream.spool == nil && stream.spool_path != "" && len(stream.kept) + len(chunk) > TOOL_STREAM_MEMORY_BYTES {
 		spool, open_error := tool_output_create(stream.spool_path)
+		// A result is never discarded, so a failed spool open keeps the stream in memory.
 		if open_error == nil {
 			stream.spool = spool
 			os.write(spool, stream.kept[:]) or_return
@@ -558,27 +555,23 @@ tool_drain_pipes :: proc(
 		data.stderr_bytes = streams[1].total
 		// A stream that never outgrew memory has no file, so its name is released here and the
 		// result takes the name of the file that does hold the whole stream.
-		if streams[0].spool != nil {
-			_ = os.close(streams[0].spool)
-			data.stdout_file = streams[0].spool_path
-		} else {
-			delete(streams[0].spool_path, allocator)
-		}
-		if streams[1].spool != nil {
-			_ = os.close(streams[1].spool)
-			data.stderr_file = streams[1].spool_path
-		} else {
-			delete(streams[1].spool_path, allocator)
+		files := [2]^string{&data.stdout_file, &data.stderr_file}
+		for stream, index in streams {
+			if stream.spool != nil {
+				_ = os.close(stream.spool)
+				files[index]^ = stream.spool_path
+			} else {
+				delete(stream.spool_path, allocator)
+			}
 		}
 	}
-	scratch: [4096]u8
-	for streams[0].open || streams[1].open {
+	scratch: [TOOL_STREAM_READ_BYTES]u8
+	drain: for streams[0].open || streams[1].open {
 		// One check covers both stops, and cancellation wins: a cancelled turn
 		// is never reported as a timeout.
 		if stop_reason := tool_control_stop(control, start, budget); stop_reason != .None {
-			_ = tool_terminate_group(child)
-			if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
-			return stop_reason, nil, false
+			stop = stop_reason
+			break
 		}
 		fds: [4]Tool_Poll
 		slots := [2]int{-1, -1}
@@ -598,9 +591,8 @@ tool_drain_pipes :: proc(
 		count += 1
 		count += tool_control_fds(fds[count:], control)
 		if err := tool_poll(fds[:count], deadline, budget > 0); err != nil {
-			_ = tool_terminate_group(child)
-			if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
-			return .Wait_Failed, err, false
+			stop, wait_error = .Wait_Failed, err
+			break
 		}
 
 		progress := false
@@ -608,36 +600,28 @@ tool_drain_pipes :: proc(
 			if slots[index] < 0 || !fds[slots[index]].ready { continue }
 			progress = true
 			n, status := tool_read(stream.file, scratch[:])
-			switch status {
-			case .Again:
-			case .Failed:
+			if status == .Again { continue }
+			if status == .Failed || n == 0 {
 				stream.open = false
-				if finish_error := tool_stream_finish(&stream); finish_error != nil {
-					_ = tool_terminate_group(child)
-					return .Wait_Failed, finish_error, false
-				}
-			case .Ok:
-				if n == 0 {
-					stream.open = false
-					if finish_error := tool_stream_finish(&stream); finish_error != nil {
-						_ = tool_terminate_group(child)
-						return .Wait_Failed, finish_error, false
-					}
-				} else if take_error := tool_stream_take(&stream, scratch[:n]); take_error != nil {
-					_ = tool_terminate_group(child)
-					if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil { return .Wait_Failed, finish_error, false }
-					return .Wait_Failed, take_error, false
-				}
+				wait_error = tool_stream_finish(&stream)
+			} else {
+				wait_error = tool_stream_take(&stream, scratch[:n])
+			}
+			if wait_error != nil {
+				stop = .Wait_Failed
+				break drain
 			}
 		}
 		// An exited leader cannot write to a quiet pipe. Retire its group instead
 		// of waiting until a background process closes the pipe.
 		if !progress && fds[exit_slot].ready { break }
 	}
+	if stop != .None { _ = tool_terminate_group(child) }
 	if finish_error := tool_stream_finish_all(streams[:]); finish_error != nil {
-		_ = tool_terminate_group(child)
-		return .Wait_Failed, finish_error, false
+		if stop == .None { _ = tool_terminate_group(child) }
+		stop, wait_error = .Wait_Failed, finish_error
 	}
+	if stop != .None { return stop, wait_error, false }
 	return tool_retire_child(child, start, budget, control)
 }
 
