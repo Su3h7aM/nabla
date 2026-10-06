@@ -199,3 +199,17 @@ test_catalog_owns_every_retained_string :: proc(t: ^testing.T) {
 	testing.expect_value(t, model.input_modalities[0], "img")
 	testing.expect_value(t, model.thinking.levels[0], "high")
 }
+
+@(test)
+test_an_unknown_provider_lists_the_configured_ones :: proc(t: ^testing.T) {
+	user := []Catalog_Provider_Source {
+		{id = "proxy", base_url_present = true, base_url = "http://localhost", api_present = true, api = "openai-chat", api_key_present = true, api_key = "KEY"},
+	}
+	models_dev := []Catalog_Provider_Source{{id = "only-listed"}}
+	catalog, err := resolve_catalog(user, nil, models_dev)
+	testing.expect_value(t, err, Catalog_Error.None)
+	defer catalog_destroy(&catalog)
+
+	_, problem := model_selection_resolve(&catalog, "openai", "m", context.allocator)
+	testing.expect_value(t, problem, "provider not found: openai; configured providers: proxy")
+}

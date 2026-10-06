@@ -58,7 +58,9 @@ provider_usable :: proc(provider: ^Catalog_Provider) -> bool {
 @(require_results)
 model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string, allocator: mem.Allocator) -> (selection: Model_Selection, problem: string) {
 	provider_index, provider_found := catalog_find_provider(catalog, provider_id)
-	if !provider_found { return {}, fmt.tprintf("provider not found: %s", provider_id) }
+	if !provider_found {
+		return {}, fmt.tprintf("provider not found: %s; configured providers: %s", provider_id, catalog_provider_names(catalog))
+	}
 	provider := &catalog.providers[provider_index]
 	if !provider_usable(provider) { return {}, fmt.tprintf("provider %s needs base_url, api, and api_key", provider_id) }
 	model_index, model_found := catalog_find_model(catalog, provider_id, model_id)
@@ -150,6 +152,22 @@ catalog_model_names :: proc(catalog: ^Catalog, provider_id: string) -> string {
 	if len(names) == 0 { return "none" }
 	joined, join_error := strings.join(names[:], ", ", context.temp_allocator)
 	if join_error != nil { return "the model list could not be listed" }
+	return joined
+}
+
+// catalog_provider_names lists the ids of the configured providers, those that state the
+// base_url, api, and api_key a connection needs, temp-allocated. The catalog also holds
+// providers known only from models.dev, which no request can use. A list that cannot be held
+// says so rather than reading as no providers.
+catalog_provider_names :: proc(catalog: ^Catalog) -> string {
+	names, names_error := make([dynamic]string, 0, context.temp_allocator)
+	if names_error != nil { return "the provider list could not be listed" }
+	for &provider in catalog.providers {
+		if provider_usable(&provider) { append(&names, provider.id) }
+	}
+	if len(names) == 0 { return "none" }
+	joined, join_error := strings.join(names[:], ", ", context.temp_allocator)
+	if join_error != nil { return "the provider list could not be listed" }
 	return joined
 }
 
