@@ -146,19 +146,8 @@ agent_team_make :: proc(allocator: mem.Allocator) -> ^Agent_Team {
 	team, alloc_error := new(Agent_Team, allocator)
 	if alloc_error != nil { return nil }
 	team.allocator = allocator
-	members, members_error := make([dynamic]^Subagent, allocator)
-	if members_error != nil {
-		free(team, allocator)
-		return nil
-	}
-	team.members = members
-	waiting, waiting_error := make([dynamic]^Subagent, allocator)
-	if waiting_error != nil {
-		delete(members)
-		free(team, allocator)
-		return nil
-	}
-	team.waiting = waiting
+	team.members.allocator = allocator
+	team.waiting.allocator = allocator
 	return team
 }
 
@@ -204,28 +193,16 @@ agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^A
 	tools, tools_error := tool_registry_clone(&chat.tools, allocator)
 	if tools_error.kind != .None { return false }
 	out.tools = tools
-	levels, levels_error := make([]string, len(chat.effort_levels), allocator)
-	if levels_error != nil { return false }
-	out.effort_levels = levels
-	directory := chat.store.directory if chat.store != nil else ""
-	locks := chat.store.locks if chat.store != nil else ""
-	clone_error: mem.Allocator_Error
-	out.workspace, clone_error = strings.clone(chat.workspace, allocator)
-	if clone_error != nil { return false }
-	out.store_directory, clone_error = strings.clone(directory, allocator)
-	if clone_error != nil { return false }
-	out.lock_directory, clone_error = strings.clone(locks, allocator)
-	if clone_error != nil { return false }
-	out.provider_id, clone_error = strings.clone(chat.provider_id, allocator)
-	if clone_error != nil { return false }
-	out.model_id, clone_error = strings.clone(chat.model_id, allocator)
-	if clone_error != nil { return false }
-	out.effort, clone_error = strings.clone(chat.effort, allocator)
-	if clone_error != nil { return false }
-	for level, index in chat.effort_levels {
-		out.effort_levels[index], clone_error = strings.clone(level, allocator)
-		if clone_error != nil { return false }
+	source := Agent_Parent {
+		workspace       = chat.workspace,
+		store_directory = chat.store.directory if chat.store != nil else "",
+		lock_directory  = chat.store.locks if chat.store != nil else "",
+		provider_id     = chat.provider_id,
+		model_id        = chat.model_id,
+		effort          = chat.effort,
+		effort_levels   = chat.effort_levels[:],
 	}
+	if agent_parent_clone_strings(source, out, allocator) != nil { return false }
 	out.session = chat.session
 	if chat.store != nil { out.run = chat.store.run }
 	out.disable_project_instructions = chat.disable_project_instructions
@@ -237,33 +214,26 @@ agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^A
 	return true
 }
 
-// agent_parent_temp_copy copies one parent snapshot into scratch memory, so a worker thread
-// can keep using it after it releases the team lock. It reports false when a field could not
-// be copied.
 @(private, require_results)
-agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -> (snapshot: Agent_Parent, ok: bool) {
-	snapshot = parent
-	clone_error: mem.Allocator_Error
-	snapshot.provider_id, clone_error = strings.clone(parent.provider_id, allocator)
-	if clone_error != nil { return {}, false }
-	snapshot.model_id, clone_error = strings.clone(parent.model_id, allocator)
-	if clone_error != nil { return {}, false }
-	snapshot.effort, clone_error = strings.clone(parent.effort, allocator)
-	if clone_error != nil { return {}, false }
-	snapshot.workspace, clone_error = strings.clone(parent.workspace, allocator)
-	if clone_error != nil { return {}, false }
-	snapshot.store_directory, clone_error = strings.clone(parent.store_directory, allocator)
-	if clone_error != nil { return {}, false }
-	snapshot.lock_directory, clone_error = strings.clone(parent.lock_directory, allocator)
-	if clone_error != nil { return {}, false }
-	levels, levels_error := make([]string, len(parent.effort_levels), allocator)
-	if levels_error != nil { return {}, false }
-	snapshot.effort_levels = levels
-	for level, index in parent.effort_levels {
-		snapshot.effort_levels[index], clone_error = strings.clone(level, allocator)
-		if clone_error != nil { return {}, false }
-	}
-	return snapshot, true
+agent_parent_clone_strings :: proc(parent: Agent_Parent, out: ^Agent_Parent, allocator: mem.Allocator) -> mem.Allocator_Error {
+	out.workspace = strings.clone(parent.workspace, allocator) or_return
+	out.store_directory = strings.clone(parent.store_directory, allocator) or_return
+	out.lock_directory = strings.clone(parent.lock_directory, allocator) or_return
+	out.provider_id = strings.clone(parent.provider_id, allocator) or_return
+	out.model_id = strings.clone(parent.model_id, allocator) or_return
+	out.effort = strings.clone(parent.effort, allocator) or_return
+	out.effort_levels = model_selection_clone_levels(parent.effort_levels, allocator) or_return
+	return nil
+}
+
+// agent_parent_temp_copy copies one parent snapshot into scratch memory, so a worker thread
+// can keep using it after it releases the team lock. It returns an allocator error when a
+// field could not be copied.
+@(private, require_results)
+agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -> (snapshot: Agent_Parent, error: mem.Allocator_Error) {
+	copied := parent
+	agent_parent_clone_strings(parent, &copied, allocator) or_return
+	return copied, nil
 }
 
 // agent_team_reap releases every subagent that is done and, given the orchestrator's
@@ -276,20 +246,21 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 	if team == nil { return false }
 	finished: [dynamic]^Subagent
 	finished.allocator = context.temp_allocator
-	sync.mutex_lock(&team.mutex)
-	for index := 0; index < len(team.members); {
-		member := team.members[index]
-		if !sync.atomic_load(&member.done) {
-			index += 1
-			continue
+	{
+		sync.mutex_guard(&team.mutex)
+		for index := 0; index < len(team.members); {
+			member := team.members[index]
+			if !sync.atomic_load(&member.done) {
+				index += 1
+				continue
+			}
+			if _, append_error := append(&finished, member); append_error != nil {
+				// The list of finished members could not grow; they are reaped next time.
+				break
+			}
+			ordered_remove(&team.members, index)
 		}
-		if _, append_error := append(&finished, member); append_error != nil {
-			// The list of finished members could not grow; they are reaped next time.
-			break
-		}
-		ordered_remove(&team.members, index)
 	}
-	sync.mutex_unlock(&team.mutex)
 	if chat != nil && chat.store != nil {
 		for index := 0; index < len(finished); {
 			if subagent_reopen(chat, finished[index]) {
@@ -380,10 +351,11 @@ subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 // journal, so the owner of that journal is the only caller.
 agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := false) -> bool {
 	if team == nil { return true }
-	sync.mutex_lock(&team.mutex)
-	team.closing = true
-	for member in team.members { subagent_request_stop(member) }
-	sync.mutex_unlock(&team.mutex)
+	{
+		sync.mutex_guard(&team.mutex)
+		team.closing = true
+		for member in team.members { subagent_request_stop(member) }
+	}
 	subagent_stop_waiting(team)
 	owner_wake_signal()
 	began := time.tick_now()
@@ -502,23 +474,24 @@ subagent_start :: proc(
 	member: ^Subagent,
 	problem: string,
 ) {
-	sync.mutex_lock(&team.mutex)
-	if team.closing {
-		sync.mutex_unlock(&team.mutex)
-		return nil, "the orchestrator is closing; nothing started"
+	parent: Agent_Parent
+	parent_error: mem.Allocator_Error
+	{
+		sync.mutex_guard(&team.mutex)
+		if team.closing { return nil, "the orchestrator is closing; nothing started" }
+		team.starting += 1
+		// The snapshot is copied into scratch memory while the lock is held, so the owner
+		// replacing it cannot release what this start still reads.
+		parent, parent_error = agent_parent_temp_copy(team.parent, context.temp_allocator)
 	}
-	team.starting += 1
 	defer {
-		sync.mutex_lock(&team.mutex)
-		team.starting -= 1
-		sync.mutex_unlock(&team.mutex)
+		{
+			sync.mutex_guard(&team.mutex)
+			team.starting -= 1
+		}
 		owner_wake_signal()
 	}
-	// The snapshot is copied into scratch memory while the lock is held, so the owner
-	// replacing it cannot release what this start still reads.
-	parent, parent_ok := agent_parent_temp_copy(team.parent, context.temp_allocator)
-	sync.mutex_unlock(&team.mutex)
-	if !parent_ok { return nil, "the orchestrator's selection could not be copied" }
+	if parent_error != nil { return nil, "the orchestrator's selection could not be copied" }
 	tools, tools_error := tool_registry_clone(&parent.tools, allocator)
 	defer tool_registry_destroy(&tools)
 	if tools_error.kind != .None { return nil, "the subagent tools could not be copied" }
@@ -559,25 +532,9 @@ subagent_start :: proc(
 	// the record instead of starting a half-defined subagent.
 	failed := true
 	defer if failed { subagent_destroy(created) }
-	clone_error: mem.Allocator_Error
-	created.instruction, clone_error = strings.clone(args.instruction, allocator)
-	if clone_error != nil { return nil, "the subagent could not be allocated" }
-	created.prompt, clone_error = strings.clone(args.prompt, allocator)
-	if clone_error != nil { return nil, "the subagent could not be allocated" }
-	created.effort, clone_error = strings.clone(effort, allocator)
-	if clone_error != nil { return nil, "the subagent could not be allocated" }
-	if resume.name != "" {
-		created.name, clone_error = strings.clone(resume.name, allocator)
-		if clone_error != nil { return nil, "the subagent could not be allocated" }
-	} else {
-		created.name = subagent_name(call, allocator)
+	if subagent_clone_strings(created, args, parent, effort, resume.name, call, allocator) != nil {
+		return nil, "the subagent could not be allocated"
 	}
-	created.workspace, clone_error = strings.clone(parent.workspace, allocator)
-	if clone_error != nil { return nil, "the subagent could not be allocated" }
-	created.store_directory, clone_error = strings.clone(parent.store_directory, allocator)
-	if clone_error != nil { return nil, "the subagent could not be allocated" }
-	created.lock_directory, clone_error = strings.clone(parent.lock_directory, allocator)
-	if clone_error != nil { return nil, "the subagent could not be allocated" }
 	if program.name != "" {
 		wake, wake_error := tool_wake_open()
 		if wake_error != nil {
@@ -585,19 +542,40 @@ subagent_start :: proc(
 		}
 		created.wake = wake
 	}
-	sync.mutex_lock(&team.mutex)
-	if team.closing {
-		sync.mutex_unlock(&team.mutex)
-		return nil, "the orchestrator is closing; nothing started"
+
+	{
+		sync.mutex_guard(&team.mutex)
+		if team.closing { return nil, "the orchestrator is closing; nothing started" }
+		if _, append_error := append(&team.members, created); append_error != nil {
+			return nil, "the subagent could not be allocated"
+		}
 	}
-	if _, append_error := append(&team.members, created); append_error != nil {
-		sync.mutex_unlock(&team.mutex)
-		return nil, "the subagent could not be allocated"
-	}
-	sync.mutex_unlock(&team.mutex)
 	failed = false
 	member = created
 	return member, ""
+}
+
+@(private, require_results)
+subagent_clone_strings :: proc(
+	created: ^Subagent,
+	args: Agent_Spawn_Args,
+	parent: Agent_Parent,
+	effort, resume_name: string,
+	call: journal.Call_Id,
+	allocator: mem.Allocator,
+) -> mem.Allocator_Error {
+	created.instruction = strings.clone(args.instruction, allocator) or_return
+	created.prompt = strings.clone(args.prompt, allocator) or_return
+	created.effort = strings.clone(effort, allocator) or_return
+	if resume_name != "" {
+		created.name = strings.clone(resume_name, allocator) or_return
+	} else {
+		created.name = subagent_name(call, allocator)
+	}
+	created.workspace = strings.clone(parent.workspace, allocator) or_return
+	created.store_directory = strings.clone(parent.store_directory, allocator) or_return
+	created.lock_directory = strings.clone(parent.lock_directory, allocator) or_return
+	return nil
 }
 
 // Subagent_Defaults is what a selection falls back to for what its call leaves out. A new child
@@ -616,13 +594,7 @@ Subagent_Defaults :: struct {
 @(private)
 subagent_defaults :: proc(parent: ^Agent_Parent, resume: Subagent_Resume) -> Subagent_Defaults {
 	if resume.model_id != "" { return {provider_id = resume.provider_id, model_id = resume.model_id, effort = resume.effort} }
-	return {
-		provider_id = parent.provider_id,
-		model_id = parent.model_id,
-		effort = parent.effort,
-		effort_levels = parent.effort_levels,
-		step_down = true,
-	}
+	return {provider_id = parent.provider_id, model_id = parent.model_id, effort = parent.effort, effort_levels = parent.effort_levels, step_down = true}
 }
 
 // subagent_select resolves the model and effort a native subagent runs from what its call
@@ -687,18 +659,18 @@ subagent_select :: proc(
 subagent_launch :: proc(member: ^Subagent) -> (queued, ok: bool) {
 	team := member.team
 	member.stop.parent = &process_interrupt
-	sync.mutex_lock(&team.mutex)
-	// A closing team has already asked every member to stop, so this one starts only to end.
-	limit := team.parent.subagents_max_running if team.parent.subagents_max_running > 0 else SUBAGENTS_MAX_RUNNING
-	if team.running >= limit && !team.closing {
-		member.status = .Queued
-		_, append_error := append(&team.waiting, member)
-		sync.mutex_unlock(&team.mutex)
-		return append_error == nil, append_error == nil
+	{
+		sync.mutex_guard(&team.mutex)
+		// A closing team has already asked every member to stop, so this one starts only to end.
+		limit := team.parent.subagents_max_running if team.parent.subagents_max_running > 0 else SUBAGENTS_MAX_RUNNING
+		if team.running >= limit && !team.closing {
+			member.status = .Queued
+			_, append_error := append(&team.waiting, member)
+			return append_error == nil, append_error == nil
+		}
+		team.running += 1
+		member.admitted = true
 	}
-	team.running += 1
-	member.admitted = true
-	sync.mutex_unlock(&team.mutex)
 	return false, subagent_thread_start(member)
 }
 
@@ -755,19 +727,20 @@ subagent_finish :: proc(member: ^Subagent) {
 @(private)
 subagent_conclude :: proc(member: ^Subagent) -> (next: ^Subagent) {
 	team := member.team
-	sync.mutex_lock(&team.mutex)
-	if member.admitted {
-		member.admitted = false
-		team.running -= 1
-		if len(team.waiting) > 0 && !team.closing {
-			next = team.waiting[0]
-			ordered_remove(&team.waiting, 0)
-			next.status = .Running
-			next.admitted = true
-			team.running += 1
+	{
+		sync.mutex_guard(&team.mutex)
+		if member.admitted {
+			member.admitted = false
+			team.running -= 1
+			if len(team.waiting) > 0 && !team.closing {
+				next = team.waiting[0]
+				ordered_remove(&team.waiting, 0)
+				next.status = .Running
+				next.admitted = true
+				team.running += 1
+			}
 		}
 	}
-	sync.mutex_unlock(&team.mutex)
 	sync.atomic_store(&member.done, true)
 	owner_wake_signal()
 	return next
@@ -779,9 +752,7 @@ subagent_conclude :: proc(member: ^Subagent) -> (next: ^Subagent) {
 subagent_fail :: proc(member: ^Subagent, status: Subagent_Status, reason: string) {
 	member.status = status
 	delete(member.cause, member.allocator)
-	clone_error: mem.Allocator_Error
-	member.cause, clone_error = strings.clone(reason, member.allocator)
-	if clone_error != nil { member.cause = "" }
+	member.cause = strings.clone(reason, member.allocator) or_else ""
 }
 
 // subagent_keep_answer sets member.answer to the text of the last Assistant node the
@@ -985,7 +956,9 @@ subagent_run :: proc(member: ^Subagent) {
 			// Nothing was sent to continue it, so it ends once the summary is installed. A
 			// summary may take many minutes, so nothing but a stop ends the wait.
 			subagent_compact_wait(member, &chat, steer.connection)
-			if chat_session_cancelled(&chat) { subagent_fail(member, .Stopped, "the subagent was stopped before it finished") } else { member.status = .Completed }
+			if chat_session_cancelled(
+				&chat,
+			) { subagent_fail(member, .Stopped, "the subagent was stopped before it finished") } else { member.status = .Completed }
 			return
 		}
 	}
@@ -1206,15 +1179,18 @@ subagent_steer_install :: proc(state: ^Subagent_Steer) {
 		return
 	}
 	// The request in flight must not continue from a selection whose record did not land.
-	if record_error != nil { chat_session_record_failure(chat, "the selected model was installed but its session record could not be committed", record_error) }
-	sync.mutex_lock(&member.team.mutex)
-	member.retired.allocator = member.allocator
-	// A selection that cannot be listed is left unreleased rather than freed under a reader.
-	_, _ = append(&member.retired, member.selection)
-	member.selection = pending.selection
-	delete(member.effort, member.allocator)
-	member.effort = pending.effort
-	sync.mutex_unlock(&member.team.mutex)
+	if record_error !=
+	   nil { chat_session_record_failure(chat, "the selected model was installed but its session record could not be committed", record_error) }
+
+	{
+		sync.mutex_guard(&member.team.mutex)
+		member.retired.allocator = member.allocator
+		// A selection that cannot be listed is left unreleased rather than freed under a reader.
+		_, _ = append(&member.retired, member.selection)
+		member.selection = pending.selection
+		delete(member.effort, member.allocator)
+		member.effort = pending.effort
+	}
 	pending^ = {}
 	state.transition = {}
 	state.connection = member.selection.connection
@@ -1270,10 +1246,10 @@ subagent_outcome :: proc(completions: []journal.Record, start: journal.Record) -
 }
 
 Subagent_Child :: struct {
-	name: string,
-	program: string,
-	start: journal.Record,
-	outcome: journal.Tool_Outcome,
+	name:     string,
+	program:  string,
+	start:    journal.Record,
+	outcome:  journal.Tool_Outcome,
 	finished: bool,
 }
 
@@ -1358,7 +1334,11 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
 	}
 
-	latest, latest_found, latest_error := journal.read_latest(chat.store, {session = target.start.subagent, kinds = {.Turn_Started, .Selection_Applied}}, context.temp_allocator)
+	latest, latest_found, latest_error := journal.read_latest(
+		chat.store,
+		{session = target.start.subagent, kinds = {.Turn_Started, .Selection_Applied}},
+		context.temp_allocator,
+	)
 	if latest_error != nil { return {}, fmt.tprintf("the last selection of %s could not be read", name) }
 	continued := Subagent_Resume {
 		name        = name,
@@ -1377,7 +1357,14 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 		continued.provider_id, continued.model_id = latest.provider, latest.model
 	}
 	// The orchestrator is the only writer of team.parent, so reading it here needs no lock.
-	_, _, problem = subagent_select(send.provider, send.model, send.effort, subagent_defaults(&team.parent, continued), team.parent.catalog, context.temp_allocator)
+	_, _, problem = subagent_select(
+		send.provider,
+		send.model,
+		send.effort,
+		subagent_defaults(&team.parent, continued),
+		team.parent.catalog,
+		context.temp_allocator,
+	)
 	if problem != "" { return {}, problem }
 	send.resume = continued
 	return target.start.subagent, ""
@@ -1404,7 +1391,13 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 	child_session := target.start.subagent
 	block: strings.Builder
 	strings.builder_init(&block, context.temp_allocator)
-	fmt.sbprintf(&block, "agent: %s\nstatus: %s\nsession: %s\n", name, subagent_outcome_status(target.outcome, target.finished), journal.session_id_to_hex(child_session, hex[:]))
+	fmt.sbprintf(
+		&block,
+		"agent: %s\nstatus: %s\nsession: %s\n",
+		name,
+		subagent_outcome_status(target.outcome, target.finished),
+		journal.session_id_to_hex(child_session, hex[:]),
+	)
 	turn, has_turn, turn_error := journal.read_latest(store, {session = child_session, kinds = {.Turn_Started}}, context.temp_allocator)
 	if turn_error != nil { return "", "the child's last turn could not be read" }
 	if has_turn {
@@ -1427,12 +1420,24 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 		if outcome.detail != "" {
 			fmt.sbprintf(&block, "last failure: %s\n", outcome.detail)
 		} else if outcome.outcome == journal.TURN_OUTCOME_NAMES[.Failed] {
-			rejected, has_rejected, rejection_error := journal.read_latest(store, {session = child_session, turn = completed.turn, kinds = {.Response_Rejected}}, context.temp_allocator)
+			rejected, has_rejected, rejection_error := journal.read_latest(
+				store,
+				{session = child_session, turn = completed.turn, kinds = {.Response_Rejected}},
+				context.temp_allocator,
+			)
 			if rejection_error != nil { return "", "the child's last provider failure could not be read" }
 			if has_rejected {
 				failure: journal.Response_Rejected
-				if journal.payload_decode(rejected.data, &failure, context.temp_allocator) != nil { return "", "the child's last provider failure could not be decoded" }
-				fmt.sbprintf(&block, "last failure: %s, status %d, provider code %s: %s\n", failure.failure_class, failure.status, failure.provider_code, failure.detail)
+				if journal.payload_decode(rejected.data, &failure, context.temp_allocator) !=
+				   nil { return "", "the child's last provider failure could not be decoded" }
+				fmt.sbprintf(
+					&block,
+					"last failure: %s, status %d, provider code %s: %s\n",
+					failure.failure_class,
+					failure.status,
+					failure.provider_code,
+					failure.detail,
+				)
 			}
 		}
 	}
@@ -1459,25 +1464,17 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 @(require_results)
 subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 	defer owner_wake_signal()
-	sync.mutex_lock(&team.mutex)
-	member := subagent_find(team, name)
-	if member == nil {
-		problem = subagent_unknown(team, name)
-		sync.mutex_unlock(&team.mutex)
-		return problem
+	member: ^Subagent
+	queued: bool
+	{
+		sync.mutex_guard(&team.mutex)
+		member = subagent_find(team, name)
+		if member == nil { return subagent_unknown(team, name) }
+		if sync.atomic_load(&member.done) { return fmt.tprintf("%s has already finished", name) }
+		queued = member.status == .Queued
+		if queued { subagent_unqueue(team, member) } else { subagent_request_stop(member) }
 	}
-	if sync.atomic_load(&member.done) {
-		sync.mutex_unlock(&team.mutex)
-		return fmt.tprintf("%s has already finished", name)
-	}
-	if member.status == .Queued {
-		subagent_unqueue(team, member)
-		sync.mutex_unlock(&team.mutex)
-		subagent_end_unstarted(member)
-		return ""
-	}
-	subagent_request_stop(member)
-	sync.mutex_unlock(&team.mutex)
+	if queued { subagent_end_unstarted(member) }
 	return ""
 }
 
@@ -1507,14 +1504,13 @@ subagent_end_unstarted :: proc(member: ^Subagent) {
 @(private)
 subagent_stop_waiting :: proc(team: ^Agent_Team) {
 	for {
-		sync.mutex_lock(&team.mutex)
-		if len(team.waiting) == 0 {
-			sync.mutex_unlock(&team.mutex)
-			return
+		member: ^Subagent
+		{
+			sync.mutex_guard(&team.mutex)
+			if len(team.waiting) == 0 { return }
+			member = team.waiting[0]
+			subagent_unqueue(team, member)
 		}
-		member := team.waiting[0]
-		subagent_unqueue(team, member)
-		sync.mutex_unlock(&team.mutex)
 		subagent_end_unstarted(member)
 	}
 }

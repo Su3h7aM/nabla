@@ -24,14 +24,11 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 ## Simplifications
 
 - Process spawning is written three times: `mcp/stdio_process*`, `agent/tool_process*`, and `agent/subagent_acp_linux.odin`. A small `process` library package would remove about 350 lines. Needs a decision because it adds a package.
-- Clone-and-check ladders (`x, clone_error = strings.clone(...)`, then `if clone_error != nil`) remain in `agent/subagent.odin`. Return `mem.Allocator_Error` and use `or_return`; consider shared string storage only where it simplifies ownership and destruction.
-- `agent_team_make` unwinds two dynamic arrays that could grow lazily.
 
 ## Naming
 
 - Acronyms in type names: `Acp_Server`, `Mcp_Server`, `Mcp_Environment` beside `ACP_Agent_Config`, `MCP_Runtime`. Use the uppercase form, as `core:net` does with `TCP_Socket`.
 - `acp_serve.odin` and `acp_server.odin` differ by one letter; name them for their subjects.
-- Use `sync.mutex_guard` where a lock covers a scoped block in `subagent.odin`.
 
 ## Architecture document drift
 
