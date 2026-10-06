@@ -80,7 +80,7 @@ tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Pa
 	tool_fields_known(arguments, TOOL_PATCH_FIELDS, allocator = ctx.allocator) or_return
 	patch := tool_field_string(arguments, "patch", allocator = ctx.allocator) or_return
 	parsed, problem, allocation_error := patch_parse(patch, ctx.allocator)
-	if allocation_error != nil { return {}, tool_argument_error(.Too_Large, "patch", "a patch that fits in memory", ctx.allocator) }
+	if allocation_error != nil { return {}, tool_argument_error(.Out_Of_Memory) }
 	if problem != "" { return {}, tool_argument_error(.Invalid_Value, "patch", problem, ctx.allocator) }
 	return parsed, nil
 }

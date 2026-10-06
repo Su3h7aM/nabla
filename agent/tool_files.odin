@@ -175,7 +175,7 @@ tool_write_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	defer delete(path, ctx.allocator)
 
 	mode, mode_error := tool_write_mode(path)
-	if mode_error != .None {
+	if mode_error != .None && mode_error != .Missing {
 		return tool_result_failure(ctx, .Tool_Failed, tool_write_mode_text(args.path, mode_error), "not writable")
 	}
 	if tool_control_cancelled(ctx.control) {
@@ -190,26 +190,29 @@ tool_write_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 }
 
 // Tool_Path_Problem is the kind of reason a write tool refused a path before
-// touching it.
+// touching it. Missing is not a refusal for a tool that creates files.
 Tool_Path_Problem :: enum {
 	None,
 	Missing,
+	Unreadable,
 	Not_Regular,
 	Symlink,
 }
 
 // tool_write_mode returns the mode a replacement file should carry: the mode the
-// existing file has, or the default for a new one. A path that exists as
-// anything but a regular file, or that is a symbolic link, is refused rather than
-// replaced: renaming over a link would silently turn it into a regular file.
+// existing file has, or a zero mode with .Missing when nothing exists at path, so
+// the file gets the creation default. A path that exists as anything but a regular
+// file, or that is a symbolic link, is refused rather than replaced: renaming over
+// a link would silently turn it into a regular file. A path that cannot be
+// inspected is .Unreadable.
 @(require_results)
 tool_write_mode :: proc(path: string) -> (os.Permissions, Tool_Path_Problem) {
 	// The mode is the answer; the info the lstat filled in is scratch.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	info, info_error := os.lstat(path, context.temp_allocator)
 	if info_error != nil {
-		if info_error == os.General_Error.Not_Exist { return {}, .None }
-		return {}, .Missing
+		if info_error == os.General_Error.Not_Exist { return {}, .Missing }
+		return {}, .Unreadable
 	}
 	defer os.file_info_delete(info, context.temp_allocator)
 	if info.type == .Symlink { return {}, .Symlink }
@@ -224,6 +227,8 @@ tool_write_mode_text :: proc(path: string, problem: Tool_Path_Problem) -> string
 		return fmt.tprintf("%s is a symbolic link, so writing it would replace the link", path)
 	case .Not_Regular:
 		return fmt.tprintf("%s is not a regular file", path)
+	case .Unreadable:
+		return fmt.tprintf("%s could not be inspected", path)
 	case .Missing, .None:
 		return fmt.tprintf("%s cannot be written", path)
 	}

@@ -78,16 +78,18 @@ patch_prepare :: proc(
 			repaired_hunks += hunks_repaired
 			patch_append(&summary_buffer, "added ", file.path, "\n") or_return
 		case .Delete:
-			change.mode = patch_existing_mode(change.source, file.path, allocator) or_return
+			exists: bool
+			change.mode, exists = patch_existing_mode(change.source, file.path, allocator) or_return
+			if !exists { return nil, "", 0, patch_missing(file.path, allocator) }
 			patch_append(&summary_buffer, "deleted ", file.path, "\n") or_return
 		case .Update:
 			original := ""
-			source_exists, source_exists_error := patch_path_exists(change.source, file.path, allocator)
-			if source_exists_error != nil { return nil, "", 0, source_exists_error }
+			source_exists: bool
+			change.mode, source_exists = patch_existing_mode(change.source, file.path, allocator) or_return
 			if !source_exists && patch_only_adds(args.lines, hunks) && file.move_to == "" {
 				patch_append(&summary_buffer, "added ", file.path, "\n") or_return
 			} else {
-				change.mode = patch_existing_mode(change.source, file.path, allocator) or_return
+				if !source_exists { return nil, "", 0, patch_missing(file.path, allocator) }
 				if change.target != change.source {
 					target_exists, target_exists_error := patch_path_exists(change.target, file.move_to, allocator)
 					if target_exists_error != nil { return nil, "", 0, target_exists_error }
@@ -135,12 +137,26 @@ patch_resolve :: proc(workspace, path: string, allocator: mem.Allocator) -> (str
 	return resolved, nil
 }
 
+// patch_existing_mode reports whether path exists and, if so, the mode it has. A path that
+// exists but cannot be replaced is a failure.
 @(private = "file", require_results)
-patch_existing_mode :: proc(path, path_argument: string, allocator: mem.Allocator) -> (os.Permissions, Patch_Error) {
-	mode, problem := tool_write_mode(path)
-	if problem == .Missing { return {}, patch_failure(.File_Missing, allocator, "%s does not exist; use %s to create it", path_argument, PATCH_HEADERS[.Add]) }
-	if problem != .None { return {}, Patch_Failure{.Not_Writable, tool_write_mode_text(path_argument, problem)} }
-	return mode, nil
+patch_existing_mode :: proc(path, path_argument: string, allocator: mem.Allocator) -> (mode: os.Permissions, exists: bool, err: Patch_Error) {
+	problem: Tool_Path_Problem
+	mode, problem = tool_write_mode(path)
+	switch problem {
+	case .None:
+		return mode, true, nil
+	case .Missing:
+		return {}, false, nil
+	case .Unreadable, .Not_Regular, .Symlink:
+		return {}, false, patch_failure(.Not_Writable, allocator, "%s", tool_write_mode_text(path_argument, problem))
+	}
+	return
+}
+
+@(private = "file", require_results)
+patch_missing :: proc(path_argument: string, allocator: mem.Allocator) -> Patch_Failure {
+	return patch_failure(.File_Missing, allocator, "%s does not exist; use %s to create it", path_argument, PATCH_HEADERS[.Add])
 }
 
 @(private = "file", require_results)

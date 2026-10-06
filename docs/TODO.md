@@ -2,11 +2,6 @@
 
 Open work found in reviews. Each item names where the problem lives and the simplest fix known so far. Remove an item when its change lands; move a decision into `docs/ARCHITECTURE.md` once it is made.
 
-## Bugs
-
-- Patch can partly apply. `tool_write_mode` (`agent/tool_files.odin`) maps a missing path to `.None`, and `patch_existing_mode` (`agent/tool_patch_apply.odin`) only treats `.Missing` as missing. A `Delete File` of a missing path passes preparation and fails during the write phase, after earlier files were written. Report `file_missing` during preparation for Delete and Update.
-- Dropped allocation errors. `agent/tool_shell.odin` returns `strings.clone(...), nil`, discarding the allocator error. `agent/tool_patch.odin` reports an allocation failure as `.Too_Large`, blaming the model for a harness failure.
-
 ## Limits to verify or remove
 
 Each limit stays only if a protocol, API, provider, model, or the OS imposes it, and then its comment names the source.

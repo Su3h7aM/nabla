@@ -193,10 +193,12 @@ tool_resolve_path :: proc(workspace, path: string, field := "path", allocator :=
 	if strings.contains_rune(path, 0) {
 		return "", tool_argument_error(.Invalid_Value, field, "a path without a NUL byte", allocator)
 	}
-	if path != "" && path[0] == '/' { return strings.clone(path, allocator), nil }
-	joined, join_error := os.join_path([]string{workspace, path}, allocator)
-	if join_error != nil {
-		return "", tool_argument_error(.Invalid_Value, field, "a valid path", allocator)
+	if path != "" && path[0] == '/' {
+		absolute, clone_error := strings.clone(path, allocator)
+		if clone_error != nil { return "", tool_argument_error(.Out_Of_Memory) }
+		return absolute, nil
 	}
+	joined, join_error := os.join_path([]string{workspace, path}, allocator)
+	if join_error != nil { return "", tool_argument_error(.Out_Of_Memory) }
 	return joined, nil
 }

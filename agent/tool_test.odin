@@ -417,6 +417,31 @@ test_patch_applies_every_file_or_none :: proc(test: ^testing.T) {
 }
 
 @(test)
+test_patch_missing_file_writes_nothing :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	workspace := tool_test_workspace(&tool_test)
+	code := strings.concatenate({workspace, "/code.txt"}, context.temp_allocator)
+	later := strings.concatenate({workspace, "/later.txt"}, context.temp_allocator)
+	if !tool_write_file(test, code, "one\ntwo\n") { return }
+
+	// The missing file is the second section, so a write phase would already have changed code.txt.
+	patches := [?]string {
+		`{"patch":"*** Begin Patch\n*** Update File: code.txt\n-two\n+TWO\n*** Delete File: absent.txt\n*** Add File: later.txt\n+x\n*** End Patch"}`,
+		`{"patch":"*** Begin Patch\n*** Update File: code.txt\n-two\n+TWO\n*** Update File: absent.txt\n-x\n+y\n*** Add File: later.txt\n+x\n*** End Patch"}`,
+	}
+	for patch in patches {
+		result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+		testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
+		testing.expect(test, strings.contains(result.content, "absent.txt does not exist"), result.content)
+		tool_file_is(test, code, "one\ntwo\n")
+		testing.expect(test, !os.exists(later), "a failed patch adds no file")
+	}
+}
+
+@(test)
 test_patch_add_refuses_a_dangling_symlink :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
 	tool_test_begin(test, &tool_test)
