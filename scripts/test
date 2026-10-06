@@ -1,36 +1,41 @@
 #!/usr/bin/env bash
-#MISE description="Run every test: in-package suites, then the external harnesses"
+#MISE description="Run every test suite"
 #MISE alias="t"
-#USAGE arg "[target]" help="Package or harness to test; omit for all"
+#USAGE arg "[target]" help="Package to test; omit for all"
 #USAGE flag "--debug-only" help="Only run the -debug configuration"
 #USAGE flag "--release-only" help="Only run the release configuration"
 #USAGE flag "--sanitize <kind>" help="Odin sanitizer for odin test" {
 #USAGE   choices "address" "memory" "thread"
 #USAGE }
-#USAGE complete "target" run="bash -c 'source scripts/_lib.sh 2>/dev/null || source $(git rev-parse --show-toplevel 2>/dev/null)/scripts/_lib.sh 2>/dev/null && { nabla_test_packages; for h in $(nabla_harnesses); do echo ${h##*/}; done; } 2>/dev/null'"
+#USAGE flag "--test <names>" help="Comma-separated test names (name or package.name) to run"
+#USAGE flag "--log-state" help="Log each test state change, to find a stalled test"
+#USAGE complete "target" run="bash -c 'source scripts/_lib.sh 2>/dev/null || source $(git rev-parse --show-toplevel 2>/dev/null)/scripts/_lib.sh 2>/dev/null && nabla_test_packages 2>/dev/null'"
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 cd "$NABLA_ROOT"
 
-target="${usage_target:-}"
-debug_only="${usage_debug_only:-false}"
-release_only="${usage_release_only:-false}"
-sanitize="${usage_sanitize:-}"
-skip_next=false
-for arg in "$@"; do
-	if "$skip_next"; then
-		sanitize="$arg"
-		skip_next=false
-		continue
-	fi
-	case "$arg" in
+# A direct run leaves the usage_* variables unset, so one loop parses the
+# arguments for both mise and direct runs; the #USAGE lines only feed mise
+# help and completion.
+target=""
+debug_only=false
+release_only=false
+sanitize=""
+test_names=""
+log_state=false
+while (($#)); do
+	case "$1" in
 		--debug-only)   debug_only=true ;;
 		--release-only) release_only=true ;;
-		--sanitize)     skip_next=true ;;
-		--sanitize=*)   sanitize="${arg#--sanitize=}" ;;
-		-*)             nabla_die "unknown flag: $arg" ;;
-		*)              target="$arg" ;;
+		--log-state)    log_state=true ;;
+		--sanitize)     (($# >= 2)) || nabla_die "--sanitize needs a value"; sanitize="$2"; shift ;;
+		--sanitize=*)   sanitize="${1#--sanitize=}" ;;
+		--test)         (($# >= 2)) || nabla_die "--test needs a value"; test_names="$2"; shift ;;
+		--test=*)       test_names="${1#--test=}" ;;
+		-*)             nabla_die "unknown flag: $1" ;;
+		*)              target="$1" ;;
 	esac
+	shift
 done
 
 timeout_secs=300
@@ -44,7 +49,6 @@ configs=()
 "$release_only" || configs+=(debug)
 
 mapfile -t packages < <(nabla_test_packages)
-mapfile -t harnesses < <(nabla_harnesses)
 
 failed=()
 for config in "${configs[@]}"; do
@@ -56,18 +60,19 @@ for config in "${configs[@]}"; do
 		)
 		[[ $config == debug ]] && extra+=(-debug)
 		[[ -n $sanitize ]] && extra+=("-sanitize:$sanitize")
+		[[ -n $test_names ]] && extra+=("-define:ODIN_TEST_NAMES=$test_names")
+		"$log_state" && extra+=(-define:ODIN_TEST_LOG_STATE_CHANGES=true)
 		# The PTY lifecycle test needs the term fault-injection hooks; without
 		# the define its file contributes no tests.
 		[[ "$pkg" == term ]] && extra+=(-define:NABLA_TERM_TEST_HOOKS=true)
 		nabla_step "test $pkg ($config)"
-		nabla_contained timeout "$timeout_secs" odin test "$pkg" "$collection" "${extra[@]}" || failed+=("$pkg ($config)")
+		status=0
+		nabla_contained timeout "$timeout_secs" odin test "$pkg" "$collection" "${extra[@]}" || status=$?
+		if ((status)); then
+			failed+=("$pkg ($config)")
+			((status != 124)) || printf 'hint: %s timed out after %ss; rerun with --log-state and --test <names> to find the stalled test\n' "$pkg" "$timeout_secs" >&2
+		fi
 	done
-done
-
-for h in "${harnesses[@]}"; do
-	[[ -n "$target" && "$target" != "$h" && "$target" != "$(basename "$h")" ]] && continue
-	nabla_step "harness $h"
-	nabla_contained timeout "$timeout_secs" odin run "$h" "$collection" "${NABLA_DEFINES[@]}" || failed+=("$h")
 done
 
 if ((${#failed[@]})); then

@@ -1,12 +1,5 @@
 # Harness feedback
 
-## 2026-10-06 Diagnosing a stalled test suite
-
-- Goal: identify the tests still running when the progress bar stopped at 298 of 300.
-- Attempt: the normal test task displayed only the last completed test. Exporting a Bash compiler function to add test-state logging did not work because the task launches the compiler through an external timeout. Attaching a debugger was denied by the operating system's ptrace restriction.
-- Gap: the test task accepts neither test-name filters nor compiler logging defines, so the progress line cannot identify an outstanding test.
-- Workaround: create a temporary compiler launcher under `/tmp` that forwards to `$ODIN_ROOT/odin` with `ODIN_TEST_LOG_STATE_CHANGES=true` and debug logging, put it first on PATH for one normal `mise run test agent --debug-only`, then compare Running and Successful records in Code Mode. Repository scripts and toolchain configuration were unchanged. The outstanding tests exposed a reversed deadline comparison, which was corrected before validation continued.
-
 ## 2026-10-06 Provider spelling when starting a subagent
 
 - Goal: delegate a bounded investigation to the requested model.

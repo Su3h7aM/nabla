@@ -21,10 +21,6 @@ NABLA_DEFINES=(-define:DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE=65536)
 # cancel token, signal dispositions, environment variables) isolate themselves
 # by re-running in a child of the test binary; see agent/isolate_test.odin.
 # No package is pinned to one thread.
-# Packages whose core:testing suites must not be discovered by `odin test`
-# because an external harness runs them instead. Empty once every suite is on
-# core:testing.
-NABLA_HARNESS_TEST_PACKAGES=""
 
 nabla_packages() {
 	local d sub base
@@ -45,9 +41,6 @@ nabla_test_packages() {
 	local pkg
 	while IFS= read -r pkg; do
 		[[ -n "$(compgen -G "$NABLA_ROOT/$pkg/*_test*.odin")" ]] || continue
-		case " $NABLA_HARNESS_TEST_PACKAGES " in
-			*" $pkg "*) continue ;;
-		esac
 		printf '%s\n' "$pkg"
 	done < <(nabla_check_packages)
 }
@@ -55,17 +48,6 @@ nabla_test_packages() {
 nabla_check_packages() {
 	nabla_packages
 	nabla_executables
-}
-
-nabla_harnesses() {
-	local d
-	# In-package executable harnesses that cannot run under `odin test`.
-	# Empty: every suite currently runs through the native test interface.
-	for d in "$NABLA_ROOT"/*/test/*/; do
-		d="${d%/}"
-		[[ -f "$d/main.odin" ]] || continue
-		printf '%s\n' "${d#"$NABLA_ROOT"/}"
-	done
 }
 
 nabla_executables() {

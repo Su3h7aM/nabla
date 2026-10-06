@@ -37,11 +37,6 @@ Each description states what the tool does, why it exists, and how to use it, pr
 - Read: when a result is cut to the preview, the notice gives the shown line count and the next `offset`. The 2000-line default can exceed the preview size.
 - `agent_spawn`: "provider not found" lists the configured providers, and the schema says which model id form is expected.
 
-## Tests
-
-- `scripts/test` has no test-name filter and no state logging. Add `--test <names>` (`ODIN_TEST_NAMES`) and `--log-state` (`ODIN_TEST_LOG_STATE_CHANGES`), and print a hint on timeout.
-- Remove the duplicate flag parsing in `scripts/test` and the empty harness-package code in `scripts/_lib.sh`.
-
 ## Simplifications
 
 - Process spawning is written three times: `mcp/stdio_process*`, `agent/tool_process*`, and `agent/subagent_acp_linux.odin`. A small `process` library package would remove about 350 lines. Needs a decision because it adds a package.
