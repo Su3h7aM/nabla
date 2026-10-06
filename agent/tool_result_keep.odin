@@ -70,13 +70,7 @@ tool_result_keep :: proc(result: ^Tool_Result, budget: ^Tool_Budget, path: strin
 	// The content stays whole in the result, so the model still sees all of it.
 	if tool_output_write(path, result.content) != nil { return }
 	preview := tool_preview_cut(result.content, shown)
-	notice := fmt.tprintf(
-		"\n[output truncated: showing the first %d of %d bytes. The complete output is in %s; read the rest with %s.]\n",
-		len(preview),
-		len(result.content),
-		path,
-		TOOL_READ_NAME,
-	)
+	notice := tool_result_notice(result^, preview, path)
 	shortened, join_error := strings.concatenate({preview, notice}, result.allocator)
 	if join_error != nil { return }
 	delete(result.content, result.allocator)
@@ -92,6 +86,36 @@ tool_preview_cut :: proc(text: string, limit: int) -> string {
 	for end > 0 && !utf8.rune_start(text[end]) { end -= 1 }
 	if newline := strings.last_index_byte(text[:end], '\n'); newline >= end / 2 { end = newline + 1 }
 	return text[:end]
+}
+
+// tool_result_notice words what replaces the rest of result after it was cut to preview,
+// temp-allocated. It names the file that keeps the whole result. For a read it also gives
+// the complete lines shown and the offset that continues the file: the cut may fall inside
+// a line, which the next read starts again.
+@(private)
+tool_result_notice :: proc(result: Tool_Result, preview, path: string) -> string {
+	if read, is_read := result.output.(Read_Output); is_read && strings.has_suffix(result.content, read.content) {
+		// The rendering ends with the file text, so what precedes it is the header.
+		text_start := min(len(result.content) - len(read.content), len(preview))
+		lines := strings.count(preview[text_start:], "\n")
+		return fmt.tprintf(
+			"\n[output truncated: showing the first %d of %d bytes, which hold %d complete lines of this read. " +
+			"The complete output is in %s; to continue the file, call %s again with offset %d and a smaller limit.]\n",
+			len(preview),
+			len(result.content),
+			lines,
+			path,
+			TOOL_READ_NAME,
+			read.first_line + lines,
+		)
+	}
+	return fmt.tprintf(
+		"\n[output truncated: showing the first %d of %d bytes. The complete output is in %s; read the rest with %s.]\n",
+		len(preview),
+		len(result.content),
+		path,
+		TOOL_READ_NAME,
+	)
 }
 
 // tool_output_write writes one kept output, creating its directory, readable by its owner only.

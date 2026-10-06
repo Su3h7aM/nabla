@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
@@ -79,6 +80,28 @@ test_a_large_result_is_previewed_and_kept_whole :: proc(test: ^testing.T) {
 	testing.expect(test, len(result.content) <= TOOL_RESULT_PREVIEW_BYTES + 1024, "the model is shown a preview")
 	testing.expect(test, strings.contains(result.content, TOOL_READ_NAME), "the notice names the tool that reads the rest")
 	testing.expect(test, strings.contains(budget_test_kept_file(test, result.content), content), "the file keeps the complete output")
+}
+
+@(test)
+test_a_cut_read_gives_the_offset_that_continues_the_file :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	workspace: string
+	chat, content := budget_test_fixture(test, &fixture, &workspace, 2_000, 41)
+	defer {
+		chat_test_end(test, &fixture)
+		os.remove_all(workspace)
+		delete(workspace, context.allocator)
+		delete(content)
+	}
+	chat_test_capacity(chat, 1_000_000, 4_096)
+
+	result := budget_test_result(test, chat)
+	notice_start := strings.index(result.content, "\n[output truncated")
+	body_start := strings.index(result.content, "\n\n")
+	if !testing.expect(test, notice_start > body_start && body_start >= 0, "the preview holds the header, the text, and the notice") { return }
+	shown_lines := strings.count(result.content[body_start + 2:notice_start], "\n")
+	next := fmt.tprintf("with offset %d ", 1 + shown_lines)
+	testing.expect(test, strings.contains(result.content[notice_start:], next), "the notice gives the line that continues the file")
 }
 
 @(test)
