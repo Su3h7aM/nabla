@@ -31,7 +31,9 @@ test_agent_status_reads_running_and_finished_children :: proc(test: ^testing.T) 
 	catalog: Subagent_Test_Catalog
 	defer subagent_test_catalog_destroy(&catalog)
 	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, nil)
-	chat.catalog = {catalog = &catalog.catalog}
+	chat.catalog = {
+		catalog = &catalog.catalog,
+	}
 	delete(chat.provider_id, chat.allocator)
 	chat.provider_id = strings.clone("test-provider", chat.allocator)
 	delete(chat.model_id, chat.allocator)
@@ -39,27 +41,57 @@ test_agent_status_reads_running_and_finished_children :: proc(test: ^testing.T) 
 	agent_team_note_parent(chat)
 	_test_accept(test, chat, "start one")
 	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"answer"}`), journal.TOOL_OUTCOME_NAMES[.Success])
+	subagent_test_wait_request(test, chat)
+	ctx := Tool_Context {
+		allocator      = context.allocator,
+		agents         = chat.team,
+		status_store   = chat.store,
+		status_session = chat.session,
+	}
+	running := tool_agent_status_execute(&ctx, Agent_Status_Args{agent = "agent-1"})
+	defer tool_result_destroy(&running)
+	testing.expect_value(test, running.outcome, journal.Tool_Outcome.Success)
+	testing.expect(
+		test,
+		strings.contains(running.content, "status: running") &&
+		strings.contains(running.content, "last record: request.sent") &&
+		strings.contains(running.content, "age:"),
+		running.content,
+	)
+	sync.sema_post(&provider.release)
+	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	finished := tool_agent_status_execute(&ctx, Agent_Status_Args{agent = "agent-1"})
+	defer tool_result_destroy(&finished)
+	testing.expect_value(test, finished.outcome, journal.Tool_Outcome.Success)
+	testing.expect(
+		test,
+		strings.contains(finished.content, "status: completed") &&
+		strings.contains(finished.content, `resume: agent_send({"agent":"agent-1","message":"Continue your task."})`),
+		finished.content,
+	)
+}
+
+// subagent_test_wait_request waits until the only child's newest journal record is a request
+// sent, which is a child held mid-request by the fixture, and returns its session.
+subagent_test_wait_request :: proc(test: ^testing.T, chat: ^Chat_Session) -> journal.Session_Id {
 	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)
 	for {
 		starts := _test_records(test, chat, {.Subagent_Started})
 		if len(starts) != 1 { testing.fail_now(test, "the child start was not recorded") }
 		latest, found, read_error := journal.read_latest(chat.store, {session = starts[0].subagent}, context.temp_allocator)
 		if read_error != nil { testing.fail_now(test, "the child journal could not be read") }
-		if found && latest.kind == .Request_Sent { break }
+		if found && latest.kind == .Request_Sent { return starts[0].subagent }
 		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(test, "the child did not send its request") }
 		time.sleep(time.Millisecond)
 	}
-	ctx := Tool_Context{allocator = context.allocator, agents = chat.team, status_store = chat.store, status_session = chat.session}
-	running := tool_agent_status_execute(&ctx, Agent_Status_Args{agent = "agent-1"})
-	defer tool_result_destroy(&running)
-	testing.expect_value(test, running.outcome, journal.Tool_Outcome.Success)
-	testing.expect(test, strings.contains(running.content, "status: running") && strings.contains(running.content, "last record: request.sent") && strings.contains(running.content, "age:"), running.content)
-	sync.sema_post(&provider.release)
-	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
-	finished := tool_agent_status_execute(&ctx, Agent_Status_Args{agent = "agent-1"})
-	defer tool_result_destroy(&finished)
-	testing.expect_value(test, finished.outcome, journal.Tool_Outcome.Success)
-	testing.expect(test, strings.contains(finished.content, "status: completed") && strings.contains(finished.content, `resume: agent_send({"agent":"agent-1","message":"Continue your task."})`), finished.content)
+}
+
+// subagent_test_hold starts a provider that holds its first response until the test releases it.
+subagent_test_hold :: proc(test: ^testing.T, provider: ^Agent_Provider, responses: []string, hold: int) -> bool {
+	if !agent_provider_start(test, provider, responses, deferred = true) { return false }
+	provider.hold = hold
+	agent_provider_serve_now(provider)
+	return true
 }
 
 // subagent_test_call runs one call of the orchestrator through the job table, as a model's
@@ -1065,4 +1097,139 @@ test_agent_send_compacts_a_finished_subagent_and_continues_with_an_effort :: pro
 
 	// Neither a message nor compact is not a call.
 	testing.expect(test, subagent_test_call(test, chat, "send_3", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1"}`) != success)
+}
+
+// While a child's first request is held, agent_send with a model on another provider switches
+// the child: the request that follows the held one reaches the second provider, carrying the
+// message, and the child's journal records the selection.
+@(test)
+test_agent_send_switches_a_running_subagent_to_another_provider :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	first, second: Agent_Provider
+	if !subagent_test_hold(test, &first, {agent_provider_reply("first")}, 1) { return }
+	defer agent_provider_stop(&first)
+	if !agent_provider_start(test, &second, {agent_provider_reply("second")}) { return }
+	defer agent_provider_stop(&second)
+	first_endpoint := agent_provider_endpoint(&first)
+	defer delete(first_endpoint)
+	second_endpoint := agent_provider_endpoint(&second)
+	defer delete(second_endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", first_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "other-provider", "other-model", second_endpoint, nil)
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"first task"}`), success)
+	child := subagent_test_wait_request(test, chat)
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Switch now.","model":"other-model"}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_result(test, chat), "a switch to other-provider/other-model"), subagent_test_result(test, chat))
+	testing.expect(test, subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Typo.","model":"nowhere"}`) != success)
+	sync.sema_post(&first.release)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "second"), "the child answered from the second provider")
+
+	testing.expect_value(test, agent_provider_request_count(&first), 1)
+	if !testing.expect_value(test, agent_provider_request_count(&second), 1) { return }
+	for expected in ([]string{"first task", "Switch now."}) {
+		testing.expect(test, strings.contains(agent_provider_request(&second, 0), expected), expected)
+	}
+	applied, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Selection_Applied}}, context.temp_allocator)
+	testing.expect(test, read_error == nil && found)
+	testing.expect_value(test, applied.provider, "other-provider")
+	testing.expect_value(test, applied.model, "other-model")
+	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 1)
+}
+
+// While a child's request is held, agent_send with a message delivers it into the running
+// turn: the child's next request carries it and no second turn starts.
+@(test)
+test_agent_send_delivers_a_message_into_a_running_subagent_turn :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	if !subagent_test_hold(test, &provider, {agent_provider_reply("first"), agent_provider_reply("second")}, 1) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, nil)
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, `{"prompt":"first task"}`), success)
+	child := subagent_test_wait_request(test, chat)
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Also check the tests."}`),
+		success,
+	)
+	sync.sema_post(&provider.release)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "second"), "the child answered the message")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	testing.expect(test, strings.contains(agent_provider_request(&provider, 1), "Also check the tests."), "the second request carries the message")
+	turns, _, turns_error := journal.read_records(chat.store, {session = child, kinds = {.Turn_Started}}, 0, 0, context.temp_allocator)
+	testing.expect(test, turns_error == nil && len(turns) == 1, "the message continued the running turn")
+}
+
+// While a child's request is held, agent_send with compact starts the child's compaction, and
+// the summary installs at a later request boundary of the same run: the child does not stop.
+@(test)
+test_agent_send_compacts_a_running_subagent_without_stopping_it :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	provider: Agent_Provider
+	tool := agent_provider_call("builtin_codemode", `{"code":"return 1"}`)
+	// The oldest messages are longer than the summary, so there is something to summarize.
+	bulk, _ := strings.repeat("forty-two ", 1000, context.temp_allocator)
+	// The first turn is six calls and an answer, so the child holds more than a summary
+	// keeps verbatim. The turn that follows is held at its first request, and the summary
+	// request is the next connection the fixture accepts.
+	responses := make([dynamic]string, context.temp_allocator)
+	for _ in 0 ..< 6 { append(&responses, tool) }
+	append(&responses, agent_provider_reply("done"), tool, agent_provider_reply(COMPACT_TEST_SUMMARY), tool, tool, agent_provider_reply("finished"))
+	if !subagent_test_hold(test, &provider, responses[:], 8) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	catalog: Subagent_Test_Catalog
+	defer subagent_test_catalog_destroy(&catalog)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, nil)
+	subagent_test_parent(chat, &catalog)
+	_test_accept(test, chat, "start one")
+
+	success := journal.TOOL_OUTCOME_NAMES[.Success]
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_SPAWN_NAME, strings.concatenate({`{"prompt":"`, bulk, `"}`}, context.temp_allocator)), success)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "done"), "the first turn ended")
+	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","message":"Once more."}`), success)
+	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)
+	for agent_provider_request_count(&provider) < 8 {
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(test, "the child did not send its held request") }
+		time.sleep(time.Millisecond)
+	}
+	testing.expect_value(test, subagent_test_call(test, chat, "send_2", TOOL_AGENT_SEND_NAME, `{"agent":"agent-1","compact":true}`), success)
+	testing.expect(test, strings.contains(subagent_test_result(test, chat), "a compaction"), subagent_test_result(test, chat))
+	sync.sema_post(&provider.release)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "finished"), "the child finished its turn")
+
+	children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	if !testing.expect(test, children_error == nil && len(children) == 1) { return }
+	for kind in ([]journal.Record_Kind{.Compaction_Completed, .Checkpoint_Installed}) {
+		records, _, read_error := journal.read_records(chat.store, {session = children[0].id, kinds = {kind}}, 0, 0, context.temp_allocator)
+		testing.expect(test, read_error == nil && len(records) == 1, "the child's journal holds the compaction")
+	}
 }

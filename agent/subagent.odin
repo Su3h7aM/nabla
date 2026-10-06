@@ -64,6 +64,12 @@ Subagent :: struct {
 	compact:                      bool, // a resumed child compacts its context first; with no prompt it ends once the summary is installed
 	team:                         ^Agent_Team, // the orchestrator's, which outlives every member
 	allocator:                    mem.Allocator,
+	// control is what the orchestrator asked of the running child since the child last looked,
+	// guarded by team.mutex; selection and effort are also written under it when the child
+	// installs a switch. retired holds the selections a switch replaced, which a request or a
+	// summary in flight may still read, until the member is destroyed.
+	control:                      Subagent_Control,
+	retired:                      [dynamic]Model_Selection,
 	admitted:                     bool, // holds one of team.running's slots; guarded by team.mutex
 	abandoned:                    bool,
 	// stop ends the subagent's work. It chains to the call that waits for it, or to the
@@ -79,6 +85,26 @@ Subagent :: struct {
 	cause:                        string, // why the subagent did not complete; "" once it completed
 	answer:                       string, // the text of its last committed answer, partial when it failed or was stopped mid-answer
 	done:                         bool, // atomic; set last
+}
+
+// Subagent_Control is the newest thing the orchestrator asked of a running child: a switch of
+// provider, model, and effort, already resolved so a name that does not exist was refused at
+// dispatch, and a compaction. Its selection and effort are owned by allocator.
+Subagent_Control :: struct {
+	selection: Model_Selection,
+	effort:    string,
+	switching: bool,
+	compact:   bool,
+	allocator: mem.Allocator,
+}
+
+// subagent_control_destroy releases the switch a control holds, if any.
+subagent_control_destroy :: proc(control: ^Subagent_Control) {
+	if control.switching {
+		model_selection_destroy(&control.selection, control.allocator)
+		delete(control.effort, control.allocator)
+	}
+	control^ = {}
 }
 
 // Agent_Team is an orchestrator's subagents. It is heap-allocated apart from its session,
@@ -109,6 +135,7 @@ Agent_Parent :: struct {
 	effort_levels:                []string,
 	disable_project_instructions: bool,
 	subagents_max_running:        int, // zero means SUBAGENTS_MAX_RUNNING
+	compact_on_switch:            bool,
 	tools:                        Tool_Registry,
 	catalog:                      Catalog_Ref,
 	acp_agents:                   []ACP_Agent_Config, // borrowed from the loaded config
@@ -203,6 +230,7 @@ agent_parent_copy :: proc(chat: ^Chat_Session, allocator: mem.Allocator, out: ^A
 	if chat.store != nil { out.run = chat.store.run }
 	out.disable_project_instructions = chat.disable_project_instructions
 	out.subagents_max_running = chat.subagents_max_running
+	out.compact_on_switch = chat.compact_on_switch
 	out.catalog = chat.catalog
 	out.acp_agents = chat.acp_agents
 	failed = false
@@ -418,6 +446,9 @@ subagent_destroy :: proc(member: ^Subagent) {
 	delete(member.instruction, allocator)
 	delete(member.prompt, allocator)
 	model_selection_destroy(&member.selection, allocator)
+	subagent_control_destroy(&member.control)
+	for &retired in member.retired { model_selection_destroy(&retired, allocator) }
+	delete(member.retired)
 	subagent_program_destroy(&member.program, allocator)
 	tool_wake_close(&member.wake)
 	delete(member.effort, allocator)
@@ -819,12 +850,12 @@ subagent_session_open :: proc(member: ^Subagent, store: ^journal.Journal) -> (br
 // subagent_compact_wait services the child's compaction as an idle session does, until no
 // summary is running, waiting or recorded, or the child is stopped.
 @(private)
-subagent_compact_wait :: proc(member: ^Subagent, chat: ^Chat_Session) {
+subagent_compact_wait :: proc(member: ^Subagent, chat: ^Chat_Session, connection: ai.Provider_Connection) {
 	for {
 		seen := owner_wake_seen()
 		chat_session_observe_stop(chat)
 		if chat_session_cancelled(chat) { return }
-		_ = chat_compact_idle_service(chat, {}, member.selection.connection)
+		_ = chat_compact_idle_service(chat, {}, connection)
 		if chat.compact.state == .Idle { return }
 		owner_wake_wait(seen, chat_compact_deadline(chat))
 	}
@@ -898,6 +929,12 @@ subagent_run :: proc(member: ^Subagent) {
 		subagent_fail(member, .Failed, "the subagent's model could not be held")
 		return
 	}
+	steer := Subagent_Steer {
+		member     = member,
+		chat       = &chat,
+		connection = member.selection.connection,
+	}
+	defer subagent_control_destroy(&steer.pending)
 
 	// The task is the first message, so what the orchestrator sent while this subagent
 	// waited for a slot is delivered after it, at the first settled point. A continued
@@ -912,18 +949,24 @@ subagent_run :: proc(member: ^Subagent) {
 		if member.prompt == "" {
 			// Nothing was sent to continue it, so it ends once the summary is installed. A
 			// summary may take many minutes, so nothing but a stop ends the wait.
-			subagent_compact_wait(member, &chat)
+			subagent_compact_wait(member, &chat, steer.connection)
 			if chat_session_cancelled(&chat) { subagent_fail(member, .Stopped, "the subagent was stopped before it finished") } else { member.status = .Completed }
 			return
 		}
 	}
 	for {
+		subagent_steer_service(&steer)
 		accepted := chat_session_accept_message(&chat, text, origin, {}, inbox_first)
 		if accepted != .Accepted {
 			subagent_fail(member, .Failed, chat.last_error if chat.last_error != "" else "the task could not be recorded")
 			return
 		}
-		if !chat_turn_drive(&chat, member.selection.connection, chat_retry_policy_default(), {}, nil, nil) {
+		turn_steer := Steer_Context {
+			observe    = subagent_steer_observe,
+			apply      = subagent_steer_apply,
+			apply_data = &steer,
+		}
+		if !chat_turn_drive(&chat, steer.connection, chat_retry_policy_default(), {}, &turn_steer, nil) {
 			if chat.terminal_status == .Cancelled {
 				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
 			} else {
@@ -954,19 +997,224 @@ subagent_find :: proc(team: ^Agent_Team, name: string) -> ^Subagent {
 	return nil
 }
 
-// SUBAGENT_RUNNING_REFUSAL is what a call that would change a running child's model, provider,
-// or effort is told. There is no path that switches a request already in flight.
-SUBAGENT_RUNNING_REFUSAL :: "running: agent_stop it first"
-
-// subagent_live returns the session of the member of team named name. A member stays in the
-// team until the orchestrator reaps it, so a child that has just finished is still found here
-// and its message waits in its inbox for the reap to read.
+// subagent_control_plan finds the running member named by send.agent and, when the call also
+// asks for a switch or a compaction, resolves what it asks while the message is still
+// unrecorded: the switch is resolved against the control the member has not yet taken, else its
+// selection, into send.control, so a name that does not exist is refused here and records
+// nothing. live is false when no member has that name. problem, temp-allocated, says why the
+// request cannot be queued. Owner only.
 @(private, require_results)
-subagent_live :: proc(team: ^Agent_Team, name: string) -> (session: journal.Session_Id, found: bool) {
-	sync.mutex_guard(&team.mutex)
-	member := subagent_find(team, name)
-	if member == nil { return {}, false }
-	return member.session, true
+subagent_control_plan :: proc(team: ^Agent_Team, send: ^Agent_Send_Args) -> (session: journal.Session_Id, live: bool, problem: string) {
+	switching := send.model != "" || send.provider != "" || send.effort != ""
+	defaults: Subagent_Defaults
+	allocator: mem.Allocator
+	catalog: Catalog_Ref
+	{
+		sync.mutex_guard(&team.mutex)
+		member := subagent_find(team, send.agent)
+		if member == nil { return {}, false, "" }
+		session, live = member.session, true
+		if !switching && !send.compact { return }
+		if member.program.name != "" {
+			if send.compact { return session, true, "ACP agents manage their own context" }
+			return session, true, fmt.tprintf("%s is an ACP agent and chooses its own model", send.agent)
+		}
+		current, effort := &member.selection, member.effort
+		if member.control.switching { current, effort = &member.control.selection, member.control.effort }
+		defaults = {
+			provider_id = fmt.tprintf("%s", current.provider_id),
+			model_id    = fmt.tprintf("%s", current.model_id),
+			effort      = fmt.tprintf("%s", effort),
+		}
+		allocator, catalog = member.allocator, team.parent.catalog
+	}
+	send.control.compact = send.compact
+	if !switching { return }
+	selection: Model_Selection
+	effort: string
+	selection, effort, problem = subagent_select(send.provider, send.model, send.effort, defaults, catalog, allocator)
+	if problem != "" { return }
+	kept, clone_error := strings.clone(effort, allocator)
+	if clone_error != nil {
+		model_selection_destroy(&selection, allocator)
+		return session, true, "the switch could not be held"
+	}
+	send.control = {
+		selection = selection,
+		effort    = kept,
+		switching = true,
+		compact   = send.compact,
+		allocator = allocator,
+	}
+	return
+}
+
+// subagent_control_apply gives the running member named name what subagent_control_plan
+// resolved, replacing a switch it has not yet taken and adding to a compaction it has not yet
+// started, and wakes it. It takes over control's switch; a member that is gone releases it.
+// Owner only, after the message is committed.
+@(private)
+subagent_control_apply :: proc(team: ^Agent_Team, name: string, control: ^Subagent_Control) {
+	if !control.switching && !control.compact { return }
+	{
+		sync.mutex_guard(&team.mutex)
+		member := subagent_find(team, name)
+		if member == nil {
+			subagent_control_destroy(control)
+			return
+		}
+		if control.switching {
+			compact := member.control.compact
+			subagent_control_destroy(&member.control)
+			member.control = control^
+			member.control.compact ||= compact
+		} else {
+			member.control.compact = true
+		}
+		control^ = {}
+	}
+	owner_wake_signal()
+}
+
+// Subagent_Steer is the request-boundary state of one running child, owned by its thread:
+// the connection its next request uses, and the switch it is fitting, if any. It is the
+// apply_data of the child's Steer_Context.
+Subagent_Steer :: struct {
+	member:     ^Subagent,
+	chat:       ^Chat_Session,
+	connection: ai.Provider_Connection, // borrowed from member.selection or a selection it retired
+	pending:    Subagent_Control, // the switch being fitted; its compact is never set
+	transition: Selection_Transition,
+}
+
+// subagent_steer_take moves what the orchestrator asked since the child last looked out of the
+// member, under the team lock: a switch replaces the one being fitted, and compact says a
+// compaction was asked for. Nothing is done under the lock.
+@(private)
+subagent_steer_take :: proc(state: ^Subagent_Steer) -> (compact: bool) {
+	taken: Subagent_Control
+	{
+		sync.mutex_guard(&state.member.team.mutex)
+		taken = state.member.control
+		state.member.control = {}
+	}
+	if taken.switching {
+		subagent_control_destroy(&state.pending)
+		state.pending = taken
+		state.pending.compact = false
+		state.transition = {}
+	}
+	return taken.compact
+}
+
+// subagent_steer_observe is the child's collection step: a compaction the orchestrator asked
+// for becomes the same intent the user's /compact makes in the main session.
+@(private)
+subagent_steer_observe :: proc(steer: ^Steer_Context, observer: Chat_Observer) {
+	state := cast(^Subagent_Steer)steer.apply_data
+	if subagent_steer_take(state) { _ = chat_compact_request(state.chat, .User_Command) }
+}
+
+// subagent_steer_apply is the child's request-boundary hook: it advances the switch the
+// orchestrator asked for and returns the connection the next request is built for.
+@(private)
+subagent_steer_apply :: proc(steer: ^Steer_Context) -> ai.Provider_Connection {
+	state := cast(^Subagent_Steer)steer.apply_data
+	subagent_steer_service(state)
+	return state.connection
+}
+
+// subagent_steer_service takes what the orchestrator asked and advances the switch through the
+// session's fit check as the main session does: a target that fits is installed, one that does
+// not waits for the compaction the check requests and is checked again after it installs, and
+// one the check refuses is reported to the orchestrator. It runs at each request boundary and
+// before the child accepts its next message.
+@(private)
+subagent_steer_service :: proc(state: ^Subagent_Steer) {
+	if subagent_steer_take(state) { _ = chat_compact_request(state.chat, .User_Command) }
+	if !state.pending.switching { return }
+	chat := state.chat
+	status, problem, check_error := chat_selection_check(chat, state.pending.selection, &state.transition, chat.compact_on_switch, state.connection)
+	if check_error != nil {
+		chat.storage_failed = true
+		subagent_steer_refuse(state, fmt.tprintf("the model switch could not be recorded: %s", journal.error_text(check_error, context.temp_allocator)))
+		return
+	}
+	switch status {
+	case .Ready:
+		subagent_steer_install(state)
+	case .Pending:
+	case .Refused:
+		subagent_steer_refuse(state, problem if problem != "" else "the requested model does not fit the active conversation")
+	}
+}
+
+// subagent_steer_install installs the fitted switch on the child's session the way the main
+// session's selection_install does, then makes it the member's selection. The selection it
+// replaces is retired, not released: a request or summary in flight may still read its
+// connection.
+@(private)
+subagent_steer_install :: proc(state: ^Subagent_Steer) {
+	chat, member, pending := state.chat, state.member, &state.pending
+	selection := &pending.selection
+	identity_changed := selection.provider_id != chat.provider_id || selection.model_id != chat.model_id || selection.connection.API != chat.model_api
+	connection_changed :=
+		state.connection.API != selection.connection.API || state.connection.Endpoint != selection.connection.Endpoint || chat.provider_transport != selection.transport
+	refused_features, omitted_features := chat.refused_features, chat.compact.omitted_features
+	installed, _ := chat_session_select(chat, selection^, pending.effort)
+	if !installed {
+		subagent_steer_refuse(state, "the model could not be held")
+		return
+	}
+	if identity_changed {
+		chat_compact_cancel(chat)
+	} else {
+		chat.refused_features, chat.compact.omitted_features = refused_features, omitted_features
+	}
+	if chat.provider_websocket != nil && (identity_changed || connection_changed) {
+		ai.Provider_WebSocket_Session_Destroy(chat.provider_websocket)
+		chat.provider_websocket = nil
+	}
+	chat.last_estimate = 0
+	chat.last_input_measured = nil
+	if chat_journal_writable(chat) {
+		chat_record(
+			chat,
+			{kind = .Selection_Applied, provider = selection.provider_id, model = selection.model_id},
+			journal.Selection_Applied {
+				version = 1,
+				api = chat_api_name(selection.connection.API),
+				provider = selection.provider_id,
+				model = selection.model_id,
+				effort = chat.effort,
+			},
+		)
+		_ = chat_commit(chat, "the selected model was installed but its session record could not be committed")
+	}
+	sync.mutex_lock(&member.team.mutex)
+	member.retired.allocator = member.allocator
+	// A selection that cannot be listed is left unreleased rather than freed under a reader.
+	_, _ = append(&member.retired, member.selection)
+	member.selection = selection^
+	delete(member.effort, member.allocator)
+	member.effort = pending.effort
+	sync.mutex_unlock(&member.team.mutex)
+	pending^ = {}
+	state.transition = {}
+	state.connection = member.selection.connection
+}
+
+// subagent_steer_refuse drops the switch being fitted and tells the orchestrator why it was not
+// applied, as a message from the child, the way the child reaches it for anything else.
+@(private)
+subagent_steer_refuse :: proc(state: ^Subagent_Steer, reason: string) {
+	chat, member := state.chat, state.member
+	text := fmt.tprintf("Your request to switch to %s/%s was not applied: %s", state.pending.selection.provider_id, state.pending.selection.model_id, reason)
+	subagent_control_destroy(&state.pending)
+	state.transition = {}
+	if !chat_journal_writable(chat) { return }
+	chat_record(chat, {kind = .Subagent_Message, subagent = chat.session}, journal.Subagent_Message{name = member.name}, transmute([]u8)text)
+	if chat_commit(chat, "the refusal of a model switch could not be recorded") { owner_wake_signal() }
 }
 
 // subagent_outcome_status names how a delegation ended, as the model reads it, from the

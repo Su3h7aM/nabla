@@ -771,7 +771,9 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 // tool_job_stage_message buffers the subagent.message record of an agent_send call, so it
 // commits in the barrier of the call's admission and the recipient is woken only after it.
 // A message to a running child needs nothing more: the child reads it at a settled point, or
-// the reap that finds it unread runs the child again. A message to a child that has finished
+// the reap that finds it unread runs the child again; the switch or compaction the call asks
+// of it is resolved here, so a refused one records nothing, and queued by the executor. A
+// message to a child that has finished
 // continues it: a new subagent.started that opens the delegation is buffered first, and
 // send.resume says how the executor starts the child. A recipient that cannot take the
 // message is left in send.refusal for the executor to report, and nothing is recorded. A
@@ -795,15 +797,14 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent
 		return
 	}
 	if job.exec.agents == nil || send.agent == "" { return }
-	session, live := subagent_live(job.exec.agents, send.agent)
+	session, live, problem := subagent_control_plan(job.exec.agents, send)
 	if live {
-		if send.model != "" || send.provider != "" || send.effort != "" || send.compact {
-			send.refusal = SUBAGENT_RUNNING_REFUSAL
+		if problem != "" {
+			send.refusal = problem
 			return
 		}
 		header.subagent = session
 	} else {
-		problem: string
 		session, problem = subagent_resume_plan(chat, job.exec.agents, send)
 		if problem != "" {
 			send.refusal = problem

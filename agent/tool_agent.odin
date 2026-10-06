@@ -13,7 +13,7 @@ TOOL_AGENT_SPAWN_SCHEMA :: `{"type":"object","properties":{"instruction":{"type"
 TOOL_AGENT_SPAWN_FIELDS :: []string{"instruction", "prompt", "model", "provider", "effort", "wait", "acp_agent"}
 
 TOOL_AGENT_SEND_NAME :: "agent_send"
-TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. A running subagent refuses them and compact: agent_stop it first. With compact true, a finished subagent compacts its context before it continues; with a message it works while the summary runs and the summary installs at its next request boundary, and without a message it ends once the summary is installed, however long that takes, and its completion reaches you. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
+TOOL_AGENT_SEND_DESCRIPTION :: "Send a message to another agent. The orchestrator names a subagent in agent, which is required. To a running or queued subagent the message reaches it between its model requests, like a line the user types, and the call returns at once: steer it, correct its course, narrow or change its task, answer its question, or pass on a fact that changes its work, instead of letting it finish the wrong job or stopping and restarting it. You control a running subagent as the user controls you, while it runs: model, provider, and effort switch its next request, as the user's model change does for you (a switch that does not fit its conversation compacts first when the configuration allows it, and otherwise the child tells you it was refused), and compact true starts a compaction of its context that installs at a request boundary. Name only what you change; message is required unless compact is true. The newest switch you send replaces an earlier one it has not applied yet.\n\nTo a subagent that has finished, whether it completed, failed, was stopped, or was interrupted by a crash, the message reopens its session. The subagent continues the same conversation, with its task, everything it did, and its last answer, then reads your message, and runs in the background like a new one; its answer arrives later as a message. Use it for a follow-up question, to continue work that failed or was cut off, or to retry on another model. It reopens on the model and effort its last turn used, and model, provider, and effort choose others for the reopened run. With compact true, a finished subagent compacts its context before it continues; with a message it works while the summary runs and the summary installs at its next request boundary, and without a message it ends once the summary is installed, however long that takes, and its completion reaches you. A session another process is running, or an ACP agent that has finished, cannot be reopened. An id that is not one of this session's subagents is refused, and the refusal lists the ones that are, with how each ended.\n\nA subagent leaves agent out to message its orchestrator: ask about missing or ambiguous information, report that the task rests on a wrong premise, or share an early finding the orchestrator can act on now. A reply arrives as a message. Subagents cannot message each other."
 TOOL_AGENT_SEND_SCHEMA :: `{"type":"object","properties":{"agent":{"type":["string","null"],"description":"The subagent id that agent_spawn returned, such as agent-1. Required for the orchestrator; a subagent leaves it out to message its orchestrator."},"message":{"type":"string","description":"The message. Required unless compact is true."},"model":{"type":["string","null"],"description":"Catalog model id with its vendor prefix, exactly as listed, for the reopened run of a finished subagent. Refused for a running subagent. Default: the model its last turn used."},"provider":{"type":["string","null"],"description":"Id of a configured provider, not a vendor name, for the reopened run of a finished subagent; needed only when several providers serve model. Refused for a running subagent. Default: the provider its last turn used."},"effort":{"type":["string","null"],"description":"Reasoning effort level for the reopened run of a finished subagent. Refused for a running subagent. Default: the effort its last turn used, or the nearest level the model states."},"compact":{"type":"boolean","description":"Compact the finished subagent's context when it is reopened. Refused for a running subagent and for an ACP agent. Orchestrator only."}},"additionalProperties":false}`
 TOOL_AGENT_SEND_FIELDS :: []string{"agent", "message", "model", "provider", "effort", "compact"}
 
@@ -78,6 +78,9 @@ Agent_Send_Args :: struct {
 	// resume.name borrows agent, and the other strings live in temp memory until the executor
 	// returns.
 	resume:   Subagent_Resume,
+	// control is set by the owner, with the message, when the call changes a running child: the
+	// switch already resolved and the compaction asked for. The executor hands it to the child.
+	control:  Subagent_Control,
 }
 
 Agent_Stop_Args :: struct {
@@ -304,6 +307,22 @@ tool_agent_resume :: proc(ctx: ^Tool_Context, args: Agent_Send_Args) -> Tool_Res
 	return tool_agent_launch(ctx, member, tool_agent_started_output(member, args.effort), "resumed")
 }
 
+// tool_agent_queued_notice says what a call queued for a running child. The text is
+// temp-allocated.
+@(private)
+tool_agent_queued_notice :: proc(args: Agent_Send_Args) -> string {
+	queued := make([dynamic]string, context.temp_allocator)
+	if args.message != "" { append(&queued, "the message") }
+	if args.control.switching {
+		selection := args.control.selection
+		effort := args.control.effort if args.control.effort != "" else "default"
+		append(&queued, fmt.tprintf("a switch to %s/%s at effort %s", selection.provider_id, selection.model_id, effort))
+	}
+	if args.control.compact { append(&queued, "a compaction") }
+	joined, _ := strings.join(queued[:], ", ", context.temp_allocator)
+	return fmt.tprintf("queued for the running child: %s; it takes effect at the child's next request", joined)
+}
+
 @(require_results)
 tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Send_Args)
@@ -325,7 +344,15 @@ tool_agent_send_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	}
 	if args.refusal != "" { return tool_result_failure(ctx, .Tool_Failed, args.refusal, "not sent") }
 	if args.resume.name != "" { return tool_agent_resume(ctx, args) }
-	return tool_result_success(ctx, Agent_Output{agent = args.agent, status = "queued"}, "queued")
+	output := Agent_Output {
+		agent  = args.agent,
+		status = "queued",
+	}
+	if args.control.switching || args.control.compact {
+		output.notice = tool_agent_queued_notice(args)
+		subagent_control_apply(ctx.agents, args.agent, &args.control)
+	}
+	return tool_result_success(ctx, output, "queued")
 }
 
 @(require_results)
