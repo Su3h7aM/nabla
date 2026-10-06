@@ -321,7 +321,8 @@ Compact_Job :: struct {
 	failed:            bool,
 	error_text:        string, // owned; the transport's or the provider's account
 	operation:         ai.Provider_Operation_Error,
-	usage:             journal.Response_Committed,
+	// usage is the latest figure the provider reported for each count during the running send.
+	usage:             ai.Provider_Usage_Event,
 	started_at:        time.Tick,
 	// stop_at is when the owner asked this job's worker to stop, and the patience the worker is
 	// given to publish is measured from it. A job that has not published by the end of it is
@@ -401,10 +402,13 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			job.error_text = message
 		}
 	case ai.Provider_Usage_Event:
-		if value.Input_Tokens_Present { job.usage.input_tokens = value.Input_Tokens }
-		if value.Output_Tokens_Present { job.usage.output_tokens = value.Output_Tokens }
-		if value.Cached_Input_Tokens_Present { job.usage.cache_read_tokens = value.Cached_Input_Tokens }
-		if value.Cache_Write_Tokens_Present { job.usage.cache_write_tokens = value.Cache_Write_Tokens }
+		if value.Input_Tokens_Present { job.usage.Input_Tokens, job.usage.Input_Tokens_Present = value.Input_Tokens, true }
+		if value.Output_Tokens_Present { job.usage.Output_Tokens, job.usage.Output_Tokens_Present = value.Output_Tokens, true }
+		if value.Reasoning_Tokens_Present { job.usage.Reasoning_Tokens, job.usage.Reasoning_Tokens_Present = value.Reasoning_Tokens, true }
+		if value.Cached_Input_Tokens_Present {
+			job.usage.Cached_Input_Tokens, job.usage.Cached_Input_Tokens_Present = value.Cached_Input_Tokens, true
+		}
+		if value.Cache_Write_Tokens_Present { job.usage.Cache_Write_Tokens, job.usage.Cache_Write_Tokens_Present = value.Cache_Write_Tokens, true }
 	}
 }
 
@@ -732,9 +736,21 @@ chat_compact_start :: proc(
 	return true
 }
 
+// chat_compact_usages is the job's reported usage in the form chat_send_usage reads, keyed to
+// the running operation. Only a job whose worker has published may be read.
+@(private)
+chat_compact_usages :: proc(chat: ^Chat_Session, job: ^Compact_Job, storage: ^[1]Chat_Request_Usage) -> []Chat_Request_Usage {
+	storage[0] = {
+		operation = u64(chat.operation.id),
+		usage     = job.usage,
+	}
+	return storage[:]
+}
+
 // chat_compact_finish_attempt records a send that produced no usable summary.
 @(private)
 chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, decision: Chat_Recovery_Decision, message: string) {
+	usages: [1]Chat_Request_Usage
 	operation_error := job.operation
 	if operation_error.detail == "" { operation_error.detail = job.error_text }
 	chat_finish_send(
@@ -749,6 +765,7 @@ chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, deci
 			recovery = decision.reason,
 			delay = decision.delay,
 		},
+		chat_compact_usages(chat, job, &usages),
 	)
 }
 
@@ -865,7 +882,8 @@ chat_compact_poll :: proc(chat: ^Chat_Session, observer: Chat_Observer) {
 	case .Running:
 		chat_compact_adopt(chat, observer, job)
 	case .Retiring:
-		chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled})
+		usages: [1]Chat_Request_Usage
+		chat_finish_send(chat, job.request, job.attempts, {outcome = .Cancelled}, chat_compact_usages(chat, job, &usages))
 		chat_compact_failed_job(control, job)
 		control.completed_outcome = .Canceled
 		_observer_message(observer, .Notice, "compaction cancelled")
@@ -970,11 +988,15 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 		return
 	}
 
-	job.usage.finish = chat_finish_reason_text(job.reason)
+	usages: [1]Chat_Request_Usage
+	completed := journal.Response_Committed {
+		finish = chat_finish_reason_text(job.reason),
+	}
+	chat_send_usage(chat, chat_compact_usages(chat, job, &usages), &completed)
 	chat_record(
 		chat,
 		{kind = .Compaction_Completed, request = job.request, attempt = journal.Attempt_No(job.attempts), provider = chat.provider_id, model = chat.model_id},
-		job.usage,
+		completed,
 		transmute([]u8)summary,
 	)
 	if !chat_commit(chat, "the compaction outcome could not be recorded") {

@@ -781,6 +781,53 @@ test_an_idle_session_starts_the_summary_a_refusal_recorded :: proc(test: ^testin
 	testing.expect(test, projection.covers != 0, "the checkpoint covers the earlier context")
 }
 
+// A compaction is billed like any request, so what its summary reported reaches the session
+// totals exactly once, through the record that completed it.
+@(test)
+test_a_compactions_usage_reaches_the_session_totals :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, 500_000)
+	_test_accept(test, chat, "first")
+	large := strings.repeat("work ", 360_000) or_else ""
+	defer delete(large)
+	_test_user(test, chat, large, .Prompt)
+	for text in ([]string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}) {
+		_test_response(test, chat, 0, text)
+	}
+	chat.state = .Idle
+	testing.expect_value(test, chat_compact_request(chat, .Provider_Overflow), Compact_Request_Result.Scheduled)
+
+	reply :=
+		"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"" +
+		COMPACT_TEST_SUMMARY +
+		"\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":700,\"completion_tokens\":30,\"total_tokens\":730}}\n\n" +
+		"data: [DONE]\n\n"
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, []string{reply}) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+
+	notices: Chat_Notice_Log
+	observer := chat_notice_log_begin(&notices)
+	defer chat_notice_log_destroy(&notices)
+	_ = chat_compact_idle_service(chat, observer, connection)
+	if !compact_await_state(test, chat, .Ready) { return }
+
+	totals, totals_error := journal.usage_totals(chat.store, chat.session)
+	if !testing.expect_value(test, totals_error, nil) { return }
+	testing.expect_value(test, totals.input, i64(700))
+	testing.expect_value(test, totals.output, i64(30))
+}
+
 // compact_service_until services the session until it reaches a state, without waiting for
 // anything it cannot do: it is what an idle tick does, in a loop.
 compact_service_until :: proc(test: ^testing.T, chat: ^Chat_Session, wanted: Compact_State) -> bool {
