@@ -68,6 +68,8 @@ Read, search, and edit through the dedicated tools; use the shell for builds, te
 
 For computation, file processing, and multi-tool workflows, use Code Mode (Lua) instead of Python, Perl, or another scripting language run through the shell. When Code Mode or another harness tool cannot do what you need and you fall back, add a report to `docs/HARNESS_FEEDBACK.md`: what you tried to do, why the tool fell short, and how you did it instead.
 
+Before adding a Code Mode helper or a tool feature for a report, check whether Lua's standard library or an existing tool already does it. Then the fix is to expose the library or to state it in a tool description or a skill, not new code.
+
 ## Version control
 
 Use **Jujutsu (`jj`)** for all version control, following the Jujutsu model: the working copy is a change, and `jj describe`, `jj new`, `jj squash`, `jj split`, and the operation log replace Git workflows. The Git repository underneath is never touched directly.
