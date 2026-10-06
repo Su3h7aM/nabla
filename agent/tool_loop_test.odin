@@ -672,7 +672,8 @@ test_usage_is_collected_per_request :: proc(test: ^testing.T) {
 	testing.expect_value(test, usages[1].usage.Cached_Input_Tokens, 11800)
 
 	// The last measurement wins, and a field the provider never sent stays absent.
-	total := chat_request_usage(&usages, 0)
+	total: journal.Response_Committed
+	chat_send_usage(chat, usages[:], &total)
 	if value, present := total.input_tokens.?; present {
 		testing.expect_value(test, value, i64(12100))
 	} else {

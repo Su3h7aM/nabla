@@ -51,11 +51,12 @@ Branch_Summary :: struct {
 	seq:            Journal_Seq,
 }
 
-// Usage_Totals sums what the session's committed responses reported. The
-// paired fields cover only the responses that reported both input and cache
-// read counts, the one population a cache hit rate may be measured over.
-// cost is the dollars the priced responses cost in total, and priced_requests
-// is how many of the requests could be priced.
+// Usage_Totals sums what the session's attempts reported: every committed,
+// rejected, and interrupted attempt. requests counts those attempts. The paired
+// fields cover only the attempts that reported both input and cache read
+// counts, the one population a cache hit rate may be measured over. cost is the
+// dollars the priced attempts cost in total, and priced_requests is how many of
+// the attempts could be priced.
 Usage_Totals :: struct {
 	requests:        int,
 	paired_requests: int,
@@ -460,7 +461,7 @@ USAGE_TOTALS_QUERY :: `WITH reported AS (SELECT
 	json_extract(data, '$.cache_read_tokens') AS cache_read,
 	json_extract(data, '$.cache_write_tokens') AS cache_write,
 	json_extract(data, '$.cost') AS cost
-	FROM records WHERE session = ? AND kind = 'response.committed'),
+	FROM records WHERE session = ? AND kind IN ('response.committed', 'response.rejected', 'request.interrupted')),
 paired AS (SELECT *, (input IS NOT NULL AND cache_read IS NOT NULL) AS both FROM reported)
 SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), COALESCE(SUM(cache_read), 0), COALESCE(SUM(cache_write), 0),

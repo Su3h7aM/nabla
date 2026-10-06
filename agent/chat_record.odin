@@ -148,31 +148,25 @@ chat_send_rejection :: proc(result: Chat_Send_Result) -> journal.Response_Reject
 	return rejection
 }
 
-// chat_send_usage is the usage the running send reported, as the response.committed
-// payload carries it, priced with the session's model when the catalog can price
-// it. The send is the operation that performed it.
+// chat_send_usage sets the usage fields of a terminal record's payload (response.committed,
+// response.rejected, or request.interrupted) to what the running send reported, priced with
+// the session's model when the catalog can price it. The send is the operation that performed
+// it, and an empty usages leaves the payload's usage absent.
 @(private)
-chat_send_usage :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usage) -> journal.Response_Committed {
-	committed := chat_request_usage(usages, u64(chat.operation.id))
-	if dollars, ok := catalog_cost_of(chat.cost, committed.input_tokens, committed.output_tokens, committed.cache_read_tokens, committed.cache_write_tokens);
-	   ok {
-		committed.cost = dollars
-	}
-	return committed
-}
-
-// chat_request_usage totals one operation's usage. The provider's last word wins,
-// because a provider may report the same measurement more than once as it
-// settles, and an absent measurement stays absent rather than becoming zero.
-@(private)
-chat_request_usage :: proc(usages: ^[dynamic]Chat_Request_Usage, operation: u64) -> (committed: journal.Response_Committed) {
+chat_send_usage :: proc(chat: ^Chat_Session, usages: []Chat_Request_Usage, payload: ^$Payload) {
+	operation := u64(chat.operation.id)
+	// The provider's last word wins, because a provider may report the same
+	// measurement more than once as it settles, and an absent measurement stays
+	// absent rather than becoming zero.
 	for entry in usages {
 		if entry.operation != operation { continue }
-		if entry.usage.Input_Tokens_Present { committed.input_tokens = entry.usage.Input_Tokens }
-		if entry.usage.Output_Tokens_Present { committed.output_tokens = entry.usage.Output_Tokens }
-		if entry.usage.Reasoning_Tokens_Present { committed.reasoning_tokens = entry.usage.Reasoning_Tokens }
-		if entry.usage.Cached_Input_Tokens_Present { committed.cache_read_tokens = entry.usage.Cached_Input_Tokens }
-		if entry.usage.Cache_Write_Tokens_Present { committed.cache_write_tokens = entry.usage.Cache_Write_Tokens }
+		if entry.usage.Input_Tokens_Present { payload.input_tokens = entry.usage.Input_Tokens }
+		if entry.usage.Output_Tokens_Present { payload.output_tokens = entry.usage.Output_Tokens }
+		if entry.usage.Reasoning_Tokens_Present { payload.reasoning_tokens = entry.usage.Reasoning_Tokens }
+		if entry.usage.Cached_Input_Tokens_Present { payload.cache_read_tokens = entry.usage.Cached_Input_Tokens }
+		if entry.usage.Cache_Write_Tokens_Present { payload.cache_write_tokens = entry.usage.Cache_Write_Tokens }
 	}
-	return
+	if dollars, ok := catalog_cost_of(chat.cost, payload.input_tokens, payload.output_tokens, payload.cache_read_tokens, payload.cache_write_tokens); ok {
+		payload.cost = dollars
+	}
 }

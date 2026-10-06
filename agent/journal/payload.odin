@@ -145,9 +145,26 @@ Turn_Completed :: struct {
 	cause:   string,
 }
 
+// Attempt_Usage is what one provider attempt reported and what it cost, carried by
+// the attempt's terminal record: response.committed, response.rejected, or
+// request.interrupted. The payloads embed it with `using _`, which the JSON
+// encoding flattens into the payload's own keys. A token count the provider did
+// not report is null, never zero. cost is the attempt's price in US dollars,
+// absent when a count or the model's catalog price is missing. A record written
+// before the field existed reads as null, so it needs no payload version.
+Attempt_Usage :: struct {
+	input_tokens:       Maybe(i64),
+	output_tokens:      Maybe(i64),
+	reasoning_tokens:   Maybe(i64),
+	cache_read_tokens:  Maybe(i64),
+	cache_write_tokens: Maybe(i64),
+	cost:               Maybe(f64),
+}
+
 Request_Interrupted :: struct {
 	version: int,
 	detail:  string,
+	using _: Attempt_Usage,
 }
 
 // Response_Rejected is why one send produced no usable response: the failure as
@@ -168,6 +185,7 @@ Response_Rejected :: struct {
 	recovery:            string,
 	delay_ms:            i64,
 	detail:              string,
+	using _:             Attempt_Usage,
 }
 
 Session_Created :: struct {
@@ -383,20 +401,13 @@ Subagent_Message :: struct {
 
 // Response_Committed carries the API family that produced the response and the
 // endpoint's native output items in the body. api uses the stable API names from
-// Request_Sent. A token count the provider did not report is null, never zero.
+// Request_Sent.
 Response_Committed :: struct {
-	version:            int,
-	api:                string,
-	model_resolved:     string,
-	finish:             string, // RESPONSE_FINISH_NAMES
-	input_tokens:       Maybe(i64),
-	output_tokens:      Maybe(i64),
-	reasoning_tokens:   Maybe(i64),
-	cache_read_tokens:  Maybe(i64),
-	cache_write_tokens: Maybe(i64),
-	// cost is the response's price in US dollars, absent when the answering model
-	// has no price in the catalog.
-	cost:               Maybe(f64),
+	version:        int,
+	api:            string,
+	model_resolved: string,
+	finish:         string, // RESPONSE_FINISH_NAMES
+	using _:        Attempt_Usage,
 }
 
 // Tool_Proposed carries the arguments exactly as the model sent them in the body.

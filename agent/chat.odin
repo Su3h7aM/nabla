@@ -152,7 +152,7 @@ chat_commit_response :: proc(
 	if outcome == .Completed {
 		if !chat_commit_response_nodes(chat, request, attempt, result.finish_reason, usages) { return }
 	} else if finish_send {
-		chat_finish_send(chat, request, attempt, send)
+		chat_finish_send(chat, request, attempt, send, usages[:])
 	}
 	// A notice is only ever committed with the response that raised it. One that
 	// did not commit, because the turn failed or was cancelled, is dropped.
@@ -179,7 +179,8 @@ chat_commit_response_nodes :: proc(
 
 	assistant := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
 	chat.response_node = assistant
-	committed := chat_send_usage(chat, usages)
+	committed: journal.Response_Committed
+	chat_send_usage(chat, usages[:], &committed)
 	committed.api = chat_api_name(chat.chain.connection.API)
 	committed.finish = chat_finish_reason_text(finish)
 	output: []u8
@@ -217,9 +218,11 @@ chat_commit_response_nodes :: proc(
 // chat_finish_send records how one send that produced no usable response ended:
 // response.rejected with the evidence of a failure, or request.interrupted for a
 // send the turn cancelled. Every send that did not commit reaches exactly one of
-// these, including a send an attempt chain abandoned, so none is left open.
+// these, including a send an attempt chain abandoned, so none is left open. The
+// record carries the usage the running send reported in usages, which a send with
+// none to report leaves empty.
 @(private)
-chat_finish_send :: proc(chat: ^Chat_Session, request: journal.Request_Id, attempt: int, result: Chat_Send_Result) {
+chat_finish_send :: proc(chat: ^Chat_Session, request: journal.Request_Id, attempt: int, result: Chat_Send_Result, usages: []Chat_Request_Usage = nil) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	header := journal.Record {
 		request  = request,
@@ -229,10 +232,16 @@ chat_finish_send :: proc(chat: ^Chat_Session, request: journal.Request_Id, attem
 	}
 	if result.outcome == .Cancelled {
 		header.kind = .Request_Interrupted
-		chat_record(chat, header, journal.Request_Interrupted{detail = "the turn was cancelled"})
+		interrupted := journal.Request_Interrupted {
+			detail = "the turn was cancelled",
+		}
+		chat_send_usage(chat, usages, &interrupted)
+		chat_record(chat, header, interrupted)
 	} else {
 		header.kind = .Response_Rejected
-		chat_record(chat, header, chat_send_rejection(result))
+		rejection := chat_send_rejection(result)
+		chat_send_usage(chat, usages, &rejection)
+		chat_record(chat, header, rejection)
 	}
 	// The commit latches the storage failure itself, which is what the turn reads next.
 	_ = chat_commit(chat, "the request outcome could not be recorded")

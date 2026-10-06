@@ -126,6 +126,37 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(test: ^testing.T) {
 	testing.expect(test, !evidence.text_exposed && !evidence.completion_accepted)
 }
 
+// A stream cut off after the provider reported usage is billed whatever the harness did with
+// it, so the session totals sum the failed attempt and the accepted one.
+@(test)
+test_a_failed_attempts_usage_reaches_the_session_totals :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
+	_test_accept(test, chat, "say something")
+	cut_off :=
+		"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n"
+	responses := []string{cut_off, agent_anthropic_reply("second try")}
+	provider: Agent_Provider
+	if !agent_provider_start(test, &provider, responses) { return }
+	defer agent_provider_stop(&provider)
+	connection := ai.Provider_Connection {
+		API      = .Anthropic_Messages,
+		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
+	}
+	defer delete(connection.Endpoint, chat.allocator)
+	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
+	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
+	totals, totals_error := journal.usage_totals(chat.store, chat.session)
+	if !testing.expect_value(test, totals_error, nil) { return }
+	testing.expect_value(test, totals.requests, 2)
+	testing.expect_value(test, totals.input, i64(8))
+	testing.expect_value(test, totals.output, i64(2))
+}
+
 // A refusal and a stream the provider broke off are both failures of the request, not of
 // the model: each is resent on the same bytes, the user is told about each retry, and the
 // model is told nothing.

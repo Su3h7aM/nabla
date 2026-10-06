@@ -722,6 +722,7 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 			recovery = chain.decision.reason,
 			delay = chain.decision.delay,
 		},
+		usages[:],
 	)
 	chain.settled = true
 
