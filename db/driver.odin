@@ -13,8 +13,12 @@ package db
 // released while that execution is still the active one, because releasing it is
 // what ends the execution. It is the last call a backend sees for a statement.
 //
-// A backend reports failure with error_make. It may assume the caller checks
-// every error and closes what it opened.
+// A backend reports failure with error_make. Message text that does not outlive
+// the call, such as the engine's own diagnostic, is copied into storage the
+// connection owns, which stays valid until the connection
+// closes. A failure that outlives the connection, such as one from a refused
+// open, carries static text. It may assume the caller checks every error and
+// closes what it opened.
 Driver :: struct {
 	// close releases the connection and everything the backend allocated for
 	// it. On failure the state stays valid and the call may be retried.

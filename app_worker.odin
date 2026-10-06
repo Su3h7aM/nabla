@@ -433,7 +433,7 @@ app_takeover :: proc(app: ^App, observer: agent.Chat_Observer) {
 	}
 	if message, settled := session_settle(&opened, setup.workspace, setup.alloc); !settled {
 		// The store stays with its owner; only what settling read is released here.
-		retryable := journal.error_is_busy(opened.settle_error)
+		retryable := opened.settle_busy
 		opened.store = nil
 		opened_session_destroy(&opened, setup.alloc)
 		app_takeover_abort(app, message, retryable)

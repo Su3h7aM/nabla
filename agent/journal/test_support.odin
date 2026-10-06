@@ -54,8 +54,7 @@ _expect_error :: proc(test: ^testing.T, error: Error, kind: Journal_Error) {
 
 _expect_db_ok :: proc(test: ^testing.T, error: db.Error) {
 	if error == nil { return }
-	local := error
-	testing.fail_now(test, fmt.tprintf("unexpected database error: %s", db.error_message(&local)))
+	testing.fail_now(test, fmt.tprintf("unexpected database error: %s", db.error_message(error)))
 }
 
 // _describe is the failure an error carries, whichever layer produced it.
@@ -65,8 +64,7 @@ _describe :: proc(error: Error) -> string {
 	case Journal_Error:
 		return fmt.tprintf("journal error %v", value)
 	case db.Error:
-		local := value
-		return fmt.tprintf("database error: %s", db.error_message(&local))
+		return fmt.tprintf("database error: %s", db.error_message(value))
 	case os.Error:
 		return fmt.tprintf("filesystem error: %s", os.error_string(value))
 	case mem.Allocator_Error:

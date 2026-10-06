@@ -293,7 +293,7 @@ test_a_failed_commit_latches_and_drops_appends :: proc(test: ^testing.T) {
 	cause, is_database := commit_error.(db.Error)
 	testing.expect(test, is_database, "a failed commit should keep the database's error")
 	if is_database {
-		message := db.error_message(&cause)
+		message := db.error_message(cause)
 		testing.expect(test, len(message) > 0, "the database's message should be kept")
 	}
 

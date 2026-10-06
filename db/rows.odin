@@ -77,11 +77,9 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 			if row_err := connection.driver.row(rows.state, rows.values); row_err != nil {
 				// A row that cannot be read is an end: nothing behind it is
 				// trustworthy, and the execution is over either way.
-				finish_err := connection.driver.execution_finish(rows.state)
-				first := row_err
-				if first == nil { first = finish_err }
+				_ = connection.driver.execution_finish(rows.state)
 				rows_release(rows)
-				return nil, false, first
+				return nil, false, row_err
 			}
 			return rows.values, true, nil
 		}
@@ -92,7 +90,8 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 	// Out of rows, or a statement that failed. Both end the execution, and both
 	// can report one more failure on the way out: reset is where SQLite commits
 	// an implicit transaction, so a statement that stepped cleanly can still
-	// fail here. An error from the row itself is the one worth keeping.
+	// fail here. An error from the row itself is the one worth keeping, and the
+	// other is dropped.
 	finish_err := connection.driver.execution_finish(rows.state)
 	first := next_err
 	if first == nil { first = finish_err }

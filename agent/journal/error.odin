@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 
 import "nabla:db"
 
@@ -66,8 +67,7 @@ error_text :: proc(error: Error, allocator := context.allocator) -> string {
 	case Journal_Error:
 		return fmt.aprint(JOURNAL_ERROR_TEXT[value], allocator = allocator)
 	case db.Error:
-		local := value
-		return fmt.aprintf("database error: %s", db.error_message(&local), allocator = allocator)
+		return fmt.aprintf("database error: %s", db.error_message(value), allocator = allocator)
 	case os.Error:
 		return fmt.aprintf("filesystem error: %s", os.error_string(value), allocator = allocator)
 	case mem.Allocator_Error:
@@ -76,4 +76,43 @@ error_text :: proc(error: Error, allocator := context.allocator) -> string {
 		return fmt.aprintf("a record could not be encoded: %v", value, allocator = allocator)
 	}
 	return fmt.aprint("no error", allocator = allocator)
+}
+
+// A database error the journal returns borrows the text of the connection that
+// failed: it is valid until the journal's connection closes, and nobody
+// releases it. The latched failure is a copy in the
+// journal's allocator, valid until close. The errors open and close return
+// outlive the connection, so they are copied into the calling thread's temp
+// allocator.
+
+// error_detach copies the text of a database error into the temp allocator, for
+// an error that must outlive the connection it came from.
+@(private)
+error_detach :: proc(error: Error) -> Error {
+	database, is_database := error.(db.Error)
+	if !is_database { return error }
+	failure, _ := database.(db.Failure)
+	copied, _ := strings.clone(failure.message, context.temp_allocator)
+	return db.error_make(failure.kind, failure.code, copied)
+}
+
+// latch keeps the first failure that stops journal from writing.
+@(private)
+latch :: proc(journal: ^Journal, error: Error) {
+	if journal.failure != nil { return }
+	journal.failure = error
+	if database, is_database := error.(db.Error); is_database {
+		failure, _ := database.(db.Failure)
+		journal.failure = db.error_clone(failure.kind, failure.code, failure.message, journal.allocator)
+	}
+}
+
+// error_release frees the message of a latched database error and sets error to
+// nil; any other error owns nothing.
+@(private)
+error_release :: proc(error: ^Error) {
+	if database, is_database := error.(db.Error); is_database {
+		db.error_destroy(&database)
+	}
+	error^ = nil
 }

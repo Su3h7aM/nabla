@@ -119,6 +119,7 @@ foreign lib {
 	extended_errcode :: proc(db: ^sqlite3) -> c.int ---
 	errcode :: proc(db: ^sqlite3) -> Result_Code ---
 	errmsg :: proc(db: ^sqlite3) -> cstring ---
+	errstr :: proc(code: c.int) -> cstring ---
 	get_autocommit :: proc(db: ^sqlite3) -> c.int ---
 
 	// These two are not called by the backend. They exist for the

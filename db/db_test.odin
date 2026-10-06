@@ -165,8 +165,7 @@ fake_rollback :: proc(state: rawptr) -> Error {
 
 _expect_ok :: proc(t: ^testing.T, err: Error) {
 	if err != nil {
-		local := err
-		testing.fail_now(t, error_message(&local))
+		testing.fail_now(t, error_message(err))
 	}
 }
 
@@ -436,30 +435,31 @@ test_value_conversions_are_lossless_or_refused :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_errors_carry_their_message_without_owning_memory :: proc(t: ^testing.T) {
+test_errors_carry_their_message :: proc(t: ^testing.T) {
 	err := error_make(.Constraint, 2067, "UNIQUE constraint failed: sessions.id")
 
 	testing.expect_value(t, error_kind(err), Error_Kind.Constraint)
 	failure, ok := err.(Failure)
 	testing.expect(t, ok, "an error of this package is always a Failure")
 	testing.expect_value(t, failure.code, i32(2067))
-	testing.expect_value(t, error_message(&err), "UNIQUE constraint failed: sessions.id")
-	testing.expect(t, !failure.truncated, "a short message is not truncated")
+	testing.expect_value(t, error_message(err), "UNIQUE constraint failed: sessions.id")
 
-	// The message lives inside the error, so it survives whatever produced it.
+	// A borrowed message owns nothing, so destroying the error frees nothing.
 	copied := err
-	testing.expect_value(t, error_message(&copied), "UNIQUE constraint failed: sessions.id")
+	testing.expect_value(t, error_message(copied), "UNIQUE constraint failed: sessions.id")
+	error_destroy(&copied)
+	testing.expect(t, copied == nil, "destroy leaves a nil error")
 }
 
 @(test)
-test_a_long_message_is_cut_short_and_marked :: proc(t: ^testing.T) {
-	long: [MAX_ERROR_MESSAGE + 64]u8
-	for i in 0 ..< len(long) { long[i] = 'x' }
+test_a_cloned_message_outlives_its_source :: proc(t: ^testing.T) {
+	source := make([]u8, 4096)
+	mem.set(raw_data(source), 'x', len(source))
+	err := error_clone(.Backend, 1, string(source), context.allocator)
+	defer error_destroy(&err)
 
-	err := error_make(.Backend, 1, string(long[:]))
-	failure, _ := err.(Failure)
-	testing.expect(t, failure.truncated, "a message past the buffer must be marked")
-	testing.expect_value(t, len(error_message(&err)), MAX_ERROR_MESSAGE)
+	delete(source)
+	testing.expect_value(t, len(error_message(err)), 4096)
 }
 
 @(test)

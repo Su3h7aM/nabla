@@ -335,7 +335,9 @@ Opened_Session :: struct {
 	following:    bool,
 	follow:       agent.Follow,
 	pending:      []journal.Record, // owned, captured with the follower cursor and head
-	settle_error: journal.Error,
+	// settle_busy says the failure that stopped settling was another writer holding
+	// the database, which a later attempt may get past.
+	settle_busy:  bool,
 }
 
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
@@ -456,7 +458,7 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 	defer if snapshot_open {
 		if snapshot_error := journal.end_read_snapshot(store); snapshot_error != nil {
 			delete(message, allocator)
-			opened.settle_error = snapshot_error
+			opened.settle_busy = journal.error_is_busy(snapshot_error)
 			message = session_error_message("cannot finish reading the session", snapshot_error, allocator)
 			ok = false
 		}
@@ -466,39 +468,39 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 		recover_error: journal.Error
 		opened.recovery, recover_error = journal.recover(store)
 		if recover_error != nil {
-			opened.settle_error = recover_error
+			opened.settle_busy = journal.error_is_busy(recover_error)
 			return session_error_message("cannot settle the session", recover_error, allocator), false
 		}
 	}
 	if opened.following {
 		if snapshot_error := journal.begin_read_snapshot(store); snapshot_error != nil {
-			opened.settle_error = snapshot_error
+			opened.settle_busy = journal.error_is_busy(snapshot_error)
 			return session_error_message("cannot read the session", snapshot_error, allocator), false
 		}
 		snapshot_open = true
 		follow_error: journal.Error
 		opened.follow, follow_error = agent.follow_start(store, id)
 		if follow_error != nil {
-			opened.settle_error = follow_error
+			opened.settle_busy = journal.error_is_busy(follow_error)
 			return session_error_message("cannot read the session", follow_error, allocator), false
 		}
 	}
 	head_error: journal.Error
 	opened.branch, opened.head, head_error = journal.session_head(store, id)
 	if head_error != nil {
-		opened.settle_error = head_error
+		opened.settle_busy = journal.error_is_busy(head_error)
 		return session_error_message("cannot read the session", head_error, allocator), false
 	}
 
 	if claimed || opened.following {
 		delivered, delivered_error := journal.last_delivered_message(store, id)
 		if delivered_error != nil {
-			opened.settle_error = delivered_error
+			opened.settle_busy = journal.error_is_busy(delivered_error)
 			return session_error_message("cannot read the session", delivered_error, allocator), false
 		}
 		waiting, waiting_error := journal.read_inbox(store, id, delivered, allocator)
 		if waiting_error != nil {
-			opened.settle_error = waiting_error
+			opened.settle_busy = journal.error_is_busy(waiting_error)
 			return session_error_message("cannot read the session", waiting_error, allocator), false
 		}
 		for record in waiting {
@@ -511,7 +513,7 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 
 	selection_record, selection_found, read_error := journal.read_latest(store, {session = id, kinds = {.Selection_Applied}}, allocator)
 	if read_error != nil {
-		opened.settle_error = read_error
+		opened.settle_busy = journal.error_is_busy(read_error)
 		return session_error_message("cannot read the session selection", read_error, allocator), false
 	}
 	if selection_found {
@@ -526,7 +528,7 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 			session = selection_record.session,
 			seq = selection_record.seq,
 		); decode_error != nil {
-			opened.settle_error = decode_error
+			opened.settle_busy = journal.error_is_busy(decode_error)
 			return session_error_message("cannot read the session selection", decode_error, allocator), false
 		}
 		provider, provider_error := strings.clone(selection.provider, allocator)
@@ -544,7 +546,7 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 	} else {
 		latest, found, turn_read_error := journal.read_latest(opened.store, {session = id, kinds = {.Turn_Started}}, allocator)
 		if turn_read_error != nil {
-			opened.settle_error = turn_read_error
+			opened.settle_busy = journal.error_is_busy(turn_read_error)
 			return session_error_message("cannot read the session", turn_read_error, allocator), false
 		}
 		defer journal.record_destroy(&latest, allocator)

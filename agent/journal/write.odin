@@ -191,8 +191,8 @@ commit :: proc(journal: ^Journal) -> (Journal_Seq, Error) {
 	clear(&journal.pending)
 	virtual.arena_free_all(&journal.batch)
 	if error != nil {
-		journal.failure = error
-		return journal.last_seq, error
+		latch(journal, error)
+		return journal.last_seq, journal.failure
 	}
 	journal.last_seq = last
 	// The commit is durable, so a watcher woken by this touch reads it. A failed
@@ -316,7 +316,7 @@ writable :: proc(journal: ^Journal, session: Session_Id) -> bool {
 push :: proc(journal: ^Journal, item: Pending) {
 	if journal.failure != nil { return }
 	if _, error := append(&journal.pending, item); error != nil {
-		journal.failure = error
+		latch(journal, error)
 		return
 	}
 	if len(journal.pending) == 1 { journal.batch_since = time.tick_now() }
@@ -327,7 +327,7 @@ push :: proc(journal: ^Journal, item: Pending) {
 @(private)
 batch_text :: proc(journal: ^Journal, text: string) -> string {
 	copied, error := strings.clone(text, virtual.arena_allocator(&journal.batch))
-	if error != nil && journal.failure == nil { journal.failure = error }
+	if error != nil && journal.failure == nil { latch(journal, error) }
 	return copied
 }
 
@@ -335,7 +335,7 @@ batch_text :: proc(journal: ^Journal, text: string) -> string {
 batch_bytes :: proc(journal: ^Journal, bytes: []u8) -> []u8 {
 	if len(bytes) == 0 { return nil }
 	copied, error := slice.clone(bytes, virtual.arena_allocator(&journal.batch))
-	if error != nil && journal.failure == nil { journal.failure = error }
+	if error != nil && journal.failure == nil { latch(journal, error) }
 	return copied
 }
 
@@ -344,7 +344,7 @@ batch_json :: proc(journal: ^Journal, payload: $Payload) -> string {
 	versioned := payload
 	if versioned.version == 0 { versioned.version = PAYLOAD_VERSION }
 	encoded, error := json.marshal(versioned, allocator = virtual.arena_allocator(&journal.batch))
-	if error != nil && journal.failure == nil { journal.failure = error }
+	if error != nil && journal.failure == nil { latch(journal, error) }
 	return string(encoded)
 }
 

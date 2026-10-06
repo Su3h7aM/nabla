@@ -53,6 +53,9 @@ Config :: struct {
 Conn :: struct {
 	handle:    ^sqlite3,
 	allocator: mem.Allocator,
+	// failures holds the text of this connection's failures, in allocator, so every
+	// error's message stays valid until the connection is closed. Repeated text is kept once.
+	failures:  [dynamic]string,
 }
 
 // Stmt is the backend state behind a prepared statement. SQLite keeps an
@@ -113,6 +116,7 @@ open :: proc(connection: ^db.Conn, config: Config, allocator := context.allocato
 		return db.error_make(.Out_Of_Memory, 0, "connection state allocation failed")
 	}
 	state.allocator = allocator
+	state.failures = make([dynamic]string, allocator)
 
 	path, path_err := strings.clone_to_cstring(config.path, context.temp_allocator)
 	if path_err != nil {
@@ -128,10 +132,9 @@ open :: proc(connection: ^db.Conn, config: Config, allocator := context.allocato
 	if result_code != .OK {
 		// open_v2 returns a handle even when it fails, and that handle still
 		// has to be closed. errmsg is read before that happens.
-		err := failure(state.handle, result_code)
+		err := failure(state, result_code)
 		if state.handle != nil { close_v2(state.handle) }
-		free(state, allocator)
-		return err
+		return open_abandon(state, err)
 	}
 
 	if config.busy_timeout_ms > 0 {
@@ -140,17 +143,15 @@ open :: proc(connection: ^db.Conn, config: Config, allocator := context.allocato
 		// short wait.
 		milliseconds := min(config.busy_timeout_ms, int(max(c.int)))
 		if result_code = busy_timeout(state.handle, c.int(milliseconds)); result_code != .OK {
-			err := failure(state.handle, result_code)
+			err := failure(state, result_code)
 			close_v2(state.handle)
-			free(state, allocator)
-			return err
+			return open_abandon(state, err)
 		}
 	}
 	if config.foreign_keys {
 		if err := run(state, "PRAGMA foreign_keys = ON"); err != nil {
 			close_v2(state.handle)
-			free(state, allocator)
-			return err
+			return open_abandon(state, err)
 		}
 	}
 
@@ -158,10 +159,30 @@ open :: proc(connection: ^db.Conn, config: Config, allocator := context.allocato
 	// state is still this procedure's to release.
 	if err := db.connection_init(connection, &DRIVER, state, allocator); err != nil {
 		close_v2(state.handle)
-		free(state, allocator)
-		return err
+		return open_abandon(state, err)
 	}
 	return nil
+}
+
+// open_abandon releases the state of a connection that failed to open. The
+// error would outlive the messages the state owns, so a SQLite failure is
+// rebuilt with SQLite's static text for its result code; an error this package
+// made itself already borrows static text.
+@(private, require_results)
+open_abandon :: proc(state: ^Conn, err: db.Error) -> db.Error {
+	result := err
+	if failure, is_failure := err.(db.Failure); is_failure && failure.code != 0 {
+		result = db.error_make(failure.kind, failure.code, string(errstr(failure.code & 0xff)))
+	}
+	state_destroy(state)
+	return result
+}
+
+@(private)
+state_destroy :: proc(state: ^Conn) {
+	for message in state.failures { delete(message, state.allocator) }
+	delete(state.failures)
+	free(state, state.allocator)
 }
 
 @(private, require_results)
@@ -169,9 +190,9 @@ connection_close :: proc(state: rawptr) -> db.Error {
 	connection := cast(^Conn)state
 	if result_code := close_v2(connection.handle); result_code != .OK {
 		// The connection is untouched on failure, so the caller can retry.
-		return failure(connection.handle, result_code)
+		return failure(connection, result_code)
 	}
-	free(connection, connection.allocator)
+	state_destroy(connection)
 	return nil
 }
 
@@ -196,7 +217,7 @@ statement_prepare :: proc(state: rawptr, sql: string) -> (rawptr, db.Error) {
 	// of its own.
 	result_code := prepare_v3(connection.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, &tail)
 	if result_code != .OK {
-		return nil, failure(connection.handle, result_code)
+		return nil, failure(connection, result_code)
 	}
 	if handle == nil {
 		// An empty string or a lone comment compiles to no statement at all.
@@ -284,9 +305,8 @@ statement_finalize :: proc(state: rawptr) {
 statement_execute :: proc(state: rawptr, arguments: []db.Value) -> (rawptr, db.Error) {
 	statement := cast(^Stmt)state
 	if expected := int(bind_parameter_count(statement.handle)); len(arguments) != expected {
-		scratch: [64]u8
-		message := fmt.bprintf(scratch[:], "statement argument count: expected %d, got %d", expected, len(arguments))
-		return nil, db.error_make(.Invalid_Argument, 0, message)
+		message := fmt.tprintf("statement argument count: expected %d, got %d", expected, len(arguments))
+		return nil, db.error_make(.Invalid_Argument, 0, remember(statement.connection, message))
 	}
 	for argument, i in arguments {
 		if bind_err := bind(statement, c.int(i + 1), argument); bind_err != nil {
@@ -340,7 +360,7 @@ bind :: proc(statement: ^Stmt, index: c.int, value: db.Value) -> db.Error {
 		result_code = bind_null(statement.handle, index)
 	}
 	if result_code != .OK {
-		return failure(statement.connection.handle, result_code)
+		return failure(statement.connection, result_code)
 	}
 	return nil
 }
@@ -355,7 +375,7 @@ execution_next :: proc(state: rawptr) -> (has_row: bool, err: db.Error) {
 	case .Done:
 		return false, nil
 	case:
-		return false, failure(statement.connection.handle, result_code)
+		return false, failure(statement.connection, result_code)
 	}
 }
 
@@ -371,7 +391,7 @@ execution_finish :: proc(state: rawptr) -> db.Error {
 	// statement that stepped cleanly: an INSERT ... RETURNING that was not
 	// walked to the end reports its failure here, not at step.
 	if result_code := reset(statement.handle); result_code != .OK {
-		return failure(statement.connection.handle, result_code)
+		return failure(statement.connection, result_code)
 	}
 	return nil
 }
@@ -463,13 +483,13 @@ run :: proc(connection: ^Conn, sql: string) -> db.Error {
 	handle: ^sqlite3_stmt
 	result_code := prepare_v3(connection.handle, cstring(raw_data(sql)), c.int(len(sql)), 0, &handle, nil)
 	if result_code != .OK {
-		return failure(connection.handle, result_code)
+		return failure(connection, result_code)
 	}
 	if handle == nil { return nil }
 
 	err: db.Error
 	if result_code = step(handle); result_code != .Done {
-		err = failure(connection.handle, result_code)
+		err = failure(connection, result_code)
 	}
 	finalize(handle)
 	return err
@@ -477,14 +497,17 @@ run :: proc(connection: ^Conn, sql: string) -> db.Error {
 
 // failure builds a db.Error from the connection's current error state. errmsg
 // and extended_errcode are read before anything else touches the handle,
-// because the next SQLite call can overwrite both.
+// because the next SQLite call can overwrite both. The message is copied in
+// full into storage the connection owns: it is valid until the connection is
+// closed, and nobody releases it. A holder that keeps the error longer copies
+// it with db.error_clone.
 @(private, require_results)
-failure :: proc(handle: ^sqlite3, result_code: Result_Code) -> db.Error {
+failure :: proc(connection: ^Conn, result_code: Result_Code) -> db.Error {
 	message := ""
 	code := c.int(result_code)
-	if handle != nil {
-		message = string(errmsg(handle))
-		code = extended_errcode(handle)
+	if connection.handle != nil {
+		message = string(errmsg(connection.handle))
+		code = extended_errcode(connection.handle)
 	}
 	kind := classify(result_code)
 	// A stale WAL snapshot is an extended Busy, so the primary code the call
@@ -492,7 +515,24 @@ failure :: proc(handle: ^sqlite3, result_code: Result_Code) -> db.Error {
 	if kind == .Busy && code == BUSY_SNAPSHOT {
 		kind = .Busy_Snapshot
 	}
-	return db.error_make(kind, i32(code), message)
+	return db.error_make(kind, i32(code), remember(connection, message))
+}
+
+// remember returns the connection's stored copy of message, adding one when the
+// text is new. A copy that does not fit leaves the message empty; the kind and
+// code still report the failure.
+@(private)
+remember :: proc(connection: ^Conn, message: string) -> string {
+	for existing in connection.failures {
+		if existing == message { return existing }
+	}
+	text, clone_err := strings.clone(message, connection.allocator)
+	if clone_err != nil { return "" }
+	if _, append_err := append(&connection.failures, text); append_err != nil {
+		delete(text, connection.allocator)
+		return ""
+	}
+	return text
 }
 
 // classify maps a result code onto db.Error_Kind. Only the kinds a caller can

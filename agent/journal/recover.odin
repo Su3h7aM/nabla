@@ -13,7 +13,7 @@ Recovery :: Session_Recovered
 recover :: proc(journal: ^Journal) -> (recovery: Recovery, error: Error) {
 	assert(journal.claimed != {}, "recover needs a claimed session")
 	_ = commit(journal) or_return
-	defer if error != nil && journal.failure == nil && !error_is_busy(error) { journal.failure = error }
+	defer if error != nil && journal.failure == nil && !error_is_busy(error) { latch(journal, error) }
 	recover_open_work(journal, &recovery) or_return
 	recover_results(journal, &recovery) or_return
 	if recovery == {} { return }

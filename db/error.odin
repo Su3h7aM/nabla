@@ -1,11 +1,6 @@
 package db
 
-// MAX_ERROR_MESSAGE bounds the diagnostic text a Failure carries. It sizes the
-// message array stored inline in Failure, which is what lets a db.Error travel
-// as a plain value: an error carries its text with it, no error allocates, and
-// no caller has to free one. A longer backend message is cut short and
-// Failure.truncated records that.
-MAX_ERROR_MESSAGE :: 128
+import "core:mem"
 
 // Error_Kind classifies a failure so a caller can decide what to do without
 // knowing a native error code. The backend's own code is always kept in
@@ -43,15 +38,17 @@ Error_Kind :: enum {
 }
 
 // Failure is what an Error carries: a classification, the backend's own code,
-// and the diagnostic text. The message is stored inline, so a Failure owns
-// nothing, survives the connection that produced it, and can be copied and
-// logged like any other value.
+// and the full diagnostic text, with no length limit.
+//
+// message is a view: static data, or text the connection that failed owns,
+// valid until the connection is closed. Nothing releases it. A holder that keeps
+// the error longer clones it with error_clone and releases the copy with
+// error_destroy. allocator is the allocator of such a copy, and zero for a view.
 Failure :: struct {
-	kind:        Error_Kind,
-	code:        i32,
-	message_len: int,
-	truncated:   bool,
-	message:     [MAX_ERROR_MESSAGE]u8,
+	kind:      Error_Kind,
+	code:      i32,
+	message:   string,
+	allocator: mem.Allocator,
 }
 
 // Error is what every fallible procedure in this package returns. Its zero
@@ -62,19 +59,39 @@ Error :: union {
 }
 
 // error_make builds an Error from a classification, a native code, and a
-// message. code is 0 when the backend has none to report. Backends call this to
-// report their own failures; the message is truncated to MAX_ERROR_MESSAGE.
+// message. code is 0 when the backend has none to report. The Error borrows
+// message and allocates nothing, so message has to outlive every copy of the
+// Error: pass a string literal, or text the backend's connection keeps.
 @(require_results)
 error_make :: proc(kind: Error_Kind, code: i32, message: string) -> Error {
-	failure := Failure {
-		kind = kind,
-		code = code,
+	return Failure{kind = kind, code = code, message = message}
+}
+
+// error_clone builds an Error that owns a copy of message, allocated with
+// allocator, for a holder that keeps an error past the close of its
+// connection. The holder releases the copy with error_destroy.
+//
+// If the copy cannot be allocated the Error keeps its kind and code and carries
+// an empty message, so a failure never turns into success.
+@(require_results)
+error_clone :: proc(kind: Error_Kind, code: i32, message: string, allocator: mem.Allocator) -> Error {
+	copied, alloc_err := mem.alloc_bytes_non_zeroed(len(message), 1, allocator)
+	if alloc_err != nil {
+		return Failure{kind = kind, code = code}
 	}
-	length := min(len(message), MAX_ERROR_MESSAGE)
-	copy(failure.message[:length], message[:length])
-	failure.message_len = length
-	failure.truncated = length < len(message)
-	return failure
+	copy(copied, message)
+	return Failure{kind = kind, code = code, message = string(copied), allocator = allocator}
+}
+
+// error_destroy releases the message err owns and sets err to nil. It does
+// nothing for nil or for an Error whose message is borrowed. Every copy of the
+// Error shares the one message, so destroy it once and drop the other copies.
+error_destroy :: proc(err: ^Error) {
+	failure, ok := err.(Failure)
+	if ok && failure.allocator.procedure != nil {
+		delete(failure.message, failure.allocator)
+	}
+	err^ = nil
 }
 
 // error_kind returns the classification of err, or .None when err is nil.
@@ -83,14 +100,10 @@ error_kind :: proc(err: Error) -> Error_Kind {
 	return failure.kind
 }
 
-// error_message returns the diagnostic text of err, or "" when err is nil. The
-// result aliases err, so it stays valid exactly as long as err does, and err has
-// to be addressable: the message is stored inside the error. An error held in a
-// by-value parameter has no address, so copy it into a local first.
-error_message :: proc(err: ^Error) -> string {
-	if err^ == nil { return "" }
-	// Error has a single variant, so a non-nil Error is a Failure and the
-	// assertion cannot fail.
-	failure := &err^.(Failure)
-	return string(failure.message[:failure.message_len])
+// error_message returns the full diagnostic text of err, or "" when err is nil.
+// The result is a view of the message err holds, valid until err is destroyed.
+// Clone it to keep it longer.
+error_message :: proc(err: Error) -> string {
+	failure, _ := err.(Failure)
+	return failure.message
 }

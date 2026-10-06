@@ -26,20 +26,17 @@ _expect_ok :: proc(t: ^testing.T, err: db.Error) {
 }
 
 message_of :: proc(err: db.Error) -> string {
-	// error_message borrows the Error it is given, so it needs one that is
-	// addressable and outlives the call. A parameter is neither.
-	local := err
-	return strings.concatenate({"unexpected error: ", db.error_message(&local)}, context.temp_allocator)
+	return strings.concatenate({"unexpected error: ", db.error_message(err)}, context.temp_allocator)
 }
 
+// _expect_failure checks the kind of err.
 _expect_failure :: proc(t: ^testing.T, err: db.Error, kind: db.Error_Kind) {
 	if err == nil {
 		testing.expectf(t, false, "expected a %v failure, got none", kind)
 		return
 	}
 	if actual := db.error_kind(err); actual != kind {
-		local := err
-		testing.expectf(t, false, "expected %v, got %v: %s", kind, actual, db.error_message(&local))
+		testing.expectf(t, false, "expected %v, got %v: %s", kind, actual, db.error_message(err))
 	}
 }
 
@@ -59,6 +56,20 @@ _temp_directory :: proc(t: ^testing.T) -> string {
 
 _temp_database :: proc(directory: string) -> string {
 	return strings.concatenate({directory, "/test.db"}, context.allocator)
+}
+
+@(test)
+test_a_long_backend_message_reaches_the_caller_whole :: proc(t: ^testing.T) {
+	connection := _open(t)
+	defer _ = db.close(&connection)
+
+	column := strings.repeat("c", 300, context.temp_allocator)
+	_expect_ok(t, db.exec(&connection, strings.concatenate({"CREATE TABLE sessions (", column, " TEXT UNIQUE)"}, context.temp_allocator)))
+	_expect_ok(t, db.exec(&connection, "INSERT INTO sessions VALUES ('a')"))
+
+	err := db.exec(&connection, "INSERT INTO sessions VALUES ('a')")
+	testing.expect_value(t, db.error_kind(err), db.Error_Kind.Constraint)
+	testing.expect_value(t, db.error_message(err), strings.concatenate({"UNIQUE constraint failed: sessions.", column}, context.temp_allocator))
 }
 
 @(test)

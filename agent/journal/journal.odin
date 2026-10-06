@@ -139,6 +139,19 @@ Journal :: struct {
 // database at another version.
 @(require_results)
 open :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> (error: Error) {
+	error = open_database(journal, directory, locks, run, mode, allocator)
+	if error != nil {
+		// The error borrows the connection's text, which the teardown frees. A
+		// failure of the teardown itself changes nothing, because the open
+		// error is what the caller needs.
+		error = error_detach(error)
+		_ = close(journal)
+	}
+	return error
+}
+
+@(private)
+open_database :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Open_Mode, allocator: mem.Allocator) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	assert(!journal.open, "the journal is already open")
 	assert(run != {}, "a journal writes for a run")
@@ -149,9 +162,6 @@ open :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Ope
 		read_only = mode == .Read_Only,
 	}
 	journal.pending.allocator = allocator
-	// A failed open tears down what it built; that teardown's own failure
-	// changes nothing, because the open error is what the caller needs.
-	defer if error != nil { _ = close(journal) }
 
 	virtual.arena_init_growing(&journal.batch) or_return
 	journal.directory = strings.clone(directory, allocator) or_return
@@ -197,20 +207,28 @@ close :: proc(journal: ^Journal) -> Error {
 	if journal.open && !journal.read_only && journal.claimed != {} && journal.failure == nil {
 		append_record(journal, Record{kind = .Session_Released, session = journal.claimed}, Session_Released{})
 		_, commit_error = commit(journal)
+		// A later failure on the connection reuses its text, and the close below
+		// ends it, so each error is copied before the next step.
+		commit_error = error_detach(commit_error)
 	}
-	release_error := release(journal)
+	release_error := error_detach(release(journal))
 	// A statement that refuses to close stays on the connection's list, and the
 	// connection close below is what reports it.
 	for &statement in journal.inserts { _ = db.statement_close(&statement) }
-	close_error := db.close(&journal.connection)
+	close_error := error_detach(db.close(&journal.connection))
+	result := commit_error
+	if close_error != nil { result = close_error }
+	if release_error != nil { result = release_error }
+	// The latched failure belongs to the journal, and callers that got it from
+	// an earlier call hold views valid until here. When close itself returns it,
+	// it passes to the caller as the copy in the temp allocator made above.
+	error_release(&journal.failure)
 	delete(journal.pending)
 	virtual.arena_destroy(&journal.batch)
 	delete(journal.directory, journal.allocator)
 	delete(journal.locks, journal.allocator)
 	journal^ = {}
-	if release_error != nil { return release_error }
-	if close_error != nil { return close_error }
-	return commit_error
+	return result
 }
 
 // claim takes the writer claim for session and returns the ids it has used.

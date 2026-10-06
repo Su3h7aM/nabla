@@ -8,7 +8,6 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 
 - If strict tool mode is added, apply OpenAI's strict-mode schema limits only when `strict` is sent.
 - The same unbounded recursion is unguarded where provider and ACP input is parsed: `acp/protocol.odin`, `ai/anthropic.odin`, `ai/openai_chat.odin`, `ai/openai_responses.odin`, `ai/classify.odin`, `ai/encode.odin` (tool schemas), `mcp/tools.odin`. `mcp/json_admit.odin` already guards MCP messages with `MAX_MESSAGE_DEPTH`. One shared guard, or an iterative parse, would cover all of them.
-- `db/error.odin` stores backend messages in a 128-byte inline buffer. SQLite has no such limit. Own the full message.
 
 Provider error classification mostly matches the Anthropic and OpenAI documentation. Open points:
 
