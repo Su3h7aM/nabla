@@ -214,8 +214,9 @@ Compact_Trigger :: enum {
 	Pressure,
 	Agent_Tool,
 	User_Command,
-	// Provider_Overflow is a provider that refused the request as too large. It is the
-	// same work as an explicit request, asked for because nothing else made room.
+	// Provider_Overflow is a provider that refused the request as too large, or answered
+	// with a response that filled the context window. It is the same work as an explicit
+	// request, asked for because nothing else made room.
 	Provider_Overflow,
 	Model_Switch,
 }
@@ -453,6 +454,7 @@ chat_compact_reason :: proc(job: ^Compact_Job) -> string {
 	if job.error_text != "" { return job.error_text }
 	if job.output_lost { return "the summary did not fit in memory" }
 	if job.reason == .Length { return "the summary was cut off by the output limit" }
+	if job.reason == .Context_Window { return "the summary filled the context window" }
 	if job.tool_calls > 0 { return "the summarizer called a tool instead of answering" }
 	if chat_compact_summary(job) == "" { return "the summarizer produced no summary" }
 	return "the summary does not free enough context"
@@ -787,6 +789,13 @@ chat_compact_recovery :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> Chat_Re
 	return chat_recovery_decide(chat.compact_retry, facts)
 }
 
+// chat_compact_in_progress reports whether a summary is running or waiting out a backoff,
+// which is when a request that needs room waits for it instead of failing.
+@(private)
+chat_compact_in_progress :: proc(chat: ^Chat_Session) -> bool {
+	return chat.compact.state == .Running || chat.compact.state == .Backoff
+}
+
 // chat_compact_deadline is when compaction next acts without a publication: the due time
 // of a summary in backoff, or nil for a wait that only a cancel ends.
 chat_compact_deadline :: proc(chat: ^Chat_Session) -> Maybe(time.Tick) {
@@ -1110,8 +1119,8 @@ chat_compact_idle_service :: proc(chat: ^Chat_Session, observer: Chat_Observer, 
 
 // chat_compact_relieve is the last thing tried before a request is refused. It
 // polls once, installs a candidate that is already ready, and reports whether the
-// context changed. It never starts work and never waits, so a request that cannot
-// be admitted still fails immediately.
+// context changed. It never starts work and never waits; the caller decides whether
+// a summary still running is worth waiting for.
 chat_compact_relieve :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bool {
 	chat_compact_poll(chat, observer)
 	if chat.compact.state != .Ready { return false }

@@ -28,8 +28,9 @@ Chat_Request_Stage :: enum {
 	Sending,
 	// Backoff: the chain waits out the delay before its next attempt.
 	Backoff,
-	// Repairing: the provider refused the payload as too large, so the chain waits for or
-	// starts a summary before rebuilding the request.
+	// Repairing: the request does not fit, because the provider refused the payload as too
+	// large or because admission refused it while a summary was running. The chain waits for
+	// or starts a summary before rebuilding the request.
 	Repairing,
 	// Committing: the chain has stopped and its response must be recorded.
 	Committing,
@@ -237,9 +238,7 @@ chat_try_context_repair :: proc(
 		if chat_compact_request(chat, .Provider_Overflow) != .Unavailable {
 			chat_compact_consider(chat, observer, connection, prep)
 		}
-		if chat.compact.state == .Running || chat.compact.state == .Backoff {
-			return .Summary_Running
-		}
+		if chat_compact_in_progress(chat) { return .Summary_Running }
 	}
 	if refusal != .None {
 		return refusal
@@ -300,15 +299,18 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	chat_compact_consider(chat, observer, connection, &prep)
 
 	// A request that does not fit is refused unless a summary that already finished can be
-	// installed right now. Nothing waits for compaction: a request that still does not fit
-	// fails explicitly, and the turn is told why.
+	// installed right now, or one is still running: that request is frozen like any other
+	// and waits for the summary in the chain's repair stage. With no summary coming, a
+	// request that still does not fit fails explicitly, and the turn is told why.
 	message, admitted := chat_admission_check(chat, prep.estimate, prep.sizes)
+	waiting := false
 	if !admitted {
 		if chat_compact_relieve(chat, observer) && !chat_session_cancelled(chat) {
 			if !chat_rebuild_prep(chat, connection, &prep, scratch_allocator) { return }
 			message, admitted = chat_admission_check(chat, prep.estimate, prep.sizes)
 		}
-		if !admitted {
+		waiting = !admitted && !chat_session_cancelled(chat) && chat_compact_in_progress(chat)
+		if !admitted && !waiting {
 			// The request never reached a provider, so the turn ends with the reason
 			// admission refused it rather than with a send that did not happen.
 			chat.turn_recovery = .Context_Exhausted
@@ -358,7 +360,7 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 
 	chat.last_estimate = prep.estimate
 	chain.active = true
-	chain.stage = .Ready
+	chain.stage = .Repairing if waiting else .Ready
 	chain.connection = connection
 	chain.policy = policy
 	chain.observer = observer
@@ -693,8 +695,9 @@ chat_chain_wait :: proc(chat: ^Chat_Session, seen: u32) {
 	chain.stage = .Ready
 }
 
-// chat_chain_repair waits for a summary or starts one for the refused request, then rebuilds
-// the frozen payload. The next attempt sends the rebuilt bytes under the same bound.
+// chat_chain_repair waits for a summary or starts one for a request that does not fit, then
+// rebuilds the frozen payload. The wait has no deadline beyond the summary's own backoff, and
+// cancellation ends it. The next attempt sends the rebuilt bytes under the same bound.
 @(private)
 chat_chain_repair :: proc(chat: ^Chat_Session, seen: u32) {
 	chain := &chat.chain
@@ -723,6 +726,7 @@ chat_chain_repair :: proc(chat: ^Chat_Session, seen: u32) {
 			return
 		}
 		chat.turn_repair_refusal = refusal
+		chat.turn_recovery = .Context_Exhausted
 		chat_session_fail_turn(chat, fmt.tprintf("the request does not fit the context: %s", chat_repair_refusal_text(refusal)))
 		chat_chain_stop(chat, .Context_Exhausted)
 		return

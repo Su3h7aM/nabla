@@ -87,6 +87,11 @@ Agent_Provider :: struct {
 	requests:   [dynamic]string,
 	thread:     ^thread.Thread,
 	failed:     bool,
+	// hold is the 1-based index of the response that waits for release before it is written,
+	// after its request was read and recorded. Zero holds nothing. agent_provider_stop posts
+	// release, so a test that fails first never leaves the serve thread waiting.
+	hold:       int,
+	release:    sync.Sema,
 	// lock orders the state the serve thread writes with the test that reads it. The
 	// socket a response crosses does not give that ordering, so the fixture states it.
 	lock:       sync.Mutex,
@@ -169,6 +174,7 @@ agent_provider_serve_now :: proc(provider: ^Agent_Provider) {
 // too, so the stop does not wait for the requests that never come.
 agent_provider_stop :: proc(provider: ^Agent_Provider) {
 	if provider.thread != nil {
+		sync.sema_post(&provider.release)
 		// Closing a socket another thread is already waiting in does not end that wait,
 		// so the stop ends both ways of waiting. It takes the open connection and shuts
 		// it down, which returns a read that is waiting on it, and then connects to
@@ -205,7 +211,7 @@ agent_provider_endpoint :: proc(provider: ^Agent_Provider, allocator := context.
 
 agent_provider_serve :: proc(thread: ^thread.Thread) {
 	provider := cast(^Agent_Provider)thread.data
-	for response in provider.responses {
+	for response, index in provider.responses {
 		socket, _, accept_err := net.accept_tcp(provider.listener)
 		if accept_err != nil {
 			agent_provider_note_failure(provider)
@@ -219,6 +225,7 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 			return
 		}
 		agent_provider_record(provider, request)
+		if provider.hold == index + 1 { _ = sync.sema_wait_with_timeout(&provider.release, AGENT_PROVIDER_BOUND) }
 		write_ok := agent_provider_write(socket, response)
 		agent_provider_release(provider, socket)
 		if !write_ok {

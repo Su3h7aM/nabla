@@ -11,8 +11,6 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 
 Provider error classification mostly matches the Anthropic and OpenAI documentation. Open points:
 
-- After a `model_context_window_exceeded` stop the summary runs in the background; if admission refuses the next request while it runs, the turn fails instead of waiting for it. `chat_request_begin` (`agent/chat_chain.odin`) should wait on the running summary, as `chat_chain_repair` does for `Summary_Running`.
-- `chat_compact_reason` (`agent/compact.odin`) reports a summarizer that filled the window as "produced no summary".
 - OpenRouter can turn a Responses API context overflow into a successful `finish_reason: "length"`, which is not classified as overflow.
 
 ## Subagents
