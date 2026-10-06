@@ -377,9 +377,11 @@ agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := fal
 	deadline := time.tick_add(began, TOOL_JOBS_STOP_PATIENCE)
 	for {
 		seen := owner_wake_seen()
+		// Observe completion before the reap so exiting cannot leave an unreaped member.
+		running := agent_team_running(team)
 		// Teardown commits nothing more; recovery closes what this leaves open.
 		agent_team_reap(team, nil)
-		if !agent_team_running(team) { break }
+		if !running { break }
 		if time.tick_diff(time.tick_now(), deadline) <= 0 {
 			subagent_record_abandoned(team, chat, time.tick_since(began))
 			return false
