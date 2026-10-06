@@ -73,7 +73,6 @@ patch_prepare :: proc(
 			if exists {
 				return nil, "", 0, patch_failure(.File_Exists, allocator, "%s already exists; use %s to change it", file.path, PATCH_HEADERS[.Update])
 			}
-			change.mode = os.Permissions_Default_File
 			hunks_repaired: int
 			change.content, hunks_repaired = patch_update(file.path, "", args.lines, hunks, allocator) or_return
 			repaired_hunks += hunks_repaired
@@ -86,7 +85,6 @@ patch_prepare :: proc(
 			source_exists, source_exists_error := patch_path_exists(change.source, file.path, allocator)
 			if source_exists_error != nil { return nil, "", 0, source_exists_error }
 			if !source_exists && patch_only_adds(args.lines, hunks) && file.move_to == "" {
-				change.mode = os.Permissions_Default_File
 				patch_append(&summary_buffer, "added ", file.path, "\n") or_return
 			} else {
 				change.mode = patch_existing_mode(change.source, file.path, allocator) or_return

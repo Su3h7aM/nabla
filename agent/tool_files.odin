@@ -6,7 +6,6 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:time"
 import "core:unicode/utf8"
 
 
@@ -209,7 +208,7 @@ tool_write_mode :: proc(path: string) -> (os.Permissions, Tool_Path_Problem) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	info, info_error := os.lstat(path, context.temp_allocator)
 	if info_error != nil {
-		if info_error == os.General_Error.Not_Exist { return os.Permissions_Default_File, .None }
+		if info_error == os.General_Error.Not_Exist { return {}, .None }
 		return {}, .Missing
 	}
 	defer os.file_info_delete(info, context.temp_allocator)
@@ -231,11 +230,6 @@ tool_write_mode_text :: proc(path: string, problem: Tool_Path_Problem) -> string
 	return ""
 }
 
-// TOOL_WRITE_TEMP_ATTEMPTS bounds how many names an atomic write tries before
-// giving up. A collision means the name is taken, which resolves on the next
-// attempt.
-TOOL_WRITE_TEMP_ATTEMPTS :: 64
-
 // tool_write_atomic writes content to a temporary file beside path and renames it
 // into place, so a reader never sees a half-written file and a failed write
 // leaves the original untouched. Cancellation is cooperative: it is checked
@@ -243,6 +237,8 @@ TOOL_WRITE_TEMP_ATTEMPTS :: 64
 // before the rename commits. A cancellation before the rename deletes the
 // temporary file and reports cancelled; once the rename succeeds the observed
 // result stands, because the effect already committed.
+// A zero mode keeps the creation default, which the process umask narrows; any
+// other mode is applied exactly, so a replaced file keeps its permissions.
 @(require_results)
 tool_write_atomic :: proc(
 	path: string,
@@ -255,56 +251,60 @@ tool_write_atomic :: proc(
 	cancelled: bool,
 ) {
 	if tool_control_cancelled(control) { return nil, true }
-	for attempt in 0 ..< TOOL_WRITE_TEMP_ATTEMPTS {
-		if tool_control_cancelled(control) { return nil, true }
-		temp_path := fmt.aprintf("%s.nabla-%d-%d", path, time.tick_now(), attempt, allocator = allocator)
-		defer delete(temp_path, allocator)
-		file, open_error := os.open(temp_path, {.Write, .Create, .Excl}, mode)
-		if open_error == os.General_Error.Exist { continue }
-		if open_error != nil { return open_error, false }
-
-		cancelled_write := false
-		written := 0
-		for written < len(content) {
-			if tool_control_cancelled(control) {
-				cancelled_write = true
-				break
-			}
-			count, chunk_error := os.write(file, content[written:])
-			if chunk_error != nil {
-				// The write already failed, so the cleanup that follows reports nothing more.
-				_ = os.close(file)
-				_ = os.remove(temp_path)
-				return chunk_error, false
-			}
-			if count <= 0 {
-				_ = os.close(file)
-				_ = os.remove(temp_path)
-				return os.General_Error.Invalid_File, false
-			}
-			written += count
-		}
-		if !cancelled_write {
-			if sync_error := os.sync(file); sync_error != nil {
-				_ = os.close(file)
-				_ = os.remove(temp_path)
-				return sync_error, false
-			}
-		}
-		if close_error := os.close(file); close_error != nil {
-			_ = os.remove(temp_path)
-			if cancelled_write { return nil, true }
-			return close_error, false
-		}
-		if cancelled_write || tool_control_cancelled(control) {
-			_ = os.remove(temp_path)
-			return nil, true
-		}
-		if rename_error := os.rename(temp_path, path); rename_error != nil {
-			_ = os.remove(temp_path)
-			return rename_error, false
-		}
-		return nil, false
+	dir, base := os.split_path(path)
+	pattern := fmt.aprintf("%s.nabla-*", base, allocator = allocator)
+	defer delete(pattern, allocator)
+	file, open_error := os.create_temp_file(dir, pattern)
+	if open_error != nil { return open_error, false }
+	// The name belongs to the file and dies with close, while removal runs after it.
+	temp_path, clone_error := strings.clone(os.name(file), allocator)
+	if clone_error != nil {
+		_ = os.close(file)
+		return clone_error, false
 	}
-	return os.General_Error.Exist, false
+	defer delete(temp_path, allocator)
+	defer _ = os.remove(temp_path)
+	if mode != {} {
+		if mode_error := os.fchmod(file, mode); mode_error != nil {
+			_ = os.close(file)
+			return mode_error, false
+		}
+	}
+
+	cancelled_write := false
+	written := 0
+	for written < len(content) {
+		if tool_control_cancelled(control) {
+			cancelled_write = true
+			break
+		}
+		count, chunk_error := os.write(file, content[written:])
+		if chunk_error != nil {
+			// The write already failed, so the cleanup that follows reports nothing more.
+			_ = os.close(file)
+			return chunk_error, false
+		}
+		if count <= 0 {
+			_ = os.close(file)
+			return os.General_Error.Invalid_File, false
+		}
+		written += count
+	}
+	if !cancelled_write {
+		if sync_error := os.sync(file); sync_error != nil {
+			_ = os.close(file)
+			return sync_error, false
+		}
+	}
+	if close_error := os.close(file); close_error != nil {
+		if cancelled_write { return nil, true }
+		return close_error, false
+	}
+	if cancelled_write || tool_control_cancelled(control) {
+		return nil, true
+	}
+	if rename_error := os.rename(temp_path, path); rename_error != nil {
+		return rename_error, false
+	}
+	return nil, false
 }
