@@ -113,9 +113,7 @@ test_measure_text_counts_cells :: proc(t: ^testing.T) {
 
 @(test)
 test_measurement_and_column_count_agree_on_the_policy :: proc(t: ^testing.T) {
-	// The whole reason display.odin exists: a string that measures N cells is
-	// drawn as N cells, and one the policy refuses measures as its drawable
-	// prefix.
+	// A string that measures N cells draws as N cells.
 	values := [?]string{"a\tb", "a\x1b" + "b", "界", "e\u0301", "👩\u200d👩", "❤️", "1️⃣"}
 	for value in values {
 		measured, err := measure_text(value)

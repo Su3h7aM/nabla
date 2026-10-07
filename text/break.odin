@@ -21,11 +21,9 @@ Break_Kind :: enum u8 {
 // `piece_end == next_offset == len(value)` and kind is .None.
 //
 // Scope: it scans bytes and breaks only on ASCII whitespace, so it is UTF-8
-// safe — a multi-byte character is part of the run and never split. Whitespace
-// is space, tab and a lone carriage return; a CR immediately followed by LF
-// belongs to the terminator, which is how CRLF stops gluing an invisible
-// character onto the last word of a line. Wider break opportunities (U+3000,
-// hyphenation) are not implemented.
+// safe: a multi-byte character is part of the run and never split. Only ASCII
+// whitespace breaks; wider opportunities (U+3000, hyphenation) are not
+// implemented.
 //
 // Contract: `offset <= piece_end <= next_offset <= len(value)`, and progress is
 // guaranteed — `next_offset > offset` unless `piece_end == len(value)`.

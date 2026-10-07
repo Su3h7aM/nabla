@@ -2,13 +2,9 @@ package text
 
 import "core:unicode/utf8"
 
-// The Unicode width and grapheme-cluster rules live in core. The iterator and
-// Grapheme come from core:unicode/utf8, whose UAX#29 implementation already
-// handles emoji ZWJ sequences, regional-indicator flags, Hangul syllables,
-// Indic conjuncts, spacing marks, prepend and extend classes, and CRLF, and
-// whose Grapheme.width is the cluster's monospace cell width from normalized
-// East Asian width. These aliases keep the text vocabulary so callers do not
-// import core:unicode/utf8 directly.
+// The Unicode width and grapheme-cluster rules live in core:unicode/utf8. These
+// aliases keep the text vocabulary so callers do not import it directly, and
+// Grapheme.width is the cluster's cell width from normalized East Asian width.
 //
 // Width and drawability decisions live in display.odin; this file is the
 // column arithmetic over that traversal.
