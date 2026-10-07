@@ -98,10 +98,7 @@ present :: proc(
 	return committed_bytes, required, write_err
 }
 
-// _validate_frame checks every frame invariant before a single byte is
-// serialized or written: dimensions, logical cell count, width, grapheme
-// safety, and cursor bounds. A zero-sized frame is a deterministic no-op
-// (nil error) unless the cursor intent is invalid.
+// _validate_frame checks every frame invariant before anything is written.
 @(require_results)
 _validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor) -> Error {
 	if buffer.columns < 0 || buffer.rows < 0 {
@@ -212,12 +209,7 @@ _encoder_write_byte :: proc(encoder: ^_Encoder, value: u8) {
 	_encoder_write(encoder, one[:])
 }
 
-// _encoder_write_uint writes the decimal form of a nonnegative value. The parameter is
-// u64 so the complete nonnegative int domain is representable (a CUP
-// coordinate of max(int) needs the +1 computed in the unsigned domain, where
-// max(int) + 1 == 2^63 fits). Callers validate nonnegativity before
-// encoding; a negative int passed through is a caller bug, not this proc's
-// contract.
+// _encoder_write_uint writes the decimal form of a nonnegative value.
 _encoder_write_uint :: proc(encoder: ^_Encoder, value: u64) {
 	// Decimal digits for the complete u64 domain: max(u64) is 20 digits, so
 	// size_of(u64) * 3 bytes is always enough.
@@ -378,8 +370,6 @@ _modifier_sgr :: proc(modifier: Modifier) -> u8 {
 }
 
 _encoder_write_color :: proc(encoder: ^_Encoder, prefix: u8, color: Color, depth: Color_Depth) {
-	// Depth reduction is deterministic: TrueColor as authored, 256 via the
-	// xterm cube, 16/8 via the nearest ANSI entry, None drops colors.
 	if depth == .None {
 		return
 	}

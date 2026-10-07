@@ -129,11 +129,6 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 	}
 	impl.file = file
 	defer if !session_active {
-		// The rollback descriptor-close cause surfaces only when no setup
-		// cause precedes it: the defer runs exclusively on failure paths, so
-		// the setup cause is the primary one today, and the guard keeps a
-		// future failure after the last setup step from swallowing the close
-		// cause.
 		if rollback_err := _session_rollback(impl); err == nil {
 			err = rollback_err
 		}
@@ -144,10 +139,7 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 	}
 	fd := linux.Fd(os.fd(file))
 
-	// Raw input mode is an explicit opt-in (.Raw): it saves and replaces the
-	// termios, sets the descriptor nonblocking for the drain-until-EAGAIN
-	// input path, and arms the termios safety net. .Unchanged leaves
-	// the input configuration entirely alone.
+	// .Raw saves and replaces the termios and sets the descriptor nonblocking.
 	if options.input_mode == .Raw {
 		if errno := _tcgetattr(fd, &impl.original_termios); errno != .NONE {
 			return Platform_Error(errno)
