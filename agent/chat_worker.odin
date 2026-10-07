@@ -42,19 +42,10 @@ Chat_Request_Worker :: struct {
 	arena:             virtual.Arena,
 }
 
-// Chat_Worker_Runtime is the callback's user data: the worker fact sink, the identity every
-// queued event carries, and the provider's stop reason as it arrives.
-Chat_Worker_Runtime :: struct {
-	worker:        ^Chat_Request_Worker,
-	source:        Chat_Event_Source,
-	finish_reason: ai.Provider_Finish_Reason,
-}
-
 // chat_request_worker_run is the job body. It stores the terminal and nothing more: job_main
 // publishes it.
 chat_request_worker_run :: proc(job: ^Job) {
-	worker := cast(^Chat_Request_Worker)job
-	worker.terminal = chat_request_worker_attempt(worker)
+	chat_request_worker_attempt(cast(^Chat_Request_Worker)job)
 }
 
 // chat_request_worker_free releases an attempt record whose worker has published, together
@@ -74,30 +65,23 @@ chat_request_worker_reclaim :: proc(worker: ^Chat_Request_Worker) {
 	chat_request_worker_free(worker)
 }
 
-// chat_request_worker_attempt runs the blocking send and returns what the owner needs to
-// decide the next stage. Everything it records as progress is queued by the callback, so a
-// stream that ends badly still leaves the owner with every fact that arrived.
-@(private, require_results)
-chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attempt_Terminal {
-	runtime := Chat_Worker_Runtime {
-		worker = worker,
-		source = worker.source,
-	}
-	operation_error: ai.Provider_Operation_Error
+// chat_request_worker_attempt runs the blocking send and records in worker.terminal what the
+// owner needs to decide the next stage. Everything it records as progress is queued by the
+// callback, so a stream that ends badly still leaves the owner with every fact that arrived.
+@(private)
+chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) {
 	if worker.websocket_request {
-		operation_error = ai.Provider_WebSocket_Request(worker.websocket, worker.encoded, rawptr(&runtime), chat_worker_event, worker.options)
+		worker.terminal.error = ai.Provider_WebSocket_Request(worker.websocket, worker.encoded, worker, chat_worker_event, worker.options)
 	} else {
-		operation_error = ai.Provider_Request_Operation_Encoded(
+		worker.terminal.error = ai.Provider_Request_Operation_Encoded(
 			worker.connection,
 			worker.encoded,
-			rawptr(&runtime),
+			worker,
 			chat_worker_event,
 			worker.options,
 			worker.worker.allocator,
 		)
 	}
-	finish_reason := runtime.finish_reason
-	return {error = operation_error, finish_reason = finish_reason}
 }
 
 // chat_worker_event is the transport callback. The transport frees the event it hands over
@@ -107,8 +91,7 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 // keep is what tells the owner nothing in it may be trusted.
 @(private)
 chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
-	runtime := cast(^Chat_Worker_Runtime)user_data
-	worker := runtime.worker
+	worker := cast(^Chat_Request_Worker)user_data
 	allocator := worker.worker.allocator
 	#partial switch value in event {
 	case ai.Provider_Text_Event:
@@ -117,13 +100,13 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			mailbox_mark_lost(worker.mailbox)
 			return
 		}
-		chat_worker_deliver(worker, Chat_Text_Event{source = runtime.source, text = text})
+		chat_worker_deliver(worker, Chat_Text_Event{source = worker.source, text = text})
 	case ai.Provider_Reasoning_Event:
 	// Reasoning is opaque replay material. The stored response is what replays it, so
 	// the owner never needs the live copy.
 	case ai.Provider_Completed_Event:
-		runtime.finish_reason = value.Reason
-		completion, kept := chat_worker_completion(worker, runtime.source, value)
+		worker.terminal.finish_reason = value.Reason
+		completion, kept := chat_worker_completion(worker, worker.source, value)
 		if !kept {
 			mailbox_mark_lost(worker.mailbox)
 			return
@@ -135,7 +118,7 @@ chat_worker_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 			mailbox_mark_lost(worker.mailbox)
 			return
 		}
-		chat_worker_deliver(worker, Chat_Failure_Event{source = runtime.source, kind = value.Kind, message = message})
+		chat_worker_deliver(worker, Chat_Failure_Event{source = worker.source, kind = value.Kind, message = message})
 	case ai.Provider_Usage_Event:
 		// Usage is a measurement, not text: it is copied whole and needs no ownership, and a
 		// queue that cannot take it does not make the response unusable the way a lost

@@ -29,11 +29,7 @@ test_lost_worker_fact_sets_the_lost_flag :: proc(test: ^testing.T) {
 			mailbox = &mailbox,
 			source = source,
 		}
-		worker_runtime := Chat_Worker_Runtime {
-			worker = &worker,
-			source = source,
-		}
-		chat_worker_event(&worker_runtime, ai.Provider_Text_Event{Text = "a lost answer"})
+		chat_worker_event(&worker, ai.Provider_Text_Event{Text = "a lost answer"})
 		testing.expect_value(test, len(mailbox.events), 0)
 		testing.expect(test, mailbox_take_lost(&mailbox), "an uncopied fragment is reported lost")
 		testing.expect(test, !mailbox_take_lost(&mailbox), "the report is taken once")
@@ -48,11 +44,7 @@ test_lost_worker_fact_sets_the_lost_flag :: proc(test: ^testing.T) {
 			mailbox = &mailbox,
 			source = source,
 		}
-		worker_runtime := Chat_Worker_Runtime {
-			worker = &worker,
-			source = source,
-		}
-		chat_worker_event(&worker_runtime, ai.Provider_Text_Event{Text = "a lost answer"})
+		chat_worker_event(&worker, ai.Provider_Text_Event{Text = "a lost answer"})
 		testing.expect_value(test, len(mailbox.events), 0)
 		testing.expect(test, mailbox_take_lost(&mailbox), "an unqueued event is reported lost")
 	}
