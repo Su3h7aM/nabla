@@ -988,17 +988,17 @@ subagent_run :: proc(member: ^Subagent) {
 			return
 		}
 	}
+	turn_steer := Steer_Context {
+		observe    = subagent_steer_observe,
+		apply      = subagent_steer_apply,
+		apply_data = &steer,
+	}
 	for {
 		subagent_steer_service(&steer)
 		accepted := chat_session_accept_message(&chat, text, origin, {}, inbox_first)
 		if accepted != .Accepted {
 			subagent_fail(member, .Failed, chat.last_error if chat.last_error != "" else "the task could not be recorded")
 			return
-		}
-		turn_steer := Steer_Context {
-			observe    = subagent_steer_observe,
-			apply      = subagent_steer_apply,
-			apply_data = &steer,
 		}
 		if !chat_turn_drive(&chat, steer.connection, chat_retry_policy_default(), {}, &turn_steer, nil) {
 			if chat.terminal_status == .Cancelled {
