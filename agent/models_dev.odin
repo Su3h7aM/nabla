@@ -136,6 +136,23 @@ models_dev_validate :: proc(data: []u8) -> bool {
 	return err == .None
 }
 
+// models_dev_error is the failure of this stage that a parse failure becomes.
+models_dev_error :: proc(err: Models_Dev_Parse_Error) -> Models_Dev_Error {
+	switch err {
+	case .None:
+		return .None
+	case .Allocation:
+		return .Allocation
+	case .Invalid_JSON:
+		return .Invalid_JSON
+	case .Invalid_Structure:
+		return .Invalid_Structure
+	case .Missing_Identity:
+		return .Missing_Identity
+	}
+	return .Invalid_Data
+}
+
 // models_dev_cached_sources parses the last cached document without checking its
 // age and never performs a network request. It is the startup path.
 @(require_results)
@@ -147,19 +164,8 @@ models_dev_cached_sources :: proc(providers: []string = {}, allocator := context
 	if !cached { return {}, .Unavailable }
 	defer delete(body, allocator)
 	sources, parse_err := models_dev_parse(body, providers, allocator)
-	switch parse_err {
-	case .None:
-		return sources, .None
-	case .Allocation:
-		return {}, .Allocation
-	case .Invalid_JSON:
-		return {}, .Invalid_JSON
-	case .Invalid_Structure:
-		return {}, .Invalid_Structure
-	case .Missing_Identity:
-		return {}, .Missing_Identity
-	}
-	return {}, .Invalid_Data
+	if parse_err != .None { return {}, models_dev_error(parse_err) }
+	return sources, .None
 }
 
 // models_dev_sources produces the resolver input from models.dev: the document is taken from
@@ -181,19 +187,8 @@ models_dev_sources :: proc(
 	defer delete(body, allocator)
 
 	sources, parse_err := models_dev_parse(body, providers, allocator)
-	switch parse_err {
-	case .None:
-		return sources, .None
-	case .Allocation:
-		return {}, .Allocation
-	case .Invalid_JSON:
-		return {}, .Invalid_JSON
-	case .Invalid_Structure:
-		return {}, .Invalid_Structure
-	case .Missing_Identity:
-		return {}, .Missing_Identity
-	}
-	return {}, .Invalid_Data
+	if parse_err != .None { return {}, models_dev_error(parse_err) }
+	return sources, .None
 }
 
 // models_dev_cache_path resolves where the document is cached and creates the directory.
