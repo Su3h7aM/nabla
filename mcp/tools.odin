@@ -411,27 +411,16 @@ tools_call_params_make :: proc(name, arguments_json: string, version: Protocol_V
 		json.destroy_value(arguments, allocator)
 		return {}, build_error
 	}
-	name_key, name_key_error := strings.clone("name", allocator)
-	if name_key_error != nil {
+	if !mcp_object_put_string(&built_params, "name", name, allocator) {
 		json.destroy_value(json.Value(built_params), allocator)
 		json.destroy_value(arguments, allocator)
 		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
-	name_value, name_value_error := strings.clone(name, allocator)
-	if name_value_error != nil {
-		delete(name_key, allocator)
+	if !mcp_object_put_value(&built_params, "arguments", json.Value(object), allocator) {
 		json.destroy_value(json.Value(built_params), allocator)
 		json.destroy_value(arguments, allocator)
 		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
-	built_params[name_key] = json.String(name_value)
-	arguments_key, arguments_key_error := strings.clone("arguments", allocator)
-	if arguments_key_error != nil {
-		json.destroy_value(json.Value(built_params), allocator)
-		json.destroy_value(arguments, allocator)
-		return {}, error_make(.Out_Of_Memory, allocator = allocator)
-	}
-	built_params[arguments_key] = json.Value(object)
 	return built_params, {}
 }
 
