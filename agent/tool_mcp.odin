@@ -136,12 +136,25 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 		return tool_result_failure(ctx, .Tool_Failed, "the server's reply could not be prepared: out of memory", "out of memory")
 	}
 	for content in call.content {
-		block := MCP_Block {
-			type = content.type_name,
-		}
-		if content.kind == .Text {
-			block.text = content.text
-		} else {
+		block: MCP_Block
+		switch variant in content {
+		case mcp.Text_Content:
+			block.type = "text"
+			block.text = variant.text
+		case mcp.Image_Content:
+			block.type = "image"
+			block.detail = tool_mcp_omitted_detail(content, context.temp_allocator)
+		case mcp.Audio_Content:
+			block.type = "audio"
+			block.detail = tool_mcp_omitted_detail(content, context.temp_allocator)
+		case mcp.Resource_Link_Content:
+			block.type = "resource_link"
+			block.detail = tool_mcp_omitted_detail(content, context.temp_allocator)
+		case mcp.Embedded_Resource_Content:
+			block.type = "resource"
+			block.detail = tool_mcp_omitted_detail(content, context.temp_allocator)
+		case mcp.Unknown_Content:
+			block.type = variant.type_name
 			block.detail = tool_mcp_omitted_detail(content, context.temp_allocator)
 		}
 		if _, append_error := append(&blocks, block); append_error != nil {
@@ -169,19 +182,22 @@ tool_mcp_call_result :: proc(ctx: ^Tool_Context, call: mcp.Call_Result) -> Tool_
 // and the MIME type are the parts a reader can act on.
 @(private, require_results)
 tool_mcp_omitted_detail :: proc(content: mcp.Content, allocator := context.allocator) -> string {
-	switch content.kind {
-	case .Image, .Audio:
-		if content.mime_type != "" { return fmt.aprintf("%s is not shown", content.mime_type, allocator = allocator) }
-		return fmt.aprintf("%s content is not shown", content.type_name, allocator = allocator)
-	case .Resource_Link:
-		if content.mime_type != "" {
-			return fmt.aprintf("link to %s (%s), not fetched", content.uri, content.mime_type, allocator = allocator)
+	switch variant in content {
+	case mcp.Text_Content:
+		return "text content is not shown"
+	case mcp.Image_Content:
+		return fmt.aprintf("%s is not shown", variant.mime_type, allocator = allocator)
+	case mcp.Audio_Content:
+		return fmt.aprintf("%s is not shown", variant.mime_type, allocator = allocator)
+	case mcp.Resource_Link_Content:
+		if variant.mime_type != "" {
+			return fmt.aprintf("link to %s (%s), not fetched", variant.uri, variant.mime_type, allocator = allocator)
 		}
-		return fmt.aprintf("link to %s, not fetched", content.uri, allocator = allocator)
-	case .Embedded_Resource:
-		return fmt.aprintf("embedded resource %s is not expanded", content.uri, allocator = allocator)
-	case .Text, .Unknown:
-		return fmt.aprintf("%s content is not shown", content.type_name, allocator = allocator)
+		return fmt.aprintf("link to %s, not fetched", variant.uri, allocator = allocator)
+	case mcp.Embedded_Resource_Content:
+		return fmt.aprintf("embedded resource %s is not expanded", variant.uri, allocator = allocator)
+	case mcp.Unknown_Content:
+		return fmt.aprintf("%s content is not shown", variant.type_name, allocator = allocator)
 	}
 	return ""
 }

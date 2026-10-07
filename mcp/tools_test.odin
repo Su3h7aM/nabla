@@ -189,8 +189,9 @@ test_call_result_reads_completion_and_failure :: proc(t: ^testing.T) {
 	if testing.expect_value(t, err.kind, Error_Kind.None) {
 		testing.expect(t, !result.is_error && !result.input_required)
 		if testing.expect_value(t, len(result.content), 1) {
-			testing.expect_value(t, result.content[0].kind, Content_Kind.Text)
-			testing.expect_value(t, result.content[0].text, "created issue 12")
+			text, is_text := result.content[0].(Text_Content)
+			testing.expect(t, is_text, "the block is text")
+			testing.expect_value(t, text.text, "created issue 12")
 		}
 		testing.expect_value(t, result.structured_json, `{"number":12}`)
 	}
@@ -249,16 +250,20 @@ test_call_result_reports_content_it_does_not_show :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
 
 	if !testing.expect_value(t, len(result.content), 4) { return }
-	testing.expect_value(t, result.content[0].kind, Content_Kind.Image)
-	testing.expect_value(t, result.content[0].mime_type, "image/png")
-	testing.expect_value(t, result.content[1].kind, Content_Kind.Resource_Link)
-	testing.expect_value(t, result.content[1].uri, "file:///tmp/log")
-	testing.expect_value(t, result.content[2].kind, Content_Kind.Embedded_Resource)
-	testing.expect_value(t, result.content[2].uri, "file:///tmp/x")
+	image, is_image := result.content[0].(Image_Content)
+	testing.expect(t, is_image, "the block is an image")
+	testing.expect_value(t, image.mime_type, "image/png")
+	link, is_link := result.content[1].(Resource_Link_Content)
+	testing.expect(t, is_link, "the block is a resource link")
+	testing.expect_value(t, link.uri, "file:///tmp/log")
+	embedded, is_embedded := result.content[2].(Embedded_Resource_Content)
+	testing.expect(t, is_embedded, "the block is an embedded resource")
+	testing.expect_value(t, embedded.uri, "file:///tmp/x")
 	// A type this revision does not define is reported, not refused, and it is
 	// named by what the server called it.
-	testing.expect_value(t, result.content[3].kind, Content_Kind.Unknown)
-	testing.expect_value(t, result.content[3].type_name, "future_block")
+	unknown, is_unknown := result.content[3].(Unknown_Content)
+	testing.expect(t, is_unknown, "the block is unknown")
+	testing.expect_value(t, unknown.type_name, "future_block")
 }
 
 // A server's text is kept as it was sent. No block is dropped or cut, and nothing is
@@ -290,7 +295,9 @@ test_call_result_keeps_every_text_block_whole :: proc(t: ^testing.T) {
 
 	if !testing.expect_value(t, len(result.content), 6) { return }
 	for content in result.content {
-		testing.expect_value(t, len(content.text), len(chunk))
+		text, is_text := content.(Text_Content)
+		testing.expect(t, is_text, "the block is text")
+		testing.expect_value(t, len(text.text), len(chunk))
 	}
 }
 
@@ -374,7 +381,9 @@ test_handshake_era_results_carry_no_result_type :: proc(t: ^testing.T) {
 		// That era has no input-required reply: a result is always a completion.
 		testing.expect(t, !result.input_required, "a handshake-era result is a completion")
 		if testing.expect_value(t, len(result.content), 1) {
-			testing.expect_value(t, result.content[0].text, "legacy ok")
+			text, is_text := result.content[0].(Text_Content)
+			testing.expect(t, is_text, "the block is text")
+			testing.expect_value(t, text.text, "legacy ok")
 		}
 		testing.expect_value(t, result.structured_json, `{"n":1}`)
 	}

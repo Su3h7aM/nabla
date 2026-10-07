@@ -326,37 +326,70 @@ tool_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Tool, strin
 
 // --- calling -----------------------------------------------------------------
 
-// Content_Kind classifies one content block.
-Content_Kind :: enum {
-	Text,
-	Image,
-	Audio,
-	Resource_Link,
-	Embedded_Resource,
-	// A content type this revision does not define, named by type_name.
-	Unknown,
+// Text_Content is a text block, kept whole.
+Text_Content :: struct {
+	text: string,
 }
 
-// Content is one content block. type_name is what the server called it, so a
-// block that is not shown can still be reported. Binary payloads are never
-// retained: an image, an audio block, and an embedded resource carry their
-// descriptive fields only, because their data would consume the model's context
-// to no purpose.
-Content :: struct {
-	kind:      Content_Kind,
-	type_name: string,
-	text:      string,
+// Image_Content and Audio_Content describe a binary block. The payload is never
+// retained, because its data would consume the model's context to no purpose.
+Image_Content :: struct {
 	mime_type: string,
-	uri:       string,
+}
+
+Audio_Content :: struct {
+	mime_type: string,
+}
+
+// Resource_Link_Content is a resource the server can read, named by name and uri.
+Resource_Link_Content :: struct {
 	name:      string,
+	uri:       string,
+	mime_type: string,
+}
+
+// Embedded_Resource_Content is a resource carried inside the result. Its body is
+// never retained, for the same reason as a binary payload.
+Embedded_Resource_Content :: struct {
+	uri:       string,
+	mime_type: string,
+}
+
+// Unknown_Content is a content type this revision does not define, named by
+// type_name so a block that is not shown can still be reported.
+Unknown_Content :: struct {
+	type_name: string,
+}
+
+// Content is one content block. Each variant holds exactly the fields its kind
+// carries; the wire type selects the variant, so it is not stored twice.
+Content :: union {
+	Text_Content,
+	Image_Content,
+	Audio_Content,
+	Resource_Link_Content,
+	Embedded_Resource_Content,
+	Unknown_Content,
 }
 
 content_block_destroy :: proc(block: ^Content, allocator := context.allocator) {
-	delete(block.type_name, allocator)
-	delete(block.text, allocator)
-	delete(block.mime_type, allocator)
-	delete(block.uri, allocator)
-	delete(block.name, allocator)
+	switch variant in block^ {
+	case Text_Content:
+		delete(variant.text, allocator)
+	case Image_Content:
+		delete(variant.mime_type, allocator)
+	case Audio_Content:
+		delete(variant.mime_type, allocator)
+	case Resource_Link_Content:
+		delete(variant.name, allocator)
+		delete(variant.uri, allocator)
+		delete(variant.mime_type, allocator)
+	case Embedded_Resource_Content:
+		delete(variant.uri, allocator)
+		delete(variant.mime_type, allocator)
+	case Unknown_Content:
+		delete(variant.type_name, allocator)
+	}
 	block^ = {}
 }
 
@@ -515,7 +548,6 @@ call_result_decode :: proc(result: json.Object, version: Protocol_Version, alloc
 // the server sent it.
 @(private, require_results)
 content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content, Error) {
-	content: Content
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, error_make(.Malformed_Message, "a content block is not an object", allocator = allocator) }
 
@@ -524,11 +556,6 @@ content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content,
 	if !has_type || !type_is_string || string(type_text) == "" {
 		return {}, error_make(.Malformed_Message, "a content block has no usable type", allocator = allocator)
 	}
-	owned_type_name, type_error := strings.clone(string(type_text), allocator)
-	if type_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-	content.type_name = owned_type_name
-	failed := true
-	defer if failed { content_block_destroy(&content, allocator) }
 
 	switch string(type_text) {
 	case "text":
@@ -537,29 +564,42 @@ content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content,
 		if !has_text || !text_is_string {
 			return {}, error_make(.Malformed_Message, "a text content block carries no text", allocator = allocator)
 		}
-		content.kind = .Text
 		owned_text, text_error := strings.clone(string(text), allocator)
 		if text_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-		content.text = owned_text
+		return Text_Content{text = owned_text}, {}
 
-	case "image", "audio":
+	case "image":
 		// The payload is checked for presence and shape without being copied: the
 		// harness reports that the block exists and what it is, and never puts the
 		// bytes anywhere.
 		data_value, has_data := object["data"]
 		_, data_is_string := data_value.(json.String)
 		if !has_data || !data_is_string {
-			return {}, error_make(.Malformed_Message, "a binary content block carries no data", allocator = allocator)
+			return {}, error_make(.Malformed_Message, "an image content block carries no data", allocator = allocator)
 		}
 		mime_value, has_mime := object["mimeType"]
 		mime, mime_is_string := mime_value.(json.String)
 		if !has_mime || !mime_is_string {
-			return {}, error_make(.Malformed_Message, "a binary content block carries no MIME type", allocator = allocator)
+			return {}, error_make(.Malformed_Message, "an image content block carries no MIME type", allocator = allocator)
 		}
-		content.kind = .Image if string(type_text) == "image" else .Audio
-		mime_error: mem.Allocator_Error
-		content.mime_type, mime_error = strings.clone(string(mime), allocator)
+		owned_mime, mime_error := strings.clone(string(mime), allocator)
 		if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		return Image_Content{mime_type = owned_mime}, {}
+
+	case "audio":
+		data_value, has_data := object["data"]
+		_, data_is_string := data_value.(json.String)
+		if !has_data || !data_is_string {
+			return {}, error_make(.Malformed_Message, "an audio content block carries no data", allocator = allocator)
+		}
+		mime_value, has_mime := object["mimeType"]
+		mime, mime_is_string := mime_value.(json.String)
+		if !has_mime || !mime_is_string {
+			return {}, error_make(.Malformed_Message, "an audio content block carries no MIME type", allocator = allocator)
+		}
+		owned_mime, mime_error := strings.clone(string(mime), allocator)
+		if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		return Audio_Content{mime_type = owned_mime}, {}
 
 	case "resource_link":
 		name_value, has_name := object["name"]
@@ -572,19 +612,30 @@ content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content,
 		if !has_uri || !uri_is_string {
 			return {}, error_make(.Malformed_Message, "a resource link carries no URI", allocator = allocator)
 		}
-		content.kind = .Resource_Link
-		name_error, uri_error: mem.Allocator_Error
-		content.name, name_error = strings.clone(string(name), allocator)
+		owned_name, name_error := strings.clone(string(name), allocator)
 		if name_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
-		content.uri, uri_error = strings.clone(string(uri), allocator)
-		if uri_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		owned_uri, uri_error := strings.clone(string(uri), allocator)
+		if uri_error != nil {
+			delete(owned_name, allocator)
+			return {}, error_make(.Out_Of_Memory, allocator = allocator)
+		}
+		link := Resource_Link_Content {
+			name = owned_name,
+			uri  = owned_uri,
+		}
+		content: Content = link
+		failed := true
+		defer if failed { content_block_destroy(&content, allocator) }
 		if mime_value, present := object["mimeType"]; present {
 			mime, mime_is_string := mime_value.(json.String)
 			if !mime_is_string { return {}, error_make(.Malformed_Message, "a resource link's MIME type is not a string", allocator = allocator) }
-			mime_error: mem.Allocator_Error
-			content.mime_type, mime_error = strings.clone(string(mime), allocator)
+			owned_mime, mime_error := strings.clone(string(mime), allocator)
 			if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+			link.mime_type = owned_mime
+			content = link
 		}
+		failed = false
+		return link, {}
 
 	case "resource":
 		resource_value, has_resource := object["resource"]
@@ -597,25 +648,31 @@ content_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (Content,
 		if !has_uri || !uri_is_string {
 			return {}, error_make(.Malformed_Message, "an embedded resource carries no URI", allocator = allocator)
 		}
-		content.kind = .Embedded_Resource
-		uri_error: mem.Allocator_Error
-		content.uri, uri_error = strings.clone(string(uri), allocator)
+		owned_uri, uri_error := strings.clone(string(uri), allocator)
 		if uri_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		embedded := Embedded_Resource_Content {
+			uri = owned_uri,
+		}
+		content: Content = embedded
+		failed := true
+		defer if failed { content_block_destroy(&content, allocator) }
 		if mime_value, present := resource["mimeType"]; present {
 			mime, mime_is_string := mime_value.(json.String)
 			if !mime_is_string { return {}, error_make(.Malformed_Message, "an embedded resource's MIME type is not a string", allocator = allocator) }
-			mime_error: mem.Allocator_Error
-			content.mime_type, mime_error = strings.clone(string(mime), allocator)
+			owned_mime, mime_error := strings.clone(string(mime), allocator)
 			if mime_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+			embedded.mime_type = owned_mime
+			content = embedded
 		}
+		failed = false
+		return embedded, {}
 
 	case:
 		// A content type this revision does not define is reported, not refused:
 		// the result itself is usable, and the model is owed the fact that
 		// something came back which the harness does not show.
-		content.kind = .Unknown
+		owned_type_name, type_error := strings.clone(string(type_text), allocator)
+		if type_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		return Unknown_Content{type_name = owned_type_name}, {}
 	}
-
-	failed = false
-	return content, {}
 }

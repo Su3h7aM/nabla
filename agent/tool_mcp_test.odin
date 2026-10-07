@@ -15,13 +15,13 @@ mcp_test_context :: proc() -> Tool_Context {
 }
 
 @(private)
-mcp_test_content :: proc(kind: mcp.Content_Kind, type_name, text, mime_type: string) -> mcp.Content {
-	return mcp.Content {
-		kind = kind,
-		type_name = strings.clone(type_name, context.allocator),
-		text = strings.clone(text, context.allocator),
-		mime_type = strings.clone(mime_type, context.allocator),
-	}
+mcp_test_text :: proc(text: string) -> mcp.Content {
+	return mcp.Text_Content{text = strings.clone(text, context.allocator)}
+}
+
+@(private)
+mcp_test_image :: proc(mime_type: string) -> mcp.Content {
+	return mcp.Image_Content{mime_type = strings.clone(mime_type, context.allocator)}
 }
 
 @(test)
@@ -125,8 +125,8 @@ test_mcp_result_shows_text_and_reports_what_it_omits :: proc(test: ^testing.T) {
 		structured_json = strings.clone(`{"number":12}`, context.allocator),
 	}
 	defer mcp.call_result_destroy(&call, context.allocator)
-	append(&call.content, mcp_test_content(.Text, "text", "created issue 12", ""))
-	append(&call.content, mcp_test_content(.Image, "image", "", "image/png"))
+	append(&call.content, mcp_test_text("created issue 12"))
+	append(&call.content, mcp_test_image("image/png"))
 
 	result := tool_mcp_call_result(&tool_context, call)
 	defer tool_result_destroy(&result)
@@ -150,7 +150,7 @@ test_mcp_failure_flag_and_truncation_reach_the_model :: proc(test: ^testing.T) {
 		content   = make([dynamic]mcp.Content, 0, 1, context.allocator),
 	}
 	defer mcp.call_result_destroy(&failed, context.allocator)
-	append(&failed.content, mcp_test_content(.Text, "text", "no such repo", ""))
+	append(&failed.content, mcp_test_text("no such repo"))
 
 	result := tool_mcp_call_result(&tool_context, failed)
 	defer tool_result_destroy(&result)
