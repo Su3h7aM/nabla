@@ -53,11 +53,7 @@ discover_provider_models :: proc(
 		body, fetched := fetch(user_data, provider.base_url.?, credential, allocator)
 		delete(credential, allocator)
 		if !fetched { continue }
-		models, listed := provider_models_list(body, allocator)
-		delete(body, allocator)
-		if !listed { continue }
-		if !provider_sources_add(&result, provider.id, models, allocator) {
-			catalog_model_sources_destroy(models, allocator)
+		if provider_models_add_body(&result, provider.id, body, allocator) == .Failed {
 			catalog_sources_destroy(&result, allocator)
 			return {}, false
 		}
@@ -78,11 +74,7 @@ provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator :
 		body, cached := fetch_cache_read(path, allocator)
 		delete(path, allocator)
 		if !cached { continue }
-		models, listed := provider_models_list(body, allocator)
-		delete(body, allocator)
-		if !listed { continue }
-		if !provider_sources_add(&result, provider.id, models, allocator) {
-			catalog_model_sources_destroy(models, allocator)
+		if provider_models_add_body(&result, provider.id, body, allocator) == .Failed {
 			catalog_sources_destroy(&result, allocator)
 			return {}, false
 		}
@@ -102,6 +94,30 @@ provider_sources_add :: proc(result: ^[dynamic]Catalog_Provider_Source, id: stri
 		return false
 	}
 	return true
+}
+
+// Provider_Models_Add reports what provider_models_add_body did with a listing body.
+@(private)
+Provider_Models_Add :: enum {
+	Skipped,
+	Added,
+	Failed,
+}
+
+// provider_models_add_body lists the models in body and appends them as one source.
+// It takes ownership of body and releases it in every case; models that cannot be
+// appended are destroyed. Skipped means body held no listing, Failed means the source
+// record could not be allocated.
+@(private, require_results)
+provider_models_add_body :: proc(result: ^[dynamic]Catalog_Provider_Source, id: string, body: []u8, allocator: mem.Allocator) -> Provider_Models_Add {
+	models, listed := provider_models_list(body, allocator)
+	delete(body, allocator)
+	if !listed { return .Skipped }
+	if !provider_sources_add(result, id, models, allocator) {
+		catalog_model_sources_destroy(models, allocator)
+		return .Failed
+	}
+	return .Added
 }
 
 // provider_models_refresh returns the freshest source available for each

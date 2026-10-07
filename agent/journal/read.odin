@@ -165,6 +165,17 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	}
 	return record, true, nil
 }
+@(require_results)
+scan_node_checked :: proc(row: ^Row, allocator: mem.Allocator) -> (node: Node, session: Session_Id, seq: Journal_Seq, ok: bool) {
+	node = scan_node(row)
+	if row.error != nil {
+		failed_session := node.session
+		failed_seq := node.seq
+		node_destroy(&node, allocator)
+		return {}, failed_session, failed_seq, false
+	}
+	return node, node.session, node.seq, true
+}
 
 // read_last_node returns the node of the given kind with the highest id in session,
 // false when the session has none. It reads every branch, so it names the newest node
@@ -184,13 +195,11 @@ read_last_node :: proc(journal: ^Journal, session: Session_Id, kind: Node_Kind, 
 		values    = values,
 		allocator = allocator,
 	}
-	node = scan_node(&row)
-	if row.error != nil {
-		node_session := node.session
-		node_seq := node.seq
-		node_destroy(&node, allocator)
-		return {}, false, corrupt(journal, row.error, node_session, node_seq)
+	scanned, failed_session, failed_seq, scanned_ok := scan_node_checked(&row, allocator)
+	if !scanned_ok {
+		return {}, false, corrupt(journal, row.error, failed_session, failed_seq)
 	}
+	node = scanned
 	return node, true, nil
 }
 
@@ -547,13 +556,11 @@ read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator
 		values    = values,
 		allocator = allocator,
 	}
-	node = scan_node(&row)
-	if row.error != nil {
-		node_session := node.session
-		node_seq := node.seq
-		node_destroy(&node, allocator)
-		return {}, corrupt(journal, row.error, node_session, node_seq)
+	scanned, failed_session, failed_seq, scanned_ok := scan_node_checked(&row, allocator)
+	if !scanned_ok {
+		return {}, corrupt(journal, row.error, failed_session, failed_seq)
 	}
+	node = scanned
 	return node, nil
 }
 

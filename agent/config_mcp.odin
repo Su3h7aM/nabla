@@ -153,6 +153,14 @@ mcp_string_slice_clone :: proc(values: []string, allocator: mem.Allocator) -> (r
 	complete = true
 	return result, nil
 }
+@(require_results)
+mcp_environment_set_entry :: proc(result: []MCP_Environment, index: int, name, value: string, allocator: mem.Allocator) -> Config_Error {
+	if !mcp_environment_name_valid(name) { return .Invalid }
+	cloned, clone_error := mcp_environment_entry_clone(name, value, allocator)
+	if clone_error != nil { return .Allocation }
+	result[index] = cloned
+	return .None
+}
 
 @(require_results)
 mcp_environment_from_pairs :: proc(names, values: []string, allocator: mem.Allocator) -> ([]MCP_Environment, Config_Error) {
@@ -167,9 +175,7 @@ mcp_environment_from_pairs :: proc(names, values: []string, allocator: mem.Alloc
 		delete(result, allocator)
 	}
 	for name, index in names {
-		if !mcp_environment_name_valid(name) { return nil, .Invalid }
-		result[index], result_error = mcp_environment_entry_clone(name, values[index], allocator)
-		if result_error != nil { return nil, .Allocation }
+		if entry_error := mcp_environment_set_entry(result, index, name, values[index], allocator); entry_error != .None { return nil, entry_error }
 	}
 	complete = true
 	return result, .None
@@ -188,9 +194,7 @@ mcp_environment_clone :: proc(source: []MCP_Environment, allocator: mem.Allocato
 		delete(result, allocator)
 	}
 	for entry, index in source {
-		if !mcp_environment_name_valid(entry.name) { return nil, .Invalid }
-		result[index], result_error = mcp_environment_entry_clone(entry.name, entry.value, allocator)
-		if result_error != nil { return nil, .Allocation }
+		if entry_error := mcp_environment_set_entry(result, index, entry.name, entry.value, allocator); entry_error != .None { return nil, entry_error }
 	}
 	complete = true
 	return result, .None

@@ -695,6 +695,22 @@ tool_field_optional_int :: proc(
 	if _, is_null := slot.(json.Null); is_null { return fallback, nil }
 	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
 }
+@(require_results)
+tool_fields_page :: proc(
+	object: json.Object,
+	offset_fallback, offset_minimum, limit_fallback: int,
+	repairs: ^Tool_Repairs,
+	path := "",
+	allocator := context.allocator,
+) -> (
+	offset, limit: int,
+	err: Tool_Argument_Error,
+) {
+	object := object
+	offset = tool_field_optional_int(object, "offset", offset_fallback, offset_minimum, TOOL_PAGE_MAX_VALUE, repairs, path, allocator) or_return
+	limit = tool_field_optional_int(object, "limit", limit_fallback, 1, TOOL_PAGE_MAX_VALUE, repairs, path, allocator) or_return
+	return offset, limit, nil
+}
 
 @(private, require_results)
 tool_field_int_value :: proc(

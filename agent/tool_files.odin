@@ -45,16 +45,7 @@ tool_read_definition :: proc(allocator := context.allocator) -> Tool_Definition 
 tool_read_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Read_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_READ_FIELDS, allocator = ctx.allocator) or_return
 	args.path = tool_field_string(arguments, "path", allocator = ctx.allocator) or_return
-	args.offset = tool_field_optional_int(arguments, "offset", 1, 1, TOOL_PAGE_MAX_VALUE, &ctx.repairs, allocator = ctx.allocator) or_return
-	args.limit = tool_field_optional_int(
-		arguments,
-		"limit",
-		TOOL_READ_DEFAULT_LINES,
-		1,
-		TOOL_PAGE_MAX_VALUE,
-		&ctx.repairs,
-		allocator = ctx.allocator,
-	) or_return
+	args.offset, args.limit = tool_fields_page(arguments, 1, 1, TOOL_READ_DEFAULT_LINES, &ctx.repairs, allocator = ctx.allocator) or_return
 	return
 }
 

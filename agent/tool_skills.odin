@@ -41,16 +41,7 @@ TOOL_LOAD_SKILL_DEFINITION :: Tool_Definition {
 tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: List_Skills_Args, err: Tool_Argument_Error) {
 	tool_fields_known(arguments, TOOL_LIST_SKILLS_FIELDS, allocator = ctx.allocator) or_return
 	args.query = tool_field_optional_string(arguments, "query", allocator = ctx.allocator) or_return
-	args.offset = tool_field_optional_int(arguments, "offset", 0, 0, TOOL_PAGE_MAX_VALUE, &ctx.repairs, allocator = ctx.allocator) or_return
-	args.limit = tool_field_optional_int(
-		arguments,
-		"limit",
-		TOOL_LIST_SKILLS_DEFAULT_LIMIT,
-		1,
-		TOOL_PAGE_MAX_VALUE,
-		&ctx.repairs,
-		allocator = ctx.allocator,
-	) or_return
+	args.offset, args.limit = tool_fields_page(arguments, 0, 0, TOOL_LIST_SKILLS_DEFAULT_LIMIT, &ctx.repairs, allocator = ctx.allocator) or_return
 	return
 }
 
