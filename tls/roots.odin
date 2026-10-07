@@ -13,15 +13,11 @@ Roots :: struct {
 	allocator:    mem.Allocator,
 }
 
-/*
-roots_parse reads every certificate of a PEM trust store, in the order the blocks
-appear.
-
-A block that is not a certificate is left alone, and one that does not parse is
-skipped: a store may carry other labels, and dropping an anchor can only refuse a
-chain, never admit one. Empty text, or text with no readable certificate, is not a
-trust store.
-*/
+// roots_parse reads every certificate of a PEM trust store, in the order the blocks
+// appear. A block that is not a certificate is left alone, and one that does not
+// parse is skipped: a store may carry other labels, and dropping an anchor can only
+// refuse a chain, never admit one. Empty text, or text with no readable certificate,
+// is not a trust store.
 @(require_results)
 roots_parse :: proc(text: []u8, allocator: mem.Allocator) -> (roots: Roots, ok: bool) {
 	roots.allocator = allocator
