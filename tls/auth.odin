@@ -90,12 +90,7 @@ Append_Result :: enum {
 // certificate views the copy, so the lists are released together by
 // certificates_destroy.
 @(private, require_results)
-certificate_append :: proc(
-	certificates: ^[dynamic]x509.Certificate,
-	ders: ^[dynamic][]u8,
-	encoded: []u8,
-	allocator: mem.Allocator,
-) -> Append_Result {
+certificate_append :: proc(certificates: ^[dynamic]x509.Certificate, ders: ^[dynamic][]u8, encoded: []u8, allocator: mem.Allocator) -> Append_Result {
 	der, make_err := make([]u8, len(encoded), allocator)
 	if make_err != nil { return .No_Room }
 	copy(der, encoded)

@@ -1182,8 +1182,9 @@ acp_run :: proc(
 			snapshot_destroy(&server.app)
 			catalog_run_destroy(&server.app)
 			free(server, server.alloc)
-		} else if retained != nil {
-			retained^ = true
+		} else {
+			fmt.eprintln("nabla: ACP shutdown is incomplete: a worker or the writer did not stop in time and the connection remains allocated")
+			if retained != nil { retained^ = true }
 		}
 	}
 

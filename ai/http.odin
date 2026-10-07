@@ -66,8 +66,8 @@ http_post_sse :: proc(
 	// value lives in a local for the duration of this call.
 	local_control := control
 	options := client.Options {
-		ca_file     = request.ca_file,
-		nameservers = request.nameservers,
+		ca_file      = request.ca_file,
+		nameservers  = request.nameservers,
 		idle_timeout = control.idle_timeout,
 	}
 	if control.interrupt != nil || control.deadline.active {

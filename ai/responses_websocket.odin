@@ -14,13 +14,13 @@ import "nabla:websocket"
 // cancellation probe retained by the upgraded connection always points at a
 // stable address.
 Provider_WebSocket_Session :: struct {
-	connection: Provider_Connection,
-	socket:     ^websocket.Conn,
-	control:    HTTP_Control,
+	connection:   Provider_Connection,
+	socket:       ^websocket.Conn,
+	control:      HTTP_Control,
 	// idle_timeout is what the open socket was dialed with, and what an idle failure
 	// reports. It is zero while no socket is open.
 	idle_timeout: time.Duration,
-	allocator:  mem.Allocator,
+	allocator:    mem.Allocator,
 }
 
 @(require_results)

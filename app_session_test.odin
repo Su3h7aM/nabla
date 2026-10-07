@@ -1872,7 +1872,10 @@ test_opening_a_child_session_installs_the_subagent_role :: proc(t: ^testing.T) {
 	if open_error := journal.open(&child_store, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
 		testing.fail_now(t, "the child's journal could not be opened")
 	}
-	_, create_error := journal.create_session(&child_store, {id = child, workspace = app.setup.workspace, role = .Subagent, parent_session = parent, parent_call = 1})
+	_, create_error := journal.create_session(
+		&child_store,
+		{id = child, workspace = app.setup.workspace, role = .Subagent, parent_session = parent, parent_call = 1},
+	)
 	if create_error != nil { testing.fail_now(t, "the child's session could not be created") }
 	if _, commit_error := journal.commit(&child_store); commit_error != nil { testing.fail_now(t, "the child's session could not be committed") }
 	_ = journal.close(&child_store)

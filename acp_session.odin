@@ -224,13 +224,9 @@ acp_server_destroy :: proc(conn: ^ACP_Server, patience := SHUTDOWN_JOIN_PATIENCE
 	}
 	if conn.worker_stuck || conn.memory_leaked {
 		// Late worker callbacks can still enqueue frames, so the writer stays alive.
-		fmt.eprintln("nabla: an ACP or tool worker did not stop in time; shutdown is incomplete and its connection remains allocated")
 		return false
 	}
-	if !acp.writer_destroy(&conn.writer, patience) {
-		fmt.eprintln("nabla: the ACP writer thread did not stop in time; the process leaves it running")
-		return false
-	}
+	if !acp.writer_destroy(&conn.writer, patience) { return false }
 	run_setup_destroy(&conn.app.setup)
 	delete(conn.default_effort, conn.alloc)
 	conn.default_effort = ""

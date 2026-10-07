@@ -231,8 +231,8 @@ provider_encoded_request :: proc(request: Provider_Request, body: string, cache:
 // one request. A zero value performs the request without cancellation, which is
 // what the synchronous prototype path wants.
 Provider_Operation_Options :: struct {
-	interrupt:   ^Interrupt,
-	deadline:    Deadline,
+	interrupt:    ^Interrupt,
+	deadline:     Deadline,
 	// idle_timeout is the longest the response may go without a byte arriving, from the
 	// end of the request write to the end of the response. Any byte restarts it,
 	// keepalive comments and pings included. Zero means no timeout. An expiry fails the
@@ -242,12 +242,12 @@ Provider_Operation_Options :: struct {
 	idle_timeout: time.Duration,
 	// Empty uses the platform trust store. Credentialed HTTPS is never sent over
 	// an unverified connection, even when this is empty.
-	ca_file:     string,
+	ca_file:      string,
 	// Empty uses the system resolver configuration. A value replaces it.
-	nameservers: []net.Endpoint,
+	nameservers:  []net.Endpoint,
 	// observer, when set, is told what this operation encoded and what came back.
 	// A zero observer observes nothing.
-	observer:    Provider_Operation_Observer,
+	observer:     Provider_Operation_Observer,
 }
 
 // provider_resource_path is the resource path an API family names. The configured

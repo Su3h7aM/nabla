@@ -120,7 +120,16 @@ Stdio_Wait :: enum {
 // is signalled, or its deadline passes. stop says why a Stopped wait ended, and err
 // why a Failed one did.
 @(require_results)
-stdio_wait :: proc(file: ^os.File, direction: subprocess.Direction, child: ^subprocess.Child, control: Control) -> (result: Stdio_Wait, stop: Stop, err: os.Error) {
+stdio_wait :: proc(
+	file: ^os.File,
+	direction: subprocess.Direction,
+	child: ^subprocess.Child,
+	control: Control,
+) -> (
+	result: Stdio_Wait,
+	stop: Stop,
+	err: os.Error,
+) {
 	for {
 		if stop = control_stop(control); stop != .None { return .Stopped, stop, nil }
 		entries: [STDIO_POLL_MAX]subprocess.Poll

@@ -317,9 +317,9 @@ responses_websocket_fixture_write :: proc(socket: net.TCP_Socket, data: []u8) ->
 // Responses_WebSocket_Case is one test's half of the conversation: the session it sends on
 // and the one frozen request it sends.
 Responses_WebSocket_Case :: struct {
-	endpoint: string,
-	session:  ^Provider_WebSocket_Session,
-	encoded:  Provider_Encoded_Request,
+	endpoint:     string,
+	session:      ^Provider_WebSocket_Session,
+	encoded:      Provider_Encoded_Request,
 	// idle_timeout is the request option the case sends with.
 	idle_timeout: time.Duration,
 }
@@ -388,7 +388,7 @@ responses_websocket_outcome_event :: proc(user_data: rawptr, event: Provider_Eve
 // the operation reported to observed. The outcome owns its error.
 responses_websocket_request_run :: proc(test_case: ^Responses_WebSocket_Case, observed: ^Transport_Observation, outcome: ^Responses_WebSocket_Outcome) {
 	options := Provider_Operation_Options {
-		observer     = {user_data = observed, report = transport_observation_report},
+		observer = {user_data = observed, report = transport_observation_report},
 		idle_timeout = test_case.idle_timeout,
 	}
 	outcome.error = Provider_WebSocket_Request(test_case.session, test_case.encoded, outcome, responses_websocket_outcome_event, options)
