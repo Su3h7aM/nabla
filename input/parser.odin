@@ -223,9 +223,6 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 		return 1, nil
 	}
 	if input_byte >= 0x40 && input_byte <= 0x7e {
-		// Bracketed paste begins here (CSI 200 ~). The parser then collects the
-		// raw bytes in parser_paste until CSI 201 ~, so the content is emitted
-		// as one Paste event instead of being decoded into keys.
 		if parser.state == .Csi && input_byte == '~' && parser_first_param(parser) == 200 {
 			if parser.paste == nil {
 				parser.paste = make([dynamic]u8, 0, 64, allocator)
@@ -252,8 +249,6 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 
 @(require_results)
 parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
-	// An SGR mouse report is CSI < Cb ; Cx ; Cy M/m: the leading '<' rides in
-	// the parameter bytes and 'M' (press/motion) and 'm' (release) finalize it.
 	if state == .Csi && parser.param_count > 0 && parser.params[0] == '<' && (final == 'M' || final == 'm') {
 		return parser_mouse_event(parser, final, events, allocator)
 	}
@@ -386,9 +381,7 @@ parser_key_modifiers :: proc(parser: ^Parser, field: int) -> Key_Modifiers {
 	return result
 }
 
-// parser_mouse_fields splits the parameter bytes of an SGR mouse report (after
-// the leading '<') into the protocol's three decimal fields. A field that is
-// empty, non-numeric, or beyond three reports failure.
+// parser_mouse_fields splits an SGR mouse report into its three decimal fields.
 @(require_results)
 parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bool) {
 	field := 0
@@ -426,13 +419,7 @@ parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bo
 	return control_byte, x, y, true
 }
 
-// parser_mouse_event decodes an SGR mouse report into a Mouse_Event. The
-// protocol packs the control into Cb: the low two bits name the button, bit 32
-// marks motion with a button held, bit 64 marks the wheel, and bits 4/8/16
-// carry shift/alt/ctrl, which pass through the button and wheel masks. A
-// report outside the 1002 vocabulary (button 3, hover reports from tracking
-// modes this parser never enables) is malformed here and becomes
-// Unknown_Input; wheel reports never release.
+// parser_mouse_event decodes an SGR mouse report into a Mouse_Event.
 @(require_results)
 parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
 	control_byte, x, y, ok := parser_mouse_fields(parser)
@@ -476,15 +463,7 @@ parser_osc :: proc(parser: ^Parser, input_byte: u8) -> (consumed: int, err: Erro
 	return 1, nil
 }
 
-// parser_paste collects the raw bytes of a bracketed paste after CSI 200 ~ and
-// emits one Paste event when the closing CSI 201 ~ arrives. The content is not
-// decoded: a paste may contain newlines and escape bytes that must not become
-// events. The end marker is matched on the tail of the buffer, so a partial
-// marker stays content.
-//
-// The scratch grows to hold the paste, so a paste of any size is delivered
-// whole. A paste whose closing marker never arrives stays in the scratch and is
-// dropped with the parser on parser_destroy.
+// parser_paste collects a bracketed paste and emits one Paste event at the closing marker.
 @(require_results)
 parser_paste :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	if _, append_err := append(&parser.paste, input_byte); append_err != nil {
