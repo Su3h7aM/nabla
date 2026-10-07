@@ -5,14 +5,10 @@ import "core:sync"
 import "nabla:ai"
 import "nabla:http/client"
 
-// Shared plumbing for the two stages that read a body over the network: the
-// provider's own model listing and the models.dev catalog. Both accumulate a
-// response under a deadline, so that policy lives here once; the stages differ
-// only in URL, credentials, and what they do with the bytes.
+// Shared plumbing for the two stages that read a response body over the network.
 
-// Fetch_Body accumulates a response body and remembers whether it could be held,
-// which is what turns an allocation that failed into a failure rather than a
-// short body. It states no size bound: every response is read whole.
+// Fetch_Body accumulates a response body. failed records an append that did not
+// land, so a short body is reported as a failure.
 Fetch_Body :: struct {
 	bytes:  [dynamic]u8,
 	failed: bool,
@@ -25,10 +21,8 @@ fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
 	if append_error != nil || written != len(chunk) { body.failed = true }
 }
 
-// fetch_body_finish hands the accumulated body to the caller as an exactly-sized
-// slice and releases the accumulator. The accumulator's capacity is never shared
-// with the result: a slice carries no capacity, so a shorter view of a larger
-// allocation could not be freed correctly.
+// fetch_body_finish copies the accumulated body into an exactly-sized slice and
+// releases the accumulator. The result is owned by the caller.
 @(require_results)
 fetch_body_finish :: proc(body: ^Fetch_Body, allocator: mem.Allocator) -> ([]u8, bool) {
 	defer delete(body.bytes)

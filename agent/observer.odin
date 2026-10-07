@@ -34,36 +34,25 @@ Chat_Observer :: struct {
 	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
 	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
 	// request_prepared is called once for each provider request the turn is about to
-	// send, after the request is built and its input size is known. It is a different
-	// moment from request_finished because the context has already grown by then: a
-	// front-end that shows the context can report the new size while the model is still
-	// answering, rather than a round trip later.
+	// send, after the request is built.
 	request_prepared: proc(user_data: rawptr),
 	// request_finished is called once for each provider request the turn made, after its
-	// outcome is recorded. The provider's own accounting of it is in the store by then, so
-	// a front-end that shows the session totals can refresh here instead of waiting for
-	// the turn to end.
+	// outcome is recorded.
 	request_finished: proc(user_data: rawptr),
-	// retry_scheduled is called once for each retry the harness schedules, after the
-	// failed send's row is finished and before the chain waits. Nothing about the
-	// decision needs the front-end; this is how a front-end says that a turn is waiting
-	// rather than stalled. A chain whose sends all succeeded, and one that stops, calls
-	// it not at all, and the send that follows clears whatever the front-end showed.
+	// retry_scheduled is called once for each retry the harness schedules, before the
+	// chain waits.
 	retry_scheduled:  proc(user_data: rawptr, event: Chat_Retry_Event),
 }
 
 // Chat_Tool_Event is one tool call the harness admitted. The strings are borrowed and
-// live until the batch that admitted the call is released, which is after the result of
-// that call has been reported.
+// live until that call's result has been reported.
 Chat_Tool_Event :: struct {
 	call_id:   string,
 	name:      string,
 	arguments: string, // the argument text the model sent, before any repair
 }
 
-// Chat_Retry_Event is one retry the harness scheduled: which send failed, which one is
-// next, why it is being retried, what the provider's failure meant, and how long the
-// harness waits before sending again.
+// Chat_Retry_Event is one retry the harness scheduled.
 Chat_Retry_Event :: struct {
 	request:       journal.Request_Id,
 	next_attempt:  int,

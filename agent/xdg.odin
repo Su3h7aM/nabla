@@ -4,17 +4,13 @@ import "base:runtime"
 import "core:os"
 import "core:path/filepath"
 
-// XDG Base Directory resolution.
-//
-// The environment variable wins when it names an absolute path; an unset, empty, or
-// relative one is invalid and the specification's default under the home directory
-// applies instead. The runtime directory has no default, so it is unresolved then.
-// The application directory name is lowercase.
+// XDG Base Directory resolution. The environment variable wins when it names an absolute
+// path; otherwise the specification's default under the home directory applies. The runtime
+// directory has no default and is unresolved then.
 
 XDG_APP_NAME :: "nabla"
 
-// The specification asks for an application directory that has to be created to
-// be readable, writable, and searchable by its owner alone.
+// XDG_APP_PERMISSIONS keep a created application directory private to its owner.
 XDG_APP_PERMISSIONS :: os.Permissions{.Read_User, .Write_User, .Execute_User}
 
 // SESSION_LOCK_DIRECTORY_NAME is the directory, inside the runtime directory, that
