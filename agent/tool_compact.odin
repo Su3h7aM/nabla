@@ -1,11 +1,9 @@
 package agent
 
 
-// context_compact lets the agent ask for a checkpoint while it keeps working.
-// It records the same intent the automatic path and /compact record, and returns
-// immediately: the summary is produced in the background and installed at the next
-// boundary, so the caller is never interrupted. A caller that wants the shorter
-// context now does not get it here.
+// context_compact asks for a checkpoint while the agent keeps working. It records the
+// same intent as the automatic path and /compact, and returns immediately: the summary
+// is produced in the background and installed at the next boundary.
 
 TOOL_COMPACT_NAME :: "context_compact"
 

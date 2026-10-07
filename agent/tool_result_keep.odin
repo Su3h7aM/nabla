@@ -8,9 +8,8 @@ import "core:unicode/utf8"
 
 import "nabla:agent/journal"
 
-// A tool result is always kept whole, but the model is shown at most a preview of it. A
-// result larger than the preview, or larger than the room the batch has left in the
-// context, is written to a file under the session's output directory, and the model sees
+// A tool result is always kept whole, but the model is shown at most a preview of it.
+// A larger result is written under the session's output directory, and the model sees
 // its beginning followed by a notice naming that file, which it reads with builtin_read.
 
 // TOOL_RESULT_PREVIEW_BYTES is how much of one result the model is shown at once.
@@ -30,8 +29,7 @@ tool_result_cost :: proc(text: string) -> int {
 }
 
 // Tool_Budget is what one turn's tool results may add to the model's context. It is
-// opened before the first result is recorded and taken in call order, reserving a notice
-// for every result still to come, so one large result cannot crowd out the rest.
+// taken in call order, reserving a notice for every result still to come.
 Tool_Budget :: struct {
 	remaining: int, // tokens the batch may still add
 	pending:   int, // results not yet recorded
@@ -48,9 +46,8 @@ chat_tool_budget_open :: proc(chat: ^Chat_Session, count: int) -> Tool_Budget {
 	return {remaining = remaining, pending = count}
 }
 
-// tool_budget_preview_bytes takes one result's turn from the budget and returns how many
-// bytes of it the model may be shown: the preview size, lowered to what the room left
-// after reserving a notice for every later result can hold.
+// tool_budget_preview_bytes takes one result's turn from the budget and returns how
+// many bytes of it the model may be shown.
 tool_budget_preview_bytes :: proc(budget: ^Tool_Budget) -> int {
 	if budget.pending > 0 { budget.pending -= 1 }
 	allowance := budget.remaining - budget.pending * TOOL_RESULT_NOTICE_TOKENS - TOOL_RESULT_NOTICE_TOKENS
@@ -58,10 +55,9 @@ tool_budget_preview_bytes :: proc(budget: ^Tool_Budget) -> int {
 }
 
 // tool_result_keep decides what the model is shown of a result. A result that fits is
-// left as it is. Otherwise its whole content is written to path and replaced by its
-// beginning and a notice naming the file. When the file cannot be written the content is
-// left whole, because a result is never discarded. The budget is charged what the model
-// is finally shown.
+// left as it is; otherwise the whole content is written to path and replaced by its
+// beginning and a notice naming the file. When the file cannot be written the content
+// is left whole: a result is never discarded.
 tool_result_keep :: proc(result: ^Tool_Result, budget: ^Tool_Budget, path: string) {
 	defer budget.remaining -= tool_result_cost(result.content)
 	shown := tool_budget_preview_bytes(budget)
@@ -88,10 +84,9 @@ tool_preview_cut :: proc(text: string, limit: int) -> string {
 	return text[:end]
 }
 
-// tool_result_notice words what replaces the rest of result after it was cut to preview,
-// temp-allocated. It names the file that keeps the whole result. For a read it also gives
-// the complete lines shown and the offset that continues the file: the cut may fall inside
-// a line, which the next read starts again.
+// tool_result_notice words what replaces the rest of result after it was cut to
+// preview, temp-allocated. For a read it also gives the complete lines shown and the
+// offset that continues the file, since the cut may fall inside a line.
 @(private)
 tool_result_notice :: proc(result: Tool_Result, preview, path: string) -> string {
 	if read, is_read := result.output.(Read_Output); is_read && strings.has_suffix(result.content, read.content) {
@@ -137,11 +132,10 @@ tool_output_create :: proc(path: string) -> (^os.File, os.Error) {
 	return os.open(path, {.Write, .Create, .Trunc}, os.Permissions{.Read_User, .Write_User})
 }
 
-// tool_output_directory is where a session keeps the outputs it did not show in full:
-// $XDG_CACHE_HOME/nabla/tool-output/<session>. It outlives the process so a resumed
-// session can still read them, and the user may delete it at any time: the journal keeps
-// what the model was shown, and a read of a removed file fails as feedback. It returns ""
-// when no cache directory resolves.
+// tool_output_directory is where a session keeps the outputs it did not show in
+// full: $XDG_CACHE_HOME/nabla/tool-output/<session>. The user may delete it at any
+// time; a read of a removed file fails as feedback. It returns "" when no cache
+// directory resolves.
 @(require_results)
 tool_output_directory :: proc(id: string, allocator := context.allocator) -> string {
 	cache, cache_error := xdg_directory(.Cache, context.temp_allocator)

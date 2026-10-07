@@ -63,8 +63,8 @@ PATCH_FAILURE_NAMES := [Patch_Failure_Kind]string {
 	.Overlap       = "overlap",
 }
 
-// Patch_Failure is why a patch does not apply. message names the file and, for a hunk, its
-// number and the nearest lines, so the model can correct the patch without rereading the file.
+// Patch_Failure is why a patch does not apply. message names the file and, for a
+// hunk, its number and the nearest lines.
 Patch_Failure :: struct {
 	kind:    Patch_Failure_Kind,
 	message: string,
@@ -140,8 +140,8 @@ patch_failure_result :: proc(ctx: ^Tool_Context, err: Patch_Error) -> Tool_Resul
 	return tool_result_failure(ctx, .Tool_Failed, "there was not enough memory to prepare the patch", "out of memory")
 }
 
-// patch_write applies one prepared change. A moved file is written at its new path before the
-// old one is removed, so a failure between the two leaves both rather than neither.
+// patch_write applies one prepared change. A moved file is written at its new path
+// before the old one is removed, so a failure between the two leaves both.
 @(private = "file", require_results)
 patch_write :: proc(change: Patch_Change, control: Tool_Control, allocator: mem.Allocator) -> (write_error: os.Error, cancelled: bool, target_written: bool) {
 	if tool_control_cancelled(control) { return nil, true, false }

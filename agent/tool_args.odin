@@ -6,10 +6,9 @@ import "core:time"
 // TOOL_PAGE_MAX_VALUE keeps the sum of a page offset and limit representable as int.
 TOOL_PAGE_MAX_VALUE :: max(int) / 2
 
-// Tool_Kind names what a tool's arguments are, which is what tells the one reader in
-// tool_args_decode how to read the document a call arrived as. Custom is the zero value: a
-// definition whose arguments the harness does not read itself, such as an MCP tool, whose
-// arguments the server validates.
+// Tool_Kind names what a tool's arguments are; it tells tool_args_decode how to read
+// the document a call arrived as. Custom is the zero value for arguments the harness
+// does not read itself, which the server validates.
 Tool_Kind :: enum {
 	Custom,
 	Read,
@@ -27,11 +26,9 @@ Tool_Kind :: enum {
 	Agent_Status,
 }
 
-// Tool_Args is one call's arguments, typed by the tool that will run it. A tool sees these
-// fields; the document they were read from stays with the call's record.
-//
-// Strings borrow the admitted document, so they live exactly as long as the job that owns it;
-// a patch's files, hunks, and lines are allocated beside it and released by tool_args_destroy.
+// Tool_Args is one call's arguments, typed by the tool that will run it. Strings borrow
+// the admitted document; a patch's files, hunks, and lines are allocated beside it and
+// released by tool_args_destroy.
 Tool_Args :: union {
 	Read_Args,
 	Write_Args,
@@ -85,9 +82,9 @@ Codemode_Args :: struct {
 	timeout: time.Duration,
 }
 
-// tool_args_decode reads one admitted document as the tool's own arguments, refusing a call
-// whose fields do not match what the tool declares. It is the only place a document becomes
-// arguments, so a tool, a Lua child call, and a repaired call all read the same way.
+// tool_args_decode reads one admitted document as the tool's own arguments. It is the
+// only place a document becomes arguments, so tools, Lua child calls, and repaired
+// calls all read the same way.
 @(require_results)
 tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object: json.Object) -> (Tool_Args, Tool_Argument_Error) {
 	switch definition.kind {

@@ -8,30 +8,25 @@ import "core:time"
 
 import "nabla:agent/journal"
 
-// Follow is what a process that shows a session another process runs keeps between
-// polls (section 8.6 of the architecture). The record that first showed a fact is its
-// seq, so nothing is shown twice.
+// Follow is what a process showing a session another process runs keeps between polls.
+// last is the highest seq rendered, so nothing is shown twice.
 Follow :: struct {
-	// last is the highest seq rendered.
 	last:     journal.Journal_Seq,
-	// working is whether a turn has started and not completed.
 	working:  bool,
-	// estimate and window are the size of the newest response request and the window it
-	// was checked against, zero before one.
+	// estimate and window are the size of the newest response request and the window
+	// it was checked against, zero before one.
 	estimate: int,
 	window:   int,
-	// input is the seq of a `user.input` line the caller waits to see answered, zero for
-	// none. follow_poll sets turn when the User node that delivers it is read, and ended and
-	// outcome when that turn's `turn.completed` is.
+	// input is the seq of a `user.input` line the caller waits to see answered, zero
+	// for none. follow_poll sets turn when the delivering User node is read, and ended
+	// and outcome at that turn's `turn.completed`.
 	input:    journal.Journal_Seq,
 	turn:     journal.Turn_Id,
 	ended:    bool,
 	outcome:  journal.Turn_Outcome,
 }
 
-// follow_start positions a follow at the end of the journal. The caller arms its session
-// watch first and captures this cursor, transcript head, and pending input in one read
-// snapshot, then ends that snapshot before replay or callbacks. working and the estimate
+// follow_start positions a follow at the end of the journal. working and the estimate
 // start from the newest turn and request records of session.
 @(require_results)
 follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (follow: Follow, error: journal.Error) {
@@ -48,26 +43,9 @@ follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (f
 
 // follow_poll renders the records of session committed after follow.last through the
 // observer, in seq order, and advances follow. Each record is reported as the live view
-// reports the same fact:
-//
-// - A `user.input` shows at once as the user's text, and the User node that later
-//   delivers it (its message names that seq) is skipped, so the line shows once.
-// - User, Assistant, Notice, Context, and Checkpoint nodes show their whole text, since
-//   streamed deltas are not recorded.
-// - `tool.proposed` announces a call, and `tool.completed` reports its result.
-// - `turn.started` and `turn.completed` move follow.working, and a turn that did not
-//   complete reports why. `request.prepared` updates the estimate and window.
-// - With follow.input set, the User node that delivers that line records its turn in
-//   follow.turn, and that turn's `turn.completed` sets follow.ended and follow.outcome. Both
-//   are set before the observer hears the record, so a callback sees whether the node it is
-//   shown belongs to the awaited turn.
-// - `retry.scheduled`, `runtime.message`, and `selection.applied` show as messages.
-//
-// Records of a Lua script's child calls are skipped, as the live view skips them. A record
-// whose payload cannot be decoded is skipped too: the harness never guesses at it, and one
-// bad record must not stop the session from showing what follows. A journal error stops
-// the poll with follow.last at the last record rendered, so the next poll continues there.
-// Nothing here writes the journal.
+// reports the same fact. Records of a Lua script's child calls and records whose payload
+// cannot be decoded are skipped. A journal error stops the poll with follow.last at the
+// last record rendered. Nothing here writes the journal.
 @(require_results)
 follow_poll :: proc(store: ^journal.Journal, session: journal.Session_Id, follow: ^Follow, observer: Chat_Observer) -> journal.Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -101,8 +79,6 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		decoded := journal.payload_decode(record.data, &completed, context.temp_allocator) == nil
 		outcome := journal.Turn_Outcome.Failed
 		if decoded { outcome, _ = journal.enum_from_name(journal.TURN_OUTCOME_NAMES, completed.outcome) }
-		// An undecodable record still ends the awaited turn, as a failure, so a caller
-		// that waits for it is not left waiting on a turn that is over.
 		if follow.turn != 0 && record.turn == follow.turn {
 			follow.ended = true
 			follow.outcome = outcome
@@ -135,8 +111,6 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		for reason in Request_Recovery_Reason {
 			if request_recovery_reason_name(reason) == scheduled.reason { event.reason = reason }
 		}
-		// The record keeps the recovery reason and not the provider's failure class; a
-		// refusal the chain repaired is the one class the display words differently.
 		event.failure_class = .Invalid_Request if event.reason == .Adaptive_Thinking_Refused || event.reason == .Cache_Hints_Refused else .Unknown
 		_observer_retry_scheduled(observer, event)
 	case .Runtime_Message:
@@ -153,7 +127,7 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 }
 
 // follow_prepared takes the size of a response request from its `request.prepared`
-// record. A compaction request is another conversation's size and is ignored.
+// record; any other purpose is ignored.
 @(private = "file")
 follow_prepared :: proc(follow: ^Follow, record: journal.Record) {
 	prepared: journal.Request_Prepared
@@ -174,8 +148,7 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 		if journal.payload_decode(node.data, &user, context.temp_allocator) != nil { return nil }
 		if follow.input != 0 && user.message == follow.input { follow.turn = node.turn }
 		origin, _ := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
-		// A node that delivers a user.input line repeats a line already shown. One that
-		// delivers an agent's report is the first the transcript shows of it.
+		// A node delivering a user.input line repeats a line already shown.
 		if user.message != 0 && origin != .Agent { return nil }
 		if origin == .Prompt {
 			_observer_user_text(observer, body)
@@ -183,7 +156,6 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 			_observer_message(observer, .Notice, body)
 		}
 	case .Assistant:
-		// A response of calls alone has no text, and an empty entry would show nothing.
 		if body == "" { return nil }
 		_observer_assistant_begin(observer)
 		_observer_assistant_text(observer, body)
@@ -196,8 +168,8 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 	return nil
 }
 
-// follow_tool_result reports a finished call. The call's name is in its `tool.proposed`
-// record, which a follower may have read in an earlier poll, so it is looked up.
+// follow_tool_result reports a finished call. The call's name is looked up from its
+// `tool.proposed` record.
 @(private = "file", require_results)
 follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, observer: Chat_Observer) -> journal.Error {
 	completed: journal.Tool_Completed
@@ -225,8 +197,8 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 	return nil
 }
 
-// session_lock_path is the lock file the journal keeps session's claim on in the lock
-// directory locks, which session_watch_add watches. The path is owned by allocator.
+// session_lock_path is the lock file for session's claim in the lock directory locks.
+// The path is owned by allocator.
 @(require_results)
 session_lock_path :: proc(locks: string, session: journal.Session_Id, allocator := context.allocator) -> (path: string, error: mem.Allocator_Error) {
 	hex_text: [journal.SESSION_ID_HEX_LENGTH]u8

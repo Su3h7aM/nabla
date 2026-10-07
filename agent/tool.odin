@@ -12,16 +12,9 @@ import "nabla:agent/skills"
 import "nabla:ai"
 
 // Tool_Control is the caller's interruption policy for one execution. A zero
-// value runs with no cancellation.
-//
-// interrupt is the execution's own stop token, so one call can be stopped without
-// stopping its siblings; it chains to the token of the work that owns it. It is
-// optional.
-//
-// wake, when present, is the read end of a Tool_Wake that is signalled once
-// interrupt is requested, so a tool that sleeps in poll wakes for the stop. It is
-// borrowed and stays open for the whole execution. Without it a sleeping tool sees
-// the stop only when its own wait ends.
+// value runs with no cancellation. interrupt is the execution's own stop token
+// and is optional; wake, when present, is the borrowed read end of a Tool_Wake
+// that wakes a tool sleeping in poll, and stays open for the whole execution.
 Tool_Control :: struct {
 	interrupt: ^ai.Interrupt,
 	wake:      ^os.File,
@@ -40,8 +33,7 @@ tool_wake_open :: proc() -> (wake: Tool_Wake, err: os.Error) {
 	return
 }
 
-// tool_wake_signal wakes every waiter on wake.read, now and later. Signalling again
-// does nothing.
+// tool_wake_signal makes wake.read readable for good. Signalling again does nothing.
 tool_wake_signal :: proc(wake: ^Tool_Wake) {
 	if wake.write == nil { return }
 	_ = os.close(wake.write)
@@ -60,70 +52,58 @@ Tool_Context :: struct {
 	call_id:          string,
 	workspace:        string,
 	control:          Tool_Control,
-	// arguments_json is the admitted argument text this call runs with, exactly as
-	// the dispatch record holds it. A tool that reads fields uses arguments; an
-	// executor that forwards the call elsewhere sends this, so the record and the
-	// remote peer see the same bytes rather than two encodings of one value.
+	// arguments_json is the admitted argument text, exactly as the dispatch record
+	// holds it. A tool that reads fields uses arguments; an executor that forwards
+	// the call elsewhere sends this text.
 	arguments_json:   string,
 	// output_base is where a tool may keep output too large to hold in memory, as
-	// output_base plus a suffix; "" when there is nowhere to keep it.
+	// output_base plus a suffix; "" means nowhere to keep it.
 	output_base:      string,
-	// timeout is the definition's default, copied here so a shared executor reads the
-	// value of the definition it runs for.
+	// timeout is the definition's default for this execution.
 	timeout:          time.Duration,
 	allocator:        mem.Allocator,
 	skills:           ^skills.Catalog,
-	// backend is the borrowed binding the definition was registered with, copied
-	// here by dispatch. It is nil for native tools. Only the execute procedure
-	// paired with the definition may interpret it; it must never be freed
-	// through this struct. The registry owner keeps it alive until no registry
-	// or in-flight turn can use it.
+	// backend is the borrowed adapter state the definition was registered with, nil
+	// for native tools. Only the paired execute procedure may interpret it, and it
+	// must never be freed through this struct.
 	backend:          rawptr,
-	// compact is the session's compaction control, available only to native tools
-	// that ask for a context change. It is borrowed and lives as long as the
-	// session. call is the id of the call being run, which is how such a tool names
-	// the boundary it was called at.
+	// compact is the borrowed session compaction control for tools that ask for a
+	// context change; call names the boundary the call was made at.
 	compact:          ^Compact_Control,
 	status_store:     ^journal.Journal, // borrowed by owner-placed agent_status
 	status_session:   journal.Session_Id,
 	call:             journal.Call_Id,
-	// repairs collects what reading the arguments changed in their values, which the owner
-	// records with the call and writes back into the arguments the call runs with.
+	// repairs collects what reading the arguments changed; the owner records it with
+	// the call and writes it back into the arguments the call runs with.
 	repairs:          Tool_Repairs,
-	// agents is the calling orchestrator's team and member the calling subagent's own record,
-	// set only for the agent tools; the other is nil. Both outlive the call.
+	// agents is the calling orchestrator's team and member the calling subagent's own
+	// record, set only for the agent tools; the other is nil. Both outlive the call.
 	agents:           ^Agent_Team,
 	member:           ^Subagent,
 	// subagent is the delegation an agent tool call acts on, named by the child session.
-	// For agent_spawn, and for agent_send to a finished child it reopens, the owner records it
-	// at dispatch and the worker sets subagent_started once the child runs; for agent_send to
-	// a live child it is the delegation the message was queued on. The owner reads both after
-	// the result is published.
+	// The owner records it at dispatch except for agent_send to a live child, where it
+	// is the delegation the message was queued on; the worker sets subagent_started
+	// once the child runs.
 	subagent:         journal.Session_Id,
 	subagent_started: bool,
 }
 
 // Tool_Execute runs one admitted call. Returning .Invalid_Arguments promises the
-// tool performed no effect, which is what lets dispatch record the refusal as a
-// call that did not run.
+// tool performed no effect, so dispatch records the refusal as a call that did not run.
 Tool_Execute :: #type proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result
 
-// Tool_Hint_Value is one static behavior statement about a tool. Unknown is
-// the zero value, so absence of knowledge reads as unknown rather than as a
-// claim. Unknown is the only honest answer when the behavior depends on
-// run-time input, such as the command a shell call executes.
+// Tool_Hint_Value is one static behavior statement about a tool. Unknown is the
+// zero value; it is the answer when the behavior depends on run-time input, such
+// as the command a shell call executes.
 Tool_Hint_Value :: enum {
 	Unknown,
 	No,
 	Yes,
 }
 
-// Tool_Behavior_Hints describes a tool before it runs. These are static facts
-// for the harness, policy code, and diagnostics, not model-facing guidance:
-// the description carries what the model needs, and provider tool formats have
-// no portable hint fields. No vague members live here: every hint names one
-// concrete property the future MCP adapter can map to the same-named protocol
-// annotation.
+// Tool_Behavior_Hints describes a tool before it runs. These are static facts for
+// the harness, policy code, and diagnostics, not model-facing guidance; every hint
+// names one concrete property the MCP adapter maps to the same-named protocol annotation.
 Tool_Behavior_Hints :: struct {
 	read_only:   Tool_Hint_Value,
 	destructive: Tool_Hint_Value,
@@ -131,15 +111,10 @@ Tool_Behavior_Hints :: struct {
 	open_world:  Tool_Hint_Value,
 }
 
-// Tool_Placement says where a definition's execution runs. It is data on the
-// definition rather than behavior in a scheduler: the job table reads it and does the
-// obvious thing.
-//
-// Worker is the zero value, because blocking work is what a tool is assumed to be
-// until it says otherwise: files, processes, and MCP clients belong off the owner's
-// thread. Owner is for short session-control operations that need the session's own
-// storage, such as compaction intent and result lookup. Lua is an owner-driven
-// coroutine: it may suspend on child jobs without occupying a worker.
+// Tool_Placement says where a definition's execution runs; the job table reads it.
+// Worker is the zero value for blocking work off the owner's thread. Owner is for
+// short session-control operations on the session's own storage. Lua is an
+// owner-driven coroutine that may suspend on child jobs without occupying a worker.
 Tool_Placement :: enum {
 	Worker,
 	Owner,
@@ -153,27 +128,22 @@ Tool_Definition :: struct {
 	name:           string,
 	description:    string,
 	input_schema:   string,
-	// integer_fields names the top-level fields whose schema type accepts an integer but
-	// neither a string nor a number. It is read from input_schema by the registry, and only
-	// for a tool whose arguments the harness does not read itself, so those fields can be
-	// repaired the way a native reader repairs its own.
+	// integer_fields names the top-level schema fields whose type accepts an integer
+	// but neither a string nor a number. The registry reads it from input_schema for
+	// tools whose arguments the harness does not read itself.
 	integer_fields: []string,
 	hints:          Tool_Behavior_Hints,
 	placement:      Tool_Placement,
 	// timeout applies from the start of an execution when the model gives none. Zero
-	// means none. There is no maximum.
+	// means none; there is no maximum.
 	timeout:        time.Duration,
 	execute:        Tool_Execute,
-	// backend is borrowed adapter state, nil for native tools. The registry
-	// copies the pointer but never frees what it points to: the adapter that
-	// registered the definition owns the state and must keep it alive until no
-	// registry holding the definition and no in-flight turn borrowing it
-	// remains. Dispatch copies it into Tool_Context, and only the execute
-	// procedure paired with this definition may cast it back.
+	// backend is borrowed adapter state, nil for native tools. The registry copies the
+	// pointer but never frees it; the registering adapter owns the state. Only the
+	// paired execute procedure may cast it back.
 	backend:        rawptr,
-	// lane is the serialization domain: calls with the same lane never run at once. nil is
-	// the native lane; an MCP tool's lane is its client, whose one stdio stream serves
-	// every tool of that server.
+	// lane is the serialization domain: calls with the same lane never run at once.
+	// nil is the native lane; an MCP tool's lane is its client.
 	lane:           rawptr,
 }
 
@@ -192,10 +162,8 @@ tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Re
 	definitions, alloc_error := make([dynamic]Tool_Definition, 0, TOOL_NATIVE_COUNT, allocator)
 	if alloc_error != nil { return {}, Tool_Registry_Error{kind = .Allocation} }
 	registry.definitions = definitions
-	// The shell tool's description names the shell this process will run, which is
-	// only known now, so the shell tool is built here rather than declared. The
-	// registry clones the strings it keeps, and this function owns the built
-	// description until it has.
+	// The shell tool's description names the shell this process runs, known only here,
+	// so the shell tool is built rather than declared.
 	shell := tool_shell_definition(tool_shell_preferred(), allocator)
 	defer delete(shell.description, allocator)
 	read := tool_read_definition(allocator)
@@ -222,8 +190,8 @@ tool_registry_destroy :: proc(registry: ^Tool_Registry) {
 	registry^ = {}
 }
 
-// tool_registry_clone copies every definition of source into a registry of its own. Backend
-// pointers are copied, never owned.
+// tool_registry_clone copies every definition of source into a registry of its own.
+// Backend pointers are copied, never owned.
 @(require_results)
 tool_registry_clone :: proc(source: ^Tool_Registry, allocator := context.allocator) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
 	registry.allocator = allocator
@@ -254,8 +222,7 @@ Tool_Registry_Error_Kind :: enum {
 }
 
 // Tool_Registry_Error is why a definition was not registered. tool borrows the
-// rejected definition's name and detail borrows static text, so both live only
-// as long as the definition passed to the registering call.
+// rejected definition's name and detail borrows static text.
 Tool_Registry_Error :: struct {
 	kind:   Tool_Registry_Error_Kind,
 	tool:   string,
@@ -266,8 +233,7 @@ Tool_Registry_Error :: struct {
 TOOL_MAX_NAME_BYTES :: 64
 
 // tool_name_valid admits one canonical tool name: a flat Lua identifier of at most
-// 64 bytes. The same grammar is accepted by the provider APIs Nabla supports, so the
-// registry name is used verbatim on the wire and inside Lua.
+// 64 bytes, used verbatim on the wire and inside Lua.
 @(require_results)
 tool_name_valid :: proc(name: string) -> bool {
 	if name == "" || len(name) > TOOL_MAX_NAME_BYTES { return false }
@@ -281,10 +247,9 @@ tool_name_valid :: proc(name: string) -> bool {
 	return true
 }
 
-// tool_definition_validate checks a definition before it is copied into a
-// registry. The schema is admitted as JSON with an object root, using the same
-// tokenizer admission as argument documents; general JSON Schema semantics stay
-// the definition source's responsibility.
+// tool_definition_validate checks a definition before it is copied into a registry.
+// The schema is admitted as JSON with an object root; general JSON Schema semantics
+// stay the definition source's responsibility.
 @(require_results)
 tool_definition_validate :: proc(definition: Tool_Definition) -> Tool_Registry_Error {
 	if !tool_name_valid(definition.name) {
@@ -329,10 +294,9 @@ tool_schema_valid :: proc(schema: string) -> string {
 	return "the schema is not valid JSON"
 }
 
-// tool_registry_add validates a definition and copies it into the registry. A
-// name already in use is refused rather than replaced: two tools sharing a name
-// would make dispatch a coin toss. The backend pointer is copied, never
-// retained: the adapter keeps owning it.
+// tool_registry_add validates a definition and copies it into the registry. A name
+// already in use is refused rather than replaced. The backend pointer is copied,
+// never retained.
 @(require_results)
 tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition) -> Tool_Registry_Error {
 	if invalid := tool_definition_validate(definition); invalid.kind != .None { return invalid }
@@ -372,9 +336,8 @@ tool_registry_add :: proc(registry: ^Tool_Registry, definition: Tool_Definition)
 }
 
 // tool_schema_integer_fields returns, sorted and owned by allocator, the top-level
-// properties of an input schema whose type accepts an integer but neither a string nor a
-// number. A string or a float in such a field is invalid as sent, so reading it as an
-// integer is its only reading. A schema that does not parse declares no such field.
+// properties of an input schema whose type accepts an integer but neither a string
+// nor a number. A schema that does not parse declares no such field.
 @(private, require_results)
 tool_schema_integer_fields :: proc(schema: string, allocator: mem.Allocator) -> (fields: []string, err: mem.Allocator_Error) {
 	root, parse_error := json.parse_string(schema, .JSON, true, context.temp_allocator)
@@ -424,8 +387,8 @@ tool_registry_find :: proc(registry: ^Tool_Registry, name: string) -> (^Tool_Def
 	return nil, false
 }
 
-// tool_registry_sort fixes the advertisement order, so the cacheable prefix does
-// not depend on the order tools were registered in.
+// tool_registry_sort fixes the advertisement order, so it does not depend on
+// registration order.
 tool_registry_sort :: proc(registry: ^Tool_Registry) {
 	slice.sort_by(registry.definitions[:], proc(a, b: Tool_Definition) -> bool { return a.name < b.name })
 }
@@ -442,8 +405,8 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 // --- results -----------------------------------------------------------------
 
 // Tool_Result is one finished call. output is what the tool produced, typed, and
-// content is its rendering: the text the model reads, exactly as the session stores it.
-// Every string and slice is owned by allocator.
+// content is its rendering, exactly as the session stores it. Every string and
+// slice is owned by allocator.
 Tool_Result :: struct {
 	call_id:           string,
 	outcome:           journal.Tool_Outcome,
@@ -468,7 +431,7 @@ tool_result_destroy :: proc(result: ^Tool_Result) {
 }
 
 // tool_result_of builds a result from what a tool produced. output may borrow; the
-// result keeps its own copy. reason is a short line for the front-end.
+// result keeps its own copy.
 @(require_results)
 tool_result_of :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, message: string, output: Tool_Output, reason := "") -> Tool_Result {
 	result := Tool_Result {
@@ -504,7 +467,7 @@ tool_result_failure :: proc(ctx: ^Tool_Context, outcome: journal.Tool_Outcome, m
 }
 
 // tool_result_refused takes ownership of err and answers a call whose arguments
-// could not be admitted. Nothing ran, and the result says exactly why.
+// could not be admitted. Nothing ran.
 @(require_results)
 tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> Tool_Result {
 	text, text_error := tool_argument_error_text(err^, ctx.allocator)
@@ -521,7 +484,7 @@ tool_result_refused :: proc(ctx: ^Tool_Context, err: ^Tool_Argument_Error) -> To
 	return result
 }
 
-// tool_control_cancelled reports whether the execution, or the work that owns it, was
+// tool_control_cancelled reports whether the execution or the work owning it was
 // asked to stop.
 @(require_results)
 tool_control_cancelled :: proc(control: Tool_Control) -> bool {
