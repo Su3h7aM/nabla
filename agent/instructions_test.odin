@@ -67,32 +67,36 @@ test_read_agents_file_treats_empty_as_missing :: proc(t: ^testing.T) {
 	path := filepath.join({base, "AGENTS.md"}, context.allocator) or_else ""
 	defer delete(path, context.allocator)
 
-	body, err, err_kind := read_agents_file(path)
-	testing.expect_value(t, err_kind, Instruction_Error.None)
-	testing.expect_value(t, err, "missing")
+	body, status, detail := read_agents_file(path)
+	testing.expect_value(t, status, Agents_File_Status.Missing)
+	testing.expect_value(t, detail, "")
 	testing.expect_value(t, body, "")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "") == nil)
-	body, err, err_kind = read_agents_file(path)
-	testing.expect_value(t, err, "missing")
+	body, status, detail = read_agents_file(path)
+	testing.expect_value(t, status, Agents_File_Status.Missing)
+	testing.expect_value(t, detail, "")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "\n\n   \n") == nil)
-	body, err, err_kind = read_agents_file(path)
-	testing.expect_value(t, err, "missing")
+	body, status, detail = read_agents_file(path)
+	testing.expect_value(t, status, Agents_File_Status.Missing)
+	testing.expect_value(t, detail, "")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "Be concise.\n") == nil)
-	body, err, err_kind = read_agents_file(path)
-	testing.expect_value(t, err, "")
+	body, status, detail = read_agents_file(path)
+	testing.expect_value(t, status, Agents_File_Status.Present)
+	testing.expect_value(t, detail, "")
 	testing.expect_value(t, body, "Be concise.\n")
 	delete(body, context.allocator)
 
 	testing.expect(t, os.write_entire_file(path, "broken\x00text") == nil)
-	body, err, err_kind = read_agents_file(path)
+	body, status, detail = read_agents_file(path)
 	defer delete(body, context.allocator)
-	testing.expect(t, strings.contains(err, path), err)
+	testing.expect_value(t, status, Agents_File_Status.Unreadable)
+	testing.expect(t, strings.contains(detail, path), detail)
 }
 
 // An instruction file larger than any fixed byte limit a reader might impose is read whole.
@@ -107,9 +111,9 @@ test_read_agents_file_reads_a_large_file_whole :: proc(t: ^testing.T) {
 	instructions := strings.repeat("a", 512 * 1024, context.temp_allocator)
 	testing.expect(t, os.write_entire_file_from_string(path, instructions) == nil)
 
-	body, err, err_kind := read_agents_file(path)
+	body, status, detail := read_agents_file(path)
 	defer delete(body, context.allocator)
-	testing.expect_value(t, err_kind, Instruction_Error.None)
-	testing.expect_value(t, err, "")
+	testing.expect_value(t, status, Agents_File_Status.Present)
+	testing.expect_value(t, detail, "")
 	testing.expect_value(t, len(body), 512 * 1024)
 }

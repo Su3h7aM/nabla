@@ -144,65 +144,74 @@ collect_agents_files :: proc(workspace: string, disable_project: bool, allocator
 		path, join_error := filepath.join({workspace, INSTRUCTIONS_AGENTS_FILE}, context.temp_allocator)
 		if join_error != nil { return nil, "an instruction path could not be allocated", .Allocation }
 		defer delete(path, context.temp_allocator)
-		body, read_error, read_kind := read_agents_file(path, context.temp_allocator)
-		defer delete(body, context.temp_allocator)
-		if read_kind == .None && read_error == "" {
-			file, clone_error := agents_file_clone(path, "local", body, allocator)
-			if clone_error != nil { return nil, "an instruction file could not be copied", .Allocation }
-			appended := append(&files, file)
-			if appended != 1 {
-				if appended == 0 { agents_files_destroy([]Agents_File{file}, allocator) }
-				return nil, "the instruction file list could not be allocated", .Allocation
-			}
-		} else if read_kind == .Read {
-			return nil, read_error, .Read
-		}
+		detail, err := instructions_add_file(&files, path, "local", allocator)
+		if err != .None { return nil, detail, err }
 	}
 	if home, home_err := os.user_home_dir(context.temp_allocator); home_err == nil && home != "" {
 		defer delete(home, context.temp_allocator)
 		path, join_error := filepath.join({home, INSTRUCTIONS_AGENTS_DIR, INSTRUCTIONS_AGENTS_FILE}, context.temp_allocator)
 		if join_error != nil { return nil, "an instruction path could not be allocated", .Allocation }
 		defer delete(path, context.temp_allocator)
-		body, read_error, read_kind := read_agents_file(path, context.temp_allocator)
-		defer delete(body, context.temp_allocator)
-		if read_kind == .None && read_error == "" {
-			file, clone_error := agents_file_clone(path, "personal", body, allocator)
-			if clone_error != nil { return nil, "an instruction file could not be copied", .Allocation }
-			appended := append(&files, file)
-			if appended != 1 {
-				if appended == 0 { agents_files_destroy([]Agents_File{file}, allocator) }
-				return nil, "the instruction file list could not be allocated", .Allocation
-			}
-		} else if read_kind == .Read {
-			return nil, read_error, .Read
-		}
+		detail, err := instructions_add_file(&files, path, "personal", allocator)
+		if err != .None { return nil, detail, err }
 	}
 	failed = false
 	return files[:], "", .None
 }
 
+@(require_results)
+instructions_add_file :: proc(files: ^[dynamic]Agents_File, path, source: string, allocator: mem.Allocator) -> (detail: string, err: Instruction_Error) {
+	body, status, read_detail := read_agents_file(path, context.temp_allocator)
+	defer delete(body, context.temp_allocator)
+	switch status {
+	case .Present:
+	case .Missing:
+		return "", .None
+	case .Unreadable:
+		return read_detail, .Read
+	case .Allocation:
+		return read_detail, .Allocation
+	}
+	file, clone_error := agents_file_clone(path, source, body, allocator)
+	if clone_error != nil { return "an instruction file could not be copied", .Allocation }
+	appended := append(files, file)
+	if appended != 1 {
+		if appended == 0 { agents_files_destroy([]Agents_File{file}, allocator) }
+		return "the instruction file list could not be allocated", .Allocation
+	}
+	return "", .None
+}
+
+Agents_File_Status :: enum {
+	Present,
+	Missing,
+	Unreadable,
+	Allocation,
+}
+
 // read_agents_file reads one automatic instruction file completely. An absent
-// file, including an empty or whitespace-only placeholder, reports "missing":
+// file, including an empty or whitespace-only placeholder, reports .Missing:
 // it carries no instructions, so it must not block the session. Every other
 // failure names the file, so the session error says which source is wrong. The
-// returned error text is borrowed and lives only for the call.
+// returned detail text is borrowed and lives only for the call.
 @(require_results)
-read_agents_file :: proc(path: string, allocator := context.allocator) -> (string, string, Instruction_Error) {
+read_agents_file :: proc(path: string, allocator := context.allocator) -> (body: string, status: Agents_File_Status, detail: string) {
 	info, stat_error := os.stat(path, context.temp_allocator)
 	defer os.file_info_delete(info, context.temp_allocator)
 	if stat_error != nil {
-		if stat_error == os.General_Error.Not_Exist { return "", "missing", .None }
-		return "", fmt.aprintf("%s could not be inspected", path, allocator = context.temp_allocator), .Read
+		if stat_error == os.General_Error.Not_Exist { return "", .Missing, "" }
+		return "", .Unreadable, fmt.aprintf("%s could not be inspected", path, allocator = context.temp_allocator)
 	}
-	if info.type != .Regular { return "", fmt.aprintf("%s is not a regular file", path, allocator = context.temp_allocator), .Read }
+	if info.type != .Regular { return "", .Unreadable, fmt.aprintf("%s is not a regular file", path, allocator = context.temp_allocator) }
 	data, read_error := os.read_entire_file(path, allocator)
-	if read_error != nil { return "", fmt.aprintf("%s could not be read", path, allocator = context.temp_allocator), .Read }
+	if read_error != nil { return "", .Unreadable, fmt.aprintf("%s could not be read", path, allocator = context.temp_allocator) }
 	defer delete(data, allocator)
-	if strings.trim_space(string(data)) == "" { return "", "missing", .None }
-	if !skills.skill_body_valid(string(data)) { return "", fmt.aprintf("%s contains invalid text", path, allocator = context.temp_allocator), .Read }
-	body, clone_error := strings.clone(string(data), allocator)
-	if clone_error != nil { return "", "the instruction file could not be copied", .Allocation }
-	return body, "", .None
+	if strings.trim_space(string(data)) == "" { return "", .Missing, "" }
+	if !skills.skill_body_valid(string(data)) { return "", .Unreadable, fmt.aprintf("%s contains invalid text", path, allocator = context.temp_allocator) }
+	clone_error: mem.Allocator_Error
+	body, clone_error = strings.clone(string(data), allocator)
+	if clone_error != nil { return "", .Allocation, "the instruction file could not be copied" }
+	return body, .Present, ""
 }
 
 @(require_results)
