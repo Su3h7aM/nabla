@@ -170,24 +170,12 @@ parse_batch :: proc(payload: string, allocator := context.allocator) -> (frames:
 	for item in items {
 		body, marshal_err := json.marshal(item, allocator = allocator)
 		if marshal_err != nil {
-			for frame in frames { delete(frame, allocator) }
-			delete(frames)
+			frame_strings_destroy(&frames, allocator)
 			return {}, true, .Allocation
 		}
-		frame, clone_err := strings.clone(string(body), allocator)
-		delete(body, allocator)
-		if clone_err != nil {
-			for owned in frames { delete(owned, allocator) }
-			delete(frames)
-			return {}, true, .Allocation
-		}
-		appended := append(&frames, frame)
-		if appended != 1 {
-			if appended == 0 { delete(frame, allocator) }
-			for owned in frames { delete(owned, allocator) }
-			delete(frames)
-			return {}, true, .Allocation
-		}
+		// The capacity was reserved above, so this append cannot allocate; the marshaled
+		// bytes become the frame without a second copy.
+		append(&frames, string(body))
 	}
 	return frames, true, .None
 }

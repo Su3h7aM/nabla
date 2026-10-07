@@ -1,5 +1,6 @@
 package mcp
 
+import "core:bytes"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -281,12 +282,17 @@ stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Er
 // outcome unknown rather than absent.
 @(require_results)
 stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Error) {
+	// searched counts the unconsumed bytes already known to hold no newline, so a long
+	// line is scanned once in total instead of once per read.
+	searched := 0
 	for {
-		if start := stdio_find_newline(stdio.line[:], stdio.line_start); start >= 0 {
+		if index := bytes.index_byte(stdio.line[stdio.line_start + searched:], '\n'); index >= 0 {
+			start := stdio.line_start + searched + index
 			line = stdio.line[stdio.line_start:start]
 			stdio.line_start = start + 1
 			return
 		}
+		searched = len(stdio.line) - stdio.line_start
 		stdio_compact(stdio)
 		if stop := control_stop(control); stop != .None {
 			return nil, control_error(stop, .Delivered, stdio.allocator)
@@ -329,14 +335,6 @@ stdio_compact :: proc(stdio: ^Stdio) {
 	// allocates, so the resize cannot fail.
 	_ = resize(&stdio.line, remaining)
 	stdio.line_start = 0
-}
-
-@(private)
-stdio_find_newline :: proc(data: []u8, from: int) -> int {
-	for index in from ..< len(data) {
-		if data[index] == '\n' { return index }
-	}
-	return -1
 }
 
 // stdio_transport_error builds a transport failure with the delivery state and the

@@ -1,5 +1,6 @@
 package acp
 
+import "core:bytes"
 import "core:mem"
 import "core:strings"
 import "core:unicode/utf8"
@@ -72,15 +73,13 @@ frame_strings_destroy :: proc(frames: ^[dynamic]string, allocator := context.all
 @(require_results)
 frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dynamic]string) -> Frame_Error {
 	first_error := Frame_Error.None
-	for byte in chunk {
-		if decoder.discard_until_newline {
-			if byte == '\n' {
-				decoder.discard_until_newline = false
-			}
-			continue
-		}
-		if byte != '\n' {
-			if _, append_error := append(&decoder.buffer, byte); append_error != nil {
+	rest := chunk
+	for len(rest) > 0 {
+		newline := bytes.index_byte(rest, '\n')
+		piece := rest if newline < 0 else rest[:newline]
+		rest = nil if newline < 0 else rest[newline + 1:]
+		if !decoder.discard_until_newline {
+			if _, append_error := append(&decoder.buffer, ..piece); append_error != nil {
 				// The bytes of the frame under assembly went with the failed append, so the
 				// rest of that frame is discarded rather than yielded shortened.
 				clear(&decoder.buffer)
@@ -89,6 +88,10 @@ frame_decoder_feed :: proc(decoder: ^Frame_Decoder, chunk: []byte, frames: ^[dyn
 					first_error = .Allocation
 				}
 			}
+		}
+		if newline < 0 { break }
+		if decoder.discard_until_newline {
+			decoder.discard_until_newline = false
 			continue
 		}
 		frame_error := frame_end(decoder, frames)

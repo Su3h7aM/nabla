@@ -173,9 +173,10 @@ openai_parse_api_error :: proc(object: json.Object, allocator := context.allocat
 	}
 	if !message_present || message == "" { message = "provider returned an API error" }
 	code, code_present, code_ok := openai_value_string(error_object, "code")
+	number_text: [32]u8
 	if !code_ok {
 		if number, number_present, number_ok := openai_value_integer(error_object, "code"); number_ok && number_present {
-			code = fmt.aprintf("%d", number, allocator = allocator)
+			code = fmt.bprintf(number_text[:], "%d", number)
 		} else if !code_present {
 			code = ""
 		} else {
