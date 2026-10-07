@@ -221,6 +221,7 @@ ed25519_verify :: proc(certificate: ^x509.Certificate, input, signature: []byte)
 finished_verify :: proc(suite: Cipher_Suite, secret: []u8, transcript_hash: []u8, verify_data: []u8) -> bool {
 	size := secret_size(suite)
 	finished_key: [MAX_SECRET_SIZE]u8
+	defer crypto.zero_explicit(&finished_key, size_of(finished_key))
 	if !hkdf_expand_label(suite, secret, "finished", {}, finished_key[:size]) { return false }
 
 	mac: [hash.MAX_DIGEST_SIZE]u8

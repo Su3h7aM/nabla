@@ -246,12 +246,10 @@ connection_read_tls :: proc(connection: ^Connection, buffer: []u8) -> (count: in
 		// same as a socket that has no more bytes.
 		if read == 0 { return 0, .Closed }
 		return read, .None
-	case .Transport:
-		return 0, tls_error(connection, tls_err, .Truncated)
-	case .Invalid_Identity, .Record, .Handshake, .Alert, .Unsupported, .No_Room, .Peer_Rejected, .Signature, .Finished:
+	case .Transport, .Invalid_Identity, .Record, .Handshake, .Alert, .Unsupported, .No_Room, .Peer_Rejected, .Signature, .Finished:
 		return 0, tls_error(connection, tls_err, .TLS_Read)
 	}
-	return 0, .TLS_Read
+	unreachable()
 }
 
 // connection_read_socket moves plaintext off the socket, waiting on the event loop

@@ -237,7 +237,7 @@ request_send :: proc(
 	dialed, dial_err := dial_first(endpoints, options, request.allocator)
 	if dial_err != .None { return nil, failure_from_error(dial_err, request.allocator) }
 
-	if url.scheme == "https" {
+	if strings.equal_fold(url.scheme, "https") {
 		phase^ = .TLS
 		if handshake_err := connection_handshake(dialed, url.host); handshake_err != .None {
 			detail := handshake_failure_detail(dialed, handshake_err, request.allocator)
@@ -443,7 +443,7 @@ request_has_header :: proc(request: Request, name: string) -> bool {
 resolve_endpoints :: proc(url: http.URL, options: Options, allocator: mem.Allocator) -> (endpoints: []net.Endpoint, err: Error) {
 	hostname, port, ok := host_and_port(url.host)
 	if !ok || hostname == "" { return nil, .Invalid_URL }
-	if port == 0 { port = 443 if url.scheme == "https" else 80 }
+	if port == 0 { port = 443 if strings.equal_fold(url.scheme, "https") else 80 }
 	if literal := net.parse_address(hostname); literal != nil {
 		found, make_err := make([]net.Endpoint, 1, allocator)
 		if make_err != nil { return nil, .No_Room }

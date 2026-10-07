@@ -32,34 +32,33 @@ connection_transport_write :: proc(user_data: rawptr, buffer: []u8) -> (count: i
 	return written, err == .None
 }
 
-// tls_error maps what the TLS layer reported onto this client's classification. A
+// tls_error maps what the TLS layer reported onto this client's classification.
+// phase is the error a record-layer failure takes in the caller's phase. A
 // transport that failed is this client's own business, so the caller's reason is
 // preferred over anything the TLS layer could guess.
 @(require_results)
-tls_error :: proc(connection: ^Connection, tls_err: tls.Error, fallback: Error) -> Error {
-	if tls_err == .Transport {
+tls_error :: proc(connection: ^Connection, tls_err: tls.Error, phase: Error) -> Error {
+	switch tls_err {
+	case .None:
+		return .None
+	case .Transport:
 		// TLS reaches an orderly end only through an authenticated close_notify.
 		// A bare transport close can truncate protected application data.
 		if connection.stop == .Peer_Closed { return .Truncated }
 		if connection.stop != .None { return error_from_stop(connection.stop) }
 		return .Truncated
-	}
-	switch tls_err {
-	case .None:
-		return .None
-	case .Transport:
-		unreachable()
 	case .Invalid_Identity:
 		return .TLS_Hostname
 	case .Record, .Handshake, .Alert:
-		return .TLS_Handshake
+		// The record layer failed in the phase the caller names.
+		return phase
 	case .Unsupported, .No_Room:
 		return .TLS_Config
 	case .Peer_Rejected, .Signature, .Finished:
 		// The peer's own chain or its proof of it was not acceptable.
 		return .TLS_Peer_Rejected
 	}
-	return fallback
+	unreachable()
 }
 
 // handshake_failure_detail is this client's account of a failed handshake, with the

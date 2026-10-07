@@ -4,6 +4,7 @@ import "base:runtime"
 
 import "core:bytes"
 import "core:crypto"
+import "core:crypto/ecdh"
 import "core:crypto/hash"
 import "core:crypto/hmac"
 import "core:crypto/x509"
@@ -129,6 +130,8 @@ destroy :: proc(connection: ^Conn) {
 	delete(connection.message, allocator)
 	delete(connection.recv, allocator)
 	delete(connection.stream)
+	// The connection holds the traffic secrets and keys, so they are wiped before the memory is returned.
+	crypto.zero_explicit(connection, size_of(Conn))
 	free(connection, allocator)
 }
 
@@ -170,6 +173,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	}
 
 	exchange: Key_Exchange
+	defer ecdh.private_key_clear(&exchange.private)
 	if !key_exchange_generate(&exchange, OFFERED_GROUPS[0]) { return .Unsupported }
 	fields.group = exchange.group
 	fields.keyshare = exchange.share[:exchange.length]
@@ -251,6 +255,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	hash.update(&connection.transcript, hello_message)
 
 	shared_secret: [SHARED_SECRET_MAX]u8
+	defer crypto.zero_explicit(&shared_secret, size_of(shared_secret))
 	if !key_exchange_shared(&exchange, hello.keyshare, shared_secret[:]) { return .Unsupported }
 	// A shared secret of zeros is a small-order peer key, and the protocol refuses
 	// the connection rather than derive keys from it (RFC 8446 section 7.4.2).
@@ -258,6 +263,8 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 
 	if !key_schedule_advance(&connection.schedule, shared_secret[:]) { return .Unsupported }
 	client_secret, server_secret: Secret
+	defer crypto.zero_explicit(&client_secret, size_of(client_secret))
+	defer crypto.zero_explicit(&server_secret, size_of(server_secret))
 	if !key_schedule_traffic_secrets(&connection.schedule, transcript_hash(connection), &client_secret, &server_secret) {
 		return .Unsupported
 	}
@@ -291,6 +298,8 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	if finished_err := handshake_client_finished(connection); finished_err != .None { return finished_err }
 
 	client_application, server_application: Secret
+	defer crypto.zero_explicit(&client_application, size_of(client_application))
+	defer crypto.zero_explicit(&server_application, size_of(server_application))
 	if !key_schedule_traffic_secrets(&connection.schedule, application_hash[:len(digest)], &client_application, &server_application) {
 		return .Unsupported
 	}
@@ -411,6 +420,7 @@ handshake_client_finished :: proc(connection: ^Conn) -> Error {
 	finished := connection.message[:HANDSHAKE_HEADER_SIZE + size]
 	handshake_encode_header(.Finished, size, finished)
 	finished_key: [MAX_SECRET_SIZE]u8
+	defer crypto.zero_explicit(&finished_key, size_of(finished_key))
 	if !hkdf_expand_label(connection.suite, connection.write_secret[:size], "finished", {}, finished_key[:size]) {
 		return .Unsupported
 	}
@@ -768,6 +778,7 @@ post_handshake_handle :: proc(connection: ^Conn) -> Error {
 
 			size := secret_size(connection.suite)
 			updated: Secret
+			defer crypto.zero_explicit(&updated, size_of(updated))
 			if !key_schedule_update(connection.suite, connection.read_secret[:size], updated[:size]) { return .Unsupported }
 			connection.read_secret = updated
 			if !traffic_key_derive(connection.suite, connection.read_secret[:size], &connection.read_key) { return .Unsupported }
@@ -792,6 +803,7 @@ key_update_send :: proc(connection: ^Conn) -> Error {
 
 	size := secret_size(connection.suite)
 	updated: Secret
+	defer crypto.zero_explicit(&updated, size_of(updated))
 	if !key_schedule_update(connection.suite, connection.write_secret[:size], updated[:size]) { return .Unsupported }
 	connection.write_secret = updated
 	if !traffic_key_derive(connection.suite, connection.write_secret[:size], &connection.write_key) { return .Unsupported }
