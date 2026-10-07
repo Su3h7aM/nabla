@@ -239,6 +239,7 @@ models_dev_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, 
 // complete catalog and a write that fails or is interrupted leaves the previous
 // one untouched. The temporary name carries the process id, so two concurrent
 // refreshes cannot write to the same file; the rename is what publishes.
+@(require_results)
 models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
 	if os.write_entire_file(temporary, body) != nil { return false }

@@ -226,6 +226,7 @@ provider_models_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([
 	return nil, false
 }
 
+@(require_results)
 provider_models_cache_write :: proc(path: string, body: []u8) -> bool {
 	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
 	if os.write_entire_file(temporary, body) != nil { return false }
