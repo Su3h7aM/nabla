@@ -818,7 +818,7 @@ provider_request_error_text :: proc(err: Provider_Request_Error) -> string {
 	case .None:
 		return ""
 	case .Unsupported_API:
-		return "unsupported API family (only openai_chat_completions and openai_responses are implemented)"
+		return "unsupported API family"
 	case .Missing_Model:
 		return "model is required"
 	case .Missing_Messages:
