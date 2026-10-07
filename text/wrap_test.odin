@@ -24,19 +24,19 @@ test_wrap_prefers_spaces_and_keeps_wide_clusters_whole :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_prefix_covering_columns_stops_on_a_cluster_boundary :: proc(t: ^testing.T) {
-	testing.expect_value(t, prefix_covering_columns("a界b", 2), "a界")
-	testing.expect_value(t, prefix_covering_columns("a界b", 3), "a界")
-	testing.expect_value(t, prefix_covering_columns("a界b", 4), "a界b")
-}
-
-@(test)
 test_wrap_leading_tab_does_not_emit_an_empty_row :: proc(t: ^testing.T) {
 	iterator := wrap_iterator_make("\tb", 2)
 	first, _ := wrap_next(&iterator)
 	second, _ := wrap_next(&iterator)
 	testing.expect_value(t, first, "\t")
 	testing.expect_value(t, second, "b")
+}
+
+@(test)
+test_prefix_covering_columns_stops_on_a_cluster_boundary :: proc(t: ^testing.T) {
+	testing.expect_value(t, prefix_covering_columns("a界b", 2), "a界")
+	testing.expect_value(t, prefix_covering_columns("a界b", 3), "a界")
+	testing.expect_value(t, prefix_covering_columns("a界b", 4), "a界b")
 }
 
 @(test)

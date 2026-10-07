@@ -18,7 +18,6 @@ Session_Impl :: struct {
 	original_termios:    Termios,
 	original_file_flags: linux.Open_Flags,
 	file_flags_changed:  bool,
-	termios_saved:       bool,
 	mode_applied:        bool,
 	// The transition flags mean "transition attempted": they are set before the
 	// write, so rollback and close always emit the compensating sequence even
@@ -153,7 +152,6 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 		if errno := _tcgetattr(fd, &impl.original_termios); errno != .NONE {
 			return Platform_Error(errno)
 		}
-		impl.termios_saved = true
 
 		// Nonblocking mode: the input stage drains reads until EAGAIN. The
 		// original flags are saved and restored on teardown.
@@ -270,89 +268,68 @@ _session_close_file :: proc(file: ^os.File) -> Error {
 // session is a process-wide hazard, not bookkeeping.
 @(require_results)
 _session_rollback :: proc(impl: ^Session_Impl) -> Error {
-	first_error: Error = nil
-	if impl.cursor_hidden {
-		if err := _session_write(impl.file, CURSOR_SHOW); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.cursor_hidden = false
-		}
+	first_error: Error
+	_keep_first_error(&first_error, _session_undo(&impl.cursor_hidden, impl.file, CURSOR_SHOW, _session_write))
+	_keep_first_error(&first_error, _session_restore(impl, _session_write))
+	if impl.file != nil {
+		_keep_first_error(&first_error, _session_close_file(impl.file))
+		impl.file = nil
 	}
-	if impl.bracketed_paste {
-		if err := _session_write(impl.file, BRACKETED_PASTE_OFF); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.bracketed_paste = false
-		}
+	atexit_active = false
+	return first_error
+}
+
+// _keep_first_error records err unless an earlier failure is already held.
+_keep_first_error :: proc(first_error: ^Error, err: Error) {
+	if first_error^ == nil {
+		first_error^ = err
 	}
-	if impl.mouse {
-		if err := _session_write(impl.file, MOUSE_OFF); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.mouse = false
-		}
+}
+
+// _session_undo writes the compensating sequence for one entered transition
+// and clears its flag only when the write succeeded.
+@(require_results)
+_session_undo :: proc(entered: ^bool, file: ^os.File, text: string, write: proc(file: ^os.File, text: string) -> Error) -> Error {
+	if !entered^ {
+		return nil
 	}
-	if impl.autowrap_disabled {
-		if err := _session_write(impl.file, AUTOWRAP_ON); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.autowrap_disabled = false
-		}
+	err := write(file, text)
+	if err == nil {
+		entered^ = false
 	}
-	if impl.alt_screen_entered {
-		if err := _session_write(impl.file, ALT_SCREEN_LEAVE); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.alt_screen_entered = false
-		}
-	}
+	return err
+}
+
+// _session_restore reverses the terminal modes in reverse setup order,
+// attempting every one, and returns the first failure. Each flag clears only
+// when its compensation succeeded. The descriptor stays open.
+@(require_results)
+_session_restore :: proc(impl: ^Session_Impl, write: proc(file: ^os.File, text: string) -> Error) -> (first_error: Error) {
+	_keep_first_error(&first_error, _session_undo(&impl.bracketed_paste, impl.file, BRACKETED_PASTE_OFF, write))
+	_keep_first_error(&first_error, _session_undo(&impl.mouse, impl.file, MOUSE_OFF, write))
+	_keep_first_error(&first_error, _session_undo(&impl.autowrap_disabled, impl.file, AUTOWRAP_ON, write))
+	_keep_first_error(&first_error, _session_undo(&impl.alt_screen_entered, impl.file, ALT_SCREEN_LEAVE, write))
 	if impl.mode_applied {
 		if errno := _tcsetattr(linux.Fd(os.fd(impl.file)), TCSAFLUSH, &impl.original_termios); errno != .NONE {
-			if first_error == nil {
-				first_error = Platform_Error(errno)
-			}
+			_keep_first_error(&first_error, Platform_Error(errno))
 		} else {
 			impl.mode_applied = false
 		}
 	}
-	impl.termios_saved = false
 	if impl.file_flags_changed {
 		if errno := linux.fcntl_setfl(linux.Fd(os.fd(impl.file)), .SETFL, impl.original_file_flags); errno != .NONE {
-			if first_error == nil {
-				first_error = Platform_Error(errno)
-			}
+			_keep_first_error(&first_error, Platform_Error(errno))
 		} else {
 			impl.file_flags_changed = false
 		}
 	}
 	if impl.sigwinch_installed {
 		if errno := linux.rt_sigaction(.SIGWINCH, &impl.previous_sigaction, nil); errno != .NONE {
-			if first_error == nil {
-				first_error = Platform_Error(errno)
-			}
+			_keep_first_error(&first_error, Platform_Error(errno))
 		} else {
 			impl.sigwinch_installed = false
 		}
 	}
-	if impl.file != nil {
-		if close_err := _session_close_file(impl.file); close_err != nil {
-			if first_error == nil {
-				first_error = close_err
-			}
-		}
-		impl.file = nil
-	}
-	atexit_active = false
 	return first_error
 }
 
@@ -373,8 +350,7 @@ _session_close :: proc(session: ^Session) -> Error {
 		}
 	}
 	impl := &session.impl
-	first_error: Error = nil
-	fd := linux.Fd(os.fd(impl.file))
+	first_error: Error
 	// The cursor is part of the documented baseline: a presented frame may have
 	// hidden it and a partial write leaves that unspecified, so close shows it
 	// whenever the descriptor is still open, rather than tracking every frame's
@@ -382,76 +358,12 @@ _session_close :: proc(session: ^Session) -> Error {
 	// close from writing to a file the session no longer owns.
 	if impl.file != nil {
 		if err := _session_close_write(impl.file, CURSOR_SHOW + SGR_RESET); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
+			_keep_first_error(&first_error, err)
 		} else {
 			impl.cursor_hidden = false
 		}
 	}
-	if impl.bracketed_paste {
-		if err := _session_close_write(impl.file, BRACKETED_PASTE_OFF); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.bracketed_paste = false
-		}
-	}
-	if impl.mouse {
-		if err := _session_close_write(impl.file, MOUSE_OFF); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.mouse = false
-		}
-	}
-	if impl.autowrap_disabled {
-		if err := _session_close_write(impl.file, AUTOWRAP_ON); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.autowrap_disabled = false
-		}
-	}
-	if impl.alt_screen_entered {
-		if err := _session_close_write(impl.file, ALT_SCREEN_LEAVE); err != nil {
-			if first_error == nil {
-				first_error = err
-			}
-		} else {
-			impl.alt_screen_entered = false
-		}
-	}
-	if impl.mode_applied {
-		if errno := _tcsetattr(fd, TCSAFLUSH, &impl.original_termios); errno != .NONE {
-			if first_error == nil {
-				first_error = Platform_Error(errno)
-			}
-		} else {
-			impl.mode_applied = false
-		}
-	}
-	if impl.file_flags_changed {
-		if errno := linux.fcntl_setfl(fd, .SETFL, impl.original_file_flags); errno != .NONE {
-			if first_error == nil {
-				first_error = Platform_Error(errno)
-			}
-		} else {
-			impl.file_flags_changed = false
-		}
-	}
-	if impl.sigwinch_installed {
-		if errno := linux.rt_sigaction(.SIGWINCH, &impl.previous_sigaction, nil); errno != .NONE {
-			if first_error == nil {
-				first_error = Platform_Error(errno)
-			}
-		} else {
-			impl.sigwinch_installed = false
-		}
-	}
+	_keep_first_error(&first_error, _session_restore(impl, _session_close_write))
 	if first_error != nil {
 		return first_error
 	}
@@ -476,21 +388,10 @@ _session_close :: proc(session: ^Session) -> Error {
 	return nil
 }
 
-// _session_present writes the whole frame through the shared write loop.
-// The write reports its committed byte count; the caller surfaces it
-// through present's committed result.
+// _session_present writes bytes (a frame or a clipboard sequence) through the
+// shared write loop and reports the committed byte count.
 @(require_results)
 _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
-	if session.impl.file == nil {
-		return 0, General_Error.Not_Open
-	}
-	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes)
-}
-
-// _session_clipboard writes a clipboard sequence through the same loop, so a
-// copy is as retryable as a frame is.
-@(require_results)
-_session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}

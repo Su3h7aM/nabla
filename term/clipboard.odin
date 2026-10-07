@@ -31,7 +31,7 @@ clipboard_set :: proc(session: ^Session, text: string, allocator := context.allo
 		return 0, sequence_err
 	}
 	defer delete(sequence, allocator)
-	return _session_clipboard(session, transmute([]byte)sequence)
+	return _session_present(session, transmute([]byte)sequence)
 }
 
 // _clipboard_sequence builds the OSC 52 write: the introducer, the clipboard

@@ -41,11 +41,7 @@ read_events :: proc(
 	}
 	first_timeout := timeout_ms
 	if has_escape_deadline {
-		remaining := time.tick_diff(time.tick_now(), escape_deadline)
-		remaining_timeout := i64(0)
-		if remaining > 0 {
-			remaining_timeout = i64((remaining + time.Millisecond - 1) / time.Millisecond)
-		}
+		remaining_timeout := i64(_milliseconds_until(escape_deadline))
 		if first_timeout < 0 || first_timeout > remaining_timeout {
 			first_timeout = remaining_timeout
 		}
@@ -67,12 +63,7 @@ read_events :: proc(
 			escape_deadline = time.tick_add(time.tick_now(), time.Duration(ESC_DEADLINE_MS) * time.Millisecond)
 			has_escape_deadline = true
 		}
-		remaining := time.tick_diff(time.tick_now(), escape_deadline)
-		remaining_timeout := i32(0)
-		if remaining > 0 {
-			remaining_timeout = i32((remaining + time.Millisecond - 1) / time.Millisecond)
-		}
-		tty_ready, interrupted, poll_err = input_poll(fd, -1, remaining_timeout)
+		tty_ready, interrupted, poll_err = input_poll(fd, -1, _milliseconds_until(escape_deadline))
 		if poll_err != nil {
 			return len(events^) - start, poll_err
 		}
@@ -87,6 +78,17 @@ read_events :: proc(
 		}
 	}
 	return len(events^) - start, nil
+}
+
+// _milliseconds_until returns the whole milliseconds, rounded up, until deadline,
+// or 0 once it has passed.
+@(private)
+_milliseconds_until :: proc(deadline: time.Tick) -> i32 {
+	remaining := time.tick_diff(time.tick_now(), deadline)
+	if remaining <= 0 {
+		return 0
+	}
+	return i32((remaining + time.Millisecond - 1) / time.Millisecond)
 }
 
 // input_poll waits once for the tty, and for wake unless it is negative. interrupted
@@ -123,7 +125,7 @@ input_drain :: proc(parser: ^Parser, file: ^os.File, events: ^[dynamic]Event, al
 			if read_err == io.Error.EOF {
 				// The EOF event is the caller's only signal that the tty closed,
 				// so a failed append is a read failure, not a silent success.
-				if emit_err := parser_emit(parser, events, End_Of_Input{}, allocator); emit_err != nil {
+				if emit_err := parser_emit(events, End_Of_Input{}, allocator); emit_err != nil {
 					return emit_err
 				}
 				return nil

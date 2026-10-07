@@ -96,7 +96,7 @@ parser_resolve_escape :: proc(parser: ^Parser, events: ^[dynamic]Event, allocato
 		return nil
 	}
 	parser_reset(parser)
-	return parser_emit(parser, events, Key_Event{code = .Escape}, allocator)
+	return parser_emit(events, Key_Event{code = .Escape}, allocator)
 }
 
 parser_reset :: proc(parser: ^Parser) {
@@ -109,11 +109,9 @@ parser_reset :: proc(parser: ^Parser) {
 }
 
 @(require_results)
-parser_emit :: proc(parser: ^Parser, events: ^[dynamic]Event, event: Event, allocator: runtime.Allocator) -> Error {
-	previous := context.allocator
+parser_emit :: proc(events: ^[dynamic]Event, event: Event, allocator: runtime.Allocator) -> Error {
 	context.allocator = allocator
-	_, err := runtime.append_elem(events, event)
-	context.allocator = previous
+	_, err := append(events, event)
 	return err
 }
 
@@ -123,13 +121,13 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 	case input_byte == 0x1b:
 		parser.state = .Escape
 	case input_byte == 0x09:
-		err = parser_emit(parser, events, Key_Event{code = .Tab}, allocator)
+		err = parser_emit(events, Key_Event{code = .Tab}, allocator)
 	case input_byte == 0x0d:
-		err = parser_emit(parser, events, Key_Event{code = .Enter}, allocator)
+		err = parser_emit(events, Key_Event{code = .Enter}, allocator)
 	case input_byte == 0x7f:
-		err = parser_emit(parser, events, Key_Event{code = .Backspace}, allocator)
+		err = parser_emit(events, Key_Event{code = .Backspace}, allocator)
 	case input_byte >= 0x01 && input_byte <= 0x1a:
-		err = parser_emit(parser, events, Key_Event{code = .Character, character = rune(input_byte), modifiers = {.Control}}, allocator)
+		err = parser_emit(events, Key_Event{code = .Character, character = rune(input_byte), modifiers = {.Control}}, allocator)
 	case input_byte >= 0x80:
 		expected := 0
 		switch {
@@ -140,7 +138,7 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 		case input_byte >= 0xf0 && input_byte <= 0xf4:
 			expected = 3
 		case:
-			err = parser_emit(parser, events, Unknown_Input{}, allocator)
+			err = parser_emit(events, Unknown_Input{}, allocator)
 		}
 		if expected > 0 {
 			parser.utf8_bytes[0] = input_byte
@@ -149,7 +147,7 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 			parser.utf8_expected = expected
 		}
 	case input_byte < 0x80:
-		err = parser_emit(parser, events, Key_Event{code = .Character, character = rune(input_byte)}, allocator)
+		err = parser_emit(events, Key_Event{code = .Character, character = rune(input_byte)}, allocator)
 	}
 	return 1, err
 }
@@ -164,18 +162,18 @@ parser_utf8 :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, al
 			encoded := string(parser.utf8_bytes[:parser.utf8_length])
 			if !utf8.valid_string(encoded) {
 				parser_reset(parser)
-				return 1, parser_emit(parser, events, Unknown_Input{}, allocator)
+				return 1, parser_emit(events, Unknown_Input{}, allocator)
 			}
 			code_point, _ := utf8.decode_rune(encoded)
 			parser_reset(parser)
-			return 1, parser_emit(parser, events, Key_Event{code = .Character, character = code_point}, allocator)
+			return 1, parser_emit(events, Key_Event{code = .Character, character = code_point}, allocator)
 		}
 		return 1, nil
 	}
 	// Not a continuation byte: the sequence is malformed. Report it, then
 	// resynchronize by reprocessing the byte in Ground (consumed = 0).
 	parser_reset(parser)
-	if unknown_err := parser_emit(parser, events, Unknown_Input{}, allocator); unknown_err != nil {
+	if unknown_err := parser_emit(events, Unknown_Input{}, allocator); unknown_err != nil {
 		return 0, unknown_err
 	}
 	return 0, nil
@@ -204,7 +202,7 @@ parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 		// A lone ESC followed by an ordinary byte: emit Escape, then
 		// reprocess the byte in Ground (ESC + printable = Escape then key).
 		parser.state = .Ground
-		if esc_err := parser_emit(parser, events, Key_Event{code = .Escape}, allocator); esc_err != nil {
+		if esc_err := parser_emit(events, Key_Event{code = .Escape}, allocator); esc_err != nil {
 			return 0, esc_err
 		}
 		return 0, nil
@@ -249,7 +247,7 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 	}
 	// A byte outside the sequence alphabet: malformed, resynchronize.
 	parser_reset(parser)
-	return 1, parser_emit(parser, events, Unknown_Input{}, allocator)
+	return 1, parser_emit(events, Unknown_Input{}, allocator)
 }
 
 @(require_results)
@@ -260,7 +258,26 @@ parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, e
 		return parser_mouse_event(parser, final, events, allocator)
 	}
 	code: Key_Code
-	found := false
+	found := true
+	switch final {
+	case 'A':
+		code = .Up
+	case 'B':
+		code = .Down
+	case 'C':
+		code = .Right
+	case 'D':
+		code = .Left
+	case 'H':
+		code = .Home
+	case 'F':
+		code = .End
+	case:
+		found = false
+	}
+	if found {
+		return parser_emit(events, Key_Event{code = code}, allocator)
+	}
 	if state == .Ss3 {
 		switch final {
 		case 'P':
@@ -271,42 +288,18 @@ parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, e
 			code, found = .F3, true
 		case 'S':
 			code, found = .F4, true
-		case 'H':
-			code, found = .Home, true
-		case 'F':
-			code, found = .End, true
-		case 'A':
-			code, found = .Up, true
-		case 'B':
-			code, found = .Down, true
-		case 'C':
-			code, found = .Right, true
-		case 'D':
-			code, found = .Left, true
 		}
 	} else {
 		param := parser_first_param(parser)
 		// Kitty's keyboard protocol reports Enter as CSI 13 ; modifier u.
 		// xterm's modifyOtherKeys mode uses CSI 27 ; modifier ; 13 ~.
 		if final == 'u' && param == 13 {
-			return parser_emit(parser, events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, allocator)
+			return parser_emit(events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, allocator)
 		}
 		if final == '~' && param == 27 && parser_param(parser, 2) == 13 {
-			return parser_emit(parser, events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, allocator)
+			return parser_emit(events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, allocator)
 		}
 		switch final {
-		case 'A':
-			code, found = .Up, true
-		case 'B':
-			code, found = .Down, true
-		case 'C':
-			code, found = .Right, true
-		case 'D':
-			code, found = .Left, true
-		case 'H':
-			code, found = .Home, true
-		case 'F':
-			code, found = .End, true
 		case '~':
 			switch param {
 			case 1, 7:
@@ -335,9 +328,9 @@ parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, e
 		}
 	}
 	if found {
-		return parser_emit(parser, events, Key_Event{code = code}, allocator)
+		return parser_emit(events, Key_Event{code = code}, allocator)
 	}
-	return parser_emit(parser, events, Unknown_Input{}, allocator)
+	return parser_emit(events, Unknown_Input{}, allocator)
 }
 
 parser_first_param :: proc(parser: ^Parser) -> int {
@@ -444,22 +437,22 @@ parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bo
 parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
 	control_byte, x, y, ok := parser_mouse_fields(parser)
 	if !ok || x <= 0 || y <= 0 {
-		return parser_emit(parser, events, Unknown_Input{}, allocator)
+		return parser_emit(events, Unknown_Input{}, allocator)
 	}
 	switch {
 	case control_byte & 64 != 0:
 		// The wheel block starts at Mouse_Button.Wheel_Up: 64..67 map to 3..6.
-		return parser_emit(parser, events, Mouse_Event{button = Mouse_Button((control_byte & 3) + 3), x = x, y = y}, allocator)
+		return parser_emit(events, Mouse_Event{button = Mouse_Button((control_byte & 3) + 3), x = x, y = y}, allocator)
 	case control_byte & 32 != 0:
 		if control_byte & 3 == 3 {
-			return parser_emit(parser, events, Unknown_Input{}, allocator)
+			return parser_emit(events, Unknown_Input{}, allocator)
 		}
-		return parser_emit(parser, events, Mouse_Event{button = Mouse_Button(control_byte & 3), x = x, y = y, motion = true}, allocator)
+		return parser_emit(events, Mouse_Event{button = Mouse_Button(control_byte & 3), x = x, y = y, motion = true}, allocator)
 	case:
 		if control_byte & 3 == 3 {
-			return parser_emit(parser, events, Unknown_Input{}, allocator)
+			return parser_emit(events, Unknown_Input{}, allocator)
 		}
-		return parser_emit(parser, events, Mouse_Event{button = Mouse_Button(control_byte & 3), x = x, y = y, release = final == 'm'}, allocator)
+		return parser_emit(events, Mouse_Event{button = Mouse_Button(control_byte & 3), x = x, y = y, release = final == 'm'}, allocator)
 	}
 }
 
@@ -505,7 +498,7 @@ parser_paste :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, a
 		}
 		clear(&parser.paste)
 		parser.state = .Ground
-		emit_err := parser_emit(parser, events, Paste{text = text}, allocator)
+		emit_err := parser_emit(events, Paste{text = text}, allocator)
 		if emit_err != nil {
 			delete(text, allocator)
 		}

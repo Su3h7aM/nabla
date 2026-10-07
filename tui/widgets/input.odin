@@ -86,14 +86,7 @@ input_insert_rune :: proc(input: ^Input, value: rune) -> bool {
 
 @(require_results)
 input_insert_newline :: proc(input: ^Input) -> bool {
-	previous_length := len(input.text)
-	if err := resize(&input.text, previous_length + 1); err != nil {
-		return false
-	}
-	copy(input.text[input.cursor + 1:], input.text[input.cursor:previous_length])
-	input.text[input.cursor] = '\n'
-	input.cursor += 1
-	return true
+	return input_insert(input, "\n")
 }
 
 input_backspace :: proc(input: ^Input) -> bool {
@@ -113,10 +106,7 @@ input_delete :: proc(input: ^Input) -> bool {
 	if input.cursor >= len(value) {
 		return false
 	}
-	if !_input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor)) {
-		return false
-	}
-	return true
+	return _input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor))
 }
 
 input_move_left :: proc(input: ^Input) -> bool {

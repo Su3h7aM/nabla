@@ -8,8 +8,8 @@ import "core:unicode/utf8"
 // The output path is caller-owned and reusable: the caller keeps one byte
 // scratch, asks encoded_size for the exact required count, and calls encode
 // (pure serialization) or present (serialize + one buffered write). No
-// procedure allocates or retains output. encoded_size and encode share one
-// validation and sizing pass, so a too-small scratch is observable through
+// procedure allocates or retains output. encoded_size, encode, and present
+// share one serialization body, so a too-small scratch is observable through
 // the exact required return before anything is written.
 //
 // Serialization establishes the Presentation Baseline (cursor origin +
@@ -27,20 +27,15 @@ import "core:unicode/utf8"
 // There is no transactional acceptance: bytes already consumed by the
 // terminal cannot be undone.
 
+// encoded_size returns the exact byte count encode needs for the frame, without
+// writing anything. It returns the same validation errors as encode.
 @(require_results)
 encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) -> (required: int, err: Error) {
-	if validation_error := _validate_frame(buffer, cursor); validation_error != nil {
-		return 0, validation_error
+	_, required, err = encode(buffer, profile, cursor, nil)
+	if err == General_Error.Presentation_Workspace_Too_Small {
+		err = nil
 	}
-	if buffer.columns == 0 || buffer.rows == 0 {
-		// Zero-sized frame: deterministic no-op success.
-		return 0, nil
-	}
-	encoder := _Encoder {
-		count_only = true,
-	}
-	_serialize(&encoder, buffer, profile, cursor)
-	return encoder.pos, nil
+	return
 }
 
 // encode serializes the frame into caller-owned output. It returns written
@@ -75,7 +70,7 @@ encode :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, ou
 	return writer.pos, required, nil
 }
 
-// present performs the same preflight as encode and never touches the
+// present encodes the frame as encode does and never touches the
 // session when the scratch is too small; on success it writes the encoded
 // frame as one buffered sequence and returns the number of bytes committed
 // before any transport failure.
@@ -94,28 +89,12 @@ present :: proc(
 	if session == nil || !session.opened {
 		return 0, 0, General_Error.Not_Open
 	}
-	if validation_error := _validate_frame(buffer, cursor); validation_error != nil {
-		return 0, 0, validation_error
+	written: int
+	written, required, err = encode(buffer, profile, cursor, output)
+	if err != nil || written == 0 {
+		return 0, required, err
 	}
-	if buffer.columns == 0 || buffer.rows == 0 {
-		return 0, 0, nil
-	}
-	encoder := _Encoder {
-		count_only = true,
-	}
-	_serialize(&encoder, buffer, profile, cursor)
-	required = encoder.pos
-	if required > len(output) {
-		return 0, required, General_Error.Presentation_Workspace_Too_Small
-	}
-	writer := _Encoder {
-		out = output,
-	}
-	_serialize(&writer, buffer, profile, cursor)
-	if writer.overflowed {
-		return 0, required, General_Error.Presentation_Workspace_Too_Small
-	}
-	committed_bytes, write_err := _session_present(session, output[:required])
+	committed_bytes, write_err := _session_present(session, output[:written])
 	return committed_bytes, required, write_err
 }
 

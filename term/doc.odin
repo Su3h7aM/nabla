@@ -121,7 +121,7 @@
 // - The output path is caller-owned and reusable: encoded_size reports the
 //   exact required byte count, encode serializes into the caller's scratch
 //   (returning .Presentation_Workspace_Too_Small without writing a usable
-//   prefix when the scratch is too small), and present preflights, encodes,
+//   prefix when the scratch is too small), and present encodes the same way
 //   and writes one buffered sequence, returning the committed byte count.
 //   Nothing allocates or retains output.
 // - Zero-sized frames are deterministic no-ops (success, zero bytes) unless

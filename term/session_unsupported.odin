@@ -35,9 +35,4 @@ _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, e
 	return 0, General_Error.Unsupported
 }
 
-@(require_results)
-_session_clipboard :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
-	return 0, General_Error.Unsupported
-}
-
 _session_set_resize_wake :: proc(fd: int) {  }

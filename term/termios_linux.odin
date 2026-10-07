@@ -5,7 +5,7 @@ package term
 import "core:sys/linux"
 
 // Termios mirrors the kernel's struct termios (asm-generic/termbits.h), the
-// layout TCGETS and TCSETS* transfer. core:sys/linux has no termios type.
+// layout TCGETS and TCSETSF transfer. core:sys/linux has no termios type.
 Termios :: struct {
 	c_iflag: u32,
 	c_oflag: u32,
@@ -17,11 +17,8 @@ Termios :: struct {
 
 TERMIOS_NCCS :: 19
 
-// Request numbers from asm-generic/ioctls.h. TCSETSF is tcsetattr's
+// Request number from asm-generic/ioctls.h. TCSETSF is tcsetattr's
 // TCSAFLUSH: apply after output drains and discard pending input.
-TCGETS :: 0x5401
-TCSETS :: 0x5402
-TCSETSW :: 0x5403
 TCSETSF :: 0x5404
 TCSAFLUSH :: TCSETSF
 
@@ -61,7 +58,7 @@ _ioctl :: proc "contextless" (fd: linux.Fd, request: u32, arg: rawptr) -> linux.
 
 @(require_results)
 _tcgetattr :: proc "contextless" (fd: linux.Fd, termios: ^Termios) -> linux.Errno {
-	return _ioctl(fd, TCGETS, termios)
+	return _ioctl(fd, linux.TCGETS, termios)
 }
 
 @(require_results)

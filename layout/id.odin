@@ -6,9 +6,6 @@ import "core:hash"
 FNV64_OFFSET_BASIS :: u64(0xcbf29ce484222325)
 
 @(private)
-FNV64_PRIME :: u64(0x100000001b3)
-
-@(private)
 _id_from_hash :: proc "contextless" (hash_value: u64) -> Id {
 	if hash_value == 0 {
 		return Id(1)
@@ -18,19 +15,14 @@ _id_from_hash :: proc "contextless" (hash_value: u64) -> Id {
 
 @(private)
 _hash_index :: proc "contextless" (seed, index: u64) -> u64 {
-	result := seed
-	for byte_index in 0 ..< 8 {
-		value := byte(index >> u64(byte_index * 8))
-		result = (result ~ u64(value)) * FNV64_PRIME
-	}
-	return result
+	bytes := transmute([8]byte)u64le(index)
+	return hash.fnv64a(bytes[:], seed)
 }
 
 @(private)
 _auto_id :: proc "contextless" (parent: Id, sibling_ordinal: u64) -> Id {
-	seed := u64(parent)
-	seed = (seed ~ u64(0xff)) * FNV64_PRIME
-	return _id_from_hash(_hash_index(seed, sibling_ordinal))
+	marker := [1]byte{0xff}
+	return _id_from_hash(_hash_index(hash.fnv64a(marker[:], u64(parent)), sibling_ordinal))
 }
 
 // id hashes `label` to a stable identifier, usable across frames and call

@@ -2,10 +2,14 @@ package markdown
 
 import "base:runtime"
 import "core:mem"
+import "core:strings"
 
 // MAX_CONTAINER_DEPTH keeps recursive block walkers within the thread stack;
 // deeper quote and list markers remain text.
 MAX_CONTAINER_DEPTH :: 128
+
+// SPACE_TAB is the cutset of the horizontal whitespace Markdown trims.
+SPACE_TAB :: " \t"
 
 // parse reads source as Markdown and returns its document. Every slice is
 // allocated from allocator and freed by destroy. Every string is a view into
@@ -175,7 +179,7 @@ parse_quote :: proc(lines: []string, start, depth: int, allocator: mem.Allocator
 		if is_blank(previous) || fence.character != 0 || starts_block(previous) || starts_block(line) {
 			break
 		}
-		append(&quote_lines, trim_leading(line)) or_return
+		append(&quote_lines, strings.trim_left(line, SPACE_TAB)) or_return
 		fence_update(&fence, quote_lines[len(quote_lines) - 1])
 		index += 1
 	}
@@ -248,7 +252,7 @@ parse_list :: proc(lines: []string, start, depth: int, allocator: mem.Allocator)
 			// a paragraph continues lazily only across no blank line
 			previous := item_lines[len(item_lines) - 1]
 			if pending_blanks == 0 && !is_blank(previous) && fence.character == 0 && !starts_block(line) {
-				content := trim_leading(line)
+				content := strings.trim_left(line, SPACE_TAB)
 				append(&item_lines, content) or_return
 				fence_update(&fence, content)
 				cursor += 1
@@ -303,7 +307,7 @@ parse_paragraph :: proc(lines: []string, start: int, allocator: mem.Allocator) -
 				break
 			}
 		}
-		append(&paragraph, trim_leading(line)) or_return
+		append(&paragraph, strings.trim_left(line, SPACE_TAB)) or_return
 		index += 1
 	}
 
@@ -446,30 +450,8 @@ strip_columns :: proc(line: string, columns: int) -> string {
 }
 
 @(private)
-trim_leading :: proc(line: string) -> string {
-	return strip_columns(line, indentation(line))
-}
-
-@(private)
 is_blank :: proc(line: string) -> bool {
-	for character in line {
-		if character != ' ' && character != '\t' {
-			return false
-		}
-	}
-	return true
-}
-
-@(private)
-trim_space :: proc(value: string) -> string {
-	start, end := 0, len(value)
-	for start < end && (value[start] == ' ' || value[start] == '\t') {
-		start += 1
-	}
-	for end > start && (value[end - 1] == ' ' || value[end - 1] == '\t') {
-		end -= 1
-	}
-	return value[start:end]
+	return strings.trim_left(line, SPACE_TAB) == ""
 }
 
 @(private)
@@ -484,7 +466,7 @@ fence_open :: proc(line: string) -> (character: u8, length: int, info: string, o
 	if length < 3 {
 		return 0, 0, "", false
 	}
-	info = trim_space(line[length:])
+	info = strings.trim(line[length:], SPACE_TAB)
 	if character == '`' {
 		for value in info {
 			if value == '`' {
@@ -564,13 +546,13 @@ atx_heading :: proc(line: string) -> (level: int, content: string, ok: bool) {
 	if level == 0 || level > 6 || level < len(line) && line[level] != ' ' && line[level] != '\t' {
 		return 0, "", false
 	}
-	content = trim_space(line[level:])
+	content = strings.trim(line[level:], SPACE_TAB)
 	end := len(content)
 	for end > 0 && content[end - 1] == '#' {
 		end -= 1
 	}
 	if end < len(content) && (end == 0 || content[end - 1] == ' ' || content[end - 1] == '\t') {
-		content = trim_space(content[:end])
+		content = strings.trim(content[:end], SPACE_TAB)
 	}
 	return level, content, true
 }
@@ -578,7 +560,7 @@ atx_heading :: proc(line: string) -> (level: int, content: string, ok: bool) {
 @(private)
 setext_level :: proc(line: string) -> int {
 	content, indent := block_content(line)
-	content = trim_space(content)
+	content = strings.trim(content, SPACE_TAB)
 	if indent > 3 || len(content) == 0 {
 		return 0
 	}
@@ -702,7 +684,7 @@ table_starts :: proc(lines: []string, index: int) -> bool {
 
 @(private)
 table_row_content :: proc(line: string) -> string {
-	content := trim_space(line)
+	content := strings.trim(line, SPACE_TAB)
 	if len(content) > 0 && content[0] == '|' {
 		content = content[1:]
 	}
@@ -741,7 +723,7 @@ table_delimiter_count :: proc(line: string) -> (count: int, has_delimiter: bool)
 		if index < len(content) && (content[index] != '|' || escaped_pipe(content, index)) {
 			continue
 		}
-		if _, ok := delimiter_alignment(trim_space(content[start:index])); !ok {
+		if _, ok := delimiter_alignment(strings.trim(content[start:index], SPACE_TAB)); !ok {
 			return 0, false
 		}
 		count += 1
@@ -760,7 +742,7 @@ table_delimiter_count :: proc(line: string) -> (count: int, has_delimiter: bool)
 
 @(private)
 delimiter_alignment :: proc(cell: string) -> (alignment: Alignment, ok: bool) {
-	value := trim_space(cell)
+	value := strings.trim(cell, SPACE_TAB)
 	left := len(value) > 0 && value[0] == ':'
 	right := len(value) > 0 && value[len(value) - 1] == ':'
 	start, end := 0, len(value)
@@ -809,7 +791,7 @@ split_table_row :: proc(line: string) -> (cells: [dynamic]string, err: mem.Alloc
 		if index < len(content) && (content[index] != '|' || escaped_pipe(content, index)) {
 			continue
 		}
-		append(&cells, trim_space(content[start:index])) or_return
+		append(&cells, strings.trim(content[start:index], SPACE_TAB)) or_return
 		start = index + 1
 	}
 	return

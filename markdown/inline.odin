@@ -84,11 +84,11 @@ parse_inlines :: proc(lines: []string, allocator: mem.Allocator) -> (spans: []Sp
 
 	for line, index in lines {
 		last := index == len(lines) - 1
-		content := trim_trailing_spaces(line)
+		content := strings.trim_right(line, " ")
 		hard_break := len(line) - len(content) >= 2
 		if last {
 			// nothing follows the last line, so no whitespace of it is text
-			content = trim_trailing_whitespace(content)
+			content = strings.trim_right(content, SPACE_TAB)
 		}
 		backslash_break := scan_line(&parser, content, !last) or_return
 		if last { continue }
@@ -289,7 +289,7 @@ parse_code_span :: proc(line: string, position: int) -> (content: string, next: 
 			continue
 		}
 		content = line[position + opening:index]
-		if len(content) > 2 && content[0] == ' ' && content[len(content) - 1] == ' ' && !spaces_only(content) {
+		if len(content) > 2 && content[0] == ' ' && content[len(content) - 1] == ' ' && strings.trim_left(content, " ") != "" {
 			content = content[1:len(content) - 1]
 		}
 		return content, index + run, true
@@ -513,7 +513,7 @@ delimiter_flanking :: proc(line: string, position, run: int, kind: Delimiter_Kin
 	before_whitespace, before_punctuation := false, false
 	if position > 0 {
 		before := line[position - 1]
-		before_whitespace = is_whitespace_byte(before)
+		before_whitespace = strings.is_ascii_space(rune(before))
 		before_punctuation = is_punctuation_byte(before)
 	} else {
 		before_whitespace = true
@@ -521,7 +521,7 @@ delimiter_flanking :: proc(line: string, position, run: int, kind: Delimiter_Kin
 	after_whitespace, after_punctuation := false, false
 	if position + run < len(line) {
 		after := line[position + run]
-		after_whitespace = is_whitespace_byte(after)
+		after_whitespace = strings.is_ascii_space(rune(after))
 		after_punctuation = is_punctuation_byte(after)
 	} else {
 		after_whitespace = true
@@ -596,35 +596,8 @@ run_length :: proc(line: string, position: int, character: u8) -> int {
 	return length
 }
 
-spaces_only :: proc(text: string) -> bool {
-	for character in text { if character != ' ' { return false } }
-	return true
-}
-
-trim_trailing_spaces :: proc(text: string) -> string {
-	end := len(text)
-	for end > 0 && text[end - 1] == ' ' { end -= 1 }
-	return text[:end]
-}
-
-trim_trailing_whitespace :: proc(text: string) -> string {
-	end := len(text)
-	for end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t') { end -= 1 }
-	return text[:end]
-}
-
 is_space_or_tab :: proc(character: u8) -> bool {
 	return character == ' ' || character == '\t'
-}
-
-// is_whitespace_byte reports whether character is ASCII whitespace, which stands
-// in for the Unicode whitespace class.
-is_whitespace_byte :: proc(character: u8) -> bool {
-	switch character {
-	case ' ', '\t', '\n', '\v', '\f', '\r':
-		return true
-	}
-	return false
 }
 
 // is_punctuation_byte reports whether character is ASCII punctuation, which
