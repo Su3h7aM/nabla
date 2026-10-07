@@ -62,10 +62,7 @@ MARKDOWN_LINK_URL_SUFFIX :: ")"
 // procedure shares no state and runs on any thread.
 @(require_results)
 markdown_lines :: proc(source: string, width: int, allocator := context.allocator) -> (lines: Markdown_Lines, err: mem.Allocator_Error) {
-	document, parse_error := markdown.parse(source, allocator)
-	if parse_error != nil {
-		return {}, parse_error
-	}
+	document := markdown.parse(source, allocator) or_return
 	defer markdown.destroy(&document)
 
 	renderer := Renderer {
@@ -78,11 +75,8 @@ markdown_lines :: proc(source: string, width: int, allocator := context.allocato
 	}
 	defer renderer_destroy(&renderer)
 
-	if render_error := render_blocks(&renderer, document.blocks, max(width, 1), false); render_error != nil {
-		return {}, render_error
-	}
-	lines, err = renderer_finish(&renderer)
-	if err != nil { return {}, err }
+	render_blocks(&renderer, document.blocks, max(width, 1), false) or_return
+	lines = renderer_finish(&renderer) or_return
 	return lines, nil
 }
 
