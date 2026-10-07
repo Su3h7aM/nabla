@@ -9,10 +9,6 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 - If strict tool mode is added, apply OpenAI's strict-mode schema limits only when `strict` is sent.
 - `core:encoding/json` gains a nesting-depth limit in the Odin fork. Once it lands, delete `mcp/json_admit.odin`'s pre-scan and `MAX_MESSAGE_DEPTH`, and use the parser's limit at every peer and provider parse site.
 
-Provider error classification mostly matches the Anthropic and OpenAI documentation. Open points:
-
-- OpenRouter can turn a Responses API context overflow into a successful `finish_reason: "length"`, which is not classified as overflow.
-
 ## Subagents
 
 A subagent is a session like any other: the orchestrator can bring it back, inspect it, compact it, switch its model, and continue it.
