@@ -38,3 +38,10 @@ Each report has a dated heading with a short name, then four parts:
 - Attempt: `fff_grep` on `catalog_model_provider` and `MAX_MESSAGE_DEPTH` with context lines.
 - Gap: overlapping context blocks were repeated for nearby matches, and leading indentation was lost in `content` output.
 - Workaround: `builtin_read` of the line range.
+
+## 2026-10-07 Sub-agents have no Code Mode
+
+- Goal: let a sub-agent repair a file where `builtin_patch` applied a repeated identical hunk twice.
+- Attempt: `builtin_patch` again, which refuses or mis-applies hunks whose unchanged lines occur several times in the file.
+- Gap: the sub-agent had no Code Mode tool, so it could not replace by counted occurrence in Lua.
+- Workaround: a Python one-liner through the shell. The orchestrator now tells sub-agents to avoid repeated-hunk edits and to ask when a patch cannot be applied.
