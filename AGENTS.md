@@ -44,6 +44,14 @@ Use JSON only where an external interface requires it: provider requests and res
 
 Treat your Odin knowledge as unverified. When unsure about a signature, a language rule, or an idiom, check before writing: read the standard library under `$(mise exec -- odin root)` (`core/`, `base/`, `vendor/`) to see how Odin's own code does it, consult the official documentation, or run a small experiment against the compiler.
 
+Validate every refactor the same way before making it: find the `core:` or `base:` code that models the same shape and copy it. A change with no such precedent is not made. Shapes already confirmed that way:
+
+- A value with presence is `Maybe(T)`, not a `T` beside a `present` bool.
+- Cases that share no field are a plain `union` of structs (`json.Value`, `net.Address`).
+- Cases that share fields are a struct with the shared fields and a `variant: union {...}` (`runtime.Type_Info`, `ast.Node`), never a union whose variants repeat the same field.
+- A `rawptr` plus procedure pair is right for a stored callback, as in `runtime.Allocator`, `thread.Task`, and `container/avl`. A directly called procedure takes a typed or polymorphic parameter instead.
+- `transmute` between a `bit_set` and its integer, and `uintptr` arithmetic on data pointers, are what `core:` itself does and need no replacement.
+
 ## Naming and comments
 
 Code describes itself through clear names and simple structure. Names are full words that say what the thing is or does: `snake_case` procedures and variables, `Ada_Case` types, `SCREAMING_SNAKE_CASE` constants. Name a procedure for its package-qualified call site (`journal.commit`, not `journal.journal_commit`); inside a package with several subjects, prefix by subject (`chain_send`). Name any literal whose meaning is not obvious at the call site.
