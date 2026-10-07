@@ -31,8 +31,7 @@ Rows :: struct {
 @(private, require_results)
 rows_execute :: proc(rows: ^Rows, arguments: []Value, materialize: bool) -> Error {
 	connection := rows.connection
-	state, err := connection.driver.execute(rows.statement_state, arguments)
-	if err != nil { return err }
+	state := connection.driver.execute(rows.statement_state, arguments) or_return
 
 	rows.state = state
 	rows.materialize = materialize

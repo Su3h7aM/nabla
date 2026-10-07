@@ -52,8 +52,7 @@ prepare :: proc(connection: ^Conn, statement: ^Statement, sql: string) -> Error 
 	if statement.state != nil {
 		return error_make(.Invalid_State, 0, "the statement passed in is already prepared")
 	}
-	state, err := statement_prepare(connection, sql)
-	if err != nil { return err }
+	state := statement_prepare(connection, sql) or_return
 	statement^ = Statement {
 		connection = connection,
 		state      = state,

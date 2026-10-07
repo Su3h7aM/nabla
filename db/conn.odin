@@ -97,8 +97,7 @@ close :: proc(connection: ^Conn) -> Error {
 // wants prepare once and statement_exec, inside a transaction if it writes.
 @(require_results)
 exec :: proc(connection: ^Conn, sql: string, arguments: []Value = nil) -> Error {
-	state, err := statement_prepare(connection, sql)
-	if err != nil { return err }
+	state := statement_prepare(connection, sql) or_return
 	statement := Statement {
 		connection = connection,
 		state      = state,
@@ -121,8 +120,7 @@ query :: proc(connection: ^Conn, rows: ^Rows, sql: string, arguments: []Value = 
 		return error_make(.Invalid_State, 0, "the result set passed in is still open")
 	}
 
-	state, err := statement_prepare(connection, sql)
-	if err != nil { return err }
+	state := statement_prepare(connection, sql) or_return
 
 	rows^ = Rows {
 		connection      = connection,
