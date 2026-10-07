@@ -153,8 +153,8 @@ chat_steering_accept :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer
 		}
 		chat_session_record_failure(chat, "the steering line could not be recorded", commit_error)
 		chat.unacknowledged -= len(taken)
-		for index := len(taken) - 1; index >= 0; index -= 1 {
-			if !steer_requeue(queue, taken[index]) {
+		#reverse for line in taken {
+			if !steer_requeue(queue, line) {
 				_observer_message(observer, .Warning, "a steering line could not stay pending")
 			}
 		}
