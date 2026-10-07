@@ -85,7 +85,7 @@ codemode_job_request :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_J
 	if run.request.kind != .Wait {
 		refusal: string
 		handle, refusal = codemode_job_start_child(jobs, chat, job)
-		if job.result_present { return }
+		if job.result != nil { return }
 		if refusal != "" {
 			answered := codemode_lua_answer_error(run, refusal)
 			delete(refusal, run.allocator)
@@ -213,7 +213,7 @@ codemode_job_child_committed :: proc(jobs: ^Tool_Jobs, child: ^Tool_Job, result:
 		entry.outcome = result.outcome
 		handle = index + 1
 	}
-	if parent.result_present || handle == 0 { return }
+	if parent.result != nil || handle == 0 { return }
 	if jobs.stop != .None {
 		codemode_job_answer(parent, .Cancelled, .Cancelled, "the Code Mode execution was cancelled", "cancelled")
 		return
@@ -248,7 +248,6 @@ codemode_job_stop_children :: proc(job: ^Tool_Job) {
 		#partial switch child.phase {
 		case .Queued:
 			child.result = tool_result_failure(&child.exec, .Not_Executed, "the script ended before this call ran", "not executed")
-			child.result_present = true
 			child.phase = .Result_Ready
 		case .Dispatching, .Running:
 			tool_job_request_stop(child)
@@ -316,7 +315,6 @@ codemode_job_answer_value :: proc(job: ^Tool_Job) {
 	}
 	result := codemode_job_result(job, .Success, "", output, "completed")
 	job.result = result
-	job.result_present = true
 	job.phase = .Result_Ready
 }
 
@@ -334,7 +332,6 @@ codemode_job_answer :: proc(job: ^Tool_Job, outcome: journal.Tool_Outcome, diagn
 		output.traceback = job.lua.traceback
 	}
 	job.result = codemode_job_result(job, outcome, message, output, reason)
-	job.result_present = true
 	job.phase = .Result_Ready
 }
 

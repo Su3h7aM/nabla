@@ -153,8 +153,7 @@ Tool_Job :: struct {
 	tabled:         bool,
 
 	// outcome
-	result:         Tool_Result,
-	result_present: bool,
+	result:         Maybe(Tool_Result),
 	committed:      bool,
 }
 
@@ -258,7 +257,7 @@ tool_job_release :: proc(job: ^Tool_Job) {
 	}
 	tool_args_destroy(&job.arguments, job.allocator)
 	tool_arguments_destroy(&job.admitted, job.allocator)
-	if job.result_present { tool_result_destroy(&job.result) }
+	if job.result != nil { tool_result_destroy(&job.result.?) }
 	tool_wake_close(&job.wake)
 	delete(job.output_base, job.allocator)
 	delete(job.name, job.allocator)
@@ -383,14 +382,12 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// becomes a not-executed result rather than a silent gap in the record.
 	if jobs.stop != .None || chat_session_cancelled(chat) {
 		job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	definition, present := tool_registry_find(&chat.tools, job.name)
 	if !present {
 		job.result = tool_result_failure(&job.exec, .Unavailable, fmt.tprintf("no tool named %q is available", job.name), "unavailable")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -427,19 +424,16 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 
 	if job.admitted.allocation_failed {
 		job.result = tool_result_failure(&job.exec, .Tool_Failed, "the tool arguments could not be allocated", "allocation failed")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	if job.admitted.status == .Rejected {
 		job.result = tool_result_refused(&job.exec, &job.admitted.error)
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
 	if _, is_object := job.admitted.value.(json.Object); !is_object {
 		job.result = tool_result_failure(&job.exec, .Invalid_Arguments, "the arguments are not a JSON object", "invalid arguments")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -449,7 +443,6 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.admitted.repairs += job.exec.repairs
 		defer tool_argument_error_destroy(&args_error, job.allocator)
 		job.result = tool_result_refused(&job.exec, &args_error)
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -459,7 +452,6 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		effective, marshal_error := json.marshal(job.admitted.value, {sort_maps_by_key = true}, job.allocator)
 		if marshal_error != nil {
 			job.result = tool_result_failure(&job.exec, .Tool_Failed, "the repaired tool arguments could not be written", "allocation failed")
-			job.result_present = true
 			job.phase = .Result_Ready
 			return
 		}
@@ -684,7 +676,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 
 	if tool_control_cancelled(job.exec.control) {
 		job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -748,7 +739,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	)
 	if job.placement == .Owner {
 		job.result = tool_job_execute(job)
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -762,7 +752,6 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		// dispatch entry stands, so the outcome is recorded honestly.
 		message := fmt.tprintf("the tool could not be started: %s", os.error_string(launch_error))
 		job.result = tool_result_failure(&job.exec, .Tool_Failed, message, "not started")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -872,7 +861,6 @@ tool_jobs_refuse :: proc(jobs: ^Tool_Jobs) {
 		job := tool_jobs_earliest(jobs, {.Queued})
 		if job == nil { return }
 		job.result = tool_result_failure(&job.exec, .Not_Executed, "the turn was cancelled before this call ran", "not executed")
-		job.result_present = true
 		job.phase = .Result_Ready
 		return
 	}
@@ -880,7 +868,6 @@ tool_jobs_refuse :: proc(jobs: ^Tool_Jobs) {
 	if job == nil { return }
 	message := "this tool's server is still running an earlier call that did not stop, so this call was not executed; retry it once that call finishes, or use another tool"
 	job.result = tool_result_failure(&job.exec, .Unavailable, message, "server busy")
-	job.result_present = true
 	job.phase = .Result_Ready
 }
 
@@ -913,9 +900,8 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 
 	// The commit takes the result off the job: one owner at a time, and the release here is
 	// the only one, so retirement has nothing left to free.
-	result := job.result
-	job.result = {}
-	job.result_present = false
+	result := job.result.?
+	job.result = nil
 	if result.allocation_failed || tool_result_report_repairs(&result, job.admitted.repairs) != nil {
 		tool_result_destroy(&result)
 		job.phase = .Retiring
@@ -981,9 +967,9 @@ tool_jobs_retire :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, now: time.Tick) 
 		tool_job_abandon(jobs, job)
 		return
 	}
-	if job.result_present {
-		tool_result_destroy(&job.result)
-		job.result_present = false
+	if job.result != nil {
+		tool_result_destroy(&job.result.?)
+		job.result = nil
 	}
 	tool_args_destroy(&job.arguments, job.allocator)
 	tool_arguments_destroy(&job.admitted, job.allocator)
@@ -1053,5 +1039,4 @@ tool_job_request_stop :: proc(job: ^Tool_Job) {
 tool_job_run :: proc(worker: ^Job) {
 	job := cast(^Tool_Job)worker
 	job.result = tool_job_execute(job)
-	job.result_present = true
 }

@@ -300,7 +300,7 @@ test_an_unpublished_nested_tool_job_frees_with_worker_allocator :: proc(test: ^t
 		allocator = parent.allocator,
 	}
 	defer delete(parent.call_id, parent.allocator)
-	defer if parent.result_present { tool_result_destroy(&parent.result) }
+	defer if parent.result != nil { tool_result_destroy(&parent.result.?) }
 
 	codemode_job_request(&jobs, chat, &parent)
 
@@ -361,12 +361,12 @@ test_an_untracked_nested_tool_job_is_never_published :: proc(test: ^testing.T) {
 	}
 	defer delete(parent.call_id, parent.allocator)
 	defer delete(parent.lua_children)
-	defer if parent.result_present { tool_result_destroy(&parent.result) }
+	defer if parent.result != nil { tool_result_destroy(&parent.result.?) }
 
 	codemode_job_request(&jobs, chat, &parent)
 
 	testing.expect_value(test, parent.phase, Tool_Job_Phase.Result_Ready)
-	testing.expect_value(test, parent.result.outcome, journal.Tool_Outcome.Tool_Failed)
+	testing.expect_value(test, parent.result.?.outcome, journal.Tool_Outcome.Tool_Failed)
 	testing.expect_value(test, len(parent.lua_children), 0)
 	testing.expect_value(test, len(jobs.jobs), 0)
 	testing.expect_value(test, len(worker_track.allocation_map), 0)
@@ -939,7 +939,7 @@ test_a_settled_batch_releases_every_thread_and_byte :: proc(test: ^testing.T) {
 
 	for job in jobs.jobs {
 		testing.expect_value(test, job.phase, Tool_Job_Phase.Retired)
-		testing.expect(test, !job.result_present, "the result must be released with the job")
+		testing.expect(test, job.result == nil, "the result must be released with the job")
 	}
 	testing.expect_value(test, jobs.active, 0)
 
