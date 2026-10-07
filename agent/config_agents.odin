@@ -119,7 +119,7 @@ acp_agent_load :: proc(state: ^lua.State, raw_idx: c.int, name: string, allocato
 
 	lua_field(state, idx, "arguments")
 	if lua.type(state, -1) != .NIL {
-		arguments, arguments_error := acp_agent_arguments_load(state, -1, allocator)
+		arguments, arguments_error := lua_string_list(state, -1, allocator)
 		if arguments_error != .None { return arguments_error }
 		out^.arguments = arguments
 	}
@@ -156,36 +156,4 @@ acp_agent_fields_known :: proc(state: ^lua.State, raw_idx: c.int) -> Config_Erro
 		}
 	}
 	return .None
-}
-
-// acp_agent_arguments_load reads one entry's `arguments`, a Lua sequence of strings.
-@(private, require_results)
-acp_agent_arguments_load :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, Config_Error) {
-	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
-	index := lua.absindex(state, raw_idx)
-	length := int(lua.rawlen(state, index))
-	values, values_error := make([dynamic]string, 0, length, allocator)
-	if values_error != nil { return nil, .Allocation }
-	for position in 1 ..= length {
-		lua.rawgeti(state, index, lua.Integer(position))
-		value, value_error := lua_string(state, -1, allocator)
-		lua.pop(state, 1)
-		if value_error != .None {
-			acp_agent_arguments_release(values, allocator)
-			return nil, value_error
-		}
-		appended := append(&values, value)
-		if appended != 1 {
-			if appended == 0 { delete(value, allocator) }
-			acp_agent_arguments_release(values, allocator)
-			return nil, .Allocation
-		}
-	}
-	return values[:], .None
-}
-
-@(private)
-acp_agent_arguments_release :: proc(values: [dynamic]string, allocator: mem.Allocator) {
-	for value in values { delete(value, allocator) }
-	delete(values)
 }

@@ -142,6 +142,37 @@ lua_plain_table :: proc(state: ^lua.State, idx: c.int) -> bool {
 	return lua.getmetatable(state, idx) == 0
 }
 
+// lua_string_list reads a Lua sequence of strings. The strings and the list belong to
+// allocator, and nothing is kept when an error is returned.
+@(require_results)
+lua_string_list :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, Config_Error) {
+	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
+	index := lua.absindex(state, raw_idx)
+	length := int(lua.rawlen(state, index))
+	values, values_error := make([dynamic]string, 0, length, allocator)
+	if values_error != nil { return nil, .Allocation }
+	release :: proc(values: [dynamic]string, allocator: mem.Allocator) {
+		for value in values { delete(value, allocator) }
+		delete(values)
+	}
+	for position in 1 ..= length {
+		lua.rawgeti(state, index, lua.Integer(position))
+		value, value_error := lua_string(state, -1, allocator)
+		lua.pop(state, 1)
+		if value_error != .None {
+			release(values, allocator)
+			return nil, value_error
+		}
+		appended := append(&values, value)
+		if appended != 1 {
+			if appended == 0 { delete(value, allocator) }
+			release(values, allocator)
+			return nil, .Allocation
+		}
+	}
+	return values[:], .None
+}
+
 @(require_results)
 load_model :: proc(
 	state: ^lua.State,

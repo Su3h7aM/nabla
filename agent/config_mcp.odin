@@ -301,7 +301,7 @@ mcp_server_load :: proc(state: ^lua.State, raw_idx: c.int, id: string, allocator
 
 	lua_field(state, idx, "arguments")
 	if lua.type(state, -1) != .NIL {
-		arguments, arguments_error := mcp_string_list(state, -1, allocator)
+		arguments, arguments_error := lua_string_list(state, -1, allocator)
 		if arguments_error != .None { return arguments_error }
 		out^.stdio.arguments = arguments
 	}
@@ -357,37 +357,6 @@ mcp_timeout_ms :: proc(state: ^lua.State, idx: c.int, field: string) -> (result_
 	milliseconds, int_ok := lua_int(state, -1)
 	if !int_ok || milliseconds <= 0 { return 0, true, false }
 	return time.Duration(milliseconds) * time.Millisecond, true, true
-}
-
-@(private, require_results)
-mcp_string_list :: proc(state: ^lua.State, raw_idx: c.int, allocator: mem.Allocator) -> ([]string, Config_Error) {
-	if !lua_plain_table(state, raw_idx) { return nil, .Invalid }
-	index := lua.absindex(state, raw_idx)
-	length := int(lua.rawlen(state, index))
-	values, values_error := make([dynamic]string, 0, length, allocator)
-	if values_error != nil { return nil, .Allocation }
-	for position in 1 ..= length {
-		lua.rawgeti(state, index, lua.Integer(position))
-		value, value_error := lua_string(state, -1, allocator)
-		lua.pop(state, 1)
-		if value_error != .None {
-			mcp_strings_release(values, allocator)
-			return nil, value_error
-		}
-		appended := append(&values, value)
-		if appended != 1 {
-			if appended == 0 { delete(value, allocator) }
-			mcp_strings_release(values, allocator)
-			return nil, .Allocation
-		}
-	}
-	return values[:], .None
-}
-
-@(private)
-mcp_strings_release :: proc(values: [dynamic]string, allocator: mem.Allocator) {
-	for value in values { delete(value, allocator) }
-	delete(values)
 }
 
 // mcp_environment_load reads a name-to-value table. Names are checked for being
