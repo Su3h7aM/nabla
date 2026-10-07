@@ -287,7 +287,7 @@ test_anthropic_retry_directive :: proc(t: ^testing.T) {
 			http.headers_destroy(&headers)
 			return
 		}
-		testing.expect_value(t, provider_retry_directive(.Anthropic_Messages, headers), test_case.expected)
+		testing.expect_value(t, provider_retry_directive(headers), test_case.expected)
 		http.headers_destroy(&headers)
 	}
 }

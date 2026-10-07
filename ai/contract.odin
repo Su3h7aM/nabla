@@ -440,7 +440,7 @@ provider_stream_fail :: proc(
 	code := "",
 ) -> Provider_Stream_Error {
 	provider_stream_batch_clear(state)
-	event, event_error := openai_error_event(kind, message, code, allocator = state.Allocator)
+	event, event_error := provider_error_event_make(kind, message, code, allocator = state.Allocator)
 	if event_error != nil {
 		// The wording could not be retained. The kind still names the failure, so the
 		// caller learns why the stream stopped rather than nothing at all.

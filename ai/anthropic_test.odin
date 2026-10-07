@@ -68,10 +68,10 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 	if !testing.expect(t, object_ok) { return }
 
 	// The instruction lane is its own top-level field, not a message turn.
-	system, system_present, _ := openai_value_string(object, "system")
+	system, system_present, _ := provider_json_string(object, "system")
 	testing.expect(t, system_present)
 	testing.expect_value(t, system, "Be brief.")
-	bound, bound_present, bound_ok := openai_value_integer(object, "max_tokens")
+	bound, bound_present, bound_ok := provider_json_integer(object, "max_tokens")
 	testing.expect(t, bound_ok && bound_present)
 	testing.expect_value(t, bound, i64(1024))
 	mode, mode_ok := object["stream"].(json.Boolean)
@@ -87,49 +87,49 @@ test_anthropic_encode_request_shape :: proc(t: ^testing.T) {
 
 	first, first_ok := messages[0].(json.Object)
 	if !testing.expect(t, first_ok) { return }
-	role, _, _ := openai_value_string(first, "role")
+	role, _, _ := provider_json_string(first, "role")
 	testing.expect_value(t, role, "user")
 
 	// The tool call is a typed block after the text block, with an object input
 	// rather than a JSON string.
 	third, third_ok := messages[1].(json.Object)
 	if !testing.expect(t, third_ok) { return }
-	role, _, _ = openai_value_string(third, "role")
+	role, _, _ = provider_json_string(third, "role")
 	testing.expect_value(t, role, "assistant")
 	blocks, blocks_ok := third["content"].(json.Array)
 	if !testing.expect(t, blocks_ok && len(blocks) == 2) { return }
 	block, block_ok := blocks[1].(json.Object)
 	if !testing.expect(t, block_ok) { return }
-	block_type, _, _ := openai_value_string(block, "type")
+	block_type, _, _ := provider_json_string(block, "type")
 	testing.expect_value(t, block_type, "tool_use")
-	call_id, call_id_present, call_id_ok := openai_value_string(block, "id")
+	call_id, call_id_present, call_id_ok := provider_json_string(block, "id")
 	testing.expect(t, call_id_ok && call_id_present)
 	testing.expect_value(t, call_id, "toolu_1")
 	_, call_cached := block["cache_control"]
 	testing.expect(t, !call_cached, "only the last block is a breakpoint")
-	name, _, _ := openai_value_string(block, "name")
+	name, _, _ := provider_json_string(block, "name")
 	testing.expect_value(t, name, "shell")
 	input, input_ok := block["input"].(json.Object)
 	if !testing.expect(t, input_ok) { return }
-	command, _, _ := openai_value_string(input, "command")
+	command, _, _ := provider_json_string(input, "command")
 	testing.expect_value(t, command, "ls")
 
 	// The result names the call it answers and rides in a user turn.
 	fourth, fourth_ok := messages[2].(json.Object)
 	if !testing.expect(t, fourth_ok) { return }
-	role, _, _ = openai_value_string(fourth, "role")
+	role, _, _ = provider_json_string(fourth, "role")
 	testing.expect_value(t, role, "user")
 	result_blocks, result_blocks_ok := fourth["content"].(json.Array)
 	if !testing.expect(t, result_blocks_ok && len(result_blocks) == 1) { return }
 	result_block, result_block_ok := result_blocks[0].(json.Object)
 	if !testing.expect(t, result_block_ok) { return }
-	block_type, _, _ = openai_value_string(result_block, "type")
+	block_type, _, _ = provider_json_string(result_block, "type")
 	testing.expect_value(t, block_type, "tool_result")
-	tool_use_id, _, _ := openai_value_string(result_block, "tool_use_id")
+	tool_use_id, _, _ := provider_json_string(result_block, "tool_use_id")
 	testing.expect_value(t, tool_use_id, "toolu_1")
 	cache, cache_ok := result_block["cache_control"].(json.Object)
 	if testing.expect(t, cache_ok, "the last block is the breakpoint") {
-		cache_type, _, _ := openai_value_string(cache, "type")
+		cache_type, _, _ := provider_json_string(cache, "type")
 		testing.expect_value(t, cache_type, "ephemeral")
 		_, has_ttl := cache["ttl"]
 		testing.expect(t, !has_ttl, "the lifetime is left to the API or a gateway on the way")
@@ -163,7 +163,7 @@ test_anthropic_encode_normalizes_tool_ids_consistently :: proc(t: ^testing.T) {
 	if !testing.expect(t, blocks_ok && len(blocks) == 2) { return }
 	tool_use, tool_use_ok := blocks[1].(json.Object)
 	if !testing.expect(t, tool_use_ok) { return }
-	call_id, call_id_present, call_id_ok := openai_value_string(tool_use, "id")
+	call_id, call_id_present, call_id_ok := provider_json_string(tool_use, "id")
 	if !testing.expect(t, call_id_ok && call_id_present) { return }
 	result_turn, result_turn_ok := messages[2].(json.Object)
 	if !testing.expect(t, result_turn_ok) { return }
@@ -171,7 +171,7 @@ test_anthropic_encode_normalizes_tool_ids_consistently :: proc(t: ^testing.T) {
 	if !testing.expect(t, result_blocks_ok && len(result_blocks) == 1) { return }
 	tool_result, tool_result_ok := result_blocks[0].(json.Object)
 	if !testing.expect(t, tool_result_ok) { return }
-	result_id, result_id_present, result_id_ok := openai_value_string(tool_result, "tool_use_id")
+	result_id, result_id_present, result_id_ok := provider_json_string(tool_result, "tool_use_id")
 	if !testing.expect(t, result_id_ok && result_id_present) { return }
 	testing.expect_value(t, result_id, call_id)
 	testing.expect(t, call_id != "call_abc|fc_1")
@@ -407,21 +407,21 @@ test_anthropic_stream_thinking_replays_before_tool_use :: proc(t: ^testing.T) {
 	if !testing.expect(t, blocks_ok && len(blocks) == 3) { destroy_events(events); return }
 	thinking_block, thinking_ok := blocks[0].(json.Object)
 	if !testing.expect(t, thinking_ok && len(thinking_block) == 3) { destroy_events(events); return }
-	block_type, _, _ := openai_value_string(thinking_block, "type")
-	thinking, _, _ := openai_value_string(thinking_block, "thinking")
-	signature, _, _ := openai_value_string(thinking_block, "signature")
+	block_type, _, _ := provider_json_string(thinking_block, "type")
+	thinking, _, _ := provider_json_string(thinking_block, "thinking")
+	signature, _, _ := provider_json_string(thinking_block, "signature")
 	testing.expect_value(t, block_type, ANTHROPIC_BLOCK_THINKING)
 	testing.expect_value(t, thinking, "Need inspect \"the source\".\n")
 	testing.expect_value(t, signature, "sig_abc")
 	text_block, text_ok := blocks[1].(json.Object)
 	if !testing.expect(t, text_ok) { destroy_events(events); return }
-	block_type, _, _ = openai_value_string(text_block, "type")
+	block_type, _, _ = provider_json_string(text_block, "type")
 	testing.expect_value(t, block_type, ANTHROPIC_BLOCK_TEXT)
-	text, _, _ := openai_value_string(text_block, "text")
+	text, _, _ := provider_json_string(text_block, "text")
 	testing.expect_value(t, text, "Running the command.")
 	tool_block, tool_ok := blocks[2].(json.Object)
 	if !testing.expect(t, tool_ok) { destroy_events(events); return }
-	block_type, _, _ = openai_value_string(tool_block, "type")
+	block_type, _, _ = provider_json_string(tool_block, "type")
 	testing.expect_value(t, block_type, ANTHROPIC_BLOCK_TOOL_USE)
 	testing.expect_value(t, len(tool_block), 4)
 	destroy_events(events)
@@ -528,8 +528,8 @@ test_anthropic_opens_with_a_user_turn_for_a_summary :: proc(t: ^testing.T) {
 	if !testing.expect(t, encoded_ok && len(encoded) == 2) { return }
 	first, first_ok := encoded[0].(json.Object)
 	if !testing.expect(t, first_ok) { return }
-	role, _, _ := openai_value_string(first, "role")
+	role, _, _ := provider_json_string(first, "role")
 	testing.expect_value(t, role, "user")
-	content, _, _ := openai_value_string(first, "content")
+	content, _, _ := provider_json_string(first, "content")
 	testing.expect(t, strings.has_prefix(content, "Summary of the conversation so far:"))
 }

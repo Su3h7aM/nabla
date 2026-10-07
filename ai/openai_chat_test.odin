@@ -108,7 +108,7 @@ test_chat_encode_keeps_prompt_cache_options_ttl :: proc(t: ^testing.T) {
 	if !testing.expect(t, object_ok) { return }
 	options, options_ok := object["prompt_cache_options"].(json.Object)
 	if !testing.expect(t, options_ok) { return }
-	ttl, ttl_present, ttl_ok := openai_value_string(options, "ttl")
+	ttl, ttl_present, ttl_ok := provider_json_string(options, "ttl")
 	testing.expect(t, ttl_ok && ttl_present && ttl == "30m")
 	_, retention_present := object["prompt_cache_retention"]
 	testing.expect(t, !retention_present)

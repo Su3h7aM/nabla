@@ -246,13 +246,10 @@ stdio_running :: proc(stdio: ^Stdio) -> bool {
 stdio_write_line :: proc(stdio: ^Stdio, message: string, control: Control) -> Error {
 	if !stdio.started { return error_make(.Write_Failed, allocator = stdio.allocator) }
 	clear(&stdio.out)
-	message_bytes := transmute([]u8)message
-	appended, append_err := append(&stdio.out, ..message_bytes)
-	if append_err != nil || appended != len(message_bytes) {
+	if _, append_err := append(&stdio.out, ..transmute([]u8)message); append_err != nil {
 		return error_make(.Out_Of_Memory, allocator = stdio.allocator)
 	}
-	appended, append_err = append(&stdio.out, '\n')
-	if append_err != nil || appended != 1 {
+	if _, append_err := append(&stdio.out, '\n'); append_err != nil {
 		return error_make(.Out_Of_Memory, allocator = stdio.allocator)
 	}
 
@@ -315,8 +312,7 @@ stdio_read_line :: proc(stdio: ^Stdio, control: Control) -> (line: []u8, err: Er
 			if subprocess.child_poll(&stdio.child) { kind = .Server_Exited }
 			return nil, stdio_transport_error(stdio, kind, .Delivered)
 		}
-		appended, append_err := append(&stdio.line, ..buffer[:count])
-		if append_err != nil || appended != count {
+		if _, append_err := append(&stdio.line, ..buffer[:count]); append_err != nil {
 			read_error := error_make(.Out_Of_Memory, allocator = stdio.allocator)
 			read_error.delivery = .Delivered
 			return nil, read_error

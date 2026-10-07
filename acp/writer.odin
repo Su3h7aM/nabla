@@ -423,39 +423,6 @@ writer_write_id :: proc(builder: ^strings.Builder, id: JSONRPC_Id) -> bool {
 // escaped, so every string the writer emits is valid whatever it contains.
 @(private, require_results)
 writer_write_quoted :: proc(builder: ^strings.Builder, value: string) -> bool {
-	if !writer_builder_byte(builder, '"') { return false }
-	for i := 0; i < len(value); i += 1 {
-		character := value[i]
-		switch character {
-		case '"':
-			if !writer_builder_string(builder, `\"`) { return false }
-		case '\\':
-			if !writer_builder_string(builder, `\\`) { return false }
-		case '\n':
-			if !writer_builder_string(builder, `\n`) { return false }
-		case '\r':
-			if !writer_builder_string(builder, `\r`) { return false }
-		case '\t':
-			if !writer_builder_string(builder, `\t`) { return false }
-		case '\b':
-			if !writer_builder_string(builder, `\b`) { return false }
-		case '\f':
-			if !writer_builder_string(builder, `\f`) { return false }
-		case:
-			if character < 0x20 {
-				if !writer_builder_string(builder, `\u00`) ||
-				   !writer_builder_byte(builder, writer_hex_digit(character >> 4)) ||
-				   !writer_builder_byte(builder, writer_hex_digit(character & 0x0F)) { return false }
-			} else if !writer_builder_byte(builder, character) {
-				return false
-			}
-		}
-	}
-	return writer_builder_byte(builder, '"')
-}
-
-@(private)
-writer_hex_digit :: proc(value: byte) -> byte {
-	if value < 10 { return '0' + value }
-	return 'a' + (value - 10)
+	_, err := io.write_quoted_string(strings.to_writer(builder), value, '"', nil, true)
+	return err == .None
 }

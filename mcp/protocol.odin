@@ -170,14 +170,6 @@ mcp_object_put_string :: proc(object: ^json.Object, key, value: string, allocato
 }
 
 @(require_results)
-mcp_object_put_integer :: proc(object: ^json.Object, key: string, value: i64, allocator: mem.Allocator) -> bool {
-	owned_key, key_error := strings.clone(key, allocator)
-	if key_error != nil { return false }
-	object^[owned_key] = json.Integer(value)
-	return true
-}
-
-@(require_results)
 mcp_object_put_value :: proc(object: ^json.Object, key: string, value: json.Value, allocator: mem.Allocator) -> bool {
 	owned_key, key_error := strings.clone(key, allocator)
 	if key_error != nil { return false }
@@ -287,26 +279,20 @@ initialize_params_make :: proc(allocator := context.allocator) -> (json.Object, 
 
 // request_encode frames one JSON-RPC request. It takes ownership of params, including
 // on failure, so a caller cannot leak a partially built envelope.
+//
+// The envelope only borrows its keys and values: it is encoded and dropped before params
+// is released.
 @(require_results)
 request_encode :: proc(method: string, params: json.Object, id: i64, allocator := context.allocator) -> (string, Error) {
+	defer json.destroy_value(json.Value(params), allocator)
 	envelope, build_error := mcp_object_make(4, allocator)
-	if build_error.kind != .None {
-		json.destroy_value(json.Value(params), allocator)
-		return "", build_error
-	}
-	failed := true
-	defer if failed { json.destroy_value(json.Value(envelope), allocator) }
-	params_installed := false
-	defer if !params_installed { json.destroy_value(json.Value(params), allocator) }
-	if !mcp_object_put_string(&envelope, "jsonrpc", "2.0", allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_integer(&envelope, "id", id, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_string(&envelope, "method", method, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_value(&envelope, "params", json.Value(params), allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	params_installed = true
-	failed = false
-	value := json.Value(envelope)
-	defer json.destroy_value(value, allocator)
-	return mcp_frame(value, allocator)
+	if build_error.kind != .None { return "", build_error }
+	defer delete(envelope)
+	envelope["jsonrpc"] = json.String("2.0")
+	envelope["id"] = json.Integer(id)
+	envelope["method"] = json.String(method)
+	envelope["params"] = json.Value(params)
+	return mcp_frame(json.Value(envelope), allocator)
 }
 
 // notification_encode frames one JSON-RPC notification. It takes ownership of
@@ -314,25 +300,14 @@ request_encode :: proc(method: string, params: json.Object, id: i64, allocator :
 // which is what makes it a notification rather than a request.
 @(require_results)
 notification_encode :: proc(method: string, params: json.Object, allocator := context.allocator) -> (string, Error) {
+	defer json.destroy_value(json.Value(params), allocator)
 	envelope, build_error := mcp_object_make(3, allocator)
-	if build_error.kind != .None {
-		if params != nil { json.destroy_value(json.Value(params), allocator) }
-		return "", build_error
-	}
-	failed := true
-	defer if failed { json.destroy_value(json.Value(envelope), allocator) }
-	params_installed := params == nil
-	defer if !params_installed { json.destroy_value(json.Value(params), allocator) }
-	if !mcp_object_put_string(&envelope, "jsonrpc", "2.0", allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_string(&envelope, "method", method, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if params != nil {
-		if !mcp_object_put_value(&envelope, "params", json.Value(params), allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-		params_installed = true
-	}
-	failed = false
-	value := json.Value(envelope)
-	defer json.destroy_value(value, allocator)
-	return mcp_frame(value, allocator)
+	if build_error.kind != .None { return "", build_error }
+	defer delete(envelope)
+	envelope["jsonrpc"] = json.String("2.0")
+	envelope["method"] = json.String(method)
+	if params != nil { envelope["params"] = json.Value(params) }
+	return mcp_frame(json.Value(envelope), allocator)
 }
 
 // response_error_encode frames one JSON-RPC error response. A client sends one
@@ -341,25 +316,19 @@ notification_encode :: proc(method: string, params: json.Object, allocator := co
 // is nothing else honest to say.
 @(require_results)
 response_error_encode :: proc(id: i64, code: i64, message: string, allocator := context.allocator) -> (string, Error) {
-	remote, build_error := mcp_object_make(2, allocator)
-	if build_error.kind != .None { return "", build_error }
-	remote_failed := true
-	defer if remote_failed { json.destroy_value(json.Value(remote), allocator) }
-	if !mcp_object_put_integer(&remote, "code", code, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_string(&remote, "message", message, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
+	remote, remote_error := mcp_object_make(2, allocator)
+	if remote_error.kind != .None { return "", remote_error }
+	defer delete(remote)
+	remote["code"] = json.Integer(code)
+	remote["message"] = json.String(message)
 
 	envelope, envelope_error := mcp_object_make(3, allocator)
 	if envelope_error.kind != .None { return "", envelope_error }
-	envelope_failed := true
-	defer if envelope_failed { json.destroy_value(json.Value(envelope), allocator) }
-	if !mcp_object_put_string(&envelope, "jsonrpc", "2.0", allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_integer(&envelope, "id", id, allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	if !mcp_object_put_value(&envelope, "error", json.Value(remote), allocator) { return "", error_make(.Out_Of_Memory, allocator = allocator) }
-	remote_failed = false
-	envelope_failed = false
-	value := json.Value(envelope)
-	defer json.destroy_value(value, allocator)
-	return mcp_frame(value, allocator)
+	defer delete(envelope)
+	envelope["jsonrpc"] = json.String("2.0")
+	envelope["id"] = json.Integer(id)
+	envelope["error"] = json.Value(remote)
+	return mcp_frame(json.Value(envelope), allocator)
 }
 
 // mcp_frame serializes one message. Keys are sorted so the same request always

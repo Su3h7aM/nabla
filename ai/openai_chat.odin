@@ -245,11 +245,11 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 	if usage_present {
 		usage_object, usage_ok := raw_usage.(json.Object)
 		if !usage_ok { return provider_stream_fail(state, .Invalid_Data, "usage is not an object") }
-		usage.Input_Tokens, usage.Input_Tokens_Present, usage_ok = openai_value_integer(usage_object, "prompt_tokens")
+		usage.Input_Tokens, usage.Input_Tokens_Present, usage_ok = provider_json_integer(usage_object, "prompt_tokens")
 		if !usage_ok { return provider_stream_fail(state, .Invalid_Data, "invalid prompt_tokens") }
-		usage.Output_Tokens, usage.Output_Tokens_Present, usage_ok = openai_value_integer(usage_object, "completion_tokens")
+		usage.Output_Tokens, usage.Output_Tokens_Present, usage_ok = provider_json_integer(usage_object, "completion_tokens")
 		if !usage_ok { return provider_stream_fail(state, .Invalid_Data, "invalid completion_tokens") }
-		usage.Total_Tokens, usage.Total_Tokens_Present, usage_ok = openai_value_integer(usage_object, "total_tokens")
+		usage.Total_Tokens, usage.Total_Tokens_Present, usage_ok = provider_json_integer(usage_object, "total_tokens")
 		if !usage_ok { return provider_stream_fail(state, .Invalid_Data, "invalid total_tokens") }
 		if raw_details, details_present := usage_object["prompt_tokens_details"]; details_present {
 			if _, details_is_null := raw_details.(json.Null); !details_is_null {
@@ -257,13 +257,13 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 				if !details_ok { return provider_stream_fail(state, .Invalid_Data, "invalid prompt_tokens_details") }
 				if raw_cached, cached_present := details["cached_tokens"]; cached_present {
 					if _, cached_is_null := raw_cached.(json.Null); !cached_is_null {
-						usage.Cached_Input_Tokens, usage.Cached_Input_Tokens_Present, details_ok = openai_value_integer(details, "cached_tokens")
+						usage.Cached_Input_Tokens, usage.Cached_Input_Tokens_Present, details_ok = provider_json_integer(details, "cached_tokens")
 						if !details_ok || usage.Cached_Input_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid cached_tokens") }
 					}
 				}
 				if raw_write, write_present := details["cache_write_tokens"]; write_present {
 					if _, write_is_null := raw_write.(json.Null); !write_is_null {
-						usage.Cache_Write_Tokens, usage.Cache_Write_Tokens_Present, details_ok = openai_value_integer(details, "cache_write_tokens")
+						usage.Cache_Write_Tokens, usage.Cache_Write_Tokens_Present, details_ok = provider_json_integer(details, "cache_write_tokens")
 						if !details_ok || usage.Cache_Write_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid cache_write_tokens") }
 					}
 				}
@@ -275,7 +275,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 				if !details_ok { return provider_stream_fail(state, .Invalid_Data, "invalid completion_tokens_details") }
 				if raw_reasoning, reasoning_present := details["reasoning_tokens"]; reasoning_present {
 					if _, reasoning_is_null := raw_reasoning.(json.Null); !reasoning_is_null {
-						usage.Reasoning_Tokens, usage.Reasoning_Tokens_Present, details_ok = openai_value_integer(details, "reasoning_tokens")
+						usage.Reasoning_Tokens, usage.Reasoning_Tokens_Present, details_ok = provider_json_integer(details, "reasoning_tokens")
 						if !details_ok || usage.Reasoning_Tokens < 0 { return provider_stream_fail(state, .Invalid_Data, "invalid reasoning_tokens") }
 					}
 				}
@@ -314,11 +314,11 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 				for entry in tools {
 					fragment_delta, fragment_ok := entry.(json.Object)
 					if !fragment_ok { return provider_stream_fail(state, .Invalid_Data, "tool call is not an object") }
-					index, index_present, index_ok := openai_value_integer(fragment_delta, "index")
+					index, index_present, index_ok := provider_json_integer(fragment_delta, "index")
 					if !index_ok || !index_present { return provider_stream_fail(state, .Invalid_Data, "tool call has no index") }
 					fragment, slot_error := provider_tool_fragment_by_wire_index(state, index)
 					if slot_error != .None { return slot_error }
-					if id, present, ok := openai_value_string(fragment_delta, "id"); ok && present && id != "" {
+					if id, present, ok := provider_json_string(fragment_delta, "id"); ok && present && id != "" {
 						if fragment.ID != "" && fragment.ID != id { return provider_stream_fail(state, .Invalid_Data, "tool call id changed") }
 						if fragment.ID == "" {
 							owned, clone_error := strings.clone(id, state.Allocator)
@@ -333,7 +333,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 						if _, is_null := raw_function.(json.Null); !is_null {
 							function, function_ok := raw_function.(json.Object)
 							if !function_ok { return provider_stream_fail(state, .Invalid_Data, "tool function is not an object") }
-							if name, present, ok := openai_value_string(function, "name"); ok && present && name != "" {
+							if name, present, ok := provider_json_string(function, "name"); ok && present && name != "" {
 								if fragment.Name != "" && fragment.Name != name { return provider_stream_fail(state, .Invalid_Data, "tool call name changed") }
 								if fragment.Name == "" {
 									owned, clone_error := strings.clone(name, state.Allocator)
@@ -343,7 +343,7 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 									fragment.Name = owned
 								}
 							} else if !ok { return provider_stream_fail(state, .Invalid_Data, "tool call name is invalid") }
-							if arguments, present, ok := openai_value_string(function, "arguments"); ok && present && arguments != "" {
+							if arguments, present, ok := provider_json_string(function, "arguments"); ok && present && arguments != "" {
 								if _, append_error := append(&fragment.Arguments, arguments); append_error != nil {
 									return provider_stream_fail_allocation(state, "the tool call arguments could not be retained")
 								}
@@ -359,16 +359,16 @@ openai_chat_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_St
 				return provider_stream_fail(state, .Unsupported_Tool_Output, "OpenAI function call output is unsupported", .None)
 			}
 		}
-		content, content_present, content_ok := openai_value_string(delta, "content")
+		content, content_present, content_ok := provider_json_string(delta, "content")
 		if !content_ok { return provider_stream_fail(state, .Invalid_Data, "delta content is not text") }
 		if content_present && content != "" {
 			text_content = content
 			text_present = true
 		}
-		refusal, refusal_present, refusal_ok := openai_value_string(delta, "refusal")
+		refusal, refusal_present, refusal_ok := provider_json_string(delta, "refusal")
 		if !refusal_ok { return provider_stream_fail(state, .Invalid_Data, "delta refusal is not text") }
 		if refusal_present && refusal != "" { refusal_text = refusal }
-		finish_text, finish_present, finish_ok := openai_value_string(choice, "finish_reason")
+		finish_text, finish_present, finish_ok := provider_json_string(choice, "finish_reason")
 		if !finish_ok { return provider_stream_fail(state, .Invalid_Data, "finish_reason is invalid") }
 		if finish_present && finish_text != "" {
 			reason = finish_text

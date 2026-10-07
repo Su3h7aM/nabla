@@ -72,17 +72,17 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 	defer json.destroy_value(value, context.temp_allocator)
 	object, ok := value.(json.Object)
 	testing.expect(t, ok)
-	model, model_present, model_ok := openai_value_string(object, "model")
+	model, model_present, model_ok := provider_json_string(object, "model")
 	testing.expect(t, model_ok && model_present && model == "gpt-5.6")
-	limit, limit_present, limit_ok := openai_value_integer(object, "max_output_tokens")
+	limit, limit_present, limit_ok := provider_json_integer(object, "max_output_tokens")
 	testing.expect(t, limit_ok && limit_present && limit == 64)
 	mode_raw, mode_ok := object["stream"].(json.Boolean)
 	testing.expect(t, mode_ok && bool(mode_raw))
 	options, options_ok := object["prompt_cache_options"].(json.Object)
 	testing.expect(t, options_ok)
-	mode, mode_present, mode_value_ok := openai_value_string(options, "mode")
+	mode, mode_present, mode_value_ok := provider_json_string(options, "mode")
 	testing.expect(t, mode_value_ok && mode_present && mode == "explicit")
-	ttl, ttl_present, ttl_value_ok := openai_value_string(options, "ttl")
+	ttl, ttl_present, ttl_value_ok := provider_json_string(options, "ttl")
 	testing.expect(t, ttl_value_ok && ttl_present && ttl == "30m")
 	_, retention_present := object["prompt_cache_retention"]
 	testing.expect(t, !retention_present)
@@ -90,9 +90,9 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 	testing.expect(t, input_ok && len(input) == 2)
 	first, first_ok := input[0].(json.Object)
 	testing.expect(t, first_ok)
-	first_role, _, _ := openai_value_string(first, "role")
+	first_role, _, _ := provider_json_string(first, "role")
 	testing.expect_value(t, first_role, "system")
-	first_content, _, _ := openai_value_string(first, "content")
+	first_content, _, _ := provider_json_string(first, "content")
 	testing.expect_value(t, first_content, "Be brief.")
 	second, second_ok := input[1].(json.Object)
 	testing.expect(t, second_ok)
@@ -100,11 +100,11 @@ test_responses_encode_matches_spec :: proc(t: ^testing.T) {
 	testing.expect(t, parts_ok && len(parts) == 1)
 	part, part_ok := parts[0].(json.Object)
 	testing.expect(t, part_ok)
-	part_type, _, _ := openai_value_string(part, "type")
+	part_type, _, _ := provider_json_string(part, "type")
 	testing.expect_value(t, part_type, "input_text")
 	breakpoint, breakpoint_ok := part["prompt_cache_breakpoint"].(json.Object)
 	testing.expect(t, breakpoint_ok)
-	breakpoint_mode, _, _ := openai_value_string(breakpoint, "mode")
+	breakpoint_mode, _, _ := provider_json_string(breakpoint, "mode")
 	testing.expect_value(t, breakpoint_mode, "explicit")
 }
 
@@ -117,7 +117,7 @@ test_responses_websocket_encode_uses_event_envelope_without_http_stream_field ::
 	defer json.destroy_value(value, context.temp_allocator)
 	object, ok := value.(json.Object)
 	if !testing.expect(t, ok, "the WebSocket request is not an object") { return }
-	event_type, present, valid := openai_value_string(object, "type")
+	event_type, present, valid := provider_json_string(object, "type")
 	testing.expect(t, valid && present && event_type == "response.create")
 	_, stream_present := object["stream"]
 	testing.expect(t, !stream_present, "the WebSocket request carried the HTTP stream field")
@@ -165,7 +165,7 @@ test_responses_encode_removes_output_status_from_replay :: proc(t: ^testing.T) {
 	replayed := input[0].(json.Object)
 	_, status_present := replayed["status"]
 	testing.expect(t, !status_present)
-	id, id_present, id_ok := openai_value_string(replayed, "id")
+	id, id_present, id_ok := provider_json_string(replayed, "id")
 	testing.expect(t, id_ok && id_present && id == "msg_1")
 }
 
@@ -211,7 +211,7 @@ test_responses_encode_effort_and_omission :: proc(t: ^testing.T) {
 	object := value.(json.Object)
 	reasoning, ok := object["reasoning"].(json.Object)
 	testing.expect(t, ok)
-	effort, _, _ := openai_value_string(reasoning, "effort")
+	effort, _, _ := provider_json_string(reasoning, "effort")
 	testing.expect_value(t, effort, "high")
 
 	request.Reasoning_Effort_Present = false
@@ -257,7 +257,7 @@ test_instructions_encode_per_api :: proc(t: ^testing.T) {
 	testing.expect_value(t, parse_err, nil)
 	object, object_ok := value.(json.Object)
 	if testing.expect(t, object_ok) {
-		instructions, _, _ := openai_value_string(object, "instructions")
+		instructions, _, _ := provider_json_string(object, "instructions")
 		testing.expect_value(t, instructions, "Be brief.")
 		input, input_ok := object["input"].(json.Array)
 		// The lane is not repeated inside the input array.
@@ -279,9 +279,9 @@ test_instructions_encode_per_api :: proc(t: ^testing.T) {
 	if !testing.expect(t, messages_ok && len(messages_array) == 2) { return }
 	first, first_ok := messages_array[0].(json.Object)
 	if !testing.expect(t, first_ok) { return }
-	role, _, _ := openai_value_string(first, "role")
+	role, _, _ := provider_json_string(first, "role")
 	testing.expect_value(t, role, "system")
-	content, _, _ := openai_value_string(first, "content")
+	content, _, _ := provider_json_string(first, "content")
 	testing.expect_value(t, content, "Be brief.")
 }
 
@@ -306,7 +306,7 @@ test_chat_encode_effort :: proc(t: ^testing.T) {messages := make([]Provider_Mess
 	testing.expect_value(t, parse_err, nil)
 	defer json.destroy_value(value, context.temp_allocator)
 	object := value.(json.Object)
-	effort, present, ok := openai_value_string(object, "reasoning_effort")
+	effort, present, ok := provider_json_string(object, "reasoning_effort")
 	testing.expect(t, ok && present)
 	testing.expect_value(t, effort, "low")
 }
@@ -489,7 +489,7 @@ test_responses_completion_carries_phase_and_raw_output :: proc(t: ^testing.T) {
 	testing.expect(t, output_ok && len(output) == 1)
 	item, item_ok := output[0].(json.Object)
 	testing.expect(t, item_ok)
-	item_type, _, _ := openai_value_string(item, "type")
+	item_type, _, _ := provider_json_string(item, "type")
 	testing.expect_value(t, item_type, "message")
 	destroy_events(events)
 }
@@ -535,11 +535,11 @@ test_responses_encode_replays_reasoning_in_order :: proc(t: ^testing.T) {
 	testing.expect(t, input_ok && len(input) == 3)
 	reasoning_item, reasoning_ok := input[1].(json.Object)
 	testing.expect(t, reasoning_ok)
-	item_type, _, _ := openai_value_string(reasoning_item, "type")
+	item_type, _, _ := provider_json_string(reasoning_item, "type")
 	testing.expect_value(t, item_type, "reasoning")
-	item_id, _, _ := openai_value_string(reasoning_item, "id")
+	item_id, _, _ := provider_json_string(reasoning_item, "id")
 	testing.expect_value(t, item_id, "rs_1")
-	encrypted, _, _ := openai_value_string(reasoning_item, "encrypted_content")
+	encrypted, _, _ := provider_json_string(reasoning_item, "encrypted_content")
 	testing.expect_value(t, encrypted, "enc_1")
 	// The schema requires summary on a replayed reasoning item; it stays empty.
 	summaries, summaries_ok := reasoning_item["summary"]
@@ -548,7 +548,7 @@ test_responses_encode_replays_reasoning_in_order :: proc(t: ^testing.T) {
 	testing.expect(t, is_array && len(summaries_array) == 0)
 	call_item, call_ok := input[2].(json.Object)
 	testing.expect(t, call_ok)
-	call_type, _, _ := openai_value_string(call_item, "type")
+	call_type, _, _ := provider_json_string(call_item, "type")
 	testing.expect_value(t, call_type, "function_call")
 }
 
@@ -584,7 +584,7 @@ test_responses_encode_skips_unreplayable_reasoning :: proc(t: ^testing.T) {
 	testing.expect(t, input_ok && len(input) == 1)
 	only, only_ok := input[0].(json.Object)
 	testing.expect(t, only_ok)
-	role, _, _ := openai_value_string(only, "role")
+	role, _, _ := provider_json_string(only, "role")
 	testing.expect_value(t, role, "assistant")
 }
 
@@ -1088,7 +1088,7 @@ test_chat_encode_output_bound_uses_the_current_field :: proc(t: ^testing.T) {
 	defer json.destroy_value(value, context.temp_allocator)
 	object, object_ok := value.(json.Object)
 	if !testing.expect(t, object_ok) { return }
-	bound, present, bound_ok := openai_value_integer(object, "max_completion_tokens")
+	bound, present, bound_ok := provider_json_integer(object, "max_completion_tokens")
 	testing.expect(t, bound_ok && present)
 	testing.expect_value(t, bound, i64(64))
 	_, deprecated := object["max_tokens"]

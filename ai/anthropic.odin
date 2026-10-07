@@ -545,7 +545,7 @@ anthropic_optional_integer :: proc(object: json.Object, key: string) -> (value: 
 	raw, exists := object[key]
 	if !exists { return 0, false, true }
 	if _, is_null := raw.(json.Null); is_null { return 0, false, true }
-	return openai_value_integer(object, key)
+	return provider_json_integer(object, key)
 }
 
 // anthropic_block_fragment finds the tool-call slot a content block index maps
@@ -696,53 +696,31 @@ anthropic_complete :: proc(state: ^Provider_Stream_State, reason_text: string) -
 
 // anthropic_error_event reads the error envelope this API uses, which names the
 // failure kind in `type` rather than `code`.
-@(private, require_results)
+@(private = "package", require_results)
 anthropic_error_event :: proc(object: json.Object, allocator := context.allocator) -> (event: Provider_Event, is_error: bool, err: mem.Allocator_Error) {
 	raw, present := object["error"]
 	if !present { return nil, false, nil }
 	error_object, ok := raw.(json.Object)
 	if !ok {
-		invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error object", allocator = allocator)
+		invalid, invalid_error := provider_error_event_make(.API_Error, "invalid provider error object", allocator = allocator)
 		return invalid, true, invalid_error
 	}
-	message, _, message_ok := openai_value_string(error_object, "message")
+	message, _, message_ok := provider_json_string(error_object, "message")
 	if !message_ok {
-		invalid, invalid_error := openai_error_event(.API_Error, "invalid provider error message", allocator = allocator)
+		invalid, invalid_error := provider_error_event_make(.API_Error, "invalid provider error message", allocator = allocator)
 		return invalid, true, invalid_error
 	}
 	if message == "" { message = "provider returned an API error" }
-	code, _, code_ok := openai_value_string(error_object, "type")
+	code, _, code_ok := provider_json_string(error_object, "type")
 	if !code_ok { code = "" }
 	detail_code := ""
 	if raw_details, details_present := error_object["details"]; details_present {
 		if details, is_object := raw_details.(json.Object); is_object {
-			if value, code_present, valid := openai_value_string(details, "error_code"); valid && code_present { detail_code = value }
+			if value, code_present, valid := provider_json_string(details, "error_code"); valid && code_present { detail_code = value }
 		}
 	}
-	parsed, parsed_error := openai_error_event(.API_Error, message, code, detail_code, allocator)
+	parsed, parsed_error := provider_error_event_make(.API_Error, message, code, detail_code, allocator)
 	return parsed, true, parsed_error
-}
-
-// anthropic_error_rejection decodes the error document this API returns for a
-// refused request, through the same reader an in-stream error event uses, so a
-// refusal read from a response body and one read from a stream cannot drift apart.
-// The returned strings are owned by allocator.
-@(require_results)
-anthropic_error_rejection :: proc(body: []u8, allocator := context.allocator) -> (Provider_Rejection, mem.Allocator_Error) {
-	value, object, parsed := provider_error_document(body, allocator)
-	if !parsed { return {}, nil }
-	defer json.destroy_value(value, allocator)
-	event, is_error, event_error := anthropic_error_event(object, allocator)
-	if !is_error { return {}, nil }
-	if event_error != nil { return {}, event_error }
-	error_event, is_error_event := event.(Provider_Error_Event)
-	if !is_error_event {
-		owned := event
-		Provider_Event_Destroy(&owned, allocator)
-		return {}, nil
-	}
-	// The rejection takes the strings the parsed event built; nothing is cloned again.
-	return Provider_Rejection{code = error_event.Provider_Code, detail_code = error_event.Provider_Detail_Code, message = error_event.Message}, nil
 }
 
 // These are the only prose this package reads, and only beside invalid_request_error,
@@ -830,7 +808,7 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		state.Phase = .Failed
 		return .None
 	}
-	event_type, type_present, type_ok := openai_value_string(object, "type")
+	event_type, type_present, type_ok := provider_json_string(object, "type")
 	if !type_ok || !type_present || event_type == "" {
 		return provider_stream_fail(state, .Invalid_Data, "stream event has no type")
 	}
@@ -845,7 +823,7 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		return anthropic_usage_from(message, "usage", state)
 	case "content_block_start":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
-		index, index_present, index_ok := openai_value_integer(object, "index")
+		index, index_present, index_ok := provider_json_integer(object, "index")
 		if !index_ok || !index_present || index < 0 {
 			return provider_stream_fail(state, .Invalid_Data, "content block has no index")
 		}
@@ -853,14 +831,14 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		if !present { return provider_stream_fail(state, .Invalid_Data, "content_block_start has no block") }
 		block, block_ok := raw_block.(json.Object)
 		if !block_ok { return provider_stream_fail(state, .Invalid_Data, "content block is not an object") }
-		block_type, _, block_type_ok := openai_value_string(block, "type")
+		block_type, _, block_type_ok := provider_json_string(block, "type")
 		if !block_type_ok || block_type == "" { return provider_stream_fail(state, .Invalid_Data, "content block has no type") }
 		if state^.Native_Block != .None {
 			return provider_stream_fail(state, .Invalid_Data, "content block started before the preceding block stopped")
 		}
 		switch block_type {
 		case ANTHROPIC_BLOCK_TEXT:
-			text, text_present, text_ok := openai_value_string(block, "text")
+			text, text_present, text_ok := provider_json_string(block, "text")
 			if !text_ok { return provider_stream_fail(state, .Invalid_Data, "text block is invalid") }
 			if text_present && text != "" {
 				owned, clone_error := strings.clone(text, state.Allocator)
@@ -870,9 +848,9 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		case ANTHROPIC_BLOCK_TOOL_USE:
 			fragment, slot_error := anthropic_block_fragment(state, index)
 			if slot_error != .None { return slot_error }
-			id, id_present, id_ok := openai_value_string(block, "id")
+			id, id_present, id_ok := provider_json_string(block, "id")
 			if !id_ok || !id_present || id == "" { return provider_stream_fail(state, .Invalid_Data, "tool_use block has no id") }
-			name, name_present, name_ok := openai_value_string(block, "name")
+			name, name_present, name_ok := provider_json_string(block, "name")
 			if !name_ok || !name_present || name == "" { return provider_stream_fail(state, .Invalid_Data, "tool_use block has no name") }
 			owned_id, id_error := strings.clone(id, state.Allocator)
 			if id_error != nil { return provider_stream_fail_allocation(state, "the tool call id could not be retained") }
@@ -900,11 +878,11 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 			}
 			fragment.Present = true
 		case ANTHROPIC_BLOCK_THINKING:
-			text, text_present, text_ok := openai_value_string(block, "thinking")
+			text, text_present, text_ok := provider_json_string(block, "thinking")
 			if !text_ok || !text_present { return provider_stream_fail(state, .Invalid_Data, "thinking block is invalid") }
 			return anthropic_native_start_thinking(state, text)
 		case ANTHROPIC_BLOCK_REDACTED_THINKING:
-			data, data_present, data_ok := openai_value_string(block, "data")
+			data, data_present, data_ok := provider_json_string(block, "data")
 			if !data_ok || !data_present { return provider_stream_fail(state, .Invalid_Data, "redacted thinking block is invalid") }
 			return anthropic_native_start_redacted_thinking(state, data)
 		case ANTHROPIC_BLOCK_FALLBACK:
@@ -920,12 +898,12 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		if !present { return provider_stream_fail(state, .Invalid_Data, "content_block_delta has no delta") }
 		delta, delta_ok := raw_delta.(json.Object)
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "delta is not an object") }
-		delta_type, _, delta_type_ok := openai_value_string(delta, "type")
+		delta_type, _, delta_type_ok := provider_json_string(delta, "type")
 		if !delta_type_ok || delta_type == "" { return provider_stream_fail(state, .Invalid_Data, "delta has no type") }
 		if state^.Native_Block == .Skipped { return .None }
 		switch delta_type {
 		case "text_delta":
-			text, text_present, text_ok := openai_value_string(delta, "text")
+			text, text_present, text_ok := provider_json_string(delta, "text")
 			if !text_ok { return provider_stream_fail(state, .Invalid_Data, "text delta is invalid") }
 			if text_present && text != "" {
 				owned, clone_error := strings.clone(text, state.Allocator)
@@ -933,14 +911,14 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 				provider_stream_push(state, Provider_Text_Event{Text = owned})
 			}
 		case "input_json_delta":
-			index, index_present, index_ok := openai_value_integer(object, "index")
+			index, index_present, index_ok := provider_json_integer(object, "index")
 			if !index_ok || !index_present || index < 0 {
 				return provider_stream_fail(state, .Invalid_Data, "argument delta has no index")
 			}
 			fragment, slot_error := anthropic_block_fragment(state, index)
 			if slot_error != .None { return slot_error }
 			if !fragment.Present { return provider_stream_fail(state, .Invalid_Data, "argument delta has no block") }
-			partial, partial_present, partial_ok := openai_value_string(delta, "partial_json")
+			partial, partial_present, partial_ok := provider_json_string(delta, "partial_json")
 			if !partial_ok { return provider_stream_fail(state, .Invalid_Data, "argument delta is invalid") }
 			if partial_present && partial != "" {
 				if !fragment.Arguments_Started {
@@ -952,11 +930,11 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 				}
 			}
 		case "thinking_delta":
-			text, text_present, text_ok := openai_value_string(delta, "thinking")
+			text, text_present, text_ok := provider_json_string(delta, "thinking")
 			if !text_ok || !text_present { return provider_stream_fail(state, .Invalid_Data, "thinking delta is invalid") }
 			return anthropic_native_thinking_delta(state, text)
 		case "signature_delta":
-			signature, signature_present, signature_ok := openai_value_string(delta, "signature")
+			signature, signature_present, signature_ok := provider_json_string(delta, "signature")
 			if !signature_ok || !signature_present { return provider_stream_fail(state, .Invalid_Data, "signature delta is invalid") }
 			return anthropic_native_signature_delta(state, signature)
 		case "citations_delta":
@@ -974,7 +952,7 @@ anthropic_consume_sse_data :: proc(payload: string, state: ^Provider_Stream_Stat
 		if !present { return .None }
 		delta, delta_ok := raw_delta.(json.Object)
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "message delta is not an object") }
-		reason, reason_present, reason_ok := openai_value_string(delta, "stop_reason")
+		reason, reason_present, reason_ok := provider_json_string(delta, "stop_reason")
 		if !reason_ok { return provider_stream_fail(state, .Invalid_Data, "stop_reason is invalid") }
 		if !reason_present || reason == "" { return .None }
 		return anthropic_complete(state, reason)

@@ -153,14 +153,12 @@ provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failu
 	switch evidence.kind {
 	case .Cancelled, .Timed_Out, .Invalid_Request, .Allocation:
 		return .None
-	case .HTTP, .Transport, .Stream, .TLS, .None:
-	}
-
-	if evidence.kind == .HTTP || evidence.kind == .Stream {
+	case .HTTP, .Stream:
 		if class, known := provider_rejection_class(evidence.api, evidence.rejection); known { return class }
+	case .Transport, .TLS, .None:
 	}
 
-	switch evidence.kind {
+	#partial switch evidence.kind {
 	case .HTTP:
 		if !evidence.head_seen { return .Unknown }
 		return provider_status_class(evidence.status)
@@ -177,10 +175,6 @@ provider_classify_failure :: proc(evidence: Provider_Evidence) -> Provider_Failu
 		return provider_stream_class(evidence.event)
 	case .TLS:
 		return .Untrusted_Connection
-	case .None:
-		return .Unknown
-	case .Cancelled, .Timed_Out, .Invalid_Request, .Allocation:
-		return .None
 	}
 	return .Unknown
 }
@@ -264,14 +258,32 @@ provider_rejection_class :: proc(api: API_Kind, rejection: Provider_Rejection) -
 @(require_results)
 provider_rejection_parse :: proc(api: API_Kind, body: []u8, allocator: mem.Allocator) -> (Provider_Rejection, mem.Allocator_Error) {
 	if len(body) == 0 { return {}, nil }
+	value, object, parsed := provider_error_document(body, allocator)
+	if !parsed { return {}, nil }
+	defer json.destroy_value(value, allocator)
+	// Both readers are the ones an in-stream error event uses, so a refusal read from a
+	// body and one read from a stream cannot drift apart.
+	event: Provider_Event
+	is_error: bool
+	event_error: mem.Allocator_Error
 	switch api {
 	case .OpenAI_Chat_Completions, .OpenAI_Responses:
-		return openai_error_rejection(body, allocator)
+		event, is_error, event_error = openai_parse_api_error(object, allocator)
 	case .Anthropic_Messages:
-		return anthropic_error_rejection(body, allocator)
+		event, is_error, event_error = anthropic_error_event(object, allocator)
 	case .Invalid:
+		return {}, nil
 	}
-	return {}, nil
+	if !is_error { return {}, nil }
+	if event_error != nil { return {}, event_error }
+	error_event, is_error_event := event.(Provider_Error_Event)
+	if !is_error_event {
+		owned := event
+		Provider_Event_Destroy(&owned, allocator)
+		return {}, nil
+	}
+	// The rejection takes the strings the parsed event built; nothing is cloned again.
+	return Provider_Rejection{code = error_event.Provider_Code, detail_code = error_event.Provider_Detail_Code, message = error_event.Message}, nil
 }
 
 // provider_error_document parses the root of an error document. The caller owns the
@@ -307,17 +319,12 @@ provider_request_id_header :: proc(api: API_Kind) -> string {
 
 // provider_retry_directive reads the x-should-retry header, which the official SDKs
 // obey but no API documents, for whether to send again.
-provider_retry_directive :: proc(api: API_Kind, headers: http.Headers) -> Provider_Retry_Directive {
-	switch api {
-	case .OpenAI_Chat_Completions, .OpenAI_Responses, .Anthropic_Messages:
-		value, present := http.headers_get_unsafe(headers, PROVIDER_RETRY_DIRECTIVE_HEADER)
-		if !present { return .Unspecified }
-		if strings.equal_fold(value, "false") { return .Forbid }
-		if strings.equal_fold(value, "true") { return .Allow }
-		// Anything else is not a directive this client reads as one.
-		return .Unspecified
-	case .Invalid:
-	}
+provider_retry_directive :: proc(headers: http.Headers) -> Provider_Retry_Directive {
+	value, present := http.headers_get_unsafe(headers, PROVIDER_RETRY_DIRECTIVE_HEADER)
+	if !present { return .Unspecified }
+	if strings.equal_fold(value, "false") { return .Forbid }
+	if strings.equal_fold(value, "true") { return .Allow }
+	// Anything else is not a directive this client reads as one.
 	return .Unspecified
 }
 

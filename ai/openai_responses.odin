@@ -358,19 +358,19 @@ openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, all
 openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Event, bool) {
 	usage := Provider_Usage_Event{}
 	ok := true
-	usage.Input_Tokens, usage.Input_Tokens_Present, ok = openai_value_integer(object, "input_tokens")
+	usage.Input_Tokens, usage.Input_Tokens_Present, ok = provider_json_integer(object, "input_tokens")
 	if !ok { return {}, false }
-	usage.Output_Tokens, usage.Output_Tokens_Present, ok = openai_value_integer(object, "output_tokens")
+	usage.Output_Tokens, usage.Output_Tokens_Present, ok = provider_json_integer(object, "output_tokens")
 	if !ok { return {}, false }
-	usage.Total_Tokens, usage.Total_Tokens_Present, ok = openai_value_integer(object, "total_tokens")
+	usage.Total_Tokens, usage.Total_Tokens_Present, ok = provider_json_integer(object, "total_tokens")
 	if !ok { return {}, false }
 	if raw_details, present := object["input_tokens_details"]; present {
 		if _, is_null := raw_details.(json.Null); !is_null {
 			details, details_ok := raw_details.(json.Object)
 			if !details_ok { return {}, false }
-			usage.Cached_Input_Tokens, usage.Cached_Input_Tokens_Present, ok = openai_value_integer(details, "cached_tokens")
+			usage.Cached_Input_Tokens, usage.Cached_Input_Tokens_Present, ok = provider_json_integer(details, "cached_tokens")
 			if !ok || (usage.Cached_Input_Tokens_Present && usage.Cached_Input_Tokens < 0) { return {}, false }
-			usage.Cache_Write_Tokens, usage.Cache_Write_Tokens_Present, ok = openai_value_integer(details, "cache_write_tokens")
+			usage.Cache_Write_Tokens, usage.Cache_Write_Tokens_Present, ok = provider_json_integer(details, "cache_write_tokens")
 			if !ok || (usage.Cache_Write_Tokens_Present && usage.Cache_Write_Tokens < 0) { return {}, false }
 		}
 	}
@@ -378,7 +378,7 @@ openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Eve
 		if _, is_null := raw_details.(json.Null); !is_null {
 			details, details_ok := raw_details.(json.Object)
 			if !details_ok { return {}, false }
-			usage.Reasoning_Tokens, usage.Reasoning_Tokens_Present, ok = openai_value_integer(details, "reasoning_tokens")
+			usage.Reasoning_Tokens, usage.Reasoning_Tokens_Present, ok = provider_json_integer(details, "reasoning_tokens")
 			if !ok || (usage.Reasoning_Tokens_Present && usage.Reasoning_Tokens < 0) { return {}, false }
 		}
 	}
@@ -434,12 +434,12 @@ Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> 
 	if make_error != nil { return nil, false }
 	for item in array {
 		object := item.(json.Object)
-		item_type, _, _ := openai_value_string(object, "type")
+		item_type, _, _ := provider_json_string(object, "type")
 		if item_type != "function_call" { continue }
-		id, _, _ := openai_value_string(object, "id")
-		call_id, _, _ := openai_value_string(object, "call_id")
-		name, _, _ := openai_value_string(object, "name")
-		arguments, _, _ := openai_value_string(object, "arguments")
+		id, _, _ := provider_json_string(object, "id")
+		call_id, _, _ := provider_json_string(object, "call_id")
+		name, _, _ := provider_json_string(object, "name")
+		arguments, _, _ := provider_json_string(object, "arguments")
 		call := Provider_Tool_Call{}
 		if !provider_call_clone_strings(&call, call_id, id, name, arguments, allocator) {
 			Provider_Tool_Calls_Destroy(declared[:], allocator)
@@ -462,29 +462,29 @@ Provider_Replay_Read :: proc(output: string, allocator := context.allocator) -> 
 // as it stands.
 @(require_results)
 openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allocator) -> bool {
-	item_type, type_present, type_ok := openai_value_string(object, "type")
+	item_type, type_present, type_ok := provider_json_string(object, "type")
 	if !type_ok || !type_present || item_type == "" { return false }
 	switch item_type {
 	case "function_call":
 		// The endpoint validates all three: a call id its results name the call by, a name
 		// its tool registry knows, and arguments that parse as the object the schema wants.
-		call_id, call_present, call_ok := openai_value_string(object, "call_id")
+		call_id, call_present, call_ok := provider_json_string(object, "call_id")
 		if !call_ok || !call_present || call_id == "" { return false }
-		name, name_present, name_ok := openai_value_string(object, "name")
+		name, name_present, name_ok := provider_json_string(object, "name")
 		if !name_ok || !name_present || name == "" { return false }
-		arguments, arguments_present, arguments_ok := openai_value_string(object, "arguments")
+		arguments, arguments_present, arguments_ok := provider_json_string(object, "arguments")
 		if !arguments_ok || !arguments_present { return false }
 		return Provider_Arguments_Object(arguments, allocator)
 	case "reasoning":
 		// A replayed reasoning item is continued from, so the endpoint requires the id and
 		// the encrypted content; a summary alone is display-only and carries nothing the
 		// endpoint can resume.
-		id, id_present, id_ok := openai_value_string(object, "id")
+		id, id_present, id_ok := provider_json_string(object, "id")
 		if !id_ok || !id_present || id == "" { return false }
-		encrypted, encrypted_present, encrypted_ok := openai_value_string(object, "encrypted_content")
+		encrypted, encrypted_present, encrypted_ok := provider_json_string(object, "encrypted_content")
 		return encrypted_ok && encrypted_present && encrypted != ""
 	case "message":
-		role, role_present, role_ok := openai_value_string(object, "role")
+		role, role_present, role_ok := provider_json_string(object, "role")
 		if !role_ok || !role_present || role == "" { return false }
 		_, content_present := object["content"]
 		return content_present
@@ -496,7 +496,7 @@ openai_responses_replay_item_ok :: proc(object: json.Object, allocator: mem.Allo
 
 @(require_results)
 provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
-	id, present, ok := openai_value_string(object, "item_id")
+	id, present, ok := provider_json_string(object, "item_id")
 	if !ok || !present || id == "" {
 		return nil, provider_stream_fail(state, .Invalid_Data, "arguments event has no item id")
 	}
@@ -515,12 +515,12 @@ provider_tool_fragment_by_item :: proc(object: json.Object, state: ^Provider_Str
 
 @(require_results)
 openai_responses_call_slot :: proc(object, item: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
-	if id, present, ok := openai_value_string(item, "id"); ok && present && id != "" {
+	if id, present, ok := provider_json_string(item, "id"); ok && present && id != "" {
 		for &fragment in state.Tool_Fragments {
 			if fragment.Present && fragment.Item_ID == id { return &fragment, .None }
 		}
 	}
-	if index, present, ok := openai_value_integer(object, "output_index"); ok && present {
+	if index, present, ok := provider_json_integer(object, "output_index"); ok && present {
 		for &fragment in state.Tool_Fragments {
 			if fragment.Present && fragment.Wire_Index == index { return &fragment, .None }
 		}
@@ -548,7 +548,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 		item = added_item
 	}
 	if item != nil {
-		item_type, type_present, type_ok := openai_value_string(item, "type")
+		item_type, type_present, type_ok := provider_json_string(item, "type")
 		if !type_ok || !type_present { return provider_stream_fail(state, .Invalid_Data, "output item has no type") }
 		if item_type == "message" { return .None }
 		if item_type == "reasoning" {
@@ -557,9 +557,9 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 			// endpoint needs id plus encrypted_content back to continue
 			// reasoning; summaries are display-only and are not replayed.
 			if !done { return .None }
-			id, id_present, id_ok := openai_value_string(item, "id")
+			id, id_present, id_ok := provider_json_string(item, "id")
 			if !id_ok || !id_present || id == "" { return provider_stream_fail(state, .Invalid_Data, "reasoning item has no id") }
-			encrypted, _, encrypted_ok := openai_value_string(item, "encrypted_content")
+			encrypted, _, encrypted_ok := provider_json_string(item, "encrypted_content")
 			if !encrypted_ok { return provider_stream_fail(state, .Invalid_Data, "reasoning content is invalid") }
 			owned_id, id_error := strings.clone(id, state.Allocator)
 			if id_error != nil {
@@ -578,7 +578,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 		if item_type != "function_call" {
 			return provider_stream_fail(state, .Unsupported_Tool_Output, "Responses tool output is unsupported", .None)
 		}
-		if id, present, ok := openai_value_string(item, "id"); ok && present && id != "" {
+		if id, present, ok := provider_json_string(item, "id"); ok && present && id != "" {
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
 			if fragment.Item_ID == "" {
 				owned, clone_error := strings.clone(id, state.Allocator)
@@ -588,7 +588,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 				fragment.Item_ID = owned
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "output item id is invalid") }
-		if id, present, ok := openai_value_string(item, "call_id"); ok && present && id != "" {
+		if id, present, ok := provider_json_string(item, "call_id"); ok && present && id != "" {
 			if fragment.ID != "" && fragment.ID != id { return provider_stream_fail(state, .Invalid_Data, "call id changed") }
 			if fragment.ID == "" {
 				owned, clone_error := strings.clone(id, state.Allocator)
@@ -598,7 +598,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 				fragment.ID = owned
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call id is invalid") }
-		if name, present, ok := openai_value_string(item, "name"); ok && present && name != "" {
+		if name, present, ok := provider_json_string(item, "name"); ok && present && name != "" {
 			if fragment.Name != "" && fragment.Name != name { return provider_stream_fail(state, .Invalid_Data, "call name changed") }
 			if fragment.Name == "" {
 				owned, clone_error := strings.clone(name, state.Allocator)
@@ -608,7 +608,7 @@ openai_responses_call_event :: proc(object: json.Object, state: ^Provider_Stream
 				fragment.Name = owned
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "call name is invalid") }
-		if arguments, present, ok := openai_value_string(item, "arguments"); ok && present && arguments != "" {
+		if arguments, present, ok := provider_json_string(item, "arguments"); ok && present && arguments != "" {
 			// The done item repeats the full arguments already streamed
 			// as deltas; replace so a replayed payload is not doubled.
 			clear(&fragment.Arguments)
@@ -682,7 +682,7 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 			if _, is_null := raw_details.(json.Null); !is_null {
 				details, details_ok := raw_details.(json.Object)
 				if !details_ok { return provider_stream_fail(state, .Invalid_Data, "incomplete details are invalid") }
-				detail_reason, _, reason_ok := openai_value_string(details, "reason")
+				detail_reason, _, reason_ok := provider_json_string(details, "reason")
 				if !reason_ok { return provider_stream_fail(state, .Invalid_Data, "incomplete details are invalid") }
 				if detail_reason != "" { reason = detail_reason }
 			}
@@ -702,18 +702,18 @@ openai_responses_terminal :: proc(event_type: string, object: json.Object, state
 			if _, is_null := raw_error.(json.Null); !is_null {
 				error_object, error_ok := raw_error.(json.Object)
 				if !error_ok { return provider_stream_fail(state, .Invalid_Data, "response error is invalid") }
-				error_message, _, message_ok := openai_value_string(error_object, "message")
-				error_code, _, code_ok := openai_value_string(error_object, "code")
+				error_message, _, message_ok := provider_json_string(error_object, "message")
+				error_code, _, code_ok := provider_json_string(error_object, "code")
 				if !message_ok || !code_ok { return provider_stream_fail(state, .Invalid_Data, "response error is invalid") }
 				if error_message != "" { message = error_message }
 				error_type := ""
-				if value, type_present, valid := openai_value_string(error_object, "type"); valid && type_present { error_type = value }
+				if value, type_present, valid := provider_json_string(error_object, "type"); valid && type_present { error_type = value }
 				code = openai_error_class_code(error_code, error_type)
 			}
 		}
 		// A failed response may still carry usage. Deliver usage first, then
 		// the error; a malformed terminal payload yields the error alone.
-		failed_event, failed_event_error := openai_error_event(.API_Error, message, code, allocator = state.Allocator)
+		failed_event, failed_event_error := provider_error_event_make(.API_Error, message, code, allocator = state.Allocator)
 		if failed_event_error != nil {
 			return provider_stream_fail_allocation(state, "the provider error could not be retained")
 		}
@@ -761,12 +761,12 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		state.Phase = .Failed
 		return .None
 	}
-	event_type, type_present, type_ok := openai_value_string(object, "type")
+	event_type, type_present, type_ok := provider_json_string(object, "type")
 	if !type_ok || !type_present || event_type == "" { return provider_stream_fail(state, .Invalid_Data, "stream event has no type") }
 	switch event_type {
 	case "response.output_text.delta", "response.refusal.delta":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
-		delta, delta_present, delta_ok := openai_value_string(object, "delta")
+		delta, delta_present, delta_ok := provider_json_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "delta is not text") }
 		if delta_present && delta != "" {
 			owned, clone_error := strings.clone(delta, state.Allocator)
@@ -783,12 +783,12 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
 		return openai_responses_call_event(object, state, true)
 	case "error":
-		message, _, message_ok := openai_value_string(object, "message")
+		message, _, message_ok := provider_json_string(object, "message")
 		if !message_ok { return provider_stream_fail(state, .Invalid_Data, "error message is invalid") }
 		if message == "" { message = "provider returned an API error" }
-		code, _, code_ok := openai_value_string(object, "code")
+		code, _, code_ok := provider_json_string(object, "code")
 		if !code_ok { return provider_stream_fail(state, .Invalid_Data, "error code is invalid") }
-		error_event, error_event_error := openai_error_event(.API_Error, message, code, allocator = state.Allocator)
+		error_event, error_event_error := provider_error_event_make(.API_Error, message, code, allocator = state.Allocator)
 		if error_event_error != nil {
 			return provider_stream_fail_allocation(state, "the provider error could not be retained")
 		}
@@ -800,7 +800,7 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
 		fragment, slot_error := provider_tool_fragment_by_item(object, state)
 		if slot_error != .None { return slot_error }
-		if id, present, ok := openai_value_string(object, "item_id"); ok && present && id != "" {
+		if id, present, ok := provider_json_string(object, "item_id"); ok && present && id != "" {
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
 			if fragment.Item_ID == "" {
 				owned, clone_error := strings.clone(id, state.Allocator)
@@ -810,7 +810,7 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 				fragment.Item_ID = owned
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
-		delta, delta_present, delta_ok := openai_value_string(object, "delta")
+		delta, delta_present, delta_ok := provider_json_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "arguments delta is not text") }
 		if delta_present && delta != "" {
 			if _, append_error := append(&fragment.Arguments, delta); append_error != nil {
@@ -823,7 +823,7 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
 		fragment, slot_error := provider_tool_fragment_by_item(object, state)
 		if slot_error != .None { return slot_error }
-		if id, present, ok := openai_value_string(object, "item_id"); ok && present && id != "" {
+		if id, present, ok := provider_json_string(object, "item_id"); ok && present && id != "" {
 			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
 			if fragment.Item_ID == "" {
 				owned, clone_error := strings.clone(id, state.Allocator)
@@ -833,7 +833,7 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 				fragment.Item_ID = owned
 			}
 		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
-		if arguments, present, ok := openai_value_string(object, "arguments"); ok && present && arguments != "" {
+		if arguments, present, ok := provider_json_string(object, "arguments"); ok && present && arguments != "" {
 			// The done event repeats full arguments; replace the
 			// accumulated bytes so a replayed prefix is not doubled.
 			clear(&fragment.Arguments)

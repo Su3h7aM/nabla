@@ -663,7 +663,7 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 			state.response_head.retry_after = provider_retry_after(value)
 		}
 	}
-	state.response_head.retry_directive = provider_retry_directive(state.api, headers)
+	state.response_head.retry_directive = provider_retry_directive(headers)
 }
 
 // provider_record_delivery states whether this attempt may have put model input in
@@ -889,7 +889,7 @@ provider_emit_error :: proc(state: ^Provider_Request_Stream_State, kind: Provide
 	}
 	state.failed = true
 	if state.failure_event == nil { state.failure_event = failure_kind }
-	event, event_error := openai_error_event(failure_kind, failure_detail, allocator = state.allocator)
+	event, event_error := provider_error_event_make(failure_kind, failure_detail, allocator = state.allocator)
 	if event_error != nil {
 		// The wording could not be retained. The kind still names the failure, and the
 		// terminal error carries no detail rather than a fabricated one.
