@@ -690,8 +690,9 @@ acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result
 		case .Response:
 			answered, is_number := envelope.id.(i64)
 			if !is_number || answered != id { continue }
-			if envelope.error_present {
-				return fmt.tprintf("the agent refused %s: %s", method, envelope.rpc_error.message)
+			if envelope.rpc_error != nil {
+				rpc_error := envelope.rpc_error.?
+				return fmt.tprintf("the agent refused %s: %s", method, rpc_error.message)
 			}
 			if _, is_null := envelope.result.(json.Null); is_null { return "" }
 			switch acp.params_decode(envelope.result, result, context.temp_allocator) {

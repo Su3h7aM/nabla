@@ -13,7 +13,7 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 	request, request_err := parse_envelope("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"prompt\",\"params\":{}}")
 	testing.expect_value(t, request_err, Envelope_Error.None)
 	testing.expect_value(t, request.kind, Envelope_Kind.Request)
-	testing.expect(t, request.id_present)
+	testing.expect(t, request.id != nil)
 	destroy_envelope(&request)
 
 	notification, notification_err := parse_envelope("{\"jsonrpc\":\"2.0\",\"method\":\"cancel\"}")
@@ -24,12 +24,12 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 	response, response_err := parse_envelope("{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}")
 	testing.expect_value(t, response_err, Envelope_Error.None)
 	testing.expect_value(t, response.kind, Envelope_Kind.Response)
-	testing.expect(t, response.result_present)
+	testing.expect(t, response.result != nil)
 	destroy_envelope(&response)
 
 	null_request, null_request_err := parse_envelope("{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}")
 	testing.expect_value(t, null_request_err, Envelope_Error.None)
-	testing.expect(t, null_request.id_present)
+	testing.expect(t, null_request.id != nil)
 	destroy_envelope(&null_request)
 
 	// Malformed envelopes are classified rather than accepted.
