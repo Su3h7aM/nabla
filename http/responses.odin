@@ -172,18 +172,12 @@ respond_json :: proc(
 	return
 }
 
-/*
-Prefer the procedure group `respond`.
-*/
 respond_with_none :: proc(response: ^Response, loc := #caller_location) {
 	assert_on_server_thread(loc)
 
 	response_send(response, response._conn, loc)
 }
 
-/*
-Prefer the procedure group `respond`.
-*/
 respond_with_status :: proc(response: ^Response, status: Status, loc := #caller_location) {
 	response_status(response, status)
 	respond(response, loc)

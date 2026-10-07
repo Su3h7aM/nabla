@@ -407,7 +407,6 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 		return
 	}
 
-	// Accept next connection.
 	current_thread.accept = nbio.accept_poly(server.tcp_socket, server, on_accept)
 
 	connection, alloc_error := new(Connection, server.connection_allocator)

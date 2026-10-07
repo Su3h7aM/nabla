@@ -36,20 +36,13 @@ response_init :: proc(response: ^Response, allocator := context.allocator) {
 	headers_init(&response.headers, allocator)
 }
 
-/*
-Prefer the procedure group `body_set`.
-*/
 body_set_bytes :: proc(response: ^Response, content: []byte, loc := #caller_location) {
 	assert(bytes.buffer_length(&response._buf) == 0, "the response body has already been written", loc)
 	_response_write_heading(response, len(content))
 	bytes.buffer_write(&response._buf, content)
 }
 
-/*
-Prefer the procedure group `body_set`.
-*/
 body_set_str :: proc(response: ^Response, content: string, loc := #caller_location) {
-	// This is safe because we don't write to the bytes.
 	body_set_bytes(response, transmute([]byte)content, loc)
 }
 
