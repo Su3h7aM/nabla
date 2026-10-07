@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:hash"
 import "core:mem"
 import "core:mem/virtual"
-import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:time"
@@ -76,7 +75,7 @@ provider_models_cached :: proc(providers: []Catalog_Provider_Source, allocator :
 	for provider in providers {
 		path, path_ok := provider_models_cache_path(provider, allocator)
 		if !path_ok { continue }
-		body, cached := provider_models_cache_read(path, allocator)
+		body, cached := fetch_cache_read(path, allocator)
 		delete(path, allocator)
 		if !cached { continue }
 		models, listed := provider_models_list(body, allocator)
@@ -139,11 +138,11 @@ provider_models_refresh_at :: proc(
 		path, path_ok := provider_models_cache_path(provider, allocator)
 		body: []u8
 		cached := false
-		if path_ok { body, cached = provider_models_cache_read(path, allocator) }
+		if path_ok { body, cached = fetch_cache_read(path, allocator) }
 		cached_models: []Catalog_Model_Source
 		cache_valid := false
 		if cached { cached_models, cache_valid = provider_models_list(body, allocator) }
-		fresh := path_ok && cache_valid && provider_models_cache_fresh(path, now)
+		fresh := path_ok && cache_valid && fetch_cache_fresh(path, now, PROVIDER_MODELS_FRESH)
 		if fresh {
 			added := provider_sources_add(&result, provider.id, cached_models, allocator)
 			delete(body, allocator)
@@ -164,7 +163,7 @@ provider_models_refresh_at :: proc(
 					models, listed := provider_models_list(acquired, allocator)
 					if listed {
 						// Caching is best effort: the listing in hand is what answers.
-						if path_ok { _ = provider_models_cache_write(path, acquired) }
+						if path_ok { _ = fetch_cache_write(path, acquired) }
 						added := provider_sources_add(&result, provider.id, models, allocator)
 						catalog_model_sources_destroy(cached_models, allocator)
 						delete(body, allocator)
@@ -207,34 +206,6 @@ provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator:
 	name := fmt.aprintf("%s-%016x.json", PROVIDER_MODELS_CACHE_PREFIX, key, allocator = context.temp_allocator)
 	path, join_err := filepath.join([]string{directory, name}, allocator)
 	return path, join_err == nil
-}
-
-@(require_results)
-provider_models_cache_fresh :: proc(path: string, now: time.Time) -> bool {
-	modified, err := os.modification_time_by_path(path)
-	if err != nil { return false }
-	age := time.diff(modified, now)
-	return age >= 0 && age < PROVIDER_MODELS_FRESH
-}
-
-@(require_results)
-provider_models_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
-	body, read_err := os.read_entire_file(path, allocator)
-	if read_err == nil && len(body) > 0 { return body, true }
-	if body != nil { delete(body, allocator) }
-	return nil, false
-}
-
-@(require_results)
-provider_models_cache_write :: proc(path: string, body: []u8) -> bool {
-	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
-	if os.write_entire_file(temporary, body) != nil { return false }
-	if os.rename(temporary, path) != nil {
-		// A temporary file that cannot be removed is left behind; only the cache matters.
-		_ = os.remove(temporary)
-		return false
-	}
-	return true
 }
 
 // provider_models_list reads a listing into model sources that state identity

@@ -187,7 +187,7 @@ test_provider_discovery_replaces_a_stale_listing_with_an_empty_listing :: proc(t
 		testing.expect_value(t, len(refreshed), 1)
 		testing.expect_value(t, len(refreshed[0].models), 0)
 
-		cached, cached_ok := provider_models_cache_read(path, context.temp_allocator)
+		cached, cached_ok := fetch_cache_read(path, context.temp_allocator)
 		testing.expect(t, cached_ok)
 		testing.expect_value(t, string(cached), `{"data":[]}`)
 	})

@@ -98,7 +98,7 @@ test_models_dev_cache_write_is_atomic :: proc(t: ^testing.T) {
 	path := fmt.tprintf("%s/catalog.json", root)
 
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("old")) == nil)
-	testing.expect(t, models_dev_cache_write(path, transmute([]u8)string("new")))
+	testing.expect(t, fetch_cache_write(path, transmute([]u8)string("new")))
 	body, read_err := os.read_entire_file(path, context.temp_allocator)
 	testing.expect(t, read_err == nil)
 	testing.expect_value(t, string(body), "new")
@@ -109,14 +109,14 @@ test_models_dev_cache_write_is_atomic :: proc(t: ^testing.T) {
 
 	// A write that cannot happen publishes nothing at all.
 	missing := fmt.tprintf("%s/absent/catalog.json", root)
-	testing.expect(t, !models_dev_cache_write(missing, transmute([]u8)string("new")))
+	testing.expect(t, !fetch_cache_write(missing, transmute([]u8)string("new")))
 	testing.expect(t, !os.exists(missing))
 
 	// A path whose parent is a file fails at the temporary write, leaving the
 	// original cache readable.
 	blocking := fmt.tprintf("%s/blocking", root)
 	testing.expect(t, os.write_entire_file(blocking, transmute([]u8)string("file")) == nil)
-	testing.expect(t, !models_dev_cache_write(fmt.tprintf("%s/catalog.json", blocking), transmute([]u8)string("new")))
+	testing.expect(t, !fetch_cache_write(fmt.tprintf("%s/catalog.json", blocking), transmute([]u8)string("new")))
 	still, still_err := os.read_entire_file(path, context.temp_allocator)
 	testing.expect(t, still_err == nil)
 	testing.expect_value(t, string(still), "new")
@@ -286,18 +286,18 @@ test_models_dev_cache_read_refuses_missing_and_empty_files :: proc(t: ^testing.T
 	_ = os.make_directory_all(root)
 	path := fmt.tprintf("%s/catalog.json", root)
 
-	_, missing_ok := models_dev_cache_read(path, context.temp_allocator)
+	_, missing_ok := fetch_cache_read(path, context.temp_allocator)
 	testing.expect(t, !missing_ok)
 
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("{}")) == nil)
-	body, ok := models_dev_cache_read(path, context.temp_allocator)
+	body, ok := fetch_cache_read(path, context.temp_allocator)
 	testing.expect(t, ok)
 	testing.expect_value(t, string(body), "{}")
 	defer delete(body, context.temp_allocator)
 
 	// An empty file is not a catalog.
 	testing.expect(t, os.write_entire_file(path, transmute([]u8)string("")) == nil)
-	_, empty_ok := models_dev_cache_read(path, context.temp_allocator)
+	_, empty_ok := fetch_cache_read(path, context.temp_allocator)
 	testing.expect(t, !empty_ok)
 
 	// A catalog larger than any harness bound is still a catalog: its size is
@@ -305,7 +305,7 @@ test_models_dev_cache_read_refuses_missing_and_empty_files :: proc(t: ^testing.T
 	large := make([]u8, 33 * mem.Megabyte)
 	defer delete(large)
 	testing.expect(t, os.write_entire_file(path, large) == nil)
-	big, big_ok := models_dev_cache_read(path, context.temp_allocator)
+	big, big_ok := fetch_cache_read(path, context.temp_allocator)
 	testing.expect(t, big_ok)
 	testing.expect_value(t, len(big), len(large))
 	delete(big, context.temp_allocator)

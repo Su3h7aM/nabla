@@ -1,6 +1,8 @@
 package agent
 
+import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:sync"
 import "core:time"
 import "nabla:ai"
@@ -63,4 +65,41 @@ fetch_get :: proc(request: client.Request, timeout: time.Duration, cancel: ^bool
 		return nil, false
 	}
 	return fetch_body_finish(&body, allocator)
+}
+
+// fetch_cache_fresh reports whether the cached file at path is younger than max_age. A
+// missing file, an unreadable timestamp, and a timestamp ahead of the clock are all stale, so
+// a damaged cache is replaced rather than trusted.
+@(require_results)
+fetch_cache_fresh :: proc(path: string, now: time.Time, max_age: time.Duration) -> bool {
+	modified, err := os.modification_time_by_path(path)
+	if err != nil { return false }
+	age := time.diff(modified, now)
+	return age >= 0 && age < max_age
+}
+
+// fetch_cache_read returns a cached body when one is present and not empty. The result is
+// owned by the caller.
+@(require_results)
+fetch_cache_read :: proc(path: string, allocator: mem.Allocator) -> ([]u8, bool) {
+	body, read_err := os.read_entire_file(path, allocator)
+	if read_err == nil && len(body) > 0 { return body, true }
+	if body != nil { delete(body, allocator) }
+	return nil, false
+}
+
+// fetch_cache_write publishes body through a temporary file in the same directory and renames
+// it into place, so the visible cache is always complete and a write that fails or is
+// interrupted leaves the previous one untouched. The temporary name carries the process id,
+// so two concurrent refreshes cannot write to the same file; the rename is what publishes.
+@(require_results)
+fetch_cache_write :: proc(path: string, body: []u8) -> bool {
+	temporary := fmt.tprintf("%s.%d.tmp", path, os.get_pid())
+	if os.write_entire_file(temporary, body) != nil { return false }
+	if os.rename(temporary, path) != nil {
+		// A temporary file that cannot be removed is left behind; only the cache matters.
+		_ = os.remove(temporary)
+		return false
+	}
+	return true
 }
