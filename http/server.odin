@@ -134,12 +134,12 @@ serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 	threads, threads_err := make([]Server_Thread, thread_count, server.connection_allocator)
 	if threads_err != nil { return threads_err }
 	sync.wait_group_add(&server.threads_closed, thread_count)
-	sync.mutex_lock(&server.threads_mutex)
-	server.threads = threads
-	for &server_thread in server.threads[1:] {
-		server_thread.thread = thread.create_and_start_with_poly_data2(server, &server_thread, _server_thread_init, context)
+	if sync.mutex_guard(&server.threads_mutex) {
+		server.threads = threads
+		for &server_thread in server.threads[1:] {
+			server_thread.thread = thread.create_and_start_with_poly_data2(server, &server_thread, _server_thread_init, context)
+		}
 	}
-	sync.mutex_unlock(&server.threads_mutex)
 
 	_server_thread_init(server, &server.threads[0])
 
@@ -148,8 +148,7 @@ serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 	// A failed shutdown changes nothing: the socket closes on the next line.
 	_ = net.shutdown(server.tcp_socket, .Both)
 	net.close(server.tcp_socket)
-	sync.mutex_lock(&server.threads_mutex)
-	defer sync.mutex_unlock(&server.threads_mutex)
+	sync.mutex_guard(&server.threads_mutex)
 	for server_thread in server.threads[1:] { thread.destroy(server_thread.thread) }
 	delete(server.threads, server.connection_allocator)
 	server.threads = nil
@@ -180,9 +179,9 @@ _server_thread_init :: proc(server: ^Server, server_thread: ^Server_Thread) {
 		}
 	}
 	current_thread.connections = make(map[net.TCP_Socket]^Connection)
-	sync.mutex_lock(&server.threads_mutex)
-	current_thread.event_loop = nbio.current_thread_event_loop()
-	sync.mutex_unlock(&server.threads_mutex)
+	if sync.mutex_guard(&server.threads_mutex) {
+		current_thread.event_loop = nbio.current_thread_event_loop()
+	}
 
 	current_thread.accept = nbio.accept_poly(server.tcp_socket, server, on_accept)
 	if current_thread == &server.threads[0] && server.interrupt_read != nil {
@@ -254,9 +253,9 @@ _server_thread_shutdown :: proc(server: ^Server, loc := #caller_location) {
 	if err := nbio.run(); err != nil {
 		log.errorf("non-blocking io error while draining: %v", err)
 	}
-	sync.mutex_lock(&server.threads_mutex)
-	current_thread.event_loop = nil
-	sync.mutex_unlock(&server.threads_mutex)
+	if sync.mutex_guard(&server.threads_mutex) {
+		current_thread.event_loop = nil
+	}
 	nbio.release_thread_event_loop()
 	current_thread.state = .Closed
 }
