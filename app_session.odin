@@ -373,8 +373,13 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 	filter := journal.Session_Filter {
 		limit = 1,
 	}
-	switch start.kind {
-	case .New:
+	// A launch that asks for nothing starts fresh, so the zero value opens a new session.
+	requested := start
+	if requested == nil { requested = Start_Fresh{} }
+	resume_latest := false
+	resume_id := ""
+	switch id in requested {
+	case Start_Fresh:
 		opened.id = journal.session_id_create()
 		workspace, workspace_error := strings.clone(launch_workspace, allocator)
 		if workspace_error != nil {
@@ -383,23 +388,25 @@ session_open :: proc(setup: ^Run_Setup, start: Session_Start, launch_workspace: 
 		opened.workspace = workspace
 		opened.branch = journal.INITIAL_BRANCH
 		return opened, "", true
-	case .Resume_Latest:
+	case Start_Resume_Latest:
 		filter.workspace = launch_workspace
 		filter.role = .Main
-	case .Resume_Id:
-		id, valid := journal.session_id_parse(start.id)
-		if !valid || id == {} { return opened, fmt.aprintf("%s is not a session id", start.id, allocator = allocator), false }
-		filter.session = id
+		resume_latest = true
+	case Start_Resume_Id:
+		resume_id = string(id)
+		parsed, valid := journal.session_id_parse(resume_id)
+		if !valid || parsed == {} { return opened, fmt.aprintf("%s is not a session id", resume_id, allocator = allocator), false }
+		filter.session = parsed
 	}
 
 	summaries, list_error := journal.list_sessions(opened.store, filter, allocator)
 	if list_error != nil { return opened, session_error_message("cannot list sessions", list_error, allocator), false }
 	defer journal.session_summaries_destroy(summaries, allocator)
 	if len(summaries) == 0 {
-		if start.kind == .Resume_Latest {
+		if resume_latest {
 			return opened, fmt.aprintf("no session has run in %s; nothing to resume", launch_workspace, allocator = allocator), false
 		}
-		return opened, fmt.aprintf("session %s does not exist", start.id, allocator = allocator), false
+		return opened, fmt.aprintf("session %s does not exist", resume_id, allocator = allocator), false
 	}
 	summary := &summaries[0]
 	// A session carries the directory it ran in, and an id can name one from
@@ -776,21 +783,26 @@ provider_configured :: proc(app: ^App, provider_id: string) -> bool {
 
 // pending_selection_clear releases whatever the intent holds and zeroes it, so it is
 // safe on an empty intent and on one whose strings a boundary already took.
-pending_selection_clear :: proc(pending: ^Pending_Selection, allocator: mem.Allocator) {
-	delete(pending.provider, allocator)
-	delete(pending.model, allocator)
-	pending^ = {}
+pending_selection_clear :: proc(pending: ^Maybe(Pending_Selection), allocator: mem.Allocator) {
+	if selected, ok := pending^.?; ok {
+		delete(selected.provider, allocator)
+		delete(selected.model, allocator)
+	}
+	pending^ = nil
 }
 
-pending_target_clear :: proc(pending: ^Pending_Target, allocator: mem.Allocator) {
-	if pending.present { agent.model_selection_destroy(&pending.target, allocator) }
-	pending^ = {}
+pending_target_clear :: proc(pending: ^Maybe(Pending_Target), allocator: mem.Allocator) {
+	if fit, ok := pending^.?; ok {
+		live := fit
+		agent.model_selection_destroy(&live.target, allocator)
+	}
+	pending^ = nil
 }
 
 selection_intent_clear :: proc(app: ^App) {
 	sync.mutex_lock(&app.run.mu)
 	pending := app.run.pending
-	app.run.pending = {}
+	app.run.pending = nil
 	sync.mutex_unlock(&app.run.mu)
 	pending_selection_clear(&pending, app.run.alloc)
 	pending_target_clear(&app.run.pending_target, app.run.alloc)
@@ -817,7 +829,6 @@ selection_request :: proc(app: ^App, provider_id, model_id: string) {
 	sync.mutex_lock(&app.run.mu)
 	previous := app.run.pending
 	app.run.pending = Pending_Selection {
-		present  = true,
 		provider = provider,
 		model    = model,
 	}
@@ -833,18 +844,18 @@ app_selection_service :: proc(app: ^App) -> bool {
 	if runtime_stopping(app) { return false }
 	sync.mutex_lock(&app.run.mu)
 	newer := app.run.pending
-	app.run.pending = {}
+	app.run.pending = nil
 	sync.mutex_unlock(&app.run.mu)
-	if newer.present {
+	if selected, newer_ok := newer.?; newer_ok {
 		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		defer pending_selection_clear(&newer, app.run.alloc)
 		if app.setup.session.state == .Idle {
 			if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
 		}
-		target, problem := selection_target_resolve(app, newer.provider, newer.model, app.run.alloc)
+		target, problem := selection_target_resolve(app, selected.provider, selected.model, app.run.alloc)
 		defer if problem != "" { delete(problem, context.temp_allocator) }
 		sync.mutex_lock(&app.run.mu)
-		superseded := app.run.pending.present
+		superseded := app.run.pending != nil
 		sync.mutex_unlock(&app.run.mu)
 		if superseded {
 			agent.model_selection_destroy(&target, app.run.alloc)
@@ -855,12 +866,11 @@ app_selection_service :: proc(app: ^App) -> bool {
 			return false
 		}
 		app.run.pending_target = Pending_Target {
-			present = true,
-			target  = target,
+			target = target,
 		}
 	}
-	pending := &app.run.pending_target
-	if !pending.present { return false }
+	if app.run.pending_target == nil { return false }
+	pending := &app.run.pending_target.?
 
 	status, problem, gate_error := agent.chat_selection_check(
 		&app.setup.session,
@@ -874,21 +884,21 @@ app_selection_service :: proc(app: ^App) -> bool {
 		detail := journal.error_text(gate_error, context.temp_allocator)
 		app.setup.session.storage_failed = true
 		selection_fail(app, fmt.tprintf("the model switch could not be recorded: %s", detail))
-		pending_target_clear(pending, app.run.alloc)
+		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		return false
 	}
 	// A newer UI request may arrive while the gate commits or advances compaction.
 	sync.mutex_lock(&app.run.mu)
-	superseded := app.run.pending.present
+	superseded := app.run.pending != nil
 	sync.mutex_unlock(&app.run.mu)
 	if superseded {
-		pending_target_clear(pending, app.run.alloc)
+		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		return false
 	}
 	switch status {
 	case .Ready:
 		installed := selection_install(app, pending.target, "", true)
-		pending_target_clear(pending, app.run.alloc)
+		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		return installed
 	case .Pending:
 		if !pending.announced {
@@ -898,7 +908,7 @@ app_selection_service :: proc(app: ^App) -> bool {
 	case .Refused:
 		if problem == "" { problem = "the requested model does not fit the active conversation" }
 		selection_fail(app, problem)
-		pending_target_clear(pending, app.run.alloc)
+		pending_target_clear(&app.run.pending_target, app.run.alloc)
 	}
 	return false
 }

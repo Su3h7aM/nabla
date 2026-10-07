@@ -72,7 +72,7 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 			// While subagents run, the worker waits on the wake instead of the queue, because
 			// their reports arrive through the wake.
 			agents_pending := app.setup.session.store != nil && agent.chat_agents_pending(&app.setup.session)
-			if app_compaction_pending(app) || app.run.pending_target.present || agents_pending {
+			if app_compaction_pending(app) || app.run.pending_target != nil || agents_pending {
 				if app_compaction_tick(app, observer) { refresh_status(app) }
 				if app_selection_service(app) { refresh_status(app) }
 				free_all(context.temp_allocator)
@@ -318,7 +318,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 		defer delete(provider, app.run.alloc)
 		defer delete(model, app.run.alloc)
-		if session_switch(app, {kind = .New}) {
+		if session_switch(app, Start_Fresh{}) {
 			snapshot_clear(app)
 			snap_append(app, .Notice, "started a new session")
 			// The new session keeps the same selection; a failure is already in the
@@ -572,7 +572,7 @@ session_resume :: proc(app: ^App, reference: string) {
 		return
 	}
 	matched_text := string(matched[:])
-	if !session_switch(app, {kind = .Resume_Id, id = matched_text}) { return }
+	if !session_switch(app, Start_Resume_Id(matched_text)) { return }
 	snapshot_clear(app)
 	snap_append(app, .Notice, fmt.tprintf("resumed session %s", matched_text))
 	session_replay(app, &app.setup.session)
@@ -604,7 +604,11 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	if recovery.calls > 0 {
 		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never reported a result; their results say whether they ran", recovery.calls))
 	}
-	if start.kind == .New { return true }
+	switch _ in start {
+	case Start_Fresh, nil:
+		return true
+	case Start_Resume_Latest, Start_Resume_Id:
+	}
 
 	// A conversation has to be configured before it can run: the new chat starts with no
 	// model, so the session's recorded one is applied, with the selection already in
@@ -720,27 +724,28 @@ refresh_status :: proc(app: ^App) {
 	// The footer shows the session's token-weighted hit rate beside the estimate.
 	// Keep the SQLite query outside the lock so readers can still read status.
 	if totals_error != nil {
-		status.session_input_present = false
-		status.session_cache_present = false
+		status.session_input = nil
+		status.session_cache_read = nil
 		status.session_hit_measured = false
 		status.session_hit_partial = false
-		status.cost_present = false
+		status.cost = nil
 		status.cost_partial = false
 	} else {
 		if totals.requests > 0 {
 			status.session_input = totals.input
-			status.session_input_present = true
 		} else {
-			status.session_input_present = false
+			status.session_input = nil
 		}
 		if totals.paired_requests > 0 {
 			status.session_cache_read = totals.cache_read
-			status.session_cache_present = true
 		} else {
-			status.session_cache_present = false
+			status.session_cache_read = nil
 		}
-		status.cost = totals.cost
-		status.cost_present = totals.priced_requests > 0
+		if totals.priced_requests > 0 {
+			status.cost = totals.cost
+		} else {
+			status.cost = nil
+		}
 		status.cost_partial = totals.priced_requests < totals.requests
 		rate, measured := journal.cache_hit_rate(totals)
 		status.session_hit_rate = rate
@@ -1098,7 +1103,6 @@ observer_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usa
 	status := &app.run.snap.status
 	if usage.Input_Tokens_Present {
 		status.last_input = usage.Input_Tokens
-		status.last_input_present = true
 	}
 	// Session totals, the priced cost among them, are recomputed at work
 	// boundaries, not per stream event, so this only records the latest request's

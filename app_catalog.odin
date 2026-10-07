@@ -205,9 +205,9 @@ catalog_selection_sync :: proc(app: ^App) {
 	revision := sync.atomic_load(&app.catalog_revision)
 	if revision == app.run.catalog_applied_revision { return }
 	sync.mutex_lock(&app.run.mu)
-	explicit_pending := app.run.pending.present
+	explicit_pending := app.run.pending != nil
 	sync.mutex_unlock(&app.run.mu)
-	if explicit_pending || app.run.pending_target.present { return }
+	if explicit_pending || app.run.pending_target != nil { return }
 	if app.setup.provider_id == "" || app.setup.model_id == "" {
 		app.run.catalog_applied_revision = revision
 		return

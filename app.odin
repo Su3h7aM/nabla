@@ -64,39 +64,35 @@ Entry :: struct {
 // display copies replaced under the runtime mutex. A usage bucket the provider never
 // reported reads as unknown rather than zero.
 Status :: struct {
-	provider_id:           string,
-	model_id:              string, // owned,
-	effort:                string, // owned,
-	effort_levels:         [dynamic]string, // owned; the levels the model allows,
-	cwd:                   string,
-	context_window:        int,
-	est_input:             int,
-	last_input:            i64,
-	last_input_present:    bool,
-	cost:                  f64,
-	cost_present:          bool,
+	provider_id:          string,
+	model_id:             string, // owned,
+	effort:               string, // owned,
+	effort_levels:        [dynamic]string, // owned; the levels the model allows,
+	cwd:                  string,
+	context_window:       int,
+	est_input:            int,
+	last_input:           Maybe(i64),
+	cost:                 Maybe(f64),
 	// cost_partial says the total prices only part of the session's responses,
 	// because some committed responses named a model the catalog has no price for.
-	cost_partial:          bool,
-	session_input:         i64,
-	session_input_present: bool,
-	session_cache_read:    i64,
-	session_cache_present: bool,
-	session_hit_rate:      f64,
-	session_hit_measured:  bool,
+	cost_partial:         bool,
+	session_input:        Maybe(i64),
+	session_cache_read:   Maybe(i64),
+	session_hit_rate:     f64,
+	session_hit_measured: bool,
 	// session_hit_partial says the rate rests on part of the session's input,
 	// because some finished requests reported no cache usage.
-	session_hit_partial:   bool,
-	running:               bool,
+	session_hit_partial:  bool,
+	running:              bool,
 	// following says the session runs in another process: this front-end shows it and
 	// sends lines to it, and running then reports that process's turn.
-	following:             bool,
+	following:            bool,
 	// working_since spans the complete execution of one accepted prompt, across
 	// every provider request and tool call, until the session returns to idle.
-	working_since:         time.Tick,
+	working_since:        time.Tick,
 	// Whether the turn is waiting to resend a failed request. The next send clears it, and the
 	// worker clears it whenever the session stops running.
-	retry_present:         bool,
+	retry_present:        bool,
 }
 
 // TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps for
@@ -123,18 +119,22 @@ snapshot_transcript_own :: proc(app: ^App) {
 // copies failed, and the launch stops rather than show a status that names nothing.
 @(require_results)
 snapshot_status_start :: proc(app: ^App) -> bool {
+	ok := false
 	provider_id, provider_error := strings.clone(app.setup.provider_id, app.run.alloc)
 	model_id, model_error := strings.clone(app.setup.model_id, app.run.alloc)
 	workspace, workspace_error := strings.clone(app.setup.workspace, app.run.alloc)
-	if provider_error != nil || model_error != nil || workspace_error != nil {
+	defer if !ok {
 		delete(provider_id, app.run.alloc)
 		delete(model_id, app.run.alloc)
 		delete(workspace, app.run.alloc)
+	}
+	if provider_error != nil || model_error != nil || workspace_error != nil {
 		return false
 	}
 	app.run.snap.status.provider_id = provider_id
 	app.run.snap.status.model_id = model_id
 	app.run.snap.status.cwd = workspace
+	ok = true
 	return true
 }
 
@@ -275,13 +275,11 @@ Session_Row :: struct {
 // boundary, so a change made while a response streams reaches the next request of that
 // same turn rather than waiting for the turn to end.
 Pending_Selection :: struct {
-	present:  bool,
 	provider: string, // owned by the runtime allocator,
 	model:    string, // owned by the runtime allocator,
 }
 
 Pending_Target :: struct {
-	present:    bool,
 	target:     agent.Model_Selection, // owned by the runtime allocator,
 	transition: agent.Selection_Transition,
 	announced:  bool,
@@ -305,11 +303,11 @@ Runtime :: struct {
 	// pending is the selection change waiting for a request boundary. It is written
 	// by the front-end and consumed by the worker, so it is guarded by mu like the
 	// snapshot the same boundary is published into.
-	pending:                  Pending_Selection,
+	pending:                  Maybe(Pending_Selection),
 	// compact_pending crosses queue and turn boundaries until the owner consumes it.
 	compact_pending:          bool,
 	// pending_target is owner-thread state retained while the target model is being fit.
-	pending_target:           Pending_Target,
+	pending_target:           Maybe(Pending_Target),
 	// steer carries lines typed while a turn is running. The front-end pushes
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
@@ -344,25 +342,22 @@ runtime_stopping :: proc(app: ^App) -> bool {
 // Run_Setup is the resolved runtime the app starts from: the catalog, the
 // selected provider/model, the connection, the session store, and the running
 // session the worker drives.
-// Session_Start_Kind is which session a launch opens.
-Session_Start_Kind :: enum {
-	// New starts a session in the launch directory. It is the zero value, so a
-	// launch that asks for nothing starts fresh. The session is recorded by its
-	// first prompt, so a launch that never gets one leaves no session behind.
-	New,
-	// Resume_Latest opens the newest session that ran and recorded work in the
-	// launch directory. A session that was created and then abandoned holds no
-	// work, so it is not a candidate.
-	Resume_Latest,
-	// Resume_Id opens one named session, wherever it ran.
-	Resume_Id,
-}
+// Start_Fresh starts a session in the launch directory. The session is recorded
+// by its first prompt, so a launch that never gets one leaves no session behind.
+Start_Fresh :: struct {}
+// Start_Resume_Latest opens the newest session that ran and recorded work in the
+// launch directory. A session that was created and then abandoned holds no
+// work, so it is not a candidate.
+Start_Resume_Latest :: struct {}
+// Start_Resume_Id opens one named session, wherever it ran. The id is borrowed.
+Start_Resume_Id :: distinct string
 
-// Session_Start is the session a launch asks for. id is borrowed and is read
-// only for .Resume_Id.
-Session_Start :: struct {
-	kind: Session_Start_Kind,
-	id:   string,
+// Session_Start is the session a launch asks for. The zero value (nil) starts
+// fresh, like Start_Fresh: a launch that asks for nothing starts a new session.
+Session_Start :: union {
+	Start_Fresh,
+	Start_Resume_Latest,
+	Start_Resume_Id,
 }
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {

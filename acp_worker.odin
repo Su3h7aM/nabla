@@ -587,15 +587,27 @@ acp_work_open_session :: proc(session: ^ACP_Session, work: ACP_Work) {
 			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
 			return
 		}
-	} else if work.start.kind != .Resume_Id {
-		v1_options, v1_options_ok = acp_model_config_options_v1(session)
-		if !v1_options_ok {
-			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
-			return
+	} else {
+		// A stored session brings its own model state; only a fresh session lists the
+		// catalog's, so the picker the client shows is never built from nothing.
+		switch _ in work.start {
+		case Start_Resume_Id:
+		case Start_Fresh, Start_Resume_Latest, nil:
+			v1_options, v1_options_ok = acp_model_config_options_v1(session)
+			if !v1_options_ok {
+				_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INTERNAL, "the model configuration could not be allocated")
+				return
+			}
 		}
 	}
 	models: acp.Models_State
-	if work.start.kind != .Resume_Id && !acp_is_v2(session.conn) {
+	resume_open := false
+	switch _ in work.start {
+	case Start_Resume_Id:
+		resume_open = true
+	case Start_Fresh, Start_Resume_Latest, nil:
+	}
+	if !resume_open && !acp_is_v2(session.conn) {
 		models_ok: bool
 		models, models_ok = acp_models_state(session)
 		if !models_ok {
@@ -640,20 +652,23 @@ acp_work_open_session :: proc(session: ^ACP_Session, work: ACP_Work) {
 	if work.replay {
 		acp_replay_session(session)
 	}
-	if work.start.kind == .Resume_Id {
+	switch _ in work.start {
+	case Start_Resume_Id:
 		if acp_is_v2(session.conn) {
 			_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Session_Resume_Result{config_options = v2_options})
 		} else {
 			_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Empty_Result{})
 		}
-	} else if acp_is_v2(session.conn) {
-		_ = acp.writer_write_response(&session.conn.writer, work.id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options})
-	} else {
-		_ = acp.writer_write_response(
-			&session.conn.writer,
-			work.id,
-			acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models},
-		)
+	case Start_Fresh, Start_Resume_Latest, nil:
+		if acp_is_v2(session.conn) {
+			_ = acp.writer_write_response(&session.conn.writer, work.id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options})
+		} else {
+			_ = acp.writer_write_response(
+				&session.conn.writer,
+				work.id,
+				acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models},
+			)
+		}
 	}
 }
 

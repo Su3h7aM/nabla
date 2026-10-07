@@ -345,7 +345,7 @@ acp_request_session_new :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	acp_enqueue_open_session(
 		server,
 		envelope,
-		.New,
+		false,
 		params.cwd,
 		"",
 		acp_session_prompt_text(params.system_prompt, &params.meta),
@@ -386,7 +386,7 @@ acp_request_session_load :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	acp_enqueue_open_session(
 		server,
 		envelope,
-		.Resume_Id,
+		true,
 		"",
 		params.session_id,
 		acp_session_prompt_text(params.system_prompt, &params.meta),
@@ -439,7 +439,7 @@ acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope)
 	acp_enqueue_open_session(
 		server,
 		envelope,
-		.Resume_Id,
+		true,
 		"",
 		params.session_id,
 		acp_session_prompt_text(params.system_prompt, &params.meta),
@@ -757,7 +757,7 @@ acp_stored_session :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, session
 acp_enqueue_open_session :: proc(
 	server: ^ACP_Server,
 	envelope: ^acp.Envelope,
-	kind: Session_Start_Kind,
+	resume: bool,
 	cwd, session_id, prompt, session_title: string,
 	client_servers: []acp.MCP_Server,
 	replay: bool,
@@ -780,12 +780,10 @@ acp_enqueue_open_session :: proc(
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
-	// start.id aliases session_ref; the work item releases session_ref only. A new
-	// session has an empty reference.
-	start := Session_Start {
-		kind = kind,
-		id   = session_ref,
-	}
+	// A resume names its session by session_ref; the work item releases session_ref
+	// only. A new session has an empty reference.
+	start: Session_Start = Start_Fresh{}
+	if resume { start = Start_Resume_Id(session_ref) }
 	work := ACP_Work {
 		kind          = .Open_Session,
 		id            = id,
@@ -802,7 +800,11 @@ acp_enqueue_open_session :: proc(
 	// table makes room for or refuses; a refusal changes no session that is running.
 	created := false
 	session: ^ACP_Session
-	if kind == .Resume_Id { session = acp_session_find(server, session_id) }
+	switch _ in start {
+	case Start_Resume_Id:
+		session = acp_session_find(server, session_id)
+	case Start_Fresh, Start_Resume_Latest, nil:
+	}
 	if session == nil {
 		reason: string
 		session, reason = acp_session_create(server, session_id)

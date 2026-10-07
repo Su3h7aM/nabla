@@ -303,12 +303,13 @@ run_prompt :: proc(
 	// reaches the transcript, so it owns its allocator here too.
 	snapshot_transcript_own(app)
 
-	start := Session_Start {
-		kind = .New,
-	}
+	start: Session_Start = Start_Fresh{}
 	if options.resume {
-		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
-		start.id = options.resume_id
+		if options.resume_id != "" {
+			start = Start_Resume_Id(options.resume_id)
+		} else {
+			start = Start_Resume_Latest{}
+		}
 	}
 	// A resumed session another process runs is followed rather than refused.
 	app.setup.shared_sessions = options.resume
@@ -423,12 +424,13 @@ chat_main :: proc() -> int {
 	}
 	if options.prompt != "" { return run_prompt(sources[:], mcp_servers[:], harness_options, options, stdout_writer()) }
 
-	start := Session_Start {
-		kind = .New,
-	}
+	start: Session_Start = Start_Fresh{}
 	if options.resume {
-		start.kind = .Resume_Id if options.resume_id != "" else .Resume_Latest
-		start.id = options.resume_id
+		if options.resume_id != "" {
+			start = Start_Resume_Id(options.resume_id)
+		} else {
+			start = Start_Resume_Latest{}
+		}
 	}
 	return tui_run(sources[:], mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
 }

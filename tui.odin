@@ -1092,10 +1092,10 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		left = "display incomplete: out of memory"
 	} else if status.model_id != "" {
 		cost := "-"
-		if status.cost_present {
-			cost = fmt.tprintf("$%.2f", status.cost)
+		if priced, priced_ok := status.cost.?; priced_ok {
+			cost = fmt.tprintf("$%.2f", priced)
 			// A total under a cent would round to "$0.00", which reads as free.
-			if status.cost < 0.01 { cost = fmt.tprintf("$%.4f", status.cost) }
+			if priced < 0.01 { cost = fmt.tprintf("$%.4f", priced) }
 			// A total that prices only some of the session is not the session's
 			// cost, and the footer is the only place a reader can see that.
 			if status.cost_partial { cost = fmt.tprintf("%s (partial)", cost) }
@@ -1106,8 +1106,8 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 			// A rate measured over part of the session is not the session's rate, and
 			// the footer is the only place a reader can see that from.
 			if status.session_hit_partial { cache = fmt.tprintf("%s (partial)", cache) }
-		} else if status.session_cache_present {
-			cache = fmt.tprintf("cache %dk", (status.session_cache_read + FOOTER_KIB_ROUNDING) / KIBIBYTE)
+		} else if cache_read, cache_ok := status.session_cache_read.?; cache_ok {
+			cache = fmt.tprintf("cache %dk", (cache_read + FOOTER_KIB_ROUNDING) / KIBIBYTE)
 		}
 		left = fmt.tprintf(
 			"%dk/%dk | cost %s | %s",
