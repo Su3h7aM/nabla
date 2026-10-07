@@ -140,13 +140,14 @@ chat_selection_check :: proc(
 		reason = ""
 	} else if part_too_large || !allow_compact {
 		decision = .Refused
-		if target.capacity.window <= 0 {
+		switch {
+		case target.capacity.window <= 0:
 			reason = "the target has no usable context window"
-		} else if prep.sizes.instructions > ceiling {
+		case prep.sizes.instructions > ceiling:
 			reason = "the instructions alone exceed the target admission budget"
-		} else if prep.sizes.tools > ceiling {
+		case prep.sizes.tools > ceiling:
 			reason = "the tool schemas alone exceed the target admission budget"
-		} else {
+		case:
 			reason = "the target estimate exceeds its admission budget and compact_on_switch is disabled"
 		}
 	}
