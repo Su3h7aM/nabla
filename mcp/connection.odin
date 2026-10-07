@@ -171,12 +171,5 @@ handshake_server_info :: proc(result: json.Object, allocator: mem.Allocator) -> 
 	if !present { return "", "", nil }
 	info, is_object := value.(json.Object)
 	if !is_object { return "", "", nil }
-	owned_name, name_error := meta_identity_field(info, "name", allocator)
-	if name_error != nil { return "", "", name_error }
-	owned_version, version_error := meta_identity_field(info, "version", allocator)
-	if version_error != nil {
-		delete(owned_name, allocator)
-		return "", "", version_error
-	}
-	return owned_name, owned_version, nil
+	return server_identity_fields(info, allocator)
 }

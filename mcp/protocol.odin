@@ -589,6 +589,22 @@ result_type :: proc(object: json.Object) -> (string, bool) {
 	return string(text), true
 }
 
+// server_identity_fields reads the name and version from a server identity
+// object. Both are owned by allocator, and err is the allocator's own failure
+// when either could not be copied. A version that cannot be copied releases
+// the name with it, so a half-owned identity never escapes.
+@(private, require_results)
+server_identity_fields :: proc(info: json.Object, allocator: mem.Allocator) -> (name: string, version: string, err: mem.Allocator_Error) {
+	owned_name, name_error := meta_identity_field(info, "name", allocator)
+	if name_error != nil { return "", "", name_error }
+	owned_version, version_error := meta_identity_field(info, "version", allocator)
+	if version_error != nil {
+		delete(owned_name, allocator)
+		return "", "", version_error
+	}
+	return owned_name, owned_version, nil
+}
+
 // meta_server_info reads the server identity a result may carry under
 // `_meta["io.modelcontextprotocol/serverInfo"]`. Identity is advisory: it is
 // reported, never acted on. The name and version are owned by allocator, and err
@@ -605,14 +621,7 @@ meta_server_info :: proc(result: json.Object, allocator := context.allocator) ->
 	info, info_is_object := info_value.(json.Object)
 	if !info_is_object { return "", "", nil }
 
-	owned_name, name_error := meta_identity_field(info, "name", allocator)
-	if name_error != nil { return "", "", name_error }
-	owned_version, version_error := meta_identity_field(info, "version", allocator)
-	if version_error != nil {
-		delete(owned_name, allocator)
-		return "", "", version_error
-	}
-	return owned_name, owned_version, nil
+	return server_identity_fields(info, allocator)
 }
 
 // meta_identity_field reads one optional string from a server identity object. A
