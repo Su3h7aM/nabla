@@ -764,6 +764,7 @@ tool_integer_reading :: proc(value: json.Value) -> (number: int, repair: Maybe(T
 
 // tool_decimal_integer reads text that is exactly one decimal integer: an optional leading
 // minus, then digits with no leading zero. A number past the int range is not one.
+// The magnitude is accumulated negatively, because min(int) has no positive twin.
 @(private, require_results)
 tool_decimal_integer :: proc(text: string) -> (number: int, ok: bool) {
 	digits := strings.trim_prefix(text, "-")
@@ -771,10 +772,13 @@ tool_decimal_integer :: proc(text: string) -> (number: int, ok: bool) {
 	for digit in transmute([]u8)digits {
 		if digit < '0' || digit > '9' { return 0, false }
 		place := int(digit - '0')
-		if number > (max(int) - place) / 10 { return 0, false }
-		number = number * 10 + place
+		if number < (min(int) + place) / 10 { return 0, false }
+		number = number * 10 - place
 	}
-	if len(digits) < len(text) { number = -number }
+	if len(digits) == len(text) {
+		if number == min(int) { return 0, false }
+		number = -number
+	}
 	return number, true
 }
 

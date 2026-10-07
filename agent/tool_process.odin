@@ -246,7 +246,15 @@ tool_stream_write :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 		_, append_error := append(&stream.kept, ..chunk)
 		return append_error
 	}
-	os.write(stream.spool, chunk) or_return
+	// A failed spool write leaves the stream in memory, because a result is never discarded
+	// and a full disk must not end the command.
+	if _, write_error := os.write(stream.spool, chunk); write_error != nil {
+		_ = os.close(stream.spool)
+		stream.spool = nil
+		if !stream.overflow { _ = os.remove(stream.spool_path) }
+		_, append_error := append(&stream.kept, ..chunk)
+		return append_error
+	}
 	head := min(len(chunk), TOOL_STREAM_MEMORY_BYTES - len(stream.kept))
 	if head < len(chunk) { stream.overflow = true }
 	if head > 0 {
