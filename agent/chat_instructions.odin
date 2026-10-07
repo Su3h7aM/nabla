@@ -309,7 +309,14 @@ snapshot_skill_make :: proc(entry: Instruction_Manifest_Skill, allocator: mem.Al
 }
 
 @(require_results)
-snapshot_root_make :: proc(entry: Instruction_Manifest_Root, source: skills.Source_Kind, allocator: mem.Allocator) -> (result_value: skills.Root, error: mem.Allocator_Error) {
+snapshot_root_make :: proc(
+	entry: Instruction_Manifest_Root,
+	source: skills.Source_Kind,
+	allocator: mem.Allocator,
+) -> (
+	result_value: skills.Root,
+	error: mem.Allocator_Error,
+) {
 	root: skills.Root
 	complete := false
 	defer if !complete {
@@ -324,7 +331,13 @@ snapshot_root_make :: proc(entry: Instruction_Manifest_Root, source: skills.Sour
 }
 
 @(require_results)
-snapshot_diagnostic_make :: proc(entry: Instruction_Manifest_Diagnostic, allocator: mem.Allocator) -> (result_value: skills.Diagnostic, error: mem.Allocator_Error) {
+snapshot_diagnostic_make :: proc(
+	entry: Instruction_Manifest_Diagnostic,
+	allocator: mem.Allocator,
+) -> (
+	result_value: skills.Diagnostic,
+	error: mem.Allocator_Error,
+) {
 	diagnostic: skills.Diagnostic
 	complete := false
 	defer if !complete {

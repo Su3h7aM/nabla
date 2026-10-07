@@ -242,7 +242,15 @@ model_selection_clone_levels :: proc(levels: []string, allocator: mem.Allocator)
 }
 
 @(private, require_results)
-chat_selection_clone :: proc(selection: Model_Selection, allocator: mem.Allocator) -> (provider: string, model: string, owned_levels: [dynamic]string, error: mem.Allocator_Error) {
+chat_selection_clone :: proc(
+	selection: Model_Selection,
+	allocator: mem.Allocator,
+) -> (
+	provider: string,
+	model: string,
+	owned_levels: [dynamic]string,
+	error: mem.Allocator_Error,
+) {
 	provider_id, model_id: string
 	levels: [dynamic]string
 	levels.allocator = allocator

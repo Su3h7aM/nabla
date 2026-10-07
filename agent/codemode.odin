@@ -4,8 +4,7 @@ import "core:encoding/json"
 import "core:time"
 
 TOOL_CODEMODE_NAME :: "builtin_codemode"
-TOOL_CODEMODE_DESCRIPTION ::
-	`Run a Lua 5.4 program that calls other tools. Use it instead of several separate tool calls when a task has several steps, computes or filters results, or edits a file by exact text, and instead of a Python, Perl, awk, or sed script run through builtin_shell. A single read or command needs no script.
+TOOL_CODEMODE_DESCRIPTION :: `Run a Lua 5.4 program that calls other tools. Use it instead of several separate tool calls when a task has several steps, computes or filters results, or edits a file by exact text, and instead of a Python, Perl, awk, or sed script run through builtin_shell. A single read or command needs no script.
 
 Call a tool as tools.<name>(args) with one table of named arguments, for example tools.builtin_read({path = "README.md"}). The names are the tool names you were given, such as builtin_read, builtin_shell, builtin_write, and builtin_patch; builtin_codemode cannot be called from a script. The call waits and returns a table with three fields:
 - outcome: a string such as "success", "tool_failed", "invalid_arguments", "timed_out", or "cancelled".

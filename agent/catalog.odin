@@ -118,13 +118,13 @@ provider_transport_name :: proc(transport: Provider_Transport) -> string {
 }
 
 Catalog_Provider_Source :: struct {
-	id:                string,
-	base_url_present:  bool,
-	base_url:          string,
-	api_present:       bool,
-	api:               string,
-	transport_present: bool,
-	transport:         Provider_Transport,
+	id:                          string,
+	base_url_present:            bool,
+	base_url:                    string,
+	api_present:                 bool,
+	api:                         string,
+	transport_present:           bool,
+	transport:                   Provider_Transport,
 	// stream_idle_timeout is the longest a response of this provider may go without a
 	// byte before the attempt is cut. Off by default (zero), because no provider
 	// documents an idle limit; the user opts in per provider. It restarts on every byte
@@ -133,11 +133,11 @@ Catalog_Provider_Source :: struct {
 	stream_idle_timeout:         time.Duration,
 	// A literal secret, or `${NAME}` naming an environment variable. Resolved
 	// only when a connection is built, so no secret is ever held here.
-	api_key_present:   bool,
-	api_key:           string,
+	api_key_present:             bool,
+	api_key:                     string,
 	// Read-only during resolution: sources state models, they are not extended
 	// by it. The resolved catalog's own list is what grows.
-	models:            []Catalog_Model_Source,
+	models:                      []Catalog_Model_Source,
 }
 
 // Catalog_Model is one resolved model. `provider_id` is part of its identity
@@ -170,17 +170,17 @@ Catalog_Model :: struct {
 }
 
 Catalog_Provider :: struct {
-	id:                string,
-	base_url:          string,
-	base_url_present:  bool,
-	api:               string,
-	api_present:       bool,
-	transport:         Provider_Transport,
-	transport_present: bool,
+	id:                          string,
+	base_url:                    string,
+	base_url_present:            bool,
+	api:                         string,
+	api_present:                 bool,
+	transport:                   Provider_Transport,
+	transport_present:           bool,
 	stream_idle_timeout_present: bool,
 	stream_idle_timeout:         time.Duration,
-	api_key_present:   bool,
-	api_key:           string,
+	api_key_present:             bool,
+	api_key:                     string,
 }
 
 Catalog_Error :: enum {

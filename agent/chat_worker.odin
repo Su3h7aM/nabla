@@ -96,7 +96,8 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 			worker.worker.allocator,
 		)
 	}
-	return {error = operation_error, finish_reason = runtime.finish_reason}
+	finish_reason := runtime.finish_reason
+	return {error = operation_error, finish_reason = finish_reason}
 }
 
 // chat_worker_event is the transport callback. The transport frees the event it hands over

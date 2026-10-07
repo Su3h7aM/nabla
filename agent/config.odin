@@ -448,7 +448,14 @@ load_provider :: proc(
 	if lua.type(state, -1) != .NIL {
 		milliseconds, ok := lua_int(state, -1)
 		if !ok {
-			return .Invalid, config_provider_field_detail(provider_id, "stream_idle_timeout_ms", "non-negative integer of milliseconds, 0 for none", state, -1, allocator)
+			return .Invalid, config_provider_field_detail(
+				provider_id,
+				"stream_idle_timeout_ms",
+				"non-negative integer of milliseconds, 0 for none",
+				state,
+				-1,
+				allocator,
+			)
 		}
 		out^.stream_idle_timeout = time.Duration(milliseconds) * time.Millisecond
 		out^.stream_idle_timeout_present = true

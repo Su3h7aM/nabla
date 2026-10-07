@@ -393,7 +393,9 @@ chat_notice_text :: proc(notice: Chat_Notice) -> string {
 	case .Truncated:
 		return "the previous response was cut off by the output limit before it finished, so none of it was executed; reissue the work in smaller steps"
 	case .Context_Window:
-		return "the previous response was cut off because the context window filled before it finished, so none of it was executed; the conversation is compacted to make room, so reissue the work in smaller steps"
+		return(
+			"the previous response was cut off because the context window filled before it finished, so none of it was executed; the conversation is compacted to make room, so reissue the work in smaller steps" \
+		)
 	case .Missing_Call_Identity:
 		return "a proposed tool call carried no id or no tool name, so none of the calls ran; every call needs the provider's id and the tool's name"
 	case .Duplicate_Call_ID:

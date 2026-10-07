@@ -12,15 +12,13 @@ TOOL_SHELL_NAME :: "builtin_shell"
 // TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the shell it
 // does it with. It is a format: the preview size in KiB, the in-memory size of one stream in
 // MiB, and the default timeout in seconds.
-TOOL_SHELL_BODY ::
-	`The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with builtin_write or builtin_patch, not with a heredoc or echo redirection. This is not a terminal.
+TOOL_SHELL_BODY :: `The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with builtin_write or builtin_patch, not with a heredoc or echo redirection. This is not a terminal.
 
 The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with builtin_read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
 
 // TOOL_SHELL_FISH_NOTES follows the body when the shell is fish, whose syntax models most
 // often get wrong because they write bash.
-TOOL_SHELL_FISH_NOTES ::
-	` Fish differs from bash in ways that fail the whole command: there is no heredoc (<<); loops and conditionals end with end, as in "for name in a b c; echo $name; end" and "if test -f x; echo yes; end", not do/done or fi; variables are set with "set name value" and the last exit status is $status, not $?; command substitution is (cmd); before fish 3.0 there is no && or ||, and "; and" and "; or" take their place; and a wildcard that matches nothing is an error, so quote a glob meant for the program, as in --include='*.odin'.`
+TOOL_SHELL_FISH_NOTES :: ` Fish differs from bash in ways that fail the whole command: there is no heredoc (<<); loops and conditionals end with end, as in "for name in a b c; echo $name; end" and "if test -f x; echo yes; end", not do/done or fi; variables are set with "set name value" and the last exit status is $status, not $?; command substitution is (cmd); before fish 3.0 there is no && or ||, and "; and" and "; or" take their place; and a wildcard that matches nothing is an error, so quote a glob meant for the program, as in --include='*.odin'.`
 
 // TOOL_SHELL_FALLBACK is the shell a command ends at when the shell this process
 // was started from cannot run it. /bin/sh is the one shell a POSIX system has.
@@ -111,7 +109,14 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Sh
 // that never started is tried twice: a shell that ran it has already had its
 // effects, and running it again would repeat them.
 @(require_results)
-tool_shell_start :: proc(command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: subprocess.Child, spawn: subprocess.Spawn, err: os.Error) {
+tool_shell_start :: proc(
+	command, directory: string,
+	stdout_write, stderr_write: ^os.File,
+) -> (
+	child: subprocess.Child,
+	spawn: subprocess.Spawn,
+	err: os.Error,
+) {
 	shell := tool_shell_preferred()
 	child, spawn, err = tool_spawn_grouped(shell, command, directory, stdout_write, stderr_write)
 	if spawn != .Exec_Failed || shell == TOOL_SHELL_FALLBACK { return }

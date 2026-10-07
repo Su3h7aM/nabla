@@ -262,7 +262,9 @@ chat_selection_install :: proc(
 ) {
 	identity_changed := target.provider_id != chat.provider_id || target.model_id != chat.model_id || target.connection.API != chat.model_api
 	connection_changed :=
-		current_connection.API != target.connection.API || current_connection.Endpoint != target.connection.Endpoint || chat.provider_transport != target.transport
+		current_connection.API != target.connection.API ||
+		current_connection.Endpoint != target.connection.Endpoint ||
+		chat.provider_transport != target.transport
 	refused_features, omitted_features := chat.refused_features, chat.compact.omitted_features
 	installed, applied = chat_session_select(chat, target, effort)
 	if !installed { return false, false, nil }

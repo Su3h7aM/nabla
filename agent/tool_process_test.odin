@@ -17,4 +17,3 @@ test_tool_stream_keeps_utf8_sequences_split_across_chunks :: proc(t: ^testing.T)
 	if !testing.expect_value(t, tool_stream_finish(&stream), nil) { return }
 	testing.expect_value(t, string(stream.kept[:]), "é")
 }
-
