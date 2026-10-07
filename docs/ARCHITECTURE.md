@@ -743,23 +743,7 @@ Config_Snapshot :: struct {
 
 ### 14.1 Definitions and registry
 
-```odin
-Tool_Kind :: enum u8 { Read, Write, Patch, Shell, Code, Catalog_Search, Skill_Load, Task_Run, Agent_Spawn, Compact, MCP }
-Placement :: enum u8 { Owner, Worker, Lua, Subagent }
-
-Tool_Definition :: struct {
-	name:        string,           // [A-Za-z_][A-Za-z0-9_]{0,63}, not a Lua keyword
-	kind:        Tool_Kind,
-	placement:   Placement,
-	description: string,
-	schema:      []u8,             // canonical JSON, advertised verbatim
-	timeout:     Maybe(time.Duration), // default when the model gives none
-	mcp:         ^MCP_Binding,     // kind == .MCP only
-}
-
-Tool_Args   :: union { Read_Args, Write_Args, Patch_Args, Shell_Args, Codemode_Args, Search_Args, Skill_Load_Args, Task_Run_Args, Spawn_Args, Compact_Args, MCP_Args }
-Tool_Output :: union { Read_Output, Write_Output, Patch_Output, Shell_Output, Codemode_Output, Search_Output, Skill_Output, Task_Output, Spawn_Output, Compact_Output, MCP_Output }
-```
+A `Tool_Definition` (`agent/tool.odin`) holds a tool's name, `Tool_Kind`, description, input schema, behavior hints, `Tool_Placement` (`Worker`, `Owner`, or `Lua`), default timeout, execute procedure, and, for an MCP tool, its adapter state and lane. `Tool_Kind` (`agent/tool_args.odin`) tells `tool_args_decode` which `Tool_Args` variant a call's arguments are read into; `Custom` marks arguments the harness does not read itself.
 
 The registry is built, validated (names, schemas, collisions), and sorted inside the config snapshot, and is immutable. Advertisement, Lua `tools.*`, and admission read the same registry. Exposure filters (model without tool support, subagent scope, `tools.expose` in config) apply to advertisement and admission alike.
 
