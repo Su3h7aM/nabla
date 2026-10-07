@@ -234,6 +234,11 @@ acp_model_selection_error :: proc(session: ^ACP_Session, selection: ^ACP_Model_S
 	acp_model_selection_destroy(session, selection)
 }
 
+acp_model_selection_config_failed :: proc(session: ^ACP_Session, selection: ^ACP_Model_Selection) -> ai.Provider_Connection {
+	acp_model_selection_error(session, selection, acp.ERROR_INTERNAL, "the model was installed but its configuration response could not be allocated")
+	return session.app.run.connection
+}
+
 // acp_model_request_resolve takes the newest reader handoff and resolves it once on the
 // session owner. The target owns its catalog-derived strings through installation.
 acp_model_request_resolve :: proc(session: ^ACP_Session) {
@@ -347,27 +352,11 @@ acp_model_selection_service :: proc(session: ^ACP_Session) -> ai.Provider_Connec
 			)
 		} else if acp_is_v2(session.conn) {
 			v2_options, options_ok := acp_model_config_options_v2(session)
-			if !options_ok {
-				acp_model_selection_error(
-					session,
-					selection,
-					acp.ERROR_INTERNAL,
-					"the model was installed but its configuration response could not be allocated",
-				)
-				return session.app.run.connection
-			}
+			if !options_ok { return acp_model_selection_config_failed(session, selection) }
 			_ = acp.writer_write_response(&session.conn.writer, selection.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options})
 		} else {
 			v1_options, options_ok := acp_model_config_options_v1(session)
-			if !options_ok {
-				acp_model_selection_error(
-					session,
-					selection,
-					acp.ERROR_INTERNAL,
-					"the model was installed but its configuration response could not be allocated",
-				)
-				return session.app.run.connection
-			}
+			if !options_ok { return acp_model_selection_config_failed(session, selection) }
 			_ = acp.writer_write_response(&session.conn.writer, selection.id, acp.V1_Session_Set_Config_Option_Result{config_options = v1_options})
 		}
 		acp_model_selection_destroy(session, selection)
@@ -956,20 +945,7 @@ acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Wor
 	// The completion flag is read because the terminal status alone cannot report a
 	// turn the store could not record: the status still names what the model reached,
 	// so an unrecorded completion is corrected to a failure below.
-	chat.catalog = app_catalog_ref(&session.app)
-	observer := acp_observer(session)
-	steer := agent.Steer_Context {
-		apply      = acp_model_selection_steer,
-		apply_data = session,
-	}
-	turn_completed := agent.chat_run_turn_steered(
-		chat,
-		session.app.run.connection,
-		agent.chat_retry_policy_default(),
-		observer,
-		&steer,
-		&session.app.run.control,
-	)
+	turn_completed := acp_run_steered_turn(session, chat)
 	if acp_is_v2(session.conn) {
 		acp_v2_turn_end(session, turn_completed)
 		return
@@ -1017,6 +993,16 @@ acp_v2_turn_end :: proc(session: ^ACP_Session, turn_completed: bool) {
 // acp_report_turn runs a turn for the oldest message a background subagent sent while no
 // request ran, and reports whether it ran one. The turn counts as work, so a cancel or a
 // shutdown stops it the way it stops a prompt's turn.
+acp_run_steered_turn :: proc(session: ^ACP_Session, chat: ^agent.Chat_Session) -> bool {
+	chat.catalog = app_catalog_ref(&session.app)
+	observer := acp_observer(session)
+	steer := agent.Steer_Context {
+		apply      = acp_model_selection_steer,
+		apply_data = session,
+	}
+	return agent.chat_run_turn_steered(chat, session.app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &session.app.run.control)
+}
+
 @(private = "file", require_results)
 acp_report_turn :: proc(session: ^ACP_Session) -> bool {
 	chat := &session.app.setup.session
@@ -1032,19 +1018,7 @@ acp_report_turn :: proc(session: ^ACP_Session) -> bool {
 	defer agent.turn_control_clear(&session.app.run.control)
 	acp_clear_active_message_id(session)
 	_ = acp_send_state(session, "running", "")
-	chat.catalog = app_catalog_ref(&session.app)
-	steer := agent.Steer_Context {
-		apply      = acp_model_selection_steer,
-		apply_data = session,
-	}
-	turn_completed := agent.chat_run_turn_steered(
-		chat,
-		session.app.run.connection,
-		agent.chat_retry_policy_default(),
-		observer,
-		&steer,
-		&session.app.run.control,
-	)
+	turn_completed := acp_run_steered_turn(session, chat)
 	acp_v2_turn_end(session, turn_completed)
 	return true
 }
@@ -1101,11 +1075,14 @@ acp_effort_config_values :: proc(session: ^ACP_Session) -> ([]acp.Config_Value, 
 }
 
 @(require_results)
-acp_model_config_options_v1 :: proc(session: ^ACP_Session) -> ([]acp.V1_Config_Option, bool) {
-	model_count := 0
+acp_config_option_counts :: proc(session: ^ACP_Session) -> (model_count, effort_count: int) {
 	if len(session.app.setup.catalog.models) > 0 { model_count = 1 }
-	effort_count := 0
 	if len(session.app.setup.session.effort_levels) > 0 { effort_count = 1 }
+	return model_count, effort_count
+}
+
+acp_model_config_options_v1 :: proc(session: ^ACP_Session) -> ([]acp.V1_Config_Option, bool) {
+	model_count, effort_count := acp_config_option_counts(session)
 	options, options_error := make([]acp.V1_Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
 	index := 0
@@ -1139,10 +1116,7 @@ acp_model_config_options_v1 :: proc(session: ^ACP_Session) -> ([]acp.V1_Config_O
 
 @(require_results)
 acp_model_config_options_v2 :: proc(session: ^ACP_Session) -> ([]acp.V2_Config_Option, bool) {
-	model_count := 0
-	if len(session.app.setup.catalog.models) > 0 { model_count = 1 }
-	effort_count := 0
-	if len(session.app.setup.session.effort_levels) > 0 { effort_count = 1 }
+	model_count, effort_count := acp_config_option_counts(session)
 	options, options_error := make([]acp.V2_Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
 	index := 0

@@ -288,6 +288,12 @@ run_prompt_follow :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> b
 // run_prompt executes one prompt without a terminal and returns the process exit code. It
 // shares the launch path with the interactive harness, so only the front-end differs and a
 // headless run is the same conversation rather than a second implementation of one.
+session_start_from_options :: proc(resume: bool, resume_id: string) -> Session_Start {
+	if !resume { return Start_Fresh{} }
+	if resume_id != "" { return Start_Resume_Id(resume_id) }
+	return Start_Resume_Latest{}
+}
+
 run_prompt :: proc(
 	sources: []agent.Catalog_Provider_Source,
 	mcp_servers: []agent.MCP_Server_Config,
@@ -303,14 +309,7 @@ run_prompt :: proc(
 	// reaches the transcript, so it owns its allocator here too.
 	snapshot_transcript_own(app)
 
-	start: Session_Start = Start_Fresh{}
-	if options.resume {
-		if options.resume_id != "" {
-			start = Start_Resume_Id(options.resume_id)
-		} else {
-			start = Start_Resume_Latest{}
-		}
-	}
+	start := session_start_from_options(options.resume, options.resume_id)
 	// A resumed session another process runs is followed rather than refused.
 	app.setup.shared_sessions = options.resume
 	app.setup.harness_options = harness_options
@@ -424,14 +423,7 @@ chat_main :: proc() -> int {
 	}
 	if options.prompt != "" { return run_prompt(sources[:], mcp_servers[:], harness_options, options, stdout_writer()) }
 
-	start: Session_Start = Start_Fresh{}
-	if options.resume {
-		if options.resume_id != "" {
-			start = Start_Resume_Id(options.resume_id)
-		} else {
-			start = Start_Resume_Latest{}
-		}
-	}
+	start := session_start_from_options(options.resume, options.resume_id)
 	return tui_run(sources[:], mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
 }
 

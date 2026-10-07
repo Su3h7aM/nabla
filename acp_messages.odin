@@ -366,10 +366,6 @@ acp_request_session_load :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
-	if _, valid := journal.session_id_parse(params.session_id); !valid {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("%s is not a session id", params.session_id))
-		return
-	}
 	// The session is read once here to refuse an unknown id with a legible error, before
 	// anything is given up for it.
 	header, header_ok := acp_stored_session(server, envelope, params.session_id)
@@ -415,10 +411,6 @@ acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope)
 	}
 	if reason := acp_session_params_reason(params.mcp_servers, params.additional_directories, acp_is_v2(server)); reason != "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
-		return
-	}
-	if _, valid := journal.session_id_parse(params.session_id); !valid {
-		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("%s is not a session id", params.session_id))
 		return
 	}
 	header, header_ok := acp_stored_session(server, envelope, params.session_id)
