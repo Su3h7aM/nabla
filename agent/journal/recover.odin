@@ -1,20 +1,30 @@
 package journal
 
 import "base:runtime"
+import "core:fmt"
+import "core:os"
+import "core:path/filepath"
 import "nabla:db"
 
 Recovery :: Session_Recovered
 
+// KEPT_STDOUT_SUFFIX and KEPT_STDERR_SUFFIX follow a call's id in the names of the files a
+// shell call writes its streams to as they arrive.
+KEPT_STDOUT_SUFFIX :: ".stdout.txt"
+KEPT_STDERR_SUFFIX :: ".stderr.txt"
+
 // recover records an outcome for all work the claimed session left open when
 // its process died, in one transaction, and replays nothing. It records nothing
 // when nothing was open, so recovering twice changes nothing. A failure after
-// outcomes are staged latches the journal, so none of them is written.
+// outcomes are staged latches the journal, so none of them is written. A call that was
+// running is settled as Unknown naming the kept stream files that exist for it in
+// kept_directory, with their sizes; "" names none.
 @(require_results)
-recover :: proc(journal: ^Journal) -> (recovery: Recovery, error: Error) {
+recover :: proc(journal: ^Journal, kept_directory := "") -> (recovery: Recovery, error: Error) {
 	assert(journal.claimed != {}, "recover needs a claimed session")
 	_ = commit(journal) or_return
 	defer if error != nil && journal.failure == nil && !error_is_busy(error) { latch(journal, error) }
-	recover_open_work(journal, &recovery) or_return
+	recover_open_work(journal, &recovery, kept_directory) or_return
 	recover_results(journal, &recovery) or_return
 	if recovery == {} { return }
 	append_record(journal, Record{kind = .Session_Recovered, session = journal.claimed}, recovery)
@@ -38,7 +48,8 @@ Recovery_Rule :: enum {
 }
 
 @(private, require_results)
-recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error) {
+recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory: string) -> (error: Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
 	db.query(&journal.connection, &rows, RECOVERY_QUERY, {db.Value(journal.claimed[:])}) or_return
@@ -86,7 +97,9 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 			recovery.calls += 1
 		case .Admitted_Call:
 			header.kind = .Tool_Completed
-			append_record(journal, header, unknown)
+			with_kept := unknown
+			with_kept.detail = recover_kept_detail(unknown.detail, kept_directory, header.call)
+			append_record(journal, header, with_kept)
 			recovery.calls += 1
 		case .Lua:
 			header.kind = .Lua_Completed
@@ -107,6 +120,23 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Err
 		}
 	}
 	return journal.failure
+}
+
+// recover_kept_detail appends the kept stream files of call that exist in directory to detail,
+// temp-allocated. It returns detail unchanged when there are none.
+@(private)
+recover_kept_detail :: proc(detail, directory: string, call: Call_Id) -> string {
+	if directory == "" { return detail }
+	text := detail
+	for suffix in ([]string{KEPT_STDOUT_SUFFIX, KEPT_STDERR_SUFFIX}) {
+		path, join_error := filepath.join({directory, fmt.tprintf("%d%s", call, suffix)}, context.temp_allocator)
+		if join_error != nil { continue }
+		info, stat_error := os.stat(path, context.temp_allocator)
+		if stat_error != nil { continue }
+		prefix := "; output it produced so far is kept in" if text == detail else ","
+		text = fmt.tprintf("%s%s %s (%d bytes)", text, prefix, path, info.size)
+	}
+	return text
 }
 
 // recover_results gives each Assistant node whose proposed calls have no

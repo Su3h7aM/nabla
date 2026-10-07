@@ -314,30 +314,30 @@ run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_
 // Opened_Session is a session resolved and taken in its own journal, not yet
 // running. It owns store and its strings until session_install takes them.
 Opened_Session :: struct {
-	store:        ^journal.Journal,
-	id:           journal.Session_Id,
-	workspace:    string,
-	branch:       journal.Branch_Id,
-	head:         journal.Node_Id,
+	store:       ^journal.Journal,
+	id:          journal.Session_Id,
+	workspace:   string,
+	branch:      journal.Branch_Id,
+	head:        journal.Node_Id,
 	// provider and model are what the session's last turn ran with, "" for a new session.
-	provider:     string,
-	model:        string,
-	effort:       string,
-	recovery:     journal.Recovery,
+	provider:    string,
+	model:       string,
+	effort:      string,
+	recovery:    journal.Recovery,
 	// queued is how many lines the session accepted and never delivered, which go with the
 	// next prompt.
-	queued:       int,
+	queued:      int,
 	// own_queued counts the queued lines this process wrote as a follower, which a takeover
 	// delivers.
-	own_queued:   int,
+	own_queued:  int,
 	// following says store follows the session another process claimed. follow is where its
 	// reading of the journal starts.
-	following:    bool,
-	follow:       agent.Follow,
-	pending:      []journal.Record, // owned, captured with the follower cursor and head
+	following:   bool,
+	follow:      agent.Follow,
+	pending:     []journal.Record, // owned, captured with the follower cursor and head
 	// settle_busy says the failure that stopped settling was another writer holding
 	// the database, which a later attempt may get past.
-	settle_busy:  bool,
+	settle_busy: bool,
 }
 
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
@@ -466,7 +466,7 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 	claimed := store.claimed != {}
 	if claimed {
 		recover_error: journal.Error
-		opened.recovery, recover_error = journal.recover(store)
+		opened.recovery, recover_error = journal.recover(store, agent.session_tool_output_directory(id, context.temp_allocator))
 		if recover_error != nil {
 			opened.settle_busy = journal.error_is_busy(recover_error)
 			return session_error_message("cannot settle the session", recover_error, allocator), false

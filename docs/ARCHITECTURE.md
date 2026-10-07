@@ -479,7 +479,7 @@ cache_hit_rate :: proc(totals: Usage_Totals) -> (rate: f64, measured: bool)
 cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
 list_sessions  :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
 list_branches  :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
-recover        :: proc(journal: ^Journal) -> (Recovery, Error)                         // the claimed session, one transaction
+recover        :: proc(journal: ^Journal, kept_directory := "") -> (Recovery, Error)   // the claimed session, one transaction
 payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator, corruption_journal: ^Journal = nil, session: Session_Id = {}, seq: Journal_Seq = 0) -> Error // Corrupt on malformed data or unsupported version
 error_text     :: proc(error: Error, allocator := context.allocator) -> string
 ```
@@ -589,7 +589,7 @@ On claiming a session, in one transaction:
 | `turn.started` without `turn.completed` | `turn.completed{Interrupted}` |
 | `request.sent` without terminal | `request.interrupted`; never resent |
 | `tool.proposed` (committed response) without `tool.admitted` | `tool.completed{Not_Executed}` |
-| `tool.admitted` without `tool.completed` | `tool.completed{Unknown, "it may have taken effect"}` (roots and Lua children) |
+| `tool.admitted` without `tool.completed` | `tool.completed{Unknown, "it may have taken effect"}` (roots and Lua children); the detail also names, with their sizes, the kept shell stream files that exist for the call, derived from the call id under the session's tool-output directory (section 14.4), so the model can read the output produced so far |
 | `lua.started`, `task.started`, `subagent.started` without completion | `*.completed{Unknown}`; scripts are never resumed. A native child whose session row was never created gets `subagent.completed{Not_Executed}`, since it never ran |
 | `Assistant` node with calls and no `Results` node | `Results` node built from committed and recovered results |
 | compaction output without `checkpoint.installed` | nothing; audit data only |
@@ -796,7 +796,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 - Read: open once, `fstat` that descriptor; text only (no NUL, valid UTF-8); the model chooses the line window, and the result is projected through the context budget like any other.
 - Write: validate, temp file in the same directory, write, fsync, rename; refuse symlinks and non-regular targets; keep the mode.
-- Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole: each stream is held in memory up to `TOOL_STREAM_MEMORY_BYTES` and past that written as it arrives to `<call>.stdout.txt` or `<call>.stderr.txt` beside the other kept outputs, with only its beginning in the result. The timeout is the model's value when given, else the default; there is no maximum.
+- Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole: each stream is written as it arrives to `<call>.stdout.txt` or `<call>.stderr.txt` beside the other kept outputs, and held in memory up to `TOOL_STREAM_MEMORY_BYTES`. A stream that stayed within memory is whole in the result and its file is removed when the call ends; a larger stream keeps its file, named in the result, with only its beginning in the result. A call whose process ends mid-run therefore leaves the output it produced so far in those files, which recovery names (section 9). A file that cannot be created leaves its stream in memory. The timeout is the model's value when given, else the default; there is no maximum.
 - MCP: one shared executor; one request at a time per client lane. Delivery state maps to `Transport_Failed` (not delivered) or `Unknown` (delivered, no reply). Non-text blocks are described, not dumped.
 
 ## 15. Deterministic repair

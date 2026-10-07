@@ -13,4 +13,3 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 
 A subagent is a session like any other: the orchestrator can bring it back, inspect it, compact it, switch its model, and continue it.
 
-- An interrupted tool call can carry the output it produced so far. Writing shell streams to their kept file as they arrive would let recovery name that file in the `Unknown` result.

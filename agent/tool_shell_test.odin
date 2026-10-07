@@ -7,8 +7,11 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:thread"
+import "core:time"
 
 import "nabla:agent/journal"
+import "nabla:ai"
 import "nabla:subprocess"
 
 // SHELL_TEST_PROBE_VARIABLE is the variable the inheritance test exports for the
@@ -259,4 +262,84 @@ test_shell_spools_sanitized_output_that_builtin_read_accepts :: proc(test: ^test
 	testing.expect_value(test, read_error, nil)
 	testing.expect_value(test, len(spooled), size + 6)
 	testing.expect(test, strings.has_suffix(string(spooled), "\ufffd\ufffd"), "the spooled NUL and invalid UTF-8 are replacement text")
+}
+
+Shell_Interrupted_Run :: struct {
+	ctx:    Tool_Context,
+	args:   Shell_Args,
+	result: Tool_Result,
+}
+
+shell_interrupted_serve :: proc(running: ^thread.Thread) {
+	run := cast(^Shell_Interrupted_Run)running.data
+	run.result = tool_shell_execute(&run.ctx, run.args)
+}
+
+shell_interrupted_stop :: proc(interrupt: ^ai.Interrupt, wake: ^Tool_Wake, running: ^thread.Thread, run: ^Shell_Interrupted_Run) {
+	ai.interrupt_request(interrupt)
+	tool_wake_signal(wake)
+	thread.join(running)
+	thread.destroy(running)
+	tool_result_destroy(&run.result)
+}
+
+// A call whose process ended while its command was still running has no result, so recovery
+// settles it as Unknown. The command's output so far is in its kept file, and the result names it.
+@(test)
+test_recovery_names_the_output_an_interrupted_shell_call_kept :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	_test_accept(test, chat, "run it")
+	request := journal.next_request(chat.store)
+	_test_response(test, chat, request, "")
+	call := _test_propose(test, chat, "call_1", `{"command":"printf partial; sleep 30"}`, TOOL_SHELL_NAME, request)
+	chat_record(chat, {kind = .Tool_Admitted, node = chat.response_node, request = request, call = call}, journal.Tool_Admitted{tool = TOOL_SHELL_NAME})
+	_test_commit(test, chat)
+
+	// The command runs on its own thread and touches no journal, so recovery below reads the
+	// journal as the next process would while the command is still mid-call.
+	wake, wake_error := tool_wake_open()
+	if wake_error != nil { testing.fail_now(test, "the wake could not be opened") }
+	defer tool_wake_close(&wake)
+	interrupt: ai.Interrupt
+	base := chat_tool_output_path(chat, call, "")
+	run := Shell_Interrupted_Run {
+		ctx = {
+			call_id = "call_1",
+			workspace = tool_loop_workspace(test),
+			control = {interrupt = &interrupt, wake = wake.read},
+			output_base = base,
+			allocator = context.allocator,
+		},
+		args = {command = "printf partial; sleep 30", timeout = time.Minute},
+	}
+	running := test_thread_start(shell_interrupted_serve, &run, "nabla-shell-run")
+	if running == nil { testing.fail_now(test, "the shell thread could not start") }
+
+	path := fmt.tprintf("%s%s", base, journal.KEPT_STDOUT_SUFFIX)
+	deadline := time.tick_add(time.tick_now(), 10 * time.Second)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		if kept, _ := os.read_entire_file(path, context.temp_allocator); len(kept) == len("partial") { break }
+		time.sleep(5 * time.Millisecond)
+	}
+
+	recovery, recover_error := journal.recover(chat.store, chat.tool_output_directory)
+	if recover_error != nil {
+		shell_interrupted_stop(&interrupt, &wake, running, &run)
+		testing.fail_now(test, "recovery failed")
+	}
+	testing.expect_value(test, recovery.calls, 1)
+	records := _test_records(test, chat, {.Tool_Completed})
+	kept, read_error := os.read_entire_file(path, context.temp_allocator)
+	shell_interrupted_stop(&interrupt, &wake, running, &run)
+
+	testing.expect_value(test, read_error, nil)
+	testing.expect_value(test, string(kept), "partial")
+	if !testing.expect_value(test, len(records), 1) { return }
+	completed: journal.Tool_Completed
+	testing.expect_value(test, journal.payload_decode(records[0].data, &completed, context.temp_allocator), nil)
+	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Unknown])
+	testing.expect(test, strings.contains(completed.detail, fmt.tprintf("%s (7 bytes)", path)), completed.detail)
 }

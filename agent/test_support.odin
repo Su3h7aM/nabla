@@ -143,7 +143,8 @@ chat_test_reopen :: proc(test: ^testing.T, fixture, reopened: ^Chat_Test, worksp
 		testing.fail_now(test, "the journal could not be opened again")
 	}
 	if _, claim_error := journal.claim(&reopened.store, session); claim_error != nil { testing.fail_now(test, "the session could not be claimed again") }
-	recovery, recover_error := journal.recover(&reopened.store)
+	kept_directory := os.join_path({reopened.directory, "tool-output"}, context.temp_allocator) or_else ""
+	recovery, recover_error := journal.recover(&reopened.store, kept_directory)
 	if recover_error != nil { testing.fail_now(test, "the session could not be recovered") }
 	branch, head, head_error := journal.session_head(&reopened.store, session)
 	if head_error != nil { testing.fail_now(test, "the session head could not be read") }

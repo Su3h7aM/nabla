@@ -4,8 +4,9 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
-import "nabla:subprocess"
 import "core:unicode/utf8"
+import "nabla:agent/journal"
+import "nabla:subprocess"
 
 // Tool_Stop is why a drain loop stopped short of the child exiting on its own.
 // Wait_Failed means the system refused the wait itself, so the child was stopped
@@ -47,7 +48,14 @@ tool_spawn_shell_flags :: proc(shell: string) -> cstring {
 // only async-signal-safe calls: it allocates, locks, and logs nothing, and every
 // failure leaves through exit_group, which runs no atexit handler and flushes no stdio.
 @(require_results)
-tool_spawn_grouped :: proc(shell, command, directory: string, stdout_write, stderr_write: ^os.File) -> (child: subprocess.Child, spawn: subprocess.Spawn, err: os.Error) {
+tool_spawn_grouped :: proc(
+	shell, command, directory: string,
+	stdout_write, stderr_write: ^os.File,
+) -> (
+	child: subprocess.Child,
+	spawn: subprocess.Spawn,
+	err: os.Error,
+) {
 	arguments, arguments_error := make([dynamic]string, 0, 4, context.temp_allocator)
 	if arguments_error != nil { return {}, .Failed, arguments_error }
 	append(&arguments, shell) or_return
@@ -123,9 +131,10 @@ tool_retire_child :: proc(child: ^subprocess.Child, start: time.Tick, budget: ti
 	return .None, nil, subprocess.terminate_group(child)
 }
 
-// TOOL_STREAM_MEMORY_BYTES is how much of one output stream is held in memory. A stream
-// that grows past it is written whole to its spool file as it arrives, and only its
-// beginning stays in memory, so a command that prints without end cannot exhaust memory.
+// TOOL_STREAM_MEMORY_BYTES is how much of one output stream is held in memory. Every
+// stream is also written to its spool file as it arrives; once a stream grows past the
+// limit only its beginning stays in memory, so a command that prints without end cannot
+// exhaust memory.
 TOOL_STREAM_MEMORY_BYTES :: 1024 * 1024
 
 // TOOL_STREAM_READ_BYTES is the fixed read buffer size, not an output limit.
@@ -138,12 +147,15 @@ TOOL_STREAM_REPLACEMENT :: "\ufffd"
 
 // Tool_Stream is one captured output stream while it is drained. kept holds the whole
 // stream until it outgrows memory, and its beginning after that. spool_path names the
-// file the whole stream goes to then; "" means the stream stays in memory whatever its size.
+// file the whole stream goes to from the start, so an interrupted call leaves what it
+// wrote; "" means the stream stays in memory whatever its size. overflow is set once the
+// stream has bytes beyond kept, which makes the spool file the only whole copy.
 @(private)
 Tool_Stream :: struct {
 	file:        ^os.File,
 	kept:        [dynamic]u8,
 	open:        bool,
+	overflow:    bool,
 	total:       int,
 	spool_path:  string,
 	spool:       ^os.File,
@@ -227,23 +239,16 @@ tool_stream_incomplete_utf8_suffix :: proc(bytes: []u8) -> int {
 	return 0
 }
 
-// tool_stream_write stores sanitized bytes in memory and, once the threshold is crossed, in a spool.
+// tool_stream_write stores sanitized bytes in the spool when there is one, and in memory up to the threshold.
 @(private, require_results)
 tool_stream_write :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
-	if stream.spool == nil && stream.spool_path != "" && len(stream.kept) + len(chunk) > TOOL_STREAM_MEMORY_BYTES {
-		spool, open_error := tool_output_create(stream.spool_path)
-		// A result is never discarded, so a failed spool open keeps the stream in memory.
-		if open_error == nil {
-			stream.spool = spool
-			os.write(spool, stream.kept[:]) or_return
-		}
-	}
 	if stream.spool == nil {
 		_, append_error := append(&stream.kept, ..chunk)
 		return append_error
 	}
 	os.write(stream.spool, chunk) or_return
 	head := min(len(chunk), TOOL_STREAM_MEMORY_BYTES - len(stream.kept))
+	if head < len(chunk) { stream.overflow = true }
 	if head > 0 {
 		_, append_error := append(&stream.kept, ..chunk[:head])
 		return append_error
@@ -291,10 +296,10 @@ tool_drain_pipes :: proc(
 	}
 	if spool_base != "" {
 		if allocation_error == nil {
-			streams[0].spool_path, allocation_error = strings.concatenate({spool_base, ".stdout.txt"}, allocator)
+			streams[0].spool_path, allocation_error = strings.concatenate({spool_base, journal.KEPT_STDOUT_SUFFIX}, allocator)
 		}
 		if allocation_error == nil {
-			streams[1].spool_path, allocation_error = strings.concatenate({spool_base, ".stderr.txt"}, allocator)
+			streams[1].spool_path, allocation_error = strings.concatenate({spool_base, journal.KEPT_STDERR_SUFFIX}, allocator)
 		}
 	}
 	if allocation_error != nil {
@@ -304,20 +309,29 @@ tool_drain_pipes :: proc(
 		}
 		return .Wait_Failed, allocation_error, false
 	}
+	// A failed open keeps the stream in memory, because a result is never discarded.
+	for &stream in streams {
+		if stream.spool_path == "" { continue }
+		spool, open_error := tool_output_create(stream.spool_path)
+		if open_error == nil { stream.spool = spool }
+	}
 	// Everything the command wrote is kept, whatever the drain ends with.
 	defer {
 		data.stdout = string(streams[0].kept[:])
 		data.stderr = string(streams[1].kept[:])
 		data.stdout_bytes = streams[0].total
 		data.stderr_bytes = streams[1].total
-		// A stream that never outgrew memory has no file, so its name is released here and the
-		// result takes the name of the file that does hold the whole stream.
+		// A stream that never outgrew memory is whole in the result, so its file is removed and
+		// its name released; the result names the file of a stream that did.
 		files := [2]^string{&data.stdout_file, &data.stderr_file}
 		for stream, index in streams {
 			if stream.spool != nil {
 				_ = os.close(stream.spool)
+			}
+			if stream.overflow {
 				files[index]^ = stream.spool_path
 			} else {
+				if stream.spool != nil { _ = os.remove(stream.spool_path) }
 				delete(stream.spool_path, allocator)
 			}
 		}

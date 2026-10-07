@@ -828,7 +828,7 @@ subagent_session_open :: proc(member: ^Subagent, store: ^journal.Journal) -> (br
 	if _, claim_error := journal.claim(store, member.session); claim_error != nil {
 		return 0, 0, fmt.tprintf("the subagent's session could not be claimed to continue it: %s", journal.error_text(claim_error, context.temp_allocator))
 	}
-	if _, recover_error := journal.recover(store); recover_error != nil {
+	if _, recover_error := journal.recover(store, session_tool_output_directory(member.session, context.temp_allocator)); recover_error != nil {
 		return 0, 0, fmt.tprintf("the subagent's session could not be recovered: %s", journal.error_text(recover_error, context.temp_allocator))
 	}
 	head_error: journal.Error

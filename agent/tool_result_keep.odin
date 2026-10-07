@@ -151,6 +151,13 @@ tool_output_directory :: proc(id: string, allocator := context.allocator) -> str
 	return directory
 }
 
+// session_tool_output_directory is tool_output_directory for the session with id session.
+@(require_results)
+session_tool_output_directory :: proc(session: journal.Session_Id, allocator := context.allocator) -> string {
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	return tool_output_directory(journal.session_id_to_hex(session, hex[:]), allocator)
+}
+
 // chat_tool_output_path is the temp-allocated path that names the kept output of the call
 // call, followed by suffix, or "" when the session has no output directory.
 @(require_results)

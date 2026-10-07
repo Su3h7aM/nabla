@@ -729,7 +729,7 @@ chat_session_accept_message :: proc(
 @(private, require_results)
 chat_session_recover_pending :: proc(chat: ^Chat_Session) -> bool {
 	if !chat.recovery_pending { return true }
-	_, recover_error := journal.recover(chat.store)
+	_, recover_error := journal.recover(chat.store, chat.tool_output_directory)
 	if recover_error != nil {
 		chat_session_record_failure(chat, "the previous turn could not be recovered", recover_error)
 		chat.state = .Idle
