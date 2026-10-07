@@ -103,8 +103,8 @@ error_from_remote :: proc(remote: Remote_Error, delivery: Delivery_State, alloca
 		message = owned
 	}
 	data: string
-	if remote.data_present {
-		owned, clone_error := strings.clone(remote.data_json, allocator)
+	if data_json, ok := remote.data_json.?; ok {
+		owned, clone_error := strings.clone(data_json, allocator)
 		if clone_error != nil {
 			delete(message, allocator)
 			return Error{kind = .Out_Of_Memory, delivery = delivery, allocator = allocator}

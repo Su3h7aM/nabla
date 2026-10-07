@@ -112,7 +112,7 @@ test_message_decode_reads_every_shape :: proc(t: ^testing.T) {
 	message, err := message_decode(result_line, context.allocator)
 	testing.expect_value(t, err.kind, Error_Kind.None)
 	testing.expect_value(t, message.kind, Message_Kind.Result)
-	testing.expect_value(t, message.id, i64(3))
+	testing.expect_value(t, message.id.?, i64(3))
 	if object, is_object := message.result.(json.Object); testing.expect(t, is_object) {
 		kind, present := result_type(object)
 		testing.expect(t, present, "every result carries a resultType")
@@ -126,10 +126,10 @@ test_message_decode_reads_every_shape :: proc(t: ^testing.T) {
 	message, err = message_decode(error_line, context.allocator)
 	testing.expect_value(t, err.kind, Error_Kind.None)
 	testing.expect_value(t, message.kind, Message_Kind.Error)
-	testing.expect(t, !message.id_present)
+	testing.expect(t, message.id == nil)
 	testing.expect_value(t, message.remote_error.code, i64(ERROR_CODE_INVALID_PARAMS))
 	testing.expect_value(t, message.remote_error.message, "bad params")
-	testing.expect(t, message.remote_error.data_present)
+	testing.expect(t, message.remote_error.data_json != nil)
 	message_destroy(&message, context.allocator)
 	error_destroy(&err, context.allocator)
 
@@ -137,7 +137,7 @@ test_message_decode_reads_every_shape :: proc(t: ^testing.T) {
 	message, err = message_decode(notification_line, context.allocator)
 	testing.expect_value(t, err.kind, Error_Kind.None)
 	testing.expect_value(t, message.kind, Message_Kind.Notification)
-	testing.expect(t, !message.id_present)
+	testing.expect(t, message.id == nil)
 	message_destroy(&message, context.allocator)
 	error_destroy(&err, context.allocator)
 
@@ -210,8 +210,8 @@ test_remote_error_text_arrives_whole :: proc(t: ^testing.T) {
 	defer error_destroy(&err, context.allocator)
 	if !testing.expect_value(t, err.kind, Error_Kind.None) { return }
 	testing.expect_value(t, message.remote_error.message, remote_message)
-	testing.expect(t, message.remote_error.data_present, "the data member is kept")
-	testing.expect(t, strings.contains(message.remote_error.data_json, data), "the data is what the server sent")
+	testing.expect(t, message.remote_error.data_json != nil, "the data member is kept")
+	testing.expect(t, strings.contains(message.remote_error.data_json.?, data), "the data is what the server sent")
 }
 
 @(test)

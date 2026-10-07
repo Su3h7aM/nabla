@@ -214,7 +214,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 
 		switch message.kind {
 		case .Result:
-			if message.id != id {
+			if got, ok := message.id.?; !ok || got != id {
 				message_destroy(&message, client.allocator)
 				return nil, client_stream_error(client, .Unexpected_Message, "a reply arrived for a request this client did not send")
 			}
@@ -225,7 +225,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 			return result, {}
 
 		case .Error:
-			if message.id_present && message.id != id {
+			if got, ok := message.id.?; ok && got != id {
 				message_destroy(&message, client.allocator)
 				return nil, client_stream_error(client, .Unexpected_Message, "an error arrived for a request this client did not send")
 			}
@@ -248,7 +248,7 @@ client_exchange :: proc(client: ^Client, method: string, params: json.Object, op
 			}
 			// The refusal is written after the message is released, so the method it
 			// answers is copied for the length of this iteration.
-			request_id := message.id
+			request_id := message.id.?
 			refused_method, method_error := strings.clone(message.method, client.allocator)
 			message_destroy(&message, client.allocator)
 			if method_error != nil { return nil, error_make(.Out_Of_Memory, allocator = client.allocator) }

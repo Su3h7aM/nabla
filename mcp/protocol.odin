@@ -365,21 +365,20 @@ Message_Kind :: enum {
 	Request,
 }
 
-// Remote_Error is a JSON-RPC error object from the server. Its strings are owned.
+// Remote_Error is a JSON-RPC error object from the server. Its strings are owned;
+// data_json carries the data member's encoding when it had one.
 Remote_Error :: struct {
-	code:         i64,
-	message:      string,
-	data_json:    string,
-	data_present: bool,
+	code:      i64,
+	message:   string,
+	data_json: Maybe(string),
 }
 
 // Message is one decoded JSON-RPC message. The fields that apply are the ones its
-// kind names; result and params are owned values and everything else is an owned
-// string, all released by message_destroy.
+// kind names; id is set for a request and its replies, result and params are
+// owned values, and the rest are owned strings, all released by message_destroy.
 Message :: struct {
 	kind:         Message_Kind,
-	id:           i64,
-	id_present:   bool,
+	id:           Maybe(i64),
 	result:       json.Value,
 	remote_error: Remote_Error,
 	method:       string,
@@ -391,7 +390,9 @@ message_destroy :: proc(message: ^Message, allocator := context.allocator) {
 	json.destroy_value(message.params, allocator)
 	delete(message.method, allocator)
 	delete(message.remote_error.message, allocator)
-	delete(message.remote_error.data_json, allocator)
+	if data, ok := message.remote_error.data_json.?; ok {
+		delete(data, allocator)
+	}
 	message^ = {}
 }
 
@@ -453,7 +454,6 @@ message_decode :: proc(line: string, allocator := context.allocator) -> (message
 		}
 		message.kind = .Result
 		message.id = id
-		message.id_present = true
 		message.result = result_value
 		object["result"] = nil
 
@@ -468,8 +468,9 @@ message_decode :: proc(line: string, allocator := context.allocator) -> (message
 			return {}, remote_err
 		}
 		message.kind = .Error
-		message.id = id
-		message.id_present = id_state == .Present
+		if id_state == .Present {
+			message.id = id
+		}
 		message.remote_error = remote
 
 	case has_method:
@@ -489,7 +490,6 @@ message_decode :: proc(line: string, allocator := context.allocator) -> (message
 		} else {
 			message.kind = .Request
 			message.id = id
-			message.id_present = true
 		}
 		method, method_error := strings.clone(string(method_name), allocator)
 		if method_error != nil {
@@ -561,7 +561,9 @@ message_read_remote_error :: proc(value: json.Value, allocator: mem.Allocator) -
 	failed := true
 	defer if failed {
 		delete(remote.message, allocator)
-		delete(remote.data_json, allocator)
+		if data, ok := remote.data_json.?; ok {
+			delete(data, allocator)
+		}
 	}
 	message, message_error := strings.clone(string(text), allocator)
 	if message_error != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
@@ -571,7 +573,6 @@ message_read_remote_error :: proc(value: json.Value, allocator: mem.Allocator) -
 		encoded, unparse_err := json.unparse(data, {spec = .JSON, sort_maps_by_key = true}, allocator)
 		if unparse_err != nil { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
 		remote.data_json = encoded
-		remote.data_present = true
 	}
 	failed = false
 	return remote, {}
