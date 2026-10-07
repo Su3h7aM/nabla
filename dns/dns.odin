@@ -84,7 +84,7 @@ lookup :: proc(hostname: string, kind: net.DNS_Record_Type, options: Options, al
 	packet, packet_err := net.make_dns_packet(packet_buffer[:], id, hostname, kind)
 	if packet_err != .None { return nil, .Invalid_Request }
 
-	timeout := attempt_timeout(options)
+timeout := attempt_timeout(options)
 	for _ in 0 ..< attempt_rounds(options) {
 		for server in options.servers {
 			answer, outcome := query_server(server, hostname, packet, id, kind, timeout, options.interrupt, allocator)

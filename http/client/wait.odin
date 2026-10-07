@@ -4,6 +4,8 @@ import "core:nbio"
 import "core:net"
 import "core:time"
 
+import "nabla:dns"
+
 // This file waits: for a connect to complete, and for a connected socket to
 // become ready. It never moves data.
 //
@@ -33,7 +35,7 @@ import "core:time"
 
 // WAIT_SLICE bounds one tick of the event loop, and so bounds how long a request
 // can go without the caller's probe being asked whether to stop.
-WAIT_SLICE :: 50 * time.Millisecond
+WAIT_SLICE :: dns.DNS_IO_SLICE
 
 // Ready_For is the readiness a wait is asking the event loop for.
 Ready_For :: enum {
@@ -52,23 +54,11 @@ Wait_Result :: enum {
 	Expired,
 }
 
-// Connect_State is a dial operation's answer, taken out of the operation while its
-// callback runs: the operation is reaped as soon as that callback returns.
-//
-// A failed dial leaves a non-zero but already closed socket on the operation, so
-// the socket alone cannot say whether the attempt succeeded.
-@(private)
-Connect_State :: struct {
-	socket: net.TCP_Socket,
-	failed: bool,
-	done:   bool,
-}
-
-@(private)
-on_connect_ready :: proc(op: ^nbio.Operation, state: ^Connect_State) {
-	state.socket = op.dial.socket
-	state.failed = op.dial.err != nil
-	state.done = true
+// probe_stop names why a probe ended a wait. A probe that no longer answers
+// with a stop reads as a cancellation, which is how dns reported it.
+probe_stop :: proc(probe: Probe) -> Transport_Stop {
+	if stop := stop_from_wait(probe_now(probe)); stop != .None { return stop }
+	return .Cancelled
 }
 
 /*
@@ -77,7 +67,8 @@ caller's probe can end an attempt that is not progressing, which a connect that
 blocks cannot express.
 
 A zero socket means the attempt failed on its own; a stop means the probe ended
-it, and the operation was cancelled rather than left to run on.
+it, and the operation was cancelled rather than left to run on. The socket is
+non-blocking.
 */
 @(require_results)
 wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP_Socket, stop: Transport_Stop) {
@@ -86,44 +77,15 @@ wait_connected :: proc(endpoint: net.Endpoint, probe: Probe) -> (socket: net.TCP
 	if nbio.acquire_thread_event_loop() != nil { return 0, .None }
 	defer nbio.release_thread_event_loop()
 
-	state: Connect_State
-	op := nbio.dial_poly(endpoint, &state, on_connect_ready)
-
-	for !state.done {
-		if probe_stop := stop_from_wait(probe_now(probe)); probe_stop != .None {
-			// Removal is final and silent: the callback never runs, so the
-			// frame's state is safe to abandon, and the loop frees the
-			// operation on a later tick. Only this operation is reaped;
-			// unrelated work on the thread's loop is never waited on.
-			nbio.remove(op)
-			return 0, probe_stop
-		}
-		if nbio.tick(WAIT_SLICE) != nil {
-			// The wait itself failed, which the caller reads as a connect that
-			// failed on its own.
-			nbio.remove(op)
-			return 0, .None
-		}
+	asked := probe
+	dialed, wait := dns.dial_tcp(endpoint, {}, {check = dns_interrupt_check, user_data = &asked})
+	#partial switch wait {
+	case .Ready:
+		return dialed, .None
+	case .Cancelled:
+		return 0, probe_stop(probe)
 	}
-
-	if state.failed {
-		// The operation closed the socket it opened, so there is nothing to
-		// return and nothing to close.
-		return 0, .None
-	}
-	return state.socket, .None
-}
-
-@(private)
-Wait_State :: struct {
-	done:   bool,
-	result: nbio.Poll_Result,
-}
-
-@(private)
-on_poll_ready :: proc(op: ^nbio.Operation, state: ^Wait_State) {
-	state.done = true
-	state.result = op.poll.result
+	return 0, .None
 }
 
 /*
@@ -145,44 +107,18 @@ wait_ready :: proc(socket: net.Any_Socket, kind: Ready_For, probe: Probe, timeou
 
 	event := nbio.Poll_Event.Receive
 	if kind == .Write { event = nbio.Poll_Event.Send }
+	deadline: time.Tick
+	if timeout > 0 { deadline = time.tick_add(time.tick_now(), timeout) }
 
-	attempt_deadline: time.Tick
-	bounded := timeout > 0
-	if bounded { attempt_deadline = time.tick_add(time.tick_now(), timeout) }
-
-	state: Wait_State
-	op := nbio.poll_poly(socket, event, &state, on_poll_ready)
-
-	for !state.done {
-		if probe_stop := stop_from_wait(probe_now(probe)); probe_stop != .None {
-			// Removal is final and silent, as above: only this operation is
-			// reaped, and unrelated work on the thread's loop is left alone.
-			nbio.remove(op)
-			return .Stopped, probe_stop
-		}
-
-		slice := WAIT_SLICE
-		if bounded {
-			remaining := -time.tick_since(attempt_deadline)
-			if remaining <= 0 {
-				nbio.remove(op)
-				return .Expired, .None
-			}
-			if remaining < slice { slice = remaining }
-		}
-		if nbio.tick(slice) != nil {
-			nbio.remove(op)
-			return .Failed, .Failed
-		}
-	}
-
-	switch state.result {
+	asked := probe
+	switch dns.wait_ready(socket, event, deadline, {check = dns_interrupt_check, user_data = &asked}) {
 	case .Ready:
 		return .Ready, .None
-	case .Timeout:
+	case .Expired:
 		return .Expired, .None
-	case .Invalid_Argument, .Error:
-		return .Failed, .Failed
+	case .Cancelled:
+		return .Stopped, probe_stop(probe)
+	case .Failed:
 	}
 	return .Failed, .Failed
 }

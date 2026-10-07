@@ -14,17 +14,17 @@ import "nabla:tls"
 // flight. Connect, handshake, writes, and reads are interruptible; name resolution
 // is not.
 Connection :: struct {
-	socket:      net.TCP_Socket,
-	tls_session: ^tls.Conn,
-	roots:       tls.Roots,
-	anchors:     []^x509.Certificate,
-	probe:       Probe,
-	ca_file:     string,
+	socket:       net.TCP_Socket,
+	tls_session:  ^tls.Conn,
+	roots:        tls.Roots,
+	anchors:      []^x509.Certificate,
+	probe:        Probe,
+	ca_file:      string,
 	// idle_timeout bounds each wait for the peer's bytes. Zero waits indefinitely.
 	idle_timeout: time.Duration,
-	allocator:   mem.Allocator,
-	stop:        Transport_Stop,
-	nonblocking: bool,
+	allocator:    mem.Allocator,
+	stop:         Transport_Stop,
+	nonblocking:  bool,
 }
 
 // dial_first dials each candidate in order and returns the first connection
@@ -73,14 +73,6 @@ connection_dial :: proc(endpoint: net.Endpoint, options: Options, allocator: mem
 			return nil, error_from_stop(stop)
 		}
 		if socket == 0 {
-			connection_destroy(connection)
-			return nil, .Connect
-		}
-		// nbio's dial may hand back a blocking socket. Reads and writes must report
-		// Would_Block instead, so a stalled peer is waited on through the event loop
-		// where the probe can end the wait.
-		connection.socket = socket
-		if net.set_blocking(socket, false) != nil {
 			connection_destroy(connection)
 			return nil, .Connect
 		}

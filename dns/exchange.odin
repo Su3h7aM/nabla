@@ -44,10 +44,16 @@ outcome_of :: proc(wait: Wait) -> Query_Outcome {
 	return .Cancelled if wait == .Cancelled else .Skip
 }
 
+// deadline_passed reports whether deadline has passed. The zero Tick is no
+// deadline: a wait under it ends only by readiness, failure, or the interrupt.
+deadline_passed :: proc(deadline: time.Tick) -> bool {
+	return deadline != {} && time.tick_since(deadline) >= 0
+}
+
 // attempt_status checks the attempt bound between non-blocking socket calls.
 attempt_status :: proc(deadline: time.Tick, interrupt: Interrupt) -> Wait {
 	if interrupt_now(interrupt) { return .Cancelled }
-	if time.tick_since(deadline) >= 0 { return .Expired }
+	if deadline_passed(deadline) { return .Expired }
 	return .Ready
 }
 
@@ -408,7 +414,9 @@ on_dialed :: proc(operation: ^nbio.Operation, state: ^Dial_State) {
 }
 
 // dial_tcp opens a non-blocking TCP stream through the event loop, so the
-// attempt deadline and the interrupt bound the connect as well.
+// attempt deadline and the interrupt bound the connect as well. The caller
+// holds the thread's event loop. On any wait but Ready there is no socket to
+// close.
 @(require_results)
 dial_tcp :: proc(server: net.Endpoint, deadline: time.Tick, interrupt: Interrupt) -> (socket: net.TCP_Socket, wait: Wait) {
 	state: Dial_State
@@ -436,7 +444,8 @@ on_polled :: proc(operation: ^nbio.Operation, state: ^Poll_State) {
 	state.done = true
 }
 
-// wait_ready waits until socket is ready for event.
+// wait_ready waits until socket is ready for event, the deadline passes, or
+// the interrupt fires. The caller holds the thread's event loop.
 wait_ready :: proc(socket: net.Any_Socket, event: nbio.Poll_Event, deadline: time.Tick, interrupt: Interrupt) -> Wait {
 	state: Poll_State
 	operation := nbio.poll_poly(socket, event, &state, on_polled)
@@ -455,12 +464,15 @@ tick_until :: proc(operation: ^nbio.Operation, done: ^bool, deadline: time.Tick,
 			nbio.remove(operation)
 			return .Cancelled
 		}
-		remaining := -time.tick_since(deadline)
-		if remaining <= 0 {
-			nbio.remove(operation)
-			return .Expired
+		remaining := time.Duration(max(i64))
+		if deadline != {} {
+			remaining = -time.tick_since(deadline)
+			if remaining <= 0 {
+				nbio.remove(operation)
+				return .Expired
+			}
 		}
-		if interrupt.check != nil { remaining = min(remaining, DNS_IO_SLICE) }
+		if interrupt.check != nil || deadline == {} { remaining = min(remaining, DNS_IO_SLICE) }
 		if nbio.tick(remaining) != nil && !done^ {
 			nbio.remove(operation)
 			return .Failed
