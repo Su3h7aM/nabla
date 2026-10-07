@@ -33,39 +33,60 @@ ACP_WORK_CAPACITY :: 4
 // not a frame: the decoder keeps reading until the frame ends.
 ACP_READ_BYTES :: 16 * 1024
 
-ACP_Work_Kind :: enum {
-	// Open_Session opens the session a client asked for: a new one in its working
-	// directory, or a stored one it names.
-	Open_Session,
-	// Prompt runs one turn on the open session.
-	Prompt,
-	// Set_Model identifies Buzz's v1 model-selection RPC.
-	Set_Model,
-	// Set_Config_Option applies the stable ACP model configuration method.
-	Set_Config_Option,
-	// Close_Session releases the active v2 session.
-	Close_Session,
+// ACP_Work_Open_Session opens the session a client asked for: a new one in its working
+// directory, or a stored one it names. session_ref names the stored session; the id of
+// start aliases it, so only session_ref is released by acp_work_destroy.
+ACP_Work_Open_Session :: struct {
+	id:            acp.JSONRPC_Id, // the request to answer
+	workspace:     string,
+	session_ref:   string,
+	mcp_servers:   [dynamic]agent.MCP_Server_Config,
+	system_prompt: string,
+	session_title: string,
+	start:         Session_Start,
+	replay:        bool,
+}
+
+// ACP_Work_Prompt runs one turn on the open session.
+ACP_Work_Prompt :: struct {
+	id:   acp.JSONRPC_Id, // the request to answer
+	text: string,
+}
+
+// ACP_Work_Set_Model is Buzz's v1 model-selection RPC. Model selection runs on the
+// session owner through ACP_Model_Request, so the worker only refuses it.
+ACP_Work_Set_Model :: struct {
+	id: acp.JSONRPC_Id, // the request to answer
+}
+
+// ACP_Work_Set_Config_Option applies the stable ACP model configuration method.
+ACP_Work_Set_Config_Option :: struct {
+	id:           acp.JSONRPC_Id, // the request to answer
+	config_id:    string,
+	config_value: string,
+}
+
+// ACP_Work_Close_Session releases the active v2 session.
+ACP_Work_Close_Session :: struct {
+	id: acp.JSONRPC_Id, // the request to answer
 }
 
 // ACP_Work is one request the reader handed to the worker. Every string is owned by the
 // session's allocator and released by acp_work_destroy.
-ACP_Work :: struct {
-	kind:          ACP_Work_Kind,
-	id:            acp.JSONRPC_Id, // the request to answer
-	// text is the prompt of a Prompt; workspace is where a new session runs;
-	// session_ref names a stored session for an Open_Session.
-	text:          string,
-	workspace:     string,
-	session_ref:   string,
-	model_id:      string,
-	config_id:     string,
-	config_value:  string,
-	mcp_servers:   [dynamic]agent.MCP_Server_Config,
-	system_prompt: string,
-	session_title: string,
-	replay:        bool,
-	// start is the session an Open_Session opens. Its id aliases session_ref.
-	start:         Session_Start,
+ACP_Work :: union {
+	ACP_Work_Open_Session,
+	ACP_Work_Prompt,
+	ACP_Work_Set_Model,
+	ACP_Work_Set_Config_Option,
+	ACP_Work_Close_Session,
+}
+
+// ACP_Model_Kind identifies which model-selection RPC a reader handoff answers.
+ACP_Model_Kind :: enum {
+	// Set_Model identifies Buzz's v1 model-selection RPC.
+	Set_Model,
+	// Set_Config_Option applies the stable ACP model configuration method.
+	Set_Config_Option,
 }
 
 ACP_Work_Chan :: chan.Chan(ACP_Work)
@@ -74,14 +95,14 @@ ACP_Work_Chan :: chan.Chan(ACP_Work)
 // session owner. Its strings are connection-allocator owned until settled.
 ACP_Model_Request :: struct {
 	active:   bool,
-	kind:     ACP_Work_Kind,
+	kind:     ACP_Model_Kind,
 	id:       acp.JSONRPC_Id,
 	model_id: string,
 }
 
 ACP_Model_Selection :: struct {
 	active:     bool,
-	kind:       ACP_Work_Kind,
+	kind:       ACP_Model_Kind,
 	id:         acp.JSONRPC_Id,
 	target:     agent.Model_Selection,
 	transition: agent.Selection_Transition,
@@ -391,12 +412,12 @@ acp_work_session_valid :: proc(session: ^ACP_Session, work: ACP_Work) -> bool {
 	sync.mutex_lock(&session.conn.table_mu)
 	closing := session.closing
 	sync.mutex_unlock(&session.conn.table_mu)
-	switch work.kind {
-	case .Open_Session:
+	switch _ in work {
+	case ACP_Work_Open_Session:
 		return !closing
-	case .Prompt, .Set_Model, .Set_Config_Option:
+	case ACP_Work_Prompt, ACP_Work_Set_Model, ACP_Work_Set_Config_Option:
 		return !closing && session.app.setup.store != nil
-	case .Close_Session:
+	case ACP_Work_Close_Session:
 		return session.app.setup.store != nil
 	}
 	return false
@@ -406,21 +427,55 @@ acp_work_session_valid :: proc(session: ^ACP_Session, work: ACP_Work) -> bool {
 
 // acp_work_destroy releases the strings one queued request owns.
 acp_work_destroy :: proc(work: ^ACP_Work, allocator: mem.Allocator) {
-	switch id in work.id {
+	switch item in work^ {
+	case ACP_Work_Open_Session:
+		acp_work_id_destroy(item.id, allocator)
+		delete(item.workspace, allocator)
+		delete(item.session_ref, allocator)
+		servers := item.mcp_servers
+		agent.MCP_Server_Configs_Destroy(&servers, allocator)
+		delete(item.system_prompt, allocator)
+		delete(item.session_title, allocator)
+	case ACP_Work_Prompt:
+		acp_work_id_destroy(item.id, allocator)
+		delete(item.text, allocator)
+	case ACP_Work_Set_Model:
+		acp_work_id_destroy(item.id, allocator)
+	case ACP_Work_Set_Config_Option:
+		acp_work_id_destroy(item.id, allocator)
+		delete(item.config_id, allocator)
+		delete(item.config_value, allocator)
+	case ACP_Work_Close_Session:
+		acp_work_id_destroy(item.id, allocator)
+	}
+	work^ = {}
+}
+
+// acp_work_id_destroy releases the owned string form of a request id.
+acp_work_id_destroy :: proc(id: acp.JSONRPC_Id, allocator: mem.Allocator) {
+	switch value in id {
 	case string:
-		delete(id, allocator)
+		delete(value, allocator)
 	case i64, f64, acp.JSONRPC_Null:
 	}
-	delete(work.text, allocator)
-	delete(work.workspace, allocator)
-	delete(work.session_ref, allocator)
-	delete(work.model_id, allocator)
-	delete(work.config_id, allocator)
-	delete(work.config_value, allocator)
-	agent.MCP_Server_Configs_Destroy(&work.mcp_servers, allocator)
-	delete(work.system_prompt, allocator)
-	delete(work.session_title, allocator)
-	work^ = {}
+}
+
+// acp_work_request_id reads the request id a response will carry.
+@(require_results)
+acp_work_request_id :: proc(work: ACP_Work) -> acp.JSONRPC_Id {
+	switch item in work {
+	case ACP_Work_Open_Session:
+		return item.id
+	case ACP_Work_Prompt:
+		return item.id
+	case ACP_Work_Set_Model:
+		return item.id
+	case ACP_Work_Set_Config_Option:
+		return item.id
+	case ACP_Work_Close_Session:
+		return item.id
+	}
+	return {}
 }
 
 // acp_work_id copies the request id a response will carry. Only the string form owns
@@ -505,7 +560,14 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 		sync.mutex_unlock(&session.conn.table_mu)
 		acp_run_work(session, work)
 		acp_owner_service_end(session)
-		retiring := work.kind == .Close_Session || (work.kind == .Open_Session && !session.opened)
+		retiring := false
+		switch _ in work {
+		case ACP_Work_Close_Session:
+			retiring = true
+		case ACP_Work_Open_Session:
+			retiring = !session.opened
+		case ACP_Work_Prompt, ACP_Work_Set_Model, ACP_Work_Set_Config_Option:
+		}
 		acp_work_destroy(&work, session.conn.alloc)
 		// Temp scratch belongs to one request: the worker is long-lived, so its pool is
 		// recycled here rather than left to grow with the conversation.
@@ -524,19 +586,24 @@ acp_run_work :: proc(session: ^ACP_Session, work: ACP_Work) {
 	if !acp_work_session_valid(session, work) {
 		// A write error latches the writer, which the run reports as its failure, so
 		// every reply's own result is not acted on here or below.
-		_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_PARAMS, "the session changed before the request could run")
+		_ = acp.writer_write_error(
+			&session.conn.writer,
+			acp_work_request_id(work),
+			acp.ERROR_INVALID_PARAMS,
+			"the session changed before the request could run",
+		)
 	} else {
-		switch work.kind {
-		case .Open_Session:
-			acp_work_open_session(session, work)
-		case .Prompt:
-			acp_work_prompt(session, work)
-		case .Set_Model:
-			_ = acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_REQUEST, "model selection must be handled by the session owner")
-		case .Set_Config_Option:
-			acp_work_set_config_option(session, work)
-		case .Close_Session:
-			acp_work_close_session(session, work)
+		switch item in work {
+		case ACP_Work_Open_Session:
+			acp_work_open_session(session, item)
+		case ACP_Work_Prompt:
+			acp_work_prompt(session, item)
+		case ACP_Work_Set_Model:
+			_ = acp.writer_write_error(&session.conn.writer, item.id, acp.ERROR_INVALID_REQUEST, "model selection must be handled by the session owner")
+		case ACP_Work_Set_Config_Option:
+			acp_work_set_config_option(session, item)
+		case ACP_Work_Close_Session:
+			acp_work_close_session(session, item)
 		}
 	}
 	// The request is answered, so the next one may be admitted. The cancellation belongs
@@ -547,7 +614,7 @@ acp_run_work :: proc(session: ^ACP_Session, work: ACP_Work) {
 
 // --- opening a session -------------------------------------------------------
 
-acp_work_open_session :: proc(session: ^ACP_Session, work: ACP_Work) {
+acp_work_open_session :: proc(session: ^ACP_Session, work: ACP_Work_Open_Session) {
 	// A session that already holds its conversation is opened a second time by a load or
 	// resume of its own id: the conversation is the same, so it is announced again and
 	// nothing is claimed or selected. A refusal then leaves the session as it was.
@@ -849,7 +916,7 @@ acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Mo
 
 // --- running a prompt --------------------------------------------------------
 
-acp_work_set_config_option :: proc(session: ^ACP_Session, work: ACP_Work) {
+acp_work_set_config_option :: proc(session: ^ACP_Session, work: ACP_Work_Set_Config_Option) {
 	applied := false
 	if work.config_id == "effort" {
 		applied = agent.chat_session_set_effort(&session.app.setup.session, work.config_value)
@@ -902,12 +969,12 @@ ACP_SESSION_LIST_PAGE_SIZE :: 50
 
 // acp_work_close_session releases the session before it answers, so a client that loads the
 // session again as soon as it hears the close finds its claim dropped.
-acp_work_close_session :: proc(session: ^ACP_Session, work: ACP_Work) {
+acp_work_close_session :: proc(session: ^ACP_Session, work: ACP_Work_Close_Session) {
 	acp_session_release(session)
 	_ = acp.writer_write_response(&session.conn.writer, work.id, acp.Empty_Result{})
 }
 
-acp_work_prompt :: proc(session: ^ACP_Session, work: ACP_Work) {
+acp_work_prompt :: proc(session: ^ACP_Session, work: ACP_Work_Prompt) {
 	chat := &session.app.setup.session
 	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(session))
 	switch accepted {

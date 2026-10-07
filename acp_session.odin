@@ -432,7 +432,12 @@ acp_session_shutdown :: proc(session: ^ACP_Session) {
 	for {
 		queued, ok := chan.try_recv(session.work)
 		if !ok { break }
-		_ = acp.writer_write_error(&session.conn.writer, queued.id, acp.ERROR_INVALID_REQUEST, "the session closed before the request could run")
+		_ = acp.writer_write_error(
+			&session.conn.writer,
+			acp_work_request_id(queued),
+			acp.ERROR_INVALID_REQUEST,
+			"the session closed before the request could run",
+		)
 		acp_work_destroy(&queued, alloc)
 	}
 	request := acp_model_request_take(session)
