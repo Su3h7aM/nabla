@@ -101,6 +101,10 @@ headers_get_all :: proc(headers: Headers, key: string, allocator: runtime.Alloca
 	return values, true, nil
 }
 
+headers_assert_writable :: proc(headers: ^Headers, loc := #caller_location) {
+	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
+}
+
 // headers_entry returns the entry for a name it lowercases first, inserted with a
 // zero value when the section had none. mem_err is set when the name could not be
 // built, or when the entry's allocation failed.
@@ -115,7 +119,7 @@ headers_entry :: proc(
 	just_inserted: bool,
 	mem_err: runtime.Allocator_Error,
 ) {
-	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
+	headers_assert_writable(headers, loc)
 	name, name_err := sanitize_key(headers^, key)
 	if name_err != nil { return nil, nil, false, name_err }
 	key_ptr, value_ptr, just_inserted, mem_err = map_entry(&headers._kv, name)
@@ -135,7 +139,7 @@ headers_entry_unsafe :: #force_inline proc(
 	just_inserted: bool,
 	mem_err: runtime.Allocator_Error,
 ) {
-	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
+	headers_assert_writable(headers, loc)
 	key_ptr, value_ptr, just_inserted, mem_err = map_entry(&headers._kv, key)
 	return
 }
