@@ -85,12 +85,12 @@ chat_request_worker_attempt :: proc(worker: ^Chat_Request_Worker) -> Chat_Attemp
 	}
 	operation_error: ai.Provider_Operation_Error
 	if worker.websocket_request {
-		operation_error = ai.Provider_WebSocket_Request(worker.websocket, worker.encoded, &runtime, chat_worker_event, worker.options)
+		operation_error = ai.Provider_WebSocket_Request(worker.websocket, worker.encoded, rawptr(&runtime), chat_worker_event, worker.options)
 	} else {
 		operation_error = ai.Provider_Request_Operation_Encoded(
 			worker.connection,
 			worker.encoded,
-			&runtime,
+			rawptr(&runtime),
 			chat_worker_event,
 			worker.options,
 			worker.worker.allocator,
