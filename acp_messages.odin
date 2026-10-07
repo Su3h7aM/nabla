@@ -596,8 +596,9 @@ acp_request_session_close :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) 
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
-	work: ACP_Work = ACP_Work_Close_Session {
-		id = id,
+	work := ACP_Work {
+		id      = id,
+		variant = ACP_Work_Close_Session{},
 	}
 	acp_cancel_session(session)
 	// Marking the session closing refuses every later request for it, and the worker runs
@@ -653,10 +654,9 @@ acp_request_set_config_option :: proc(server: ^ACP_Server, envelope: ^acp.Envelo
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
-	work: ACP_Work = ACP_Work_Set_Config_Option {
-		id           = id,
-		config_id    = config_id,
-		config_value = value,
+	work := ACP_Work {
+		id = id,
+		variant = ACP_Work_Set_Config_Option{config_id = config_id, config_value = value},
 	}
 	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
@@ -782,15 +782,17 @@ acp_enqueue_open_session :: proc(
 	// only. A new session has an empty reference.
 	start: Session_Start = Start_Fresh{}
 	if resume { start = Start_Resume_Id(session_ref) }
-	work: ACP_Work = ACP_Work_Open_Session {
-		id            = id,
-		workspace     = workspace,
-		session_ref   = session_ref,
-		mcp_servers   = mcp_servers,
-		system_prompt = system_prompt,
-		session_title = title,
-		start         = start,
-		replay        = replay,
+	work := ACP_Work {
+		id = id,
+		variant = ACP_Work_Open_Session {
+			workspace = workspace,
+			session_ref = session_ref,
+			mcp_servers = mcp_servers,
+			system_prompt = system_prompt,
+			session_title = title,
+			start = start,
+			replay = replay,
+		},
 	}
 	// A stored session this connection already runs is opened again by its own worker, so
 	// it is never claimed twice. Anything else gets a session of its own, which a full
@@ -960,9 +962,9 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
-	work: ACP_Work = ACP_Work_Prompt {
-		id   = id,
-		text = prompt_text,
+	work := ACP_Work {
+		id = id,
+		variant = ACP_Work_Prompt{text = prompt_text},
 	}
 	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
