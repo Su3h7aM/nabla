@@ -179,26 +179,7 @@ openai_responses_encode_request_body :: proc(
 	}
 	encode_write_field(&cursor, body, &first, "model")
 	encode_write_text(&cursor, body, request.Model)
-	if request.Prompt_Cache_Key_Present {
-		encode_write_field(&cursor, body, &first, "prompt_cache_key")
-		encode_write_text(&cursor, body, request.Prompt_Cache_Key)
-	}
-	if request.Prompt_Cache_Options_Present {
-		encode_write_field(&cursor, body, &first, "prompt_cache_options")
-		encode_write_raw(&cursor, body, "{")
-		options_first := true
-		if request.Prompt_Cache_Options.Mode_Present {
-			mode := "implicit"
-			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
-			encode_write_field(&cursor, body, &options_first, "mode")
-			encode_write_literal_string(&cursor, body, mode)
-		}
-		if request.Prompt_Cache_Options.TTL_Present {
-			encode_write_field(&cursor, body, &options_first, "ttl")
-			encode_write_literal_string(&cursor, body, request.Prompt_Cache_Options.TTL)
-		}
-		encode_write_raw(&cursor, body, "}")
-	}
+	encode_write_cache_fields(&cursor, body, &first, request)
 	if request.Reasoning_Effort_Present {
 		encode_write_field(&cursor, body, &first, "reasoning")
 		encode_write_raw(&cursor, body, "{")
@@ -248,11 +229,7 @@ openai_responses_encode_request_body :: proc(
 		encode_write_literal_string(&cursor, body, "response.create")
 	}
 	encode_write_raw(&cursor, body, "}")
-	encode_finish(&cursor)
-	if cursor.error != .None { return "", cursor.error }
-	result, take_error := encode_body_take(&cursor)
-	if take_error != .None { return "", take_error }
-	return result, .None
+	return encode_finish_take(&cursor)
 }
 
 // openai_responses_record_write writes the items one response record replays as, where
@@ -747,6 +724,23 @@ openai_responses_consume_sse_data :: proc(payload: string, state: ^Provider_Stre
 }
 
 @(require_results)
+openai_responses_event_fragment :: proc(object: json.Object, state: ^Provider_Stream_State) -> (^Provider_Tool_Fragment, Provider_Stream_Error) {
+	fragment, slot_error := provider_tool_fragment_by_item(object, state)
+	if slot_error != .None { return nil, slot_error }
+	if id, present, ok := provider_json_string(object, "item_id"); ok && present && id != "" {
+		if fragment.Item_ID != "" && fragment.Item_ID != id { return nil, provider_stream_fail(state, .Invalid_Data, "output item id changed") }
+		if fragment.Item_ID == "" {
+			owned, clone_error := strings.clone(id, state.Allocator)
+			if clone_error != nil {
+				return nil, provider_stream_fail_allocation(state, "the output item id could not be retained")
+			}
+			fragment.Item_ID = owned
+		}
+	} else if !ok { return nil, provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
+	return fragment, .None
+}
+
+@(require_results)
 openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_State) -> Provider_Stream_Error {
 	if state == nil || state^.API != .OpenAI_Responses { return .Invalid_State }
 	if state^.Phase == .Done || state^.Phase == .Failed {
@@ -803,18 +797,8 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		return .None
 	case "response.function_call_arguments.delta":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
-		fragment, slot_error := provider_tool_fragment_by_item(object, state)
+		fragment, slot_error := openai_responses_event_fragment(object, state)
 		if slot_error != .None { return slot_error }
-		if id, present, ok := provider_json_string(object, "item_id"); ok && present && id != "" {
-			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
-			if fragment.Item_ID == "" {
-				owned, clone_error := strings.clone(id, state.Allocator)
-				if clone_error != nil {
-					return provider_stream_fail_allocation(state, "the output item id could not be retained")
-				}
-				fragment.Item_ID = owned
-			}
-		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
 		delta, delta_present, delta_ok := provider_json_string(object, "delta")
 		if !delta_ok { return provider_stream_fail(state, .Invalid_Data, "arguments delta is not text") }
 		if delta_present && delta != "" {
@@ -826,18 +810,8 @@ openai_responses_consume_event :: proc(payload: string, state: ^Provider_Stream_
 		return .None
 	case "response.function_call_arguments.done":
 		if state^.Phase == .Completed { return provider_stream_fail(state, .Invalid_Data, "data received after completion") }
-		fragment, slot_error := provider_tool_fragment_by_item(object, state)
+		fragment, slot_error := openai_responses_event_fragment(object, state)
 		if slot_error != .None { return slot_error }
-		if id, present, ok := provider_json_string(object, "item_id"); ok && present && id != "" {
-			if fragment.Item_ID != "" && fragment.Item_ID != id { return provider_stream_fail(state, .Invalid_Data, "output item id changed") }
-			if fragment.Item_ID == "" {
-				owned, clone_error := strings.clone(id, state.Allocator)
-				if clone_error != nil {
-					return provider_stream_fail_allocation(state, "the output item id could not be retained")
-				}
-				fragment.Item_ID = owned
-			}
-		} else if !ok { return provider_stream_fail(state, .Invalid_Data, "item id is invalid") }
 		if arguments, present, ok := provider_json_string(object, "arguments"); ok && present && arguments != "" {
 			// The done event repeats full arguments; replace the
 			// accumulated bytes so a replayed prefix is not doubled.

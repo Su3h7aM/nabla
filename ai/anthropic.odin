@@ -104,11 +104,7 @@ anthropic_encode_request :: proc(
 		encode_write_raw(&cursor, body, "]")
 	}
 	encode_write_raw(&cursor, body, "}")
-	encode_finish(&cursor)
-	if cursor.error != .None { return "", cursor.error }
-	result, take_error := encode_body_take(&cursor)
-	if take_error != .None { return "", take_error }
-	return result, .None
+	return encode_finish_take(&cursor)
 }
 
 // anthropic_write_messages projects the conversation onto the Messages API. The

@@ -213,6 +213,13 @@ encode_body_take :: proc(cursor: ^Encode_Cursor) -> (string, Provider_Request_Er
 	return text, .None
 }
 
+@(private = "package", require_results)
+encode_finish_take :: proc(cursor: ^Encode_Cursor) -> (string, Provider_Request_Error) {
+	encode_finish(cursor)
+	if cursor.error != .None { return "", cursor.error }
+	return encode_body_take(cursor)
+}
+
 // encode_body_end releases what encode_body_begin started. A cache's buffer is kept for the
 // next request; a temporary one was either handed over by encode_body_take or is freed here.
 @(private = "package")
@@ -379,4 +386,28 @@ encode_object_bytes :: proc(text: string, out: ^strings.Builder, allocator: mem.
 	defer delete(rendered, allocator)
 	if strings.write_string(out, rendered) != len(rendered) { return false, .Allocation }
 	return true, .None
+}
+
+@(private = "package")
+encode_write_cache_fields :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, first: ^bool, request: Provider_Request) {
+	if request.Prompt_Cache_Key_Present {
+		encode_write_field(cursor, body, first, "prompt_cache_key")
+		encode_write_text(cursor, body, request.Prompt_Cache_Key)
+	}
+	if request.Prompt_Cache_Options_Present {
+		encode_write_field(cursor, body, first, "prompt_cache_options")
+		encode_write_raw(cursor, body, "{")
+		options_first := true
+		if request.Prompt_Cache_Options.Mode_Present {
+			mode := "implicit"
+			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
+			encode_write_field(cursor, body, &options_first, "mode")
+			encode_write_literal_string(cursor, body, mode)
+		}
+		if request.Prompt_Cache_Options.TTL_Present {
+			encode_write_field(cursor, body, &options_first, "ttl")
+			encode_write_literal_string(cursor, body, request.Prompt_Cache_Options.TTL)
+		}
+		encode_write_raw(cursor, body, "}")
+	}
 }

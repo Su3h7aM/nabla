@@ -111,26 +111,7 @@ openai_chat_encode_request :: proc(
 	encode_write_raw(&cursor, body, "]")
 	encode_write_field(&cursor, body, &first, "model")
 	encode_write_text(&cursor, body, request.Model)
-	if request.Prompt_Cache_Key_Present {
-		encode_write_field(&cursor, body, &first, "prompt_cache_key")
-		encode_write_text(&cursor, body, request.Prompt_Cache_Key)
-	}
-	if request.Prompt_Cache_Options_Present {
-		encode_write_field(&cursor, body, &first, "prompt_cache_options")
-		encode_write_raw(&cursor, body, "{")
-		options_first := true
-		if request.Prompt_Cache_Options.Mode_Present {
-			mode := "implicit"
-			if request.Prompt_Cache_Options.Mode == .Explicit { mode = "explicit" }
-			encode_write_field(&cursor, body, &options_first, "mode")
-			encode_write_literal_string(&cursor, body, mode)
-		}
-		if request.Prompt_Cache_Options.TTL_Present {
-			encode_write_field(&cursor, body, &options_first, "ttl")
-			encode_write_literal_string(&cursor, body, request.Prompt_Cache_Options.TTL)
-		}
-		encode_write_raw(&cursor, body, "}")
-	}
+	encode_write_cache_fields(&cursor, body, &first, request)
 	if request.Reasoning_Effort_Present {
 		encode_write_field(&cursor, body, &first, "reasoning_effort")
 		encode_write_text(&cursor, body, request.Reasoning_Effort)
@@ -177,11 +158,7 @@ openai_chat_encode_request :: proc(
 		encode_write_raw(&cursor, body, "]")
 	}
 	encode_write_raw(&cursor, body, "}")
-	encode_finish(&cursor)
-	if cursor.error != .None { return "", cursor.error }
-	result, take_error := encode_body_take(&cursor)
-	if take_error != .None { return "", take_error }
-	return result, .None
+	return encode_finish_take(&cursor)
 }
 
 openai_chat_calls_open :: proc(state: ^Provider_Stream_State) -> bool {
