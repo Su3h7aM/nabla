@@ -133,6 +133,7 @@ chat_request_freeze :: proc(
 	}
 	body, body_error := make([]u8, len(frozen.Body), allocator)
 	if body_error != nil {
+		if !frozen.Body_Borrowed { delete(frozen.Body, chat.allocator) }
 		chat_session_fail_turn(chat, "the rebuilt request body could not be kept for the attempt")
 		return false
 	}

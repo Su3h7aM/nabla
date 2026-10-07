@@ -2,6 +2,7 @@ package agent
 
 import "base:runtime"
 import "core:fmt"
+import "core:mem"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -53,13 +54,14 @@ Chat_Request_Usage :: struct {
 // the only fallback: it never authorizes a second send of the same model request.
 //
 // On failure the turn is failed here and no body is returned. On success the caller owns
-// encoded.Body and must release it once the chain is over.
+// encoded.Body, which lives in arena and is released with it.
 @(private, require_results)
 chat_request_transport :: proc(
 	chat: ^Chat_Session,
 	connection: ai.Provider_Connection,
 	prep: ^Chat_Request_Prep,
 	options: ai.Provider_Operation_Options,
+	arena: mem.Allocator,
 ) -> (
 	encoded: ai.Provider_Encoded_Request,
 	websocket_request: bool,
@@ -74,21 +76,11 @@ chat_request_transport :: proc(
 
 	// A request that cannot be encoded never reaches the provider, so it fails the turn
 	// before a request row exists rather than being recorded as a send that did not happen.
-	encode_err: ai.Provider_Operation_Error
-	if websocket_request {
-		encoded, encode_err = ai.Provider_Request_Freeze_WebSocket_Reusing(prep.request, &chat.encode_cache, chat.allocator)
-	} else {
-		encoded, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
-	}
-	if encode_err.kind != .None {
-		chat_session_fail_turn(chat, encode_err.detail)
-		ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
-		return {}, false, false
-	}
+	if !chat_request_freeze(chat, prep, &encoded, websocket_request, arena) { return {}, false, false }
 	if websocket_request && chat.provider_websocket == nil {
+		encode_err: ai.Provider_Operation_Error
 		chat.provider_websocket, encode_err = ai.Provider_WebSocket_Session_Open(connection, chat.allocator)
 		if encode_err.kind != .None {
-			if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
 			chat_session_fail_turn(chat, encode_err.detail)
 			ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
 			return {}, false, false
@@ -98,7 +90,6 @@ chat_request_transport :: proc(
 		connect_err := ai.Provider_WebSocket_Connect(chat.provider_websocket, encoded, options)
 		if connect_err.kind != .None {
 			if !chat_websocket_fallback_safe(connect_err) {
-				if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
 				chat_session_fail_turn(chat, connect_err.detail)
 				ai.Provider_Operation_Error_Destroy(&connect_err, chat.allocator)
 				return {}, false, false
@@ -108,13 +99,7 @@ chat_request_transport :: proc(
 			chat.provider_websocket = nil
 			chat.websocket_fallback_http = true
 			websocket_request = false
-			if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
-			encoded, encode_err = ai.Provider_Request_Freeze_Reusing(prep.request, &chat.encode_cache, chat.allocator)
-			if encode_err.kind != .None {
-				chat_session_fail_turn(chat, encode_err.detail)
-				ai.Provider_Operation_Error_Destroy(&encode_err, chat.allocator)
-				return {}, false, false
-			}
+			if !chat_request_freeze(chat, prep, &encoded, false, arena) { return {}, false, false }
 		}
 	}
 	return encoded, websocket_request, true

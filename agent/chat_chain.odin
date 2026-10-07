@@ -338,21 +338,8 @@ chat_request_begin :: proc(chat: ^Chat_Session, connection: ai.Provider_Connecti
 	// The bytes this request sends are frozen once, before the first attempt, so every
 	// attempt of the chain sends exactly what the first would have sent instead of a fresh
 	// encoding that has to be assumed equal.
-	encoded, websocket_request, transport_ok := chat_request_transport(chat, connection, &prep, options)
+	encoded, websocket_request, transport_ok := chat_request_transport(chat, connection, &prep, options, scratch_allocator)
 	if !transport_ok { return }
-	// The bytes this attempt sends must outlive the chain, because a worker that ignores its
-	// stop may still be sending them after the chain is released. The transport freezes through
-	// the session's encode cache, whose next encode writes over them, so the attempt gets its
-	// own copy in the arena the chain owns and an abandoned attempt is retained with.
-	body, body_error := make([]u8, len(encoded.Body), scratch_allocator)
-	if body_error != nil {
-		chat_session_fail_turn(chat, "the request body could not be kept for the attempt")
-		return
-	}
-	copy(body, encoded.Body)
-	if !encoded.Body_Borrowed { delete(encoded.Body, chat.allocator) }
-	encoded.Body = body
-	encoded.Body_Borrowed = false
 
 	// What the harness intends to send is recorded before it is stored, so a request that
 	// never reaches the store still says what it was going to carry.

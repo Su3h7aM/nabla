@@ -496,13 +496,17 @@ subagent_start :: proc(
 ) {
 	parent: Agent_Parent
 	parent_error: mem.Allocator_Error
+	tools: Tool_Registry
+	tools_error: Tool_Registry_Error
 	{
 		sync.mutex_guard(&team.mutex)
 		if team.closing { return nil, "the orchestrator is closing; nothing started" }
 		team.starting += 1
-		// The snapshot is copied into scratch memory while the lock is held, so the owner
-		// replacing it cannot release what this start still reads.
+		// The snapshot and the tool registry are copied while the lock is held, so the owner
+		// replacing them cannot release what this start still reads.
 		parent, parent_error = agent_parent_temp_copy(team.parent, context.temp_allocator)
+		parent.tools = {}
+		tools, tools_error = tool_registry_clone(&team.parent.tools, allocator)
 	}
 	defer {
 		{
@@ -511,9 +515,8 @@ subagent_start :: proc(
 		}
 		owner_wake_signal()
 	}
-	if parent_error != nil { return nil, "the orchestrator's selection could not be copied" }
-	tools, tools_error := tool_registry_clone(&parent.tools, allocator)
 	defer tool_registry_destroy(&tools)
+	if parent_error != nil { return nil, "the orchestrator's selection could not be copied" }
 	if tools_error.kind != .None { return nil, "the subagent tools could not be copied" }
 	selection: Model_Selection
 	program: Subagent_Program

@@ -541,12 +541,10 @@ chat_title_from_prompt :: proc(prompt: string, allocator := context.allocator) -
 	if newline := strings.index_byte(line, '\n'); newline >= 0 { line = line[:newline] }
 	line = strings.trim_space(line)
 	if len(line) > CHAT_TITLE_MAX_BYTES {
-		line = line[:CHAT_TITLE_MAX_BYTES]
-		for len(line) > 0 {
-			_, width := utf8.decode_last_rune_in_string(line)
-			if width > 0 { break }
-			line = line[:len(line) - 1]
-		}
+		// Cut before the first byte that does not continue a rune, so no rune is split.
+		end := CHAT_TITLE_MAX_BYTES
+		for end > 0 && !utf8.rune_start(line[end]) { end -= 1 }
+		line = line[:end]
 	}
 	return strings.clone(line, allocator)
 }
@@ -680,7 +678,8 @@ chat_session_accept_message :: proc(
 		if busy_failure { chat_last_error_set(chat, pending_message) }
 		finish := chat_session_advance(chat)
 		assert(finish.kind == .Turn_Finished, "a rejected prompt must have a terminal effect")
-		assert(chat_session_claim_finish(chat, finish), "a rejected prompt must claim its terminal effect")
+		claimed := chat_session_claim_finish(chat, finish)
+		assert(claimed, "a rejected prompt must claim its terminal effect")
 		recorded := chat_persist_turn_end(chat, finish)
 		if busy_failure && !chat.storage_failed {
 			if recorded {
