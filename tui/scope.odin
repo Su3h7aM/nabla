@@ -282,7 +282,6 @@ _element_node_leave :: proc(ctx: ^Context, desc: Element_Node_Desc, loc: runtime
 	}
 }
 
-// current_node returns the active layout node. The frame root is handle zero.
 @(require_results)
 current_node :: proc(ctx: ^Context) -> (layout.Node_Handle, bool) #optional_ok {
 	if ctx == nil || !ctx._frame_open {
@@ -291,7 +290,6 @@ current_node :: proc(ctx: ^Context) -> (layout.Node_Handle, bool) #optional_ok {
 	return ctx._current.node, true
 }
 
-// bounds returns the active scope's selected box.
 @(require_results)
 bounds :: proc(ctx: ^Context) -> (Cell_Rect, bool) #optional_ok {
 	if ctx == nil || !ctx._frame_open {
@@ -300,7 +298,6 @@ bounds :: proc(ctx: ^Context) -> (Cell_Rect, bool) #optional_ok {
 	return ctx._current.bounds, true
 }
 
-// width_profile returns the width policy bound to the active frame.
 @(require_results)
 width_profile :: proc(ctx: ^Context) -> (width_text.Width_Profile, bool) #optional_ok {
 	if ctx == nil || !ctx._frame_open {
@@ -309,7 +306,6 @@ width_profile :: proc(ctx: ^Context) -> (width_text.Width_Profile, bool) #option
 	return ctx._profile, true
 }
 
-// boxes returns the active element's outer and inner boxes.
 @(require_results)
 boxes :: proc(ctx: ^Context) -> (outer, inner: Cell_Rect, ok: bool) {
 	if ctx == nil || !ctx._frame_open {

@@ -18,7 +18,6 @@ layout_services :: proc(measure_context: ^Measure_Context) -> layout.Services {
 	return {measure_text = measure_proc, measure_text_user_data = measure_context, break_text = break_proc}
 }
 
-// measure_proc is the layout.Services.measure_text callback.
 @(require_results)
 measure_proc :: proc(
 	user_data: rawptr,
@@ -41,8 +40,7 @@ measure_proc :: proc(
 	return {size = size, min_size = size, baseline = 1}, .None
 }
 
-// break_proc is the layout.Services.break_text callback. user_data is unused:
-// the classifier is stateless.
+// break_proc is the layout.Services.break_text callback. user_data is unused.
 @(require_results)
 break_proc :: proc(
 	user_data: rawptr,

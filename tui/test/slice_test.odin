@@ -56,13 +56,8 @@ SELECTED_STYLE :: term.Style {
 	modifiers  = {.Bold},
 }
 
-// item_style exists because a *constant* struct holding a union miscompiles when
-// it reaches a conditional expression: `selected ? SELECTED_STYLE : term.Style{}`
-// makes LLVM reject the module with "PHI node operands are not the same type as
-// the result". Copying the constant to a local first is enough to avoid it,
-// which is why this reads `style := SELECTED_STYLE` rather than returning the
-// constant directly. Broken on every Odin release that has the feature
-// (dev-2025-11 through dev-2026-07a, verified).
+// item_style copies SELECTED_STYLE to a local first: returning the constant
+// through a conditional miscompiles with an LLVM PHI type error.
 item_style :: proc(selected: bool) -> term.Style {
 	if selected {
 		selected_style := SELECTED_STYLE
