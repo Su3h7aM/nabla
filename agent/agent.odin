@@ -291,13 +291,14 @@ chat_session_feed_completion :: proc(chat: ^Chat_Session, source: Chat_Event_Sou
 chat_session_feed_response_output :: proc(chat: ^Chat_Session, source: Chat_Event_Source, output: string) -> bool {
 	if !chat_session_accepts_event(chat, source) { return false }
 	if output == "" { return true }
-	if chat.pending_response_present { return false }
+	if chat.pending_response != nil { return false }
 	owned, clone_error := chat_clone_string(output, chat.allocator)
 	// The staged output is the replay record; one that cannot be kept leaves the response
 	// with no replay record, which the caller reports as a response it cannot use.
 	if clone_error != nil { return false }
-	chat.pending_response.output = owned
-	chat.pending_response_present = true
+	chat.pending_response = Chat_Response_Output {
+		output = owned,
+	}
 	return true
 }
 

@@ -38,8 +38,10 @@ chat_response_output_destroy :: proc(output: ^Chat_Response_Output, allocator: m
 // assembled, and with it the fact that one is staged. Every move of a staged response
 // into the store ends this way.
 chat_pending_response_clear :: proc(chat: ^Chat_Session) {
-	chat_response_output_destroy(&chat.pending_response, chat.allocator)
-	chat.pending_response_present = false
+	if chat.pending_response != nil {
+		chat_response_output_destroy(&chat.pending_response.?, chat.allocator)
+		chat.pending_response = nil
+	}
 }
 
 // Chat_State is the control state of the session. Durable state lives in the
@@ -152,8 +154,7 @@ Chat_Session :: struct {
 	// pending_response and pending_calls are what the current response produced
 	// and has not committed yet. pending_response holds the verbatim Responses
 	// output array; pending_calls holds the validated calls awaiting execution.
-	pending_response:             Chat_Response_Output,
-	pending_response_present:     bool,
+	pending_response:             Maybe(Chat_Response_Output),
 	pending_calls:                [dynamic]Chat_Tool_Call,
 	// pending_notice is why the running response could not be used. It is set
 	// while the response is still streaming and committed with it, so the

@@ -606,7 +606,6 @@ chat_chain_settle :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 		{
 			outcome = .Failed,
 			error = chain.operation_error,
-			error_present = true,
 			text_exposed = chain.text_exposed,
 			completion_accepted = chain.completion_accepted,
 			recovery = chain.decision.reason,
@@ -760,8 +759,7 @@ chat_chain_commit :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Us
 	if reason != .Completed && !turn_continues { chat.turn_recovery = reason }
 	send := Chat_Send_Result {
 		finish_reason       = chain.finish_reason,
-		error               = chain.operation_error,
-		error_present       = chain.operation_error.kind != .None,
+		error               = chain.operation_error if chain.operation_error.kind != .None else nil,
 		message             = chat.last_error,
 		text_exposed        = chain.text_exposed,
 		completion_accepted = chain.completion_accepted,

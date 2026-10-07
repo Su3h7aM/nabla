@@ -169,7 +169,7 @@ chat_commit_response_nodes :: proc(
 	committed.api = chat_api_name(chat.chain.connection.API)
 	committed.finish = chat_finish_reason_text(finish)
 	output: []u8
-	if chat.pending_response_present { output = transmute([]u8)chat.pending_response.output }
+	if chat.pending_response != nil { output = transmute([]u8)chat.pending_response.?.output }
 	header := journal.Record {
 		kind     = .Response_Committed,
 		node     = assistant,
@@ -243,8 +243,8 @@ chat_response_cost :: proc(chat: ^Chat_Session, text, notice: string) -> int {
 	messages := 0
 	if text != "" { messages += 1 }
 	if notice != "" { messages += 1 }
-	if chat.pending_response_present {
-		chars += len(chat.pending_response.output)
+	if chat.pending_response != nil {
+		chars += len(chat.pending_response.?.output)
 		messages += 1
 	}
 	if len(chat.pending_calls) > 0 {

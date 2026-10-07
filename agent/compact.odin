@@ -738,8 +738,7 @@ chat_compact_finish_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job, deci
 		job.attempts,
 		Chat_Send_Result {
 			outcome = .Failed,
-			error = operation_error,
-			error_present = job.operation.kind != .None,
+			error = operation_error if job.operation.kind != .None else nil,
 			message = message,
 			recovery = decision.reason,
 			delay = decision.delay,

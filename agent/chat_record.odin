@@ -113,8 +113,7 @@ CHAT_SEND_OUTCOME_NAMES := [Chat_Send_Outcome]string {
 Chat_Send_Result :: struct {
 	outcome:             Chat_Send_Outcome,
 	finish_reason:       ai.Provider_Finish_Reason,
-	error:               ai.Provider_Operation_Error,
-	error_present:       bool,
+	error:               Maybe(ai.Provider_Operation_Error),
 	message:             string,
 	text_exposed:        bool,
 	completion_accepted: bool,
@@ -136,8 +135,8 @@ chat_send_rejection :: proc(result: Chat_Send_Result) -> journal.Response_Reject
 		delay_ms            = i64(result.delay / time.Millisecond),
 		detail              = result.message,
 	}
-	if !result.error_present { return rejection }
-	error := result.error
+	if result.error == nil { return rejection }
+	error := result.error.?
 	rejection.kind = ai.provider_operation_error_name(error.kind)
 	rejection.failure_class = ai.provider_failure_class_name(error.failure_class)
 	rejection.status = error.status
