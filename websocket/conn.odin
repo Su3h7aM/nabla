@@ -173,6 +173,10 @@ ping :: proc(connection: ^Conn, body: []u8) -> Error {
 
 // close sends the close frame and waits for the peer's, so that both ends agree the
 // connection is over (RFC 6455 section 5.5.1). The transport is the caller's to close.
+//
+// Message data the peer sends before its close frame is read into `buffer` and
+// dropped. A caller with no room to spare may pass an empty buffer: close then reads
+// into a scratch of its own, so every call makes progress.
 @(require_results)
 close :: proc(connection: ^Conn, code: Close_Code, reason: string, buffer: []u8) -> Error {
 	if !close_code_valid(code) || len(reason) > MAX_CONTROL_PAYLOAD - 2 || !utf8.valid_string(reason) {
@@ -193,8 +197,11 @@ close :: proc(connection: ^Conn, code: Close_Code, reason: string, buffer: []u8)
 	if connection.closed { return .None }
 
 	// Read what the peer says, which is a close frame or nothing at all.
+	scratch: [64]u8
+	discard := buffer
+	if len(discard) == 0 { discard = scratch[:] }
 	for {
-		_, _, _, err := read(connection, buffer)
+		_, _, _, err := read(connection, discard)
 		if err == .Closed { return .None }
 		if err != .None { return err }
 	}

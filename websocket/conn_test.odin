@@ -288,6 +288,21 @@ test_client_mandatory_extension_close_code_is_send_only :: proc(t: ^testing.T) {
 	testing.expect_value(t, close_code_sent(fixture.outgoing[:]), Close_Code.Mandatory_Extension)
 }
 
+// Data the peer sent before its close frame is discarded, and an empty buffer is
+// not a reason to wait on it forever.
+@(test)
+test_close_with_an_empty_buffer_discards_pending_data :: proc(t: ^testing.T) {
+	fixture: Fixture
+	incoming := []u8{0x81, 0x03, 'a', 'b', 'c', 0x88, 0x02, 0x03, 0xe8}
+	connection := fixture_connection(t, &fixture, incoming)
+	if connection == nil { return }
+	defer destroy(connection)
+	defer delete(fixture.outgoing)
+
+	testing.expect_value(t, close(connection, .Normal, "", nil), Error.None)
+	testing.expect_value(t, close_code_sent(fixture.outgoing[:]), Close_Code.Normal)
+}
+
 @(test)
 test_local_close_input_is_checked_before_the_control_buffer_is_sliced :: proc(t: ^testing.T) {
 	fixture: Fixture
