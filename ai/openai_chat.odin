@@ -57,7 +57,7 @@ openai_chat_encode_request :: proc(
 		encode_write_raw(&cursor, body, "{")
 		switch {
 		case message.Role == .Assistant && message.Content == "" && len(message.Tool_Calls) > 0:
-			// content is optional beside tool_calls, and compatible endpoints disagree on an empty one.
+		// content is optional beside tool_calls, and compatible endpoints disagree on an empty one.
 		case message.Cache_Breakpoint:
 			encode_write_field(&cursor, body, &field_first, "content")
 			encode_write_raw(&cursor, body, "[{")

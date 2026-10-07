@@ -386,9 +386,14 @@ openai_responses_parse_usage :: proc(object: json.Object) -> (Provider_Usage_Eve
 }
 
 openai_responses_incomplete_reason :: proc(reason: string) -> Provider_Finish_Reason {
-	if reason == "max_output_tokens" || reason == "max_messages" { return .Length }
-	if reason == "content_filter" { return .Content_Filter }
-	return .Unknown
+	switch reason {
+	case "max_output_tokens", "max_messages":
+		return .Length
+	case "content_filter":
+		return .Content_Filter
+	case:
+		return .Unknown
+	}
 }
 
 // openai_responses_clone_output clones the terminal response's output array
