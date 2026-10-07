@@ -7,8 +7,6 @@ import "core:os"
 import "core:path/filepath"
 import "core:time"
 
-import "nabla:ai"
-import "nabla:http/client"
 
 // The models.dev catalog is one enrichment source: it states providers and the
 // models they serve. It is fetched once and cached, and it stays a source record
@@ -256,22 +254,10 @@ models_dev_cache_write :: proc(path: string, body: []u8) -> bool {
 // of them has to be exercised to test them.
 @(require_results)
 models_dev_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
-	body: Fetch_Body
-	body.bytes.allocator = allocator
-
-	control := Fetch_Control {
-		deadline = ai.deadline_in(MODELS_DEV_TIMEOUT),
-		cancel   = cast(^bool)user_data,
-	}
-	failure := client.stream_request(
+	return fetch_get(
 		{url = MODELS_DEV_URL, method = .Get, expected_content_type = "application/json", allocator = allocator},
-		{probe = {check = fetch_control_probe, user_data = &control}},
-		&body,
-		fetch_collect,
+		MODELS_DEV_TIMEOUT,
+		cast(^bool)user_data,
+		allocator,
 	)
-	if failure.kind != .None {
-		delete(body.bytes)
-		return nil, false
-	}
-	return fetch_body_finish(&body, allocator)
 }

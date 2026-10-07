@@ -10,7 +10,6 @@ import "core:path/filepath"
 import "core:strings"
 import "core:time"
 
-import "nabla:ai"
 import "nabla:http/client"
 
 // The second enrichment stage: each configured provider's own model listing, served from
@@ -313,23 +312,6 @@ provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allo
 	if authorization_error != nil { return nil, false }
 	defer delete(authorization, allocator)
 
-	body: Fetch_Body
-	body.bytes.allocator = allocator
 	headers := [1]client.Header{{"authorization", authorization}}
-
-	control := Fetch_Control {
-		deadline = ai.deadline_in(PROVIDER_MODELS_TIMEOUT),
-		cancel   = cast(^bool)user_data,
-	}
-	failure := client.stream_request(
-		{url = url, method = .Get, headers = headers[:], allocator = allocator},
-		{probe = {check = fetch_control_probe, user_data = &control}},
-		&body,
-		fetch_collect,
-	)
-	if failure.kind != .None {
-		delete(body.bytes)
-		return nil, false
-	}
-	return fetch_body_finish(&body, allocator)
+	return fetch_get({url = url, method = .Get, headers = headers[:], allocator = allocator}, PROVIDER_MODELS_TIMEOUT, cast(^bool)user_data, allocator)
 }

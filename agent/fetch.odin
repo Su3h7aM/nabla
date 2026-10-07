@@ -2,6 +2,7 @@ package agent
 
 import "core:mem"
 import "core:sync"
+import "core:time"
 import "nabla:ai"
 import "nabla:http/client"
 
@@ -43,4 +44,23 @@ fetch_control_probe :: proc(user_data: rawptr) -> client.Wait_Status {
 	if control.cancel != nil && sync.atomic_load(control.cancel) { return .Cancelled }
 	if ai.deadline_expired(control.deadline) { return .Timed_Out }
 	return .Ready
+}
+
+// fetch_get performs one request and returns its body in an exactly-sized slice owned by
+// allocator, or false when the request failed or the body is empty. The request ends early
+// when cancel, if not nil, becomes true, or when timeout passes.
+@(require_results)
+fetch_get :: proc(request: client.Request, timeout: time.Duration, cancel: ^bool, allocator: mem.Allocator) -> ([]u8, bool) {
+	body: Fetch_Body
+	body.bytes.allocator = allocator
+	control := Fetch_Control {
+		deadline = ai.deadline_in(timeout),
+		cancel   = cancel,
+	}
+	failure := client.stream_request(request, {probe = {check = fetch_control_probe, user_data = &control}}, &body, fetch_collect)
+	if failure.kind != .None {
+		delete(body.bytes)
+		return nil, false
+	}
+	return fetch_body_finish(&body, allocator)
 }
