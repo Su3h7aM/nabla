@@ -50,7 +50,7 @@ read_events :: proc(
 			first_timeout = remaining_timeout
 		}
 	}
-	tty_ready, interrupted, poll_err := input_poll(fd, linux.Fd(wake), i32(first_timeout))
+	tty_ready, interrupted, poll_err := input_poll(fd, linux.Fd(wake), i32(min(first_timeout, i64(max(i32)))))
 	if poll_err != nil {
 		return 0, poll_err
 	}

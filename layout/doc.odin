@@ -221,7 +221,6 @@
 // | `Options` and `Capacities` | Caller; copied by `init` | The call that supplied them |
 // | `Services` callbacks and `*_user_data` | Caller; borrowed by the active solve | End of that frame's deferred solve |
 // | Ordinary text and custom payloads | Caller; layout borrows them | Next `frame`, `destroy`, or `reserve` |
-// | `.Static` text | Caller; immutable and address-stable | `invalidate_metrics` or `destroy` |
 // | `Frame_Result` slices and query views | Layout context | Next `frame`, `destroy`, or `reserve` |
 // | `diagnostics` result | Layout context | Next `frame`, `destroy`, or `reserve` |
 //

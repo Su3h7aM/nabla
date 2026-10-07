@@ -171,16 +171,11 @@ Text_Break_Error :: enum u8 {
 // is borrowed).
 Text_Break_Proc :: #type proc(user_data: rawptr, text: string, offset: int) -> (piece_end: int, next_offset: int, kind: Text_Break_Kind, err: Text_Break_Error)
 
-Text_Flag :: enum u8 {
-	Static,
-}
-Text_Flags :: distinct bit_set[Text_Flag;u8]
 
 Text_Desc :: struct {
 	id:     Id,
 	text:   string,
 	style:  Text_Style,
-	flags:  Text_Flags,
 	sizing: Sizing,
 	user:   User_Tag,
 }

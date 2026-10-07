@@ -29,7 +29,6 @@ _Node_Input :: struct {
 	in_flow:           bool,
 	text:              string,
 	text_style:        Text_Style,
-	text_flags:        Text_Flags,
 	// Identity of this node's text and style, folded once at declaration.
 	// Measurement keys extend it with the offset and length of the run being
 	// measured, so a lookup costs a few multiplies rather than a hash over the

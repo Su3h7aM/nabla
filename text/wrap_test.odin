@@ -31,7 +31,16 @@ test_prefix_covering_columns_stops_on_a_cluster_boundary :: proc(t: ^testing.T) 
 }
 
 @(test)
-test_wrap_reports_invalid_text :: proc(t: ^testing.T) {
+test_wrap_leading_tab_does_not_emit_an_empty_row :: proc(t: ^testing.T) {
+	iterator := wrap_iterator_make("\tb", 2)
+	first, _ := wrap_next(&iterator)
+	second, _ := wrap_next(&iterator)
+	testing.expect_value(t, first, "\t")
+	testing.expect_value(t, second, "b")
+}
+
+@(test)
+test_wrap_invalid_text_reports_status :: proc(t: ^testing.T) {
 	reject := Width_Profile {
 		invalid_text = .Reject,
 		tab_width    = 4,

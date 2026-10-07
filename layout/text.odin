@@ -58,7 +58,6 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 	input.is_text = true
 	input.text = desc.text
 	input.text_style = desc.style
-	input.text_flags = desc.flags
 	_normalize_nonnegative(state, &input.text_style.size, node, .Y, loc)
 	_normalize_nonnegative(state, &input.text_style.line_height, node, .Y, loc)
 	_normalize_nonnegative(state, &input.text_style.letter_spacing, node, .X, loc)
@@ -79,18 +78,7 @@ a cache lookup costs a few multiplies rather than a hash over the text.
 _text_identity_key :: proc(state: ^_Context_State, input: _Node_Input) -> u64 {
 	style := input.text_style
 	key := u64(FNV64_OFFSET_BASIS)
-	if .Static in input.text_flags {
-		key = _hash_index(key, u64(uintptr(raw_data(input.text))))
-		key = _hash_index(key, u64(len(input.text)))
-		// Pointer identity is only sound while the buffer really is immortal, so
-		// debug builds fold the content in too: a reused buffer then changes the
-		// key instead of silently reusing a stale measurement.
-		when ODIN_DEBUG {
-			key = _hash_index(key, hash.fnv64a(transmute([]byte)input.text))
-		}
-	} else {
-		key = _hash_index(key, hash.fnv64a(transmute([]byte)input.text))
-	}
+	key = _hash_index(key, hash.fnv64a(transmute([]byte)input.text))
 	key = _hash_index(key, u64(style.font))
 	key = _hash_index(key, u64(transmute(u32)style.size))
 	key = _hash_index(key, u64(transmute(u32)style.letter_spacing))
