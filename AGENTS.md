@@ -13,6 +13,8 @@ Read `docs/ARCHITECTURE.md` before changing package boundaries, adding a subsyst
 ## Principles
 
 - **Simplicity.** Choose the simple, explicit, data-oriented solution. Structs hold data, procedures process it, and indirection exists only at a real substitution boundary. Build only what the task needs. When you touch code that can be simpler, simplify it.
+- **Simple means easy to understand and maintain.** It does not mean fewer features or fewer lines. Code that is longer but plainer is simpler. Simplifying or unifying keeps every feature and implements it more clearly.
+- **Standalone packages.** Every foundation and library package is reusable outside Nabla, so its features are judged by its own protocol, specification, or purpose. Never delete or trim a feature because the harness does not use it.
 - **Small is robust.** Every line, state, and branch is one more place something can go wrong, so the smallest code that meets the requirement is the most robust. Weigh a change by what it removes as much as by what it adds.
 - **Resilience.** The harness keeps running as long as it reasonably can, and a non-critical failure never stops the agent or blocks it permanently. Prevent failures first with simple, idiomatic code. A failure that still happens stays inside the work it touched: a stuck worker is abandoned, its call reports `Unknown`, its memory leaks, and new work takes over its claims. Threads are never killed, and a lock never spans I/O, a wait, or a callback. Recovery must cost less than the failure it handles; for a rare failure that would need a complex mechanism, let the turn or process end with a clear message and rely on journal recovery. Section 2.4 of `docs/ARCHITECTURE.md` has the rules.
 - **Root causes.** For a bug, inspect every caller of the procedure you change and fix the shared cause.
@@ -53,6 +55,8 @@ Comments document contracts the code cannot express. Each package has a `doc.odi
 ## Tests
 
 Keep tests few and meaningful. Write a test only when its failure would show something is broken, and test the final behavior through the highest-level procedure that exercises it rather than each helper beneath it. Leave out assertions on styling, colors, or internal structure.
+
+Delete a test that validates nothing real or only re-checks what a higher-level test already covers.
 
 Tests live in the package they validate: `<source>_test.odin` beside the source, broader suites under `<package>/test/`, all run by `odin test` with no custom runner. Suites run on every thread, so tests share no process-global state: no environment variables, no package-level state, no stdout or stderr writes, and per-test temporary directories. A test that sets the cancel token or signal dispositions runs in a child process through `test_isolate_process` (`agent/isolate_test.odin`).
 
