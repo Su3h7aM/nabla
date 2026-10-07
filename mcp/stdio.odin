@@ -359,8 +359,7 @@ stdio_wait_error :: proc(stdio: ^Stdio, kind: Error_Kind, delivery: Delivery_Sta
 // tail.
 @(require_results)
 stdio_stderr_excerpt :: proc(stdio: ^Stdio, allocator := context.allocator) -> (string, mem.Allocator_Error) {
-	sync.mutex_lock(&stdio.stderr_mutex)
-	defer sync.mutex_unlock(&stdio.stderr_mutex)
+	sync.mutex_guard(&stdio.stderr_mutex)
 	if len(stdio.stderr_tail) == 0 { return "", nil }
 	return strings.clone(string(stdio.stderr_tail[:]), allocator)
 }
@@ -390,9 +389,9 @@ stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 		read_count, status := subprocess.read(stdio.pipes.stderr, buffer[:])
 		if status == .Again { continue }
 		if status == .Failed || read_count <= 0 { return }
-		sync.mutex_lock(&stdio.stderr_mutex)
-		stdio_stderr_retain(stdio, buffer[:read_count])
-		sync.mutex_unlock(&stdio.stderr_mutex)
+		if sync.mutex_guard(&stdio.stderr_mutex) {
+			stdio_stderr_retain(stdio, buffer[:read_count])
+		}
 	}
 }
 
