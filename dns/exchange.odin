@@ -152,13 +152,36 @@ exchange_udp :: proc(
 		reply := buffer[:count]
 		if source != server || !response_matches(packet, reply) { continue }
 		if message_truncated(reply) { return nil, .Retry_TCP }
-		answer, response_id, parsed := net.parse_response(reply, kind, allocator)
-		if !parsed || response_id != id {
-			net.destroy_dns_records(answer, allocator)
-			continue
-		}
-		return reply_outcome(reply, answer, hostname, kind, allocator)
+		answer_records, answer_outcome, answered := exchange_answer(packet, reply, id, hostname, kind, allocator)
+		if !answered { continue }
+		return answer_records, answer_outcome
 	}
+}
+
+// exchange_answer parses a reply that already matches this query and turns it
+// into the attempt's outcome. It reports whether the reply answered this query:
+// a foreign or garbled reply is passed over in UDP and ends the TCP attempt,
+// so the caller decides what an unanswered query means.
+@(require_results)
+exchange_answer :: proc(
+	query: []u8,
+	reply: []u8,
+	id: u16be,
+	hostname: string,
+	kind: net.DNS_Record_Type,
+	allocator: mem.Allocator,
+) -> (
+	records: []net.DNS_Record,
+	outcome: Query_Outcome,
+	answered: bool,
+) {
+	answer, response_id, parsed := net.parse_response(reply, kind, allocator)
+	if !parsed || response_id != id {
+		net.destroy_dns_records(answer, allocator)
+		return nil, .Skip, false
+	}
+	records, outcome = reply_outcome(reply, answer, hostname, kind, allocator)
+	return records, outcome, true
 }
 
 // reply_outcome turns a parsed reply to this query into the attempt's outcome.
@@ -350,12 +373,8 @@ exchange_tcp :: proc(
 	if wait := tcp_receive(socket, response, deadline, interrupt); wait != .Ready { return nil, outcome_of(wait) }
 
 	if !response_matches(packet, response) { return nil, .Skip }
-	answer, response_id, parsed := net.parse_response(response, kind, allocator)
-	if !parsed || response_id != id {
-		net.destroy_dns_records(answer, allocator)
-		return nil, .Skip
-	}
-	return reply_outcome(response, answer, hostname, kind, allocator)
+	answer_records, answer_outcome, _ := exchange_answer(packet, response, id, hostname, kind, allocator)
+	return answer_records, answer_outcome
 }
 
 // tcp_send writes the whole buffer, consuming prefixes the peer accepted.
