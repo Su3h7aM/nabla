@@ -39,60 +39,33 @@ Upgraded :: struct {
 upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgraded, failure: Failure) {
 	summary: Transfer_Summary
 	phase := Transfer_Phase.Validate
-	defer {
-		summary.stopped_at = phase
-		summary.error = failure.cause
-		if options.observer.complete != nil {
-			options.observer.complete(options.observer.user_data, summary)
-		}
-	}
+	defer transfer_complete(options.observer, &summary, &phase, &failure)
 
 	if loop_failure := event_loop_acquire(request.allocator); loop_failure.kind != .None { return nil, loop_failure }
 	defer nbio.release_thread_event_loop()
 
-	connection, send_failure := request_send(request, options, &phase, &summary)
-	if send_failure.kind != .None { return nil, send_failure }
-
-	phase = .Response_Head
-	reader: Reader
-	if reader_err := reader_init(&reader, connection_read_source, connection, request.allocator); reader_err != .None {
-		connection_destroy(connection)
-		return nil, failure_from_error(reader_err, request.allocator)
-	}
-	defer reader_destroy(&reader)
-
-	head, headers, head_err := read_final_response_head(&reader, request.allocator, request.method)
-	status := head.code
-	if head_err != .None {
-		http.headers_destroy(&headers)
-		connection_destroy(connection)
-		return nil, failure_from_read(head_err, options, request.allocator)
-	}
-	summary.response_head_received = true
-	summary.status = status
+	exchange, open_failure := exchange_open(request, options, &phase, &summary)
+	if open_failure.kind != .None { return nil, open_failure }
+	defer exchange_destroy(&exchange)
+	status := exchange.head.code
 
 	if options.response_head.observed != nil {
 		head := Response_Head {
 			status = status,
 			usable = status == 101,
 		}
-		options.response_head.observed(options.response_head.user_data, head, headers)
+		options.response_head.observed(options.response_head.user_data, head, exchange.headers)
 	}
 	if status != 101 {
-		http.headers_destroy(&headers)
-		connection_destroy(connection)
 		detail := fmt.aprintf("HTTP %d: the response did not upgrade the connection", status, allocator = request.allocator)
 		return nil, Failure{kind = .HTTP_Status, status = status, detail = detail}
 	}
 
-	handle, handle_err := upgraded_make(connection, &reader, headers, request.allocator)
-	if handle_err != .None {
-		http.headers_destroy(&headers)
-		connection_destroy(connection)
-		return nil, failure_from_error(handle_err, request.allocator)
-	}
+	handle, handle_err := upgraded_make(exchange.connection, &exchange.reader, exchange.headers, request.allocator)
+	if handle_err != .None { return nil, failure_from_error(handle_err, request.allocator) }
+	exchange.connection = nil
+	exchange.headers = {}
 
-	summary.request_complete = true
 	phase = .Complete
 	return handle, {}
 }

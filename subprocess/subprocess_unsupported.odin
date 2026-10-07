@@ -7,18 +7,6 @@ import "core:os"
 // Targets without the process-group backend report every start as unsupported, so the portable
 // surface exists everywhere and fails explicitly.
 
-@(private)
-Exec :: struct {
-	argv:         [^]cstring,
-	envp:         [^]cstring,
-	directory:    cstring,
-	input:        Fd,
-	output:       Fd,
-	errors:       Fd,
-	report:       Fd,
-	parent_death: bool,
-}
-
 @(private, require_results)
 fork_exec :: proc(exec: Exec) -> (pid: int, err: os.Error) {
 	return 0, io.Error.Unsupported

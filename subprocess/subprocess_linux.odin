@@ -4,20 +4,6 @@ package subprocess
 import "core:os"
 import "core:sys/linux"
 
-// Exec describes the command a forked child runs. argv and envp end in a nil entry. report is the
-// descriptor the child writes one errno byte to when exec fails.
-@(private)
-Exec :: struct {
-	argv:         [^]cstring,
-	envp:         [^]cstring,
-	directory:    cstring,
-	input:        Fd,
-	output:       Fd,
-	errors:       Fd,
-	report:       Fd,
-	parent_death: bool,
-}
-
 // The parent may die before prctl, so check its identity after installing the signal.
 @(private)
 child_bind_parent :: proc "contextless" (parent_pid: linux.Pid) -> bool {

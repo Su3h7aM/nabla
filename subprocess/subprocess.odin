@@ -33,6 +33,20 @@ fd :: proc(file: ^os.File) -> Fd {
 	return Fd(os.fd(file))
 }
 
+// Exec describes the command a forked child runs. argv and envp end in a nil entry. report is the
+// descriptor the child writes one errno byte to when exec fails.
+@(private)
+Exec :: struct {
+	argv:         [^]cstring,
+	envp:         [^]cstring,
+	directory:    cstring,
+	input:        Fd,
+	output:       Fd,
+	errors:       Fd,
+	report:       Fd,
+	parent_death: bool,
+}
+
 // Desc describes the program a child runs.
 Desc :: struct {
 	// argv holds the program and its arguments. argv[0] is executed as given, with no search of

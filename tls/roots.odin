@@ -39,30 +39,11 @@ roots_parse :: proc(text: []u8, allocator: mem.Allocator) -> (roots: Roots, ok: 
 	for {
 		block, rest, err := pem.decode(remaining, allocator)
 		if block != nil {
-			if block.label == pem.LABEL_CERTIFICATE {
-				der, make_err := make([]u8, len(block.data), allocator)
-				if make_err != nil {
-					failed = true
-				} else {
-					copy(der, block.data[:])
-					certificate, parse_err := x509.parse(der, allocator)
-					if parse_err != nil {
-						delete(der, allocator)
-					} else if _, append_err := append(&certificates, certificate); append_err != nil {
-						x509.destroy(&certificate, allocator)
-						delete(der, allocator)
-						failed = true
-					} else if _, der_append_err := append(&ders, der); der_append_err != nil {
-						// The certificate is already in the list this failure path
-						// destroys.
-						delete(der, allocator)
-						failed = true
-					}
-				}
+			// A block that does not parse is skipped; only a failed allocation ends the store.
+			if block.label == pem.LABEL_CERTIFICATE && certificate_append(&certificates, &ders, block.data[:], allocator) == .No_Room {
+				failed = true
 			}
-			delete(block.data)
-			delete(block.label, allocator)
-			free(block, allocator)
+			pem.block_delete(block)
 		}
 		if failed || err != nil || block == nil { break }
 		remaining = rest
@@ -88,10 +69,6 @@ roots_parse :: proc(text: []u8, allocator: mem.Allocator) -> (roots: Roots, ok: 
 
 roots_destroy :: proc(roots: ^Roots) {
 	if roots == nil { return }
-	allocator := roots.allocator
-	for &certificate in roots.certificates { x509.destroy(&certificate, allocator) }
-	delete(roots.certificates, allocator)
-	for der in roots.der { delete(der, allocator) }
-	delete(roots.der, allocator)
+	certificates_destroy(roots.certificates, roots.der, roots.allocator)
 	roots^ = {}
 }

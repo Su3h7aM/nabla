@@ -82,34 +82,16 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	// confused with one after the whole request went out.
 	summary: Transfer_Summary
 	phase := Transfer_Phase.Validate
-	defer {
-		summary.stopped_at = phase
-		summary.error = failure.cause
-		if options.observer.complete != nil {
-			options.observer.complete(options.observer.user_data, summary)
-		}
-	}
+	defer transfer_complete(options.observer, &summary, &phase, &failure)
 
 	if loop_failure := event_loop_acquire(request.allocator); loop_failure.kind != .None { return loop_failure }
 	defer nbio.release_thread_event_loop()
 
-	connection, send_failure := request_send(request, options, &phase, &summary)
-	if send_failure.kind != .None { return send_failure }
-	defer connection_destroy(connection)
-
-	phase = .Response_Head
-	reader: Reader
-	if reader_err := reader_init(&reader, connection_read_source, connection, request.allocator); reader_err != .None {
-		return failure_from_error(reader_err, request.allocator)
-	}
-	defer reader_destroy(&reader)
-
-	head, headers, head_err := read_final_response_head(&reader, request.allocator, request.method)
-	defer http.headers_destroy(&headers)
-	if head_err != .None { return failure_from_read(head_err, options, request.allocator) }
+	exchange, open_failure := exchange_open(request, options, &phase, &summary)
+	if open_failure.kind != .None { return open_failure }
+	defer exchange_destroy(&exchange)
+	head, headers := exchange.head, exchange.headers
 	status := head.code
-	summary.response_head_received = true
-	summary.status = status
 
 	// The head is where a declared length comes from, whatever the status is, and a
 	// refusal is reported for what it is however the head's framing turned out.
@@ -168,7 +150,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		if refusal.kind != .None { return refusal }
 		return failure_from_error(framing_err, request.allocator)
 	}
-	if body_err := stream_body(&reader, framing, length, user_data, callback); body_err != .None {
+	if body_err := stream_body(&exchange.reader, framing, length, user_data, callback); body_err != .None {
 		if refusal.kind != .None {
 			refusal.cause = body_err
 			return refusal
@@ -179,6 +161,74 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 
 	phase = .Complete
 	return {}
+}
+
+// Exchange is a request that has been written and answered with a final response
+// head. It owns the connection, the reader and its buffered bytes, and the head's
+// fields, and exchange_destroy releases them together.
+@(private)
+Exchange :: struct {
+	connection: ^Connection,
+	reader:     Reader,
+	head:       Response_Status,
+	headers:    http.Headers,
+}
+
+// exchange_open sends request and reads the final response head. A failure is
+// returned with everything already released; on success the caller releases the
+// exchange with exchange_destroy, or takes the connection and headers out of it
+// and clears those two fields. phase and summary are written in place, as in
+// request_send, and the summary also records the head. The caller holds the
+// thread's event loop.
+@(private, require_results)
+exchange_open :: proc(
+	request: Request,
+	options: Options,
+	phase: ^Transfer_Phase,
+	summary: ^Transfer_Summary,
+	connect_authority: string = "",
+) -> (
+	exchange: Exchange,
+	failure: Failure,
+) {
+	connection, send_failure := request_send(request, options, phase, summary, connect_authority)
+	if send_failure.kind != .None { return {}, send_failure }
+	exchange.connection = connection
+
+	phase^ = .Response_Head
+	if reader_err := reader_init(&exchange.reader, connection_read_source, connection, request.allocator); reader_err != .None {
+		exchange_destroy(&exchange)
+		return {}, failure_from_error(reader_err, request.allocator)
+	}
+	head_err: Error
+	exchange.head, exchange.headers, head_err = read_final_response_head(&exchange.reader, request.allocator, request.method)
+	if head_err != .None {
+		exchange_destroy(&exchange)
+		return {}, failure_from_read(head_err, options, request.allocator)
+	}
+	summary.response_head_received = true
+	summary.status = exchange.head.code
+	return exchange, {}
+}
+
+// exchange_destroy releases what an exchange still owns. A connection or headers
+// handed to another owner are cleared first.
+@(private)
+exchange_destroy :: proc(exchange: ^Exchange) {
+	http.headers_destroy(&exchange.headers)
+	reader_destroy(&exchange.reader)
+	connection_destroy(exchange.connection)
+	exchange^ = {}
+}
+
+// transfer_complete reports the one observation of a request: where it stopped
+// and why. It takes pointers because a deferred call reads them when the request
+// returns.
+@(private)
+transfer_complete :: proc(observer: Transfer_Observer, summary: ^Transfer_Summary, phase: ^Transfer_Phase, failure: ^Failure) {
+	summary.stopped_at = phase^
+	summary.error = failure.cause
+	if observer.complete != nil { observer.complete(observer.user_data, summary^) }
 }
 
 // event_loop_acquire brackets a request with the calling thread's event loop,

@@ -150,11 +150,11 @@ http_url :: proc(url: string, allocator: mem.Allocator) -> (converted: string, o
 @(require_results)
 response_accepts :: proc(upgraded: ^client.Upgraded, key: string, request_headers: []client.Header, allocator: mem.Allocator) -> Dial_Failure {
 	upgrade, has_upgrade := http.headers_get_unsafe(upgraded.headers, "upgrade")
-	if !has_upgrade || !field_has_token(upgrade, "websocket") {
+	if !has_upgrade || !http.list_has_token(upgrade, "websocket") {
 		return response_refusal(allocator, "the response does not upgrade the connection to websocket")
 	}
 	connection, has_connection := http.headers_get_unsafe(upgraded.headers, "connection")
-	if !has_connection || !field_has_token(connection, "Upgrade") {
+	if !has_connection || !http.list_has_token(connection, "Upgrade") {
 		return response_refusal(allocator, "the response does not name the upgrade in its connection field")
 	}
 	accept, has_accept := http.headers_get_unsafe(upgraded.headers, "sec-websocket-accept")
@@ -228,18 +228,6 @@ protocol_offered :: proc(headers: []client.Header, selected: string) -> bool {
 @(require_results)
 response_refusal :: proc(allocator: mem.Allocator, detail: string) -> Dial_Failure {
 	return dial_failure_detail(.Response, 101, detail, allocator)
-}
-
-// field_has_token reports whether a field value holds one of a list of tokens,
-// compared without case, since HTTP field values are not case-sensitive
-// (RFC 9110 5.6.1).
-@(require_results)
-field_has_token :: proc(value, token: string) -> bool {
-	remaining := value
-	for part in strings.split_iterator(&remaining, ",") {
-		if strings.equal_fold(http.trim_ows(part), token) { return true }
-	}
-	return false
 }
 
 // transport_for reads and writes an upgraded connection, and closes it when the

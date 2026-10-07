@@ -50,32 +50,7 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 	for entries.ok && entries.at < len(entries.data) {
 		encoded := read_bytes(&entries, read_u24(&entries))
 		_ = read_bytes(&entries, int(read_u16(&entries))) // the entry's extensions
-		if !entries.ok {
-			failed = true
-			break
-		}
-
-		der, make_err := make([]u8, len(encoded), allocator)
-		if make_err != nil {
-			failed = true
-			break
-		}
-		copy(der, encoded)
-		certificate, parse_err := x509.parse(der, allocator)
-		if parse_err != nil {
-			delete(der, allocator)
-			failed = true
-			break
-		}
-		if _, append_err := append(&certificates, certificate); append_err != nil {
-			x509.destroy(&certificate, allocator)
-			delete(der, allocator)
-			failed = true
-			break
-		}
-		if _, append_err := append(&ders, der); append_err != nil {
-			// The certificate is already in the list the failure path destroys.
-			delete(der, allocator)
+		if !entries.ok || certificate_append(&certificates, &ders, encoded, allocator) != .Appended {
 			failed = true
 			break
 		}
@@ -96,12 +71,60 @@ certificate_chain_decode :: proc(message: []u8, allocator: mem.Allocator) -> (ch
 // certificate_chain_destroy releases a chain and the DER its certificates view.
 certificate_chain_destroy :: proc(chain: ^Certificate_Chain) {
 	if chain == nil { return }
-	allocator := chain.allocator
-	for &certificate in chain.certificates { x509.destroy(&certificate, allocator) }
-	delete(chain.certificates, allocator)
-	for der in chain.der { delete(der, allocator) }
-	delete(chain.der, allocator)
+	certificates_destroy(chain.certificates, chain.der, chain.allocator)
 	chain^ = {}
+}
+
+// Append_Result is how one certificate's addition to a list ended.
+@(private)
+Append_Result :: enum {
+	Appended,
+	// Malformed is DER that is not a certificate. Nothing was added.
+	Malformed,
+	// No_Room is an allocation that failed. Nothing was added.
+	No_Room,
+}
+
+// certificate_append copies encoded into storage of its own, parses it, and adds
+// the certificate and that copy to the two lists, which stay parallel. The
+// certificate views the copy, so the lists are released together by
+// certificates_destroy.
+@(private, require_results)
+certificate_append :: proc(
+	certificates: ^[dynamic]x509.Certificate,
+	ders: ^[dynamic][]u8,
+	encoded: []u8,
+	allocator: mem.Allocator,
+) -> Append_Result {
+	der, make_err := make([]u8, len(encoded), allocator)
+	if make_err != nil { return .No_Room }
+	copy(der, encoded)
+	certificate, parse_err := x509.parse(der, allocator)
+	if parse_err != nil {
+		delete(der, allocator)
+		return .Malformed
+	}
+	if _, append_err := append(certificates, certificate); append_err != nil {
+		x509.destroy(&certificate, allocator)
+		delete(der, allocator)
+		return .No_Room
+	}
+	if _, append_err := append(ders, der); append_err != nil {
+		// The certificate is already in the list the caller's failure path destroys.
+		delete(der, allocator)
+		return .No_Room
+	}
+	return .Appended
+}
+
+// certificates_destroy releases parsed certificates, the DER they view, and the
+// two lists.
+@(private)
+certificates_destroy :: proc(certificates: []x509.Certificate, ders: [][]u8, allocator: mem.Allocator) {
+	for &certificate in certificates { x509.destroy(&certificate, allocator) }
+	delete(certificates, allocator)
+	for der in ders { delete(der, allocator) }
+	delete(ders, allocator)
 }
 
 // certificate_pointers returns the certificates as the pointers core's verifier

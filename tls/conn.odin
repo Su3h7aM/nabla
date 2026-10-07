@@ -97,28 +97,18 @@ init :: proc(transport: Transport, config: Config) -> (connection: ^Conn, err: E
 	allocator := config.allocator
 	self, alloc_error := new(Conn, allocator)
 	if alloc_error != nil { return nil, .No_Room }
+	// Every later failure releases what was allocated so far.
+	defer if err != .None { destroy(self) }
 	self.transport = transport
 	self.config = config
 	self.send, alloc_error = make([]u8, RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD, allocator)
-	if alloc_error != nil {
-		destroy(self)
-		return nil, .No_Room
-	}
+	if alloc_error != nil { return nil, .No_Room }
 	self.message, alloc_error = make([]u8, HANDSHAKE_HEADER_SIZE + MAX_SENT_MESSAGE, allocator)
-	if alloc_error != nil {
-		destroy(self)
-		return nil, .No_Room
-	}
+	if alloc_error != nil { return nil, .No_Room }
 	self.recv, alloc_error = make([]u8, RECORD_HEADER_SIZE + MAX_CIPHERTEXT_RECORD, allocator)
-	if alloc_error != nil {
-		destroy(self)
-		return nil, .No_Room
-	}
+	if alloc_error != nil { return nil, .No_Room }
 	self.stream, alloc_error = make([dynamic]u8, 0, MAX_CIPHERTEXT_RECORD, allocator)
-	if alloc_error != nil {
-		destroy(self)
-		return nil, .No_Room
-	}
+	if alloc_error != nil { return nil, .No_Room }
 	return self, .None
 }
 
@@ -159,8 +149,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	// An address literal is not a name, and SNI carries no address literals
 	// (RFC 6066 section 3), so it is verified without being sent.
 	sni := server_name
-	if _, is_ip4 := net.parse_ip4_address(sni); is_ip4 { sni = "" }
-	if _, is_ip6 := net.parse_ip6_address(sni); is_ip6 { sni = "" }
+	if net.parse_address(sni) != nil { sni = "" }
 
 	// What a second ClientHello repeats unchanged: a retry differs from the first only
 	// in the key share it was asked for and the cookie it was given (RFC 8446 section
@@ -271,8 +260,7 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	connection.read_secret = server_secret
 	connection.write_secret = client_secret
 	connection.encrypted = true
-	if !traffic_key_derive(suite, connection.read_secret[:secret_size(suite)], &connection.read_key) { return .Unsupported }
-	if !traffic_key_derive(suite, connection.write_secret[:secret_size(suite)], &connection.write_key) { return .Unsupported }
+	if !traffic_keys_derive(connection) { return .Unsupported }
 
 	if flight_err := handshake_server_flight(connection, server_name, sni != "", alpn); flight_err != .None { return flight_err }
 
@@ -305,9 +293,25 @@ handshake :: proc(connection: ^Conn, server_name: string, alpn: []string) -> Err
 	}
 	connection.read_secret = server_application
 	connection.write_secret = client_application
-	if !traffic_key_derive(suite, connection.read_secret[:secret_size(suite)], &connection.read_key) { return .Unsupported }
-	if !traffic_key_derive(suite, connection.write_secret[:secret_size(suite)], &connection.write_key) { return .Unsupported }
+	if !traffic_keys_derive(connection) { return .Unsupported }
 	return .None
+}
+
+// traffic_keys_derive derives the read and write keys from the connection's secrets.
+@(require_results)
+traffic_keys_derive :: proc(connection: ^Conn) -> bool {
+	size := secret_size(connection.suite)
+	if !traffic_key_derive(connection.suite, connection.read_secret[:size], &connection.read_key) { return false }
+	return traffic_key_derive(connection.suite, connection.write_secret[:size], &connection.write_key)
+}
+
+// handshake_expect returns the next handshake message, which must be of type expected.
+@(require_results)
+handshake_expect :: proc(connection: ^Conn, expected: Handshake_Type) -> (message: []u8, err: Error) {
+	message = handshake_next(connection) or_return
+	message_type, _, decoded := handshake_decode_header(message)
+	if !decoded || message_type != expected { return nil, .Handshake }
+	return message, .None
 }
 
 // handshake_server_flight reads what the server says once the handshake keys are
@@ -346,19 +350,13 @@ handshake_server_flight :: proc(connection: ^Conn, server_name: string, server_n
 	if !verified { return .Peer_Rejected }
 	hash.update(&connection.transcript, certificate_message)
 
-	verify_message, verify_err := handshake_next(connection)
-	if verify_err != .None { return verify_err }
-	verify_type, _, verify_decoded := handshake_decode_header(verify_message)
-	if !verify_decoded || verify_type != .Certificate_Verify { return .Handshake }
+	verify_message := handshake_expect(connection, .Certificate_Verify) or_return
 	if !certificate_verify_verify(verify_message[HANDSHAKE_HEADER_SIZE:], &chain.certificates[0], transcript_hash(connection)) {
 		return .Signature
 	}
 	hash.update(&connection.transcript, verify_message)
 
-	finished_message, finished_err := handshake_next(connection)
-	if finished_err != .None { return finished_err }
-	finished_type, _, finished_decoded := handshake_decode_header(finished_message)
-	if !finished_decoded || finished_type != .Finished { return .Handshake }
+	finished_message := handshake_expect(connection, .Finished) or_return
 	size := secret_size(connection.suite)
 	if !finished_verify(connection.suite, connection.read_secret[:size], transcript_hash(connection), finished_message[HANDSHAKE_HEADER_SIZE:]) {
 		return .Finished
@@ -600,7 +598,7 @@ read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Ty
 			payload, content_type = decoded_payload, plain_type
 		}
 
-		switch content_type {
+		#partial switch content_type {
 		case .Handshake:
 			// Handshake bytes belong to the handshake stream, and the caller has
 			// them to parse now rather than after the next record.
@@ -608,8 +606,6 @@ read_record :: proc(connection: ^Conn) -> (content: []u8, record_type: Record_Ty
 			return nil, .Handshake, .None
 		case .Alert, .Application_Data:
 			return payload, content_type, .None
-		case .Change_Cipher_Spec:
-			return nil, {}, fail(connection, .Unexpected_Message, .Record)
 		case:
 			return nil, {}, fail(connection, .Unexpected_Message, .Record)
 		}
