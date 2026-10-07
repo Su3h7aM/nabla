@@ -52,13 +52,10 @@ catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
 
 	fixture.user = make([]agent.Catalog_Provider_Source, 1, context.allocator)
 	fixture.user[0] = agent.Catalog_Provider_Source {
-		id               = "test-provider",
-		base_url_present = true,
-		base_url         = "http://provider.test/v1",
-		api_present      = true,
-		api              = "openai_chat_completions",
-		api_key_present  = true,
-		api_key          = "test-key",
+		id       = "test-provider",
+		base_url = "http://provider.test/v1",
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
 	}
 	fixture.app.run.alloc = context.allocator
 	fixture.app.catalog_sources = fixture.user
@@ -100,10 +97,10 @@ test_catalog_refresh_publishes_one_complete_pipeline :: proc(t: ^testing.T) {
 	model_index, found := agent.catalog_find_model(&app.setup.catalog, "test-provider", "discovered-model")
 	if !testing.expect(t, found, "the provider model should be present") { return }
 	model := &app.setup.catalog.models[model_index]
-	testing.expect_value(t, model.context_window, 128_000)
-	testing.expect(t, model.tools_present && model.tools)
-	testing.expect_value(t, len(model.thinking.levels), 2)
-	testing.expect_value(t, model.thinking.levels[1], "high")
+	testing.expect_value(t, model.context_window.?, 128_000)
+	testing.expect(t, (model.tools.? or_else false))
+	testing.expect_value(t, len(model.thinking.levels.?), 2)
+	testing.expect_value(t, model.thinking.levels.?[1], "high")
 }
 
 // A publication releases the catalog it replaces, so a run that refreshes twice holds
@@ -159,7 +156,7 @@ test_catalog_refresh_keeps_the_enrichment_a_failed_request_could_not_replace :: 
 
 	model_index, found := agent.catalog_find_model(&app.setup.catalog, "test-provider", "discovered-model")
 	if !testing.expect(t, found, "the model stays in the catalog") { return }
-	testing.expect_value(t, len(app.setup.catalog.models[model_index].thinking.levels), 2)
+	testing.expect_value(t, len(app.setup.catalog.models[model_index].thinking.levels.?), 2)
 }
 
 @(test)
@@ -293,7 +290,7 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 
 	app.run.snap.status.working_since = time.tick_now()
 	observer_retry_scheduled(&app, {next_attempt = 2, failure_class = ai.Provider_Failure_Class.Rate_Limited, delay = 2 * time.Second})
-	testing.expect(t, app.run.snap.status.retry_present, "the front-end is waiting for a retry")
+	testing.expect(t, app.run.snap.status.retrying, "the front-end is waiting for a retry")
 	// One notice per scheduled retry, in the transcript the user reads.
 	if testing.expect_value(t, len(app.run.snap.entries), 1) {
 		testing.expect_value(t, app.run.snap.entries[0].kind, Entry_Kind.Notice)
@@ -301,7 +298,7 @@ test_a_scheduled_retry_is_shown_until_the_send_clears_it :: proc(t: ^testing.T) 
 	testing.expect(t, strings.has_prefix(working_label(&app), "Working for "), "the indicator keeps the turn timer during a retry")
 
 	clear_retry(&app)
-	testing.expect(t, !app.run.snap.status.retry_present, "the send that followed clears the retry")
+	testing.expect(t, !app.run.snap.status.retrying, "the send that followed clears the retry")
 	testing.expect(t, strings.has_prefix(working_label(&app), "Working for "), "clearing retry state does not reset the turn timer")
 }
 

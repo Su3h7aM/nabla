@@ -92,7 +92,7 @@ Status :: struct {
 	working_since:        time.Tick,
 	// Whether the turn is waiting to resend a failed request. The next send clears it, and the
 	// worker clears it whenever the session stops running.
-	retry_present:        bool,
+	retrying:             bool,
 }
 
 // TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps for

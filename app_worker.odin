@@ -763,7 +763,7 @@ refresh_status :: proc(app: ^App) {
 	}
 	// A retry belongs to the turn that scheduled it. A turn that is no longer running has
 	// none, so the working indicator cannot keep showing the attempt it waited for.
-	if !status.running { status.retry_present = false }
+	if !status.running { status.retrying = false }
 	snap_status_replace(app, &status.provider_id, app.setup.provider_id)
 	snap_status_replace(app, &status.model_id, app.setup.model_id)
 	snap_status_replace(app, &status.effort, running.effort)
@@ -997,14 +997,14 @@ observer_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Even
 	snap_append(app, .Notice, retry_display_text(event))
 	sync.mutex_guard(&app.run.mu)
 	status := &app.run.snap.status
-	status.retry_present = true
+	status.retrying = true
 	snap_publish_locked(app)
 }
 
 clear_retry :: proc(app: ^App) {
 	sync.mutex_guard(&app.run.mu)
-	if !app.run.snap.status.retry_present { return }
-	app.run.snap.status.retry_present = false
+	if !app.run.snap.status.retrying { return }
+	app.run.snap.status.retrying = false
 	snap_publish_locked(app)
 }
 
