@@ -78,6 +78,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 			outcome = TOOL_OUTCOME_NAMES[.Unknown],
 			detail  = "the session ended before this call reported a result; it may have taken effect",
 		}
+		unknown.detail = recover_kept_detail(unknown.detail, kept_directory, header.call)
 		switch rule {
 		case .Turn:
 			header.kind = .Turn_Completed
@@ -97,9 +98,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 			recovery.calls += 1
 		case .Admitted_Call:
 			header.kind = .Tool_Completed
-			with_kept := unknown
-			with_kept.detail = recover_kept_detail(unknown.detail, kept_directory, header.call)
-			append_record(journal, header, with_kept)
+			append_record(journal, header, unknown)
 			recovery.calls += 1
 		case .Lua:
 			header.kind = .Lua_Completed
