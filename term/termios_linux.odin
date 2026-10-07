@@ -17,8 +17,9 @@ Termios :: struct {
 
 TERMIOS_NCCS :: 19
 
-// Request number from asm-generic/ioctls.h. TCSETSF is tcsetattr's
+// Request numbers from asm-generic/ioctls.h. TCSETSF is tcsetattr's
 // TCSAFLUSH: apply after output drains and discard pending input.
+TCGETS :: 0x5401
 TCSETSF :: 0x5404
 TCSAFLUSH :: TCSETSF
 
@@ -58,7 +59,7 @@ _ioctl :: proc "contextless" (fd: linux.Fd, request: u32, arg: rawptr) -> linux.
 
 @(require_results)
 _tcgetattr :: proc "contextless" (fd: linux.Fd, termios: ^Termios) -> linux.Errno {
-	return _ioctl(fd, linux.TCGETS, termios)
+	return _ioctl(fd, TCGETS, termios)
 }
 
 @(require_results)
