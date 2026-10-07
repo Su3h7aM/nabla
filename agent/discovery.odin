@@ -49,10 +49,10 @@ discover_provider_models :: proc(
 	for provider in providers {
 		// A provider with no endpoint or no credential is not asked: the request
 		// could only fail, and the other stages still describe it.
-		if provider.base_url == "" || provider.api_key == "" { continue }
-		credential, credential_ok := config_resolve_credential(provider.api_key, allocator)
+		if (provider.base_url.? or_else "") == "" || (provider.api_key.? or_else "") == "" { continue }
+		credential, credential_ok := config_resolve_credential(provider.api_key.?, allocator)
 		if !credential_ok { continue }
-		body, fetched := fetch(user_data, provider.base_url, credential, allocator)
+		body, fetched := fetch(user_data, provider.base_url.?, credential, allocator)
 		delete(credential, allocator)
 		if !fetched { continue }
 		models, listed := provider_models_list(body, allocator)
@@ -156,10 +156,10 @@ provider_models_refresh_at :: proc(
 			}
 			continue
 		}
-		if provider.base_url != "" && provider.api_key != "" {
-			credential, credential_ok := config_resolve_credential(provider.api_key, allocator)
+		if (provider.base_url.? or_else "") != "" && (provider.api_key.? or_else "") != "" {
+			credential, credential_ok := config_resolve_credential(provider.api_key.?, allocator)
 			if credential_ok {
-				acquired, fetched := fetch(user_data, provider.base_url, credential, allocator)
+				acquired, fetched := fetch(user_data, provider.base_url.?, credential, allocator)
 				delete(credential, allocator)
 				if fetched {
 					models, listed := provider_models_list(acquired, allocator)
@@ -203,7 +203,7 @@ provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator:
 	if directory_err != .None { return "", false }
 	defer delete(directory, allocator)
 	if xdg_directory_create(directory) != .None { return "", false }
-	identity := fmt.aprintf("%s\x00%s", provider.id, provider.base_url, allocator = context.temp_allocator)
+	identity := fmt.aprintf("%s\x00%s", provider.id, provider.base_url.? or_else "", allocator = context.temp_allocator)
 	key := hash.fnv64a(transmute([]byte)identity)
 	name := fmt.aprintf("%s-%016x.json", PROVIDER_MODELS_CACHE_PREFIX, key, allocator = context.temp_allocator)
 	path, join_err := filepath.join([]string{directory, name}, allocator)

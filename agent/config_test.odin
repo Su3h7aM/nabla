@@ -45,11 +45,11 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(sources), 1)
 	provider := sources[0]
 	testing.expect_value(t, provider.id, "acme")
-	testing.expect_value(t, provider.base_url, "https://api.acme.test")
-	testing.expect_value(t, provider.api, "openai_responses")
-	testing.expect(t, provider.transport_present)
-	testing.expect_value(t, provider.transport, Provider_Transport.WebSocket)
-	testing.expect_value(t, provider.api_key, "ACME_KEY")
+	testing.expect_value(t, provider.base_url.?, "https://api.acme.test")
+	testing.expect_value(t, provider.api.?, "openai_responses")
+	testing.expect(t, (provider.transport != nil))
+	testing.expect_value(t, provider.transport.?, Provider_Transport.WebSocket)
+	testing.expect_value(t, provider.api_key.?, "ACME_KEY")
 	testing.expect_value(t, len(provider.models), 3)
 
 	chat: ^Catalog_Model_Source
@@ -66,27 +66,27 @@ test_lua_config_roundtrip :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, chat != nil && mini != nil && old != nil)
-	testing.expect_value(t, chat^.display_name, "Chat")
-	testing.expect_value(t, chat^.api, "openai_chat_completions")
-	testing.expect_value(t, chat^.context_window, 100000)
-	testing.expect_value(t, chat^.max_output_tokens, 4096)
-	testing.expect(t, chat^.tools)
-	testing.expect_value(t, len(chat^.input_modalities), 1)
-	testing.expect_value(t, chat^.input_modalities[0], "text")
-	testing.expect_value(t, len(chat^.output_modalities), 1)
-	testing.expect_value(t, chat^.output_modalities[0], "text")
-	testing.expect(t, chat^.thinking.toggle)
-	testing.expect_value(t, len(chat^.thinking.levels), 2)
-	testing.expect_value(t, chat^.thinking.levels[0], "low")
-	testing.expect_value(t, chat^.thinking.levels[1], "high")
-	testing.expect_value(t, chat^.cost.input, 3.0)
-	testing.expect_value(t, chat^.cost.output, 15.0)
-	testing.expect(t, chat^.cost.cache_read_present)
-	testing.expect_value(t, chat^.cost.cache_read, 0.3)
-	testing.expect(t, chat^.cost.cache_write_present)
-	testing.expect_value(t, chat^.cost.cache_write, 3.75)
+	testing.expect_value(t, chat^.display_name.?, "Chat")
+	testing.expect_value(t, chat^.api.?, "openai_chat_completions")
+	testing.expect_value(t, chat^.context_window.?, 100000)
+	testing.expect_value(t, chat^.max_output_tokens.?, 4096)
+	testing.expect(t, chat^.tools.?)
+	testing.expect_value(t, len(chat^.input_modalities.?), 1)
+	testing.expect_value(t, chat^.input_modalities.?[0], "text")
+	testing.expect_value(t, len(chat^.output_modalities.?), 1)
+	testing.expect_value(t, chat^.output_modalities.?[0], "text")
+	testing.expect(t, chat^.thinking.toggle.?)
+	testing.expect_value(t, len(chat^.thinking.levels.?), 2)
+	testing.expect_value(t, chat^.thinking.levels.?[0], "low")
+	testing.expect_value(t, chat^.thinking.levels.?[1], "high")
+	testing.expect_value(t, chat^.cost.input.?, 3.0)
+	testing.expect_value(t, chat^.cost.output.?, 15.0)
+	testing.expect(t, (chat^.cost.cache_read != nil))
+	testing.expect_value(t, chat^.cost.cache_read.?, 0.3)
+	testing.expect(t, (chat^.cost.cache_write != nil))
+	testing.expect_value(t, chat^.cost.cache_write.?, 3.75)
 	testing.expect(t, mini^.thinking.present && mini^.thinking.blocked)
-	testing.expect(t, old^.disabled_present && old^.disabled)
+	testing.expect(t, (old^.disabled.? or_else false))
 
 	// A missing config is a valid empty setup, not an error; a path that exists
 	// but cannot be read as a file still is.
@@ -300,8 +300,8 @@ test_lua_config_loads_stream_idle_timeout :: proc(t: ^testing.T) {
 			continue
 		}
 		if !testing.expectf(t, err == .None && len(sources) == 1, "%s: got %v", entry.name, err) { continue }
-		testing.expectf(t, sources[0].stream_idle_timeout_present == entry.present, "%s: presence", entry.name)
-		testing.expectf(t, sources[0].stream_idle_timeout == entry.want, "%s: got %v", entry.name, sources[0].stream_idle_timeout)
+		testing.expectf(t, (sources[0].stream_idle_timeout != nil) == entry.present, "%s: presence", entry.name)
+		testing.expectf(t, (sources[0].stream_idle_timeout.? or_else 0) == entry.want, "%s: got %v", entry.name, sources[0].stream_idle_timeout)
 	}
 }
 
@@ -313,8 +313,8 @@ test_stream_idle_timeout_reads_the_live_catalog :: proc(t: ^testing.T) {
 		allocator = context.allocator,
 	}
 	defer delete(catalog.providers)
-	append(&catalog.providers, Catalog_Provider{id = "stated", stream_idle_timeout_present = true, stream_idle_timeout = 20 * time.Second})
-	append(&catalog.providers, Catalog_Provider{id = "off", stream_idle_timeout_present = true})
+	append(&catalog.providers, Catalog_Provider{id = "stated", stream_idle_timeout = 20 * time.Second})
+	append(&catalog.providers, Catalog_Provider{id = "off", stream_idle_timeout = time.Duration(0)})
 	append(&catalog.providers, Catalog_Provider{id = "silent"})
 	ref := Catalog_Ref {
 		catalog = &catalog,
@@ -391,14 +391,14 @@ test_configuration_of_any_size_loads_whole :: proc(t: ^testing.T) {
 	}
 	if !testing.expect(t, big != nil && padded != nil) { return }
 	testing.expect_value(t, len(big.models), 4101)
-	testing.expect_value(t, len(padded.api_key), 1200 * 1024)
+	testing.expect_value(t, len(padded.api_key.?), 1200 * 1024)
 
 	wide_model: ^Catalog_Model_Source
 	for &model in big.models {
 		if model.id == "wide" { wide_model = &model }
 	}
 	if !testing.expect(t, wide_model != nil) { return }
-	testing.expect_value(t, len(wide_model.thinking.levels), 100)
+	testing.expect_value(t, len(wide_model.thinking.levels.?), 100)
 
 	if !testing.expect_value(t, len(servers), 41) { return }
 	wide: ^MCP_Server_Config

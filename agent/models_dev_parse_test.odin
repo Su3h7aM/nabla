@@ -119,58 +119,58 @@ test_models_dev_parse_reads_providers_and_models :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(beta.models), 1)
 
 	// Provider identity, endpoint, protocol, and the credential reference.
-	testing.expect_value(t, acme.base_url, "https://api.acme.test/v1")
-	testing.expect_value(t, acme.api, "openai_chat_completions")
-	testing.expect_value(t, acme.api_key, "${ACME_API_KEY}")
+	testing.expect_value(t, acme.base_url.?, "https://api.acme.test/v1")
+	testing.expect_value(t, acme.api.?, "openai_chat_completions")
+	testing.expect_value(t, acme.api_key.?, "${ACME_API_KEY}")
 	// A provider that relies on its SDK's default endpoint states none, and a
 	// later entry in env is not an interchangeable credential.
-	testing.expect(t, !beta.base_url_present)
-	testing.expect_value(t, beta.api, "anthropic_messages")
-	testing.expect_value(t, beta.api_key, "${BETA_KEY}")
+	testing.expect(t, (beta.base_url == nil))
+	testing.expect_value(t, beta.api.?, "anthropic_messages")
+	testing.expect_value(t, beta.api_key.?, "${BETA_KEY}")
 
 	// Model identity keeps the provider's namespace rather than being rewritten.
 	thinker := models_dev_fixture_model(t, acme, "acme/thinker")
-	testing.expect_value(t, thinker.display_name, "Acme Thinker")
-	testing.expect_value(t, thinker.context_window, 200000)
-	testing.expect_value(t, thinker.max_output_tokens, 64000)
-	testing.expect(t, thinker.tools_present && thinker.tools)
-	testing.expect_value(t, len(thinker.input_modalities), 2)
-	testing.expect_value(t, thinker.input_modalities[1], "image")
-	testing.expect_value(t, len(thinker.output_modalities), 1)
-	testing.expect_value(t, thinker.output_modalities[0], "text")
+	testing.expect_value(t, thinker.display_name.?, "Acme Thinker")
+	testing.expect_value(t, thinker.context_window.?, 200000)
+	testing.expect_value(t, thinker.max_output_tokens.?, 64000)
+	testing.expect(t, (thinker.tools.? or_else false))
+	testing.expect_value(t, len(thinker.input_modalities.?), 2)
+	testing.expect_value(t, thinker.input_modalities.?[1], "image")
+	testing.expect_value(t, len(thinker.output_modalities.?), 1)
+	testing.expect_value(t, thinker.output_modalities.?[0], "text")
 
 	// Prices are floats and merge price by price.
-	testing.expect_value(t, thinker.cost.input, 1.0)
-	testing.expect_value(t, thinker.cost.output, 2.0)
-	testing.expect(t, thinker.cost.cache_read_present)
-	testing.expect_value(t, thinker.cost.cache_read, 0.1)
-	testing.expect(t, !thinker.cost.cache_write_present)
+	testing.expect_value(t, thinker.cost.input.?, 1.0)
+	testing.expect_value(t, thinker.cost.output.?, 2.0)
+	testing.expect(t, (thinker.cost.cache_read != nil))
+	testing.expect_value(t, thinker.cost.cache_read.?, 0.1)
+	testing.expect(t, (thinker.cost.cache_write == nil))
 
 	// Reasoning support and each control form it advertises.
-	testing.expect(t, thinker.thinking.present && thinker.thinking.supported)
-	testing.expect(t, thinker.thinking.toggle_present && thinker.thinking.toggle)
-	testing.expect(t, thinker.thinking.levels_present)
-	testing.expect_value(t, len(thinker.thinking.levels), 3)
-	testing.expect_value(t, thinker.thinking.levels[0], "low")
-	testing.expect_value(t, thinker.thinking.levels[2], "max")
+	testing.expect(t, thinker.thinking.present && thinker.thinking.supported.?)
+	testing.expect(t, (thinker.thinking.toggle.? or_else false))
+	testing.expect(t, (thinker.thinking.levels != nil))
+	testing.expect_value(t, len(thinker.thinking.levels.?), 3)
+	testing.expect_value(t, thinker.thinking.levels.?[0], "low")
+	testing.expect_value(t, thinker.thinking.levels.?[2], "max")
 	testing.expect(t, thinker.thinking.budget.present)
-	testing.expect_value(t, thinker.thinking.budget.min, 1024)
-	testing.expect_value(t, thinker.thinking.budget.max, 81920)
+	testing.expect_value(t, thinker.thinking.budget.min.?, 1024)
+	testing.expect_value(t, thinker.thinking.budget.max.?, 81920)
 
 	// A model that cannot reason is a terminal negative, so its subtree is blocked.
 	plain := models_dev_fixture_model(t, acme, "acme/plain")
-	testing.expect(t, plain.thinking.present && plain.thinking.supported_present)
-	testing.expect(t, !plain.thinking.supported)
+	testing.expect(t, plain.thinking.present && plain.thinking.supported != nil)
+	testing.expect(t, !plain.thinking.supported.?)
 	testing.expect(t, plain.thinking.blocked)
-	testing.expect(t, !plain.thinking.toggle_present)
-	testing.expect(t, !plain.thinking.levels_present)
+	testing.expect(t, (plain.thinking.toggle == nil))
+	testing.expect(t, (plain.thinking.levels == nil))
 	testing.expect(t, !plain.thinking.budget.present)
 
 	// Budget bounds are independent of each other and of the control form.
 	talker := models_dev_fixture_model(t, beta, "beta/talker")
 	testing.expect(t, talker.thinking.budget.present)
-	testing.expect(t, !talker.thinking.budget.min_present)
-	testing.expect(t, !talker.thinking.budget.max_present)
+	testing.expect(t, (talker.thinking.budget.min == nil))
+	testing.expect(t, (talker.thinking.budget.max == nil))
 }
 
 @(test)
@@ -183,23 +183,23 @@ test_models_dev_parse_distinguishes_explicit_values_from_absent :: proc(t: ^test
 	// A stated false is a value the merge must not overwrite, and a stated zero is
 	// a limit rather than an unconfigured one.
 	plain := models_dev_fixture_model(t, acme, "acme/plain")
-	testing.expect(t, plain.tools_present)
-	testing.expect(t, !plain.tools)
+	testing.expect(t, (plain.tools != nil))
+	testing.expect(t, !plain.tools.?)
 	// A model that states no cost leaves every price absent.
-	testing.expect(t, !plain.cost.input_present)
-	testing.expect(t, !plain.cost.output_present)
-	testing.expect(t, !plain.cost.cache_read_present)
-	testing.expect(t, !plain.cost.cache_write_present)
+	testing.expect(t, (plain.cost.input == nil))
+	testing.expect(t, (plain.cost.output == nil))
+	testing.expect(t, (plain.cost.cache_read == nil))
+	testing.expect(t, (plain.cost.cache_write == nil))
 
 	zeroed := models_dev_fixture_model(t, acme, "acme/zeroed")
-	testing.expect(t, zeroed.context_window_present)
-	testing.expect_value(t, zeroed.context_window, 0)
-	testing.expect(t, zeroed.max_output_tokens_present)
-	testing.expect_value(t, zeroed.max_output_tokens, 0)
-	testing.expect(t, zeroed.input_modalities_present)
-	testing.expect_value(t, len(zeroed.input_modalities), 0)
-	testing.expect(t, zeroed.output_modalities_present)
-	testing.expect_value(t, len(zeroed.output_modalities), 0)
+	testing.expect(t, (zeroed.context_window != nil))
+	testing.expect_value(t, zeroed.context_window.?, 0)
+	testing.expect(t, (zeroed.max_output_tokens != nil))
+	testing.expect_value(t, zeroed.max_output_tokens.?, 0)
+	testing.expect(t, (zeroed.input_modalities != nil))
+	testing.expect_value(t, len(zeroed.input_modalities.?), 0)
+	testing.expect(t, (zeroed.output_modalities != nil))
+	testing.expect_value(t, len(zeroed.output_modalities.?), 0)
 }
 
 @(test)
@@ -236,16 +236,16 @@ test_models_dev_parse_ignores_unknown_and_mistyped_fields :: proc(t: ^testing.T)
 
 	gamma := models_dev_fixture_source(t, "gamma", catalog[:])
 	// An unrecognized SDK leaves the protocol unstated rather than guessed.
-	testing.expect(t, !gamma.api_present)
-	testing.expect(t, !gamma.base_url_present)
-	testing.expect(t, !gamma.api_key_present)
+	testing.expect(t, (gamma.api == nil))
+	testing.expect(t, (gamma.base_url == nil))
+	testing.expect(t, (gamma.api_key == nil))
 
 	odd := models_dev_fixture_model(t, gamma, "gamma/odd")
-	testing.expect(t, !odd.display_name_present)
-	testing.expect(t, !odd.context_window_present)
-	testing.expect(t, !odd.max_output_tokens_present)
-	testing.expect(t, !odd.tools_present)
-	testing.expect(t, !odd.input_modalities_present)
+	testing.expect(t, (odd.display_name == nil))
+	testing.expect(t, (odd.context_window == nil))
+	testing.expect(t, (odd.max_output_tokens == nil))
+	testing.expect(t, (odd.tools == nil))
+	testing.expect(t, (odd.input_modalities == nil))
 	testing.expect(t, !odd.thinking.present)
 	testing.expect(t, !odd.thinking.budget.present)
 }
@@ -264,16 +264,16 @@ test_models_dev_parse_drops_non_string_list_entries :: proc(t: ^testing.T) {
 	defer catalog_sources_destroy(&catalog)
 
 	delta := models_dev_fixture_source(t, "delta", catalog[:])
-	testing.expect_value(t, delta.api, "openai_responses")
+	testing.expect_value(t, delta.api.?, "openai_responses")
 	mixed := models_dev_fixture_model(t, delta, "delta/mixed")
-	testing.expect(t, mixed.thinking.levels_present)
-	testing.expect_value(t, len(mixed.thinking.levels), 2)
-	testing.expect_value(t, mixed.thinking.levels[0], "low")
-	testing.expect_value(t, mixed.thinking.levels[1], "high")
-	testing.expect(t, mixed.input_modalities_present)
-	testing.expect_value(t, len(mixed.input_modalities), 1)
-	testing.expect(t, mixed.output_modalities_present)
-	testing.expect_value(t, len(mixed.output_modalities), 0)
+	testing.expect(t, (mixed.thinking.levels != nil))
+	testing.expect_value(t, len(mixed.thinking.levels.?), 2)
+	testing.expect_value(t, mixed.thinking.levels.?[0], "low")
+	testing.expect_value(t, mixed.thinking.levels.?[1], "high")
+	testing.expect(t, (mixed.input_modalities != nil))
+	testing.expect_value(t, len(mixed.input_modalities.?), 1)
+	testing.expect(t, (mixed.output_modalities != nil))
+	testing.expect_value(t, len(mixed.output_modalities.?), 0)
 }
 
 @(test)
@@ -295,14 +295,14 @@ test_models_dev_parse_records_a_models_own_routing :: proc(t: ^testing.T) {
 
 	eps := models_dev_fixture_source(t, "eps", catalog[:])
 	testing.expect_value(t, len(eps.models), 5)
-	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/foreign").api, "anthropic_messages")
-	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/other-wire").api, "openai_responses")
-	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/agreeing").api, "openai_chat_completions")
+	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/foreign").api.?, "anthropic_messages")
+	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/other-wire").api.?, "openai_responses")
+	testing.expect_value(t, models_dev_fixture_model(t, eps, "eps/agreeing").api.?, "openai_chat_completions")
 	// An unimplemented or absent family leaves the model's own absent, so the
 	// provider's stands.
-	testing.expect(t, !models_dev_fixture_model(t, eps, "eps/unknown").api_present)
-	testing.expect(t, !models_dev_fixture_model(t, eps, "eps/plain").api_present)
-	testing.expect_value(t, eps.api, "openai_chat_completions")
+	testing.expect(t, models_dev_fixture_model(t, eps, "eps/unknown").api == nil)
+	testing.expect(t, models_dev_fixture_model(t, eps, "eps/plain").api == nil)
+	testing.expect_value(t, eps.api.?, "openai_chat_completions")
 }
 
 @(test)
@@ -352,20 +352,18 @@ test_models_dev_parse_feeds_the_resolver_unchanged :: proc(t: ^testing.T) {
 
 	// The parser's output is exactly the resolver's input: no adapter, and user
 	// configuration still wins over everything the catalog states.
-	user := []Catalog_Provider_Source {
-		{id = "acme", models = []Catalog_Model_Source{{id = "acme/thinker", context_window_present = true, context_window = 999}}},
-	}
+	user := []Catalog_Provider_Source{{id = "acme", models = []Catalog_Model_Source{{id = "acme/thinker", context_window = 999}}}}
 	resolved, resolve_err := resolve_catalog(user, {}, catalog[:])
 	testing.expect_value(t, resolve_err, Catalog_Error.None)
 	defer catalog_destroy(&resolved)
 
 	thinking := catalog_test_find(resolved, "acme", "acme/thinker")
 	testing.expect(t, thinking != nil)
-	testing.expect_value(t, thinking.context_window, 999)
-	testing.expect_value(t, thinking.display_name, "Acme Thinker")
+	testing.expect_value(t, thinking.context_window.?, 999)
+	testing.expect_value(t, thinking.display_name.?, "Acme Thinker")
 	testing.expect(t, thinking.thinking.budget.present)
-	testing.expect_value(t, thinking.thinking.budget.max, 81920)
-	testing.expect_value(t, len(thinking.thinking.levels), 3)
+	testing.expect_value(t, thinking.thinking.budget.max.?, 81920)
+	testing.expect_value(t, len(thinking.thinking.levels.?), 3)
 
 	// Every provider the catalog stated is resolvable, and each model keeps the
 	// provider identity from its source record.
@@ -374,7 +372,7 @@ test_models_dev_parse_feeds_the_resolver_unchanged :: proc(t: ^testing.T) {
 	testing.expect(t, catalog_test_find(resolved, "acme", "acme/plain") != nil)
 
 	// A disabled model is still excluded even when the catalog reports it.
-	excluding := []Catalog_Provider_Source{{id = "acme", models = []Catalog_Model_Source{{id = "acme/plain", disabled_present = true, disabled = true}}}}
+	excluding := []Catalog_Provider_Source{{id = "acme", models = []Catalog_Model_Source{{id = "acme/plain", disabled = true}}}}
 	excluded, excluded_err := resolve_catalog(excluding, {}, catalog[:])
 	testing.expect_value(t, excluded_err, Catalog_Error.None)
 	defer catalog_destroy(&excluded)

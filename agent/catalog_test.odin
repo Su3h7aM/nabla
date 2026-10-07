@@ -13,40 +13,24 @@ catalog_test_find :: proc(catalog: Catalog, provider_id, model_id: string) -> ^C
 @(test)
 test_catalog_resolution :: proc(t: ^testing.T) {
 	user_models := []Catalog_Model_Source {
-		{
-			id = "kept",
-			context_window_present = true,
-			context_window = 500000,
-			thinking = Catalog_Thinking_Source{present = true, levels_present = true, levels = []string{"high", "max"}},
-		},
-		{id = "false-tools", tools_present = true, tools = false},
-		{id = "empty-customization", input_modalities_present = true, input_modalities = {}},
+		{id = "kept", context_window = 500000, thinking = Catalog_Thinking_Source{present = true, levels = []string{"high", "max"}}},
+		{id = "false-tools", tools = false},
+		{id = "empty-customization", input_modalities = []string{}},
 		{id = "blocked", thinking = Catalog_Thinking_Source{present = true, blocked = true}},
-		{id = "disabled", disabled_present = true, disabled = true},
+		{id = "disabled", disabled = true},
 	}
 	provider_models := []Catalog_Model_Source {
-		{id = "kept", context_window_present = true, context_window = 750000},
-		{id = "false-tools", tools_present = true, tools = true},
-		{id = "empty-customization", display_name_present = true, display_name = "Discovered"},
-		{
-			id = "blocked",
-			thinking = Catalog_Thinking_Source {
-				present = true,
-				supported_present = true,
-				supported = true,
-				toggle_present = true,
-				toggle = true,
-				levels_present = true,
-				levels = []string{"low"},
-			},
-		},
-		{id = "disabled", context_window_present = true, context_window = 99},
-		{id = "remote-only", context_window_present = true, context_window = 333},
+		{id = "kept", context_window = 750000},
+		{id = "false-tools", tools = true},
+		{id = "empty-customization", display_name = "Discovered"},
+		{id = "blocked", thinking = Catalog_Thinking_Source{present = true, supported = true, toggle = true, levels = []string{"low"}}},
+		{id = "disabled", context_window = 99},
+		{id = "remote-only", context_window = 333},
 	}
 	models_dev_models := []Catalog_Model_Source {
-		{id = "kept", context_window_present = true, context_window = 1000000},
-		{id = "catalog-only", display_name_present = true, display_name = "Catalog"},
-		{id = "disabled", display_name_present = true, display_name = "Nope"},
+		{id = "kept", context_window = 1000000},
+		{id = "catalog-only", display_name = "Catalog"},
+		{id = "disabled", display_name = "Nope"},
 	}
 	user := []Catalog_Provider_Source{{id = "exact/provider", models = user_models}}
 	provider := []Catalog_Provider_Source{{id = "exact/provider", models = provider_models}}
@@ -58,24 +42,24 @@ test_catalog_resolution :: proc(t: ^testing.T) {
 	// The user's window is never replaced by a later source's larger one.
 	kept := catalog_test_find(catalog, "exact/provider", "kept")
 	testing.expect(t, kept != nil)
-	testing.expect_value(t, kept.context_window, 500000)
-	testing.expect_value(t, len(kept.thinking.levels), 2)
-	testing.expect_value(t, kept.thinking.levels[0], "high")
+	testing.expect_value(t, kept.context_window.?, 500000)
+	testing.expect_value(t, len(kept.thinking.levels.?), 2)
+	testing.expect_value(t, kept.thinking.levels.?[0], "high")
 
 	// An explicit false is a value, not an absence.
 	false_tools := catalog_test_find(catalog, "exact/provider", "false-tools")
-	testing.expect(t, false_tools != nil && !false_tools.tools)
+	testing.expect(t, false_tools != nil && !false_tools.tools.?)
 
 	// An explicit empty collection is present and stays empty.
 	empty := catalog_test_find(catalog, "exact/provider", "empty-customization")
-	testing.expect(t, empty != nil && empty.input_modalities_present)
-	testing.expect_value(t, len(empty.input_modalities), 0)
+	testing.expect(t, empty != nil && empty.input_modalities != nil)
+	testing.expect_value(t, len(empty.input_modalities.?), 0)
 
 	// A blocked subtree never acquires subordinate controls.
 	blocked := catalog_test_find(catalog, "exact/provider", "blocked")
 	testing.expect(t, blocked != nil && blocked.thinking.blocked)
-	testing.expect(t, !blocked.thinking.toggle_present)
-	testing.expect(t, !blocked.thinking.levels_present)
+	testing.expect(t, (blocked.thinking.toggle == nil))
+	testing.expect(t, (blocked.thinking.levels == nil))
 
 	// An excluded model is neither enriched nor published, by any source.
 	testing.expect(t, catalog_test_find(catalog, "exact/provider", "disabled") == nil)
@@ -87,17 +71,13 @@ test_catalog_resolution :: proc(t: ^testing.T) {
 
 @(test)
 test_catalog_rejects_disabled_customization :: proc(t: ^testing.T) {
-	user := []Catalog_Provider_Source {
-		{id = "p", models = []Catalog_Model_Source{{id = "m", disabled_present = true, disabled = true, tools_present = true, tools = true}}},
-	}
+	user := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", disabled = true, tools = true}}}}
 	catalog, err := resolve_catalog(user, {}, {})
 	testing.expect_value(t, err, Catalog_Error.Invalid_Disabled_Model)
 	testing.expect_value(t, len(catalog.models), 0)
 	catalog_destroy(&catalog)
 
-	api_user := []Catalog_Provider_Source {
-		{id = "p", models = []Catalog_Model_Source{{id = "m", disabled_present = true, disabled = true, api_present = true, api = "openai_chat_completions"}}},
-	}
+	api_user := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", disabled = true, api = "openai_chat_completions"}}}}
 	api_catalog, api_err := resolve_catalog(api_user, {}, {})
 	testing.expect_value(t, api_err, Catalog_Error.Invalid_Disabled_Model)
 	catalog_destroy(&api_catalog)
@@ -105,9 +85,9 @@ test_catalog_rejects_disabled_customization :: proc(t: ^testing.T) {
 
 @(test)
 test_catalog_fresh_resolution_updates_remote :: proc(t: ^testing.T) {
-	user := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", display_name_present = true, display_name = "User"}}}}
-	remote_1 := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", context_window_present = true, context_window = 100}}}}
-	remote_2 := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", context_window_present = true, context_window = 200}}}}
+	user := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", display_name = "User"}}}}
+	remote_1 := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", context_window = 100}}}}
+	remote_2 := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", context_window = 200}}}}
 	first, first_err := resolve_catalog(user, remote_1, {})
 	second, second_err := resolve_catalog(user, remote_2, {})
 	testing.expect_value(t, first_err, Catalog_Error.None)
@@ -117,9 +97,9 @@ test_catalog_fresh_resolution_updates_remote :: proc(t: ^testing.T) {
 
 	// First-present wins per resolution, not forever: a fresh source snapshot is
 	// allowed to update its own value.
-	testing.expect_value(t, catalog_test_find(first, "p", "m").context_window, 100)
-	testing.expect_value(t, catalog_test_find(second, "p", "m").context_window, 200)
-	testing.expect_value(t, catalog_test_find(second, "p", "m").display_name, "User")
+	testing.expect_value(t, catalog_test_find(first, "p", "m").context_window.?, 100)
+	testing.expect_value(t, catalog_test_find(second, "p", "m").context_window.?, 200)
+	testing.expect_value(t, catalog_test_find(second, "p", "m").display_name.?, "User")
 }
 
 @(test)
@@ -148,20 +128,15 @@ test_catalog_owns_every_retained_string :: proc(t: ^testing.T) {
 
 	source_model := Catalog_Model_Source {
 		id = string(model_bytes[:]),
-		display_name_present = true,
 		display_name = string(display_bytes[:]),
-		input_modalities_present = true,
 		input_modalities = []string{string(modality_bytes[:])},
-		thinking = Catalog_Thinking_Source{present = true, levels_present = true, levels = []string{string(level_bytes[:])}},
+		thinking = Catalog_Thinking_Source{present = true, levels = []string{string(level_bytes[:])}},
 	}
 	user := []Catalog_Provider_Source {
 		{
 			id = string(provider_bytes[:]),
-			base_url_present = true,
 			base_url = string(url_bytes[:]),
-			api_present = true,
 			api = string(api_bytes[:]),
-			api_key_present = true,
 			api_key = string(key_bytes[:]),
 			models = []Catalog_Model_Source{source_model},
 		},
@@ -191,28 +166,18 @@ test_catalog_owns_every_retained_string :: proc(t: ^testing.T) {
 	model := catalog_test_find(catalog, "p", "m")
 	testing.expect(t, model != nil)
 	testing.expect_value(t, provider.id, "p")
-	testing.expect_value(t, provider.base_url, "url")
-	testing.expect_value(t, provider.api, "api")
-	testing.expect_value(t, provider.api_key, "KEY")
+	testing.expect_value(t, provider.base_url.?, "url")
+	testing.expect_value(t, provider.api.?, "api")
+	testing.expect_value(t, provider.api_key.?, "KEY")
 	testing.expect_value(t, model.id, "m")
-	testing.expect_value(t, model.display_name, "User")
-	testing.expect_value(t, model.input_modalities[0], "img")
-	testing.expect_value(t, model.thinking.levels[0], "high")
+	testing.expect_value(t, model.display_name.?, "User")
+	testing.expect_value(t, model.input_modalities.?[0], "img")
+	testing.expect_value(t, model.thinking.levels.?[0], "high")
 }
 
 @(test)
 test_an_unknown_provider_lists_the_configured_ones :: proc(t: ^testing.T) {
-	user := []Catalog_Provider_Source {
-		{
-			id = "proxy",
-			base_url_present = true,
-			base_url = "http://localhost",
-			api_present = true,
-			api = "openai-chat",
-			api_key_present = true,
-			api_key = "KEY",
-		},
-	}
+	user := []Catalog_Provider_Source{{id = "proxy", base_url = "http://localhost", api = "openai-chat", api_key = "KEY"}}
 	models_dev := []Catalog_Provider_Source{{id = "only-listed"}}
 	catalog, err := resolve_catalog(user, nil, models_dev)
 	testing.expect_value(t, err, Catalog_Error.None)

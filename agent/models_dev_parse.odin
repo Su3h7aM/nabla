@@ -136,12 +136,10 @@ models_dev_provider_source :: proc(object: json.Object, provider_id: string, all
 	// the provider require an explicit base_url in configuration.
 	if base_url, base_url_present := models_dev_member_string(object, "api"); base_url_present && base_url != "" {
 		out.base_url = strings.clone(base_url, allocator) or_return
-		out.base_url_present = true
 	}
 	if npm, npm_present := models_dev_member_string(object, "npm"); npm_present {
 		if api, api_known := models_dev_api_family(npm); api_known {
 			out.api = strings.clone(api, allocator) or_return
-			out.api_present = true
 		}
 	}
 	// The catalog names the environment variable a credential is read from. Only
@@ -153,7 +151,6 @@ models_dev_provider_source :: proc(object: json.Object, provider_id: string, all
 		defer catalog_strings_destroy(variables, allocator)
 		if len(variables) > 0 && variables[0] != "" {
 			out.api_key = strings.concatenate([]string{"${", variables[0], "}"}, allocator = allocator) or_return
-			out.api_key_present = true
 		}
 	}
 	failed = false
@@ -173,7 +170,6 @@ models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, o
 			if npm, npm_present := models_dev_member_string(override, "npm"); npm_present {
 				if api, api_known := models_dev_api_family(npm); api_known {
 					out.api = strings.clone(api, allocator) or_return
-					out.api_present = true
 				}
 			}
 		}
@@ -181,16 +177,13 @@ models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, o
 
 	if display_name, display_name_present := models_dev_member_string(object, "name"); display_name_present {
 		out.display_name = strings.clone(display_name, allocator) or_return
-		out.display_name_present = true
 	}
 	if limit_value, has_limit := object["limit"]; has_limit {
 		if limit, limit_is_object := limit_value.(json.Object); limit_is_object {
 			if context_window, context_present := models_dev_member_integer(limit, "context"); context_present {
-				out.context_window_present = true
 				out.context_window = context_window
 			}
 			if output, output_present := models_dev_member_integer(limit, "output"); output_present {
-				out.max_output_tokens_present = true
 				out.max_output_tokens = output
 			}
 		}
@@ -200,37 +193,30 @@ models_dev_model_source :: proc(object: json.Object, allocator: mem.Allocator, o
 			input, input_present, input_error := models_dev_member_strings(modalities, "input", allocator)
 			if input_error != nil { return input_error }
 			if input_present {
-				out.input_modalities_present = true
 				out.input_modalities = input
 			}
 			output, output_present, output_error := models_dev_member_strings(modalities, "output", allocator)
 			if output_error != nil { return output_error }
 			if output_present {
-				out.output_modalities_present = true
 				out.output_modalities = output
 			}
 		}
 	}
 	if tools, tools_present := models_dev_member_bool(object, "tool_call"); tools_present {
-		out.tools_present = true
 		out.tools = tools
 	}
 	if cost_value, has_cost := object["cost"]; has_cost {
 		if cost, cost_is_object := cost_value.(json.Object); cost_is_object {
 			if input, input_present := models_dev_member_price(cost, "input"); input_present {
-				out.cost.input_present = true
 				out.cost.input = input
 			}
 			if output, output_present := models_dev_member_price(cost, "output"); output_present {
-				out.cost.output_present = true
 				out.cost.output = output
 			}
 			if cache_read, cache_read_present := models_dev_member_price(cost, "cache_read"); cache_read_present {
-				out.cost.cache_read_present = true
 				out.cost.cache_read = cache_read
 			}
 			if cache_write, cache_write_present := models_dev_member_price(cost, "cache_write"); cache_write_present {
-				out.cost.cache_write_present = true
 				out.cost.cache_write = cache_write
 			}
 		}
@@ -249,7 +235,6 @@ models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator, out: 
 	supported, supported_present := models_dev_member_bool(object, "reasoning")
 	if !supported_present { return nil }
 	out.present = true
-	out.supported_present = true
 	out.supported = supported
 	// A model that cannot reason is a terminal negative: no control form below it
 	// can apply, and resolution relies on that to block the whole subtree.
@@ -269,26 +254,22 @@ models_dev_thinking :: proc(object: json.Object, allocator: mem.Allocator, out: 
 		if !kind_present { continue }
 		switch kind {
 		case "toggle":
-			out.toggle_present = true
 			out.toggle = true
 		case "effort":
 			// The first effort list wins, and one is kept at most, so a record
 			// that repeats the control form cannot leak the earlier list.
-			if out.levels_present { continue }
+			if out.levels != nil { continue }
 			levels, levels_present, levels_error := models_dev_member_strings(option_object, "values", allocator)
 			if levels_error != nil { return levels_error }
 			if levels_present {
-				out.levels_present = true
 				out.levels = levels
 			}
 		case "budget_tokens":
 			out.budget.present = true
 			if minimum, minimum_present := models_dev_member_integer(option_object, "min"); minimum_present {
-				out.budget.min_present = true
 				out.budget.min = minimum
 			}
 			if maximum, maximum_present := models_dev_member_integer(option_object, "max"); maximum_present {
-				out.budget.max_present = true
 				out.budget.max = maximum
 			}
 		case:

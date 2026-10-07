@@ -1058,7 +1058,7 @@ acp_models_state :: proc(session: ^ACP_Session) -> (acp.Models_State, bool) {
 	if available_error != nil { return {}, false }
 	for model, index in session.app.setup.catalog.models {
 		name := model.id
-		if model.display_name_present && model.display_name != "" { name = model.display_name }
+		if name_value, ok := model.display_name.?; ok && name_value != "" { name = name_value }
 		available[index] = acp.Model_Info {
 			model_id = model.id,
 			name     = name,
@@ -1074,7 +1074,7 @@ acp_model_config_values :: proc(session: ^ACP_Session) -> ([]acp.Config_Value, b
 	if values_error != nil { return nil, false }
 	for model, index in session.app.setup.catalog.models {
 		name := model.id
-		if model.display_name_present && model.display_name != "" { name = model.display_name }
+		if name_value, ok := model.display_name.?; ok && name_value != "" { name = name_value }
 		values[index] = acp.Config_Value {
 			value = model.id,
 			name  = name,

@@ -388,13 +388,13 @@ test_models_dev_sources_are_the_resolver_input :: proc(t: ^testing.T) {
 			testing.expect_value(t, len(resolved.providers), 2)
 
 			provider := resolved.providers[0]
-			testing.expect_value(t, provider.api, "openai_chat_completions")
-			testing.expect_value(t, provider.api_key, "${ACME_API_KEY}")
+			testing.expect_value(t, provider.api.?, "openai_chat_completions")
+			testing.expect_value(t, provider.api_key.?, "${ACME_API_KEY}")
 			thinking := catalog_test_find(resolved, "acme", "acme/thinker")
 			testing.expect(t, thinking != nil)
-			testing.expect_value(t, thinking.context_window, 200000)
-			testing.expect_value(t, thinking.thinking.levels[2], "max")
-			testing.expect_value(t, thinking.thinking.budget.max, 81920)
+			testing.expect_value(t, thinking.context_window.?, 200000)
+			testing.expect_value(t, thinking.thinking.levels.?[2], "max")
+			testing.expect_value(t, thinking.thinking.budget.max.?, 81920)
 		},
 	)
 }

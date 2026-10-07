@@ -805,25 +805,19 @@ acp_test_session_protocol :: proc(t: ^testing.T, scenario: ACP_Test_Session_Scen
 	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
 	defer delete(models, context.allocator)
 	models[0] = {
-		id                        = "testmodel",
-		context_window_present    = true,
-		context_window            = 100000,
-		max_output_tokens_present = true,
-		max_output_tokens         = 4096,
-		tools_present             = true,
-		tools                     = true,
+		id                = "testmodel",
+		context_window    = 100000,
+		max_output_tokens = 4096,
+		tools             = true,
 	}
 	sources[0] = {
-		id               = "testprovider",
-		base_url_present = true,
-		base_url         = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api_present      = true,
-		api              = "openai_chat_completions",
-		api_key_present  = true,
-		api_key          = "test-key",
-		models           = models,
+		id       = "testprovider",
+		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
 	}
-	defer delete(sources[0].base_url, context.allocator)
+	defer delete(sources[0].base_url.?, context.allocator)
 
 	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
@@ -1140,25 +1134,19 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
 	defer delete(models, context.allocator)
 	models[0] = {
-		id                        = "v2model",
-		context_window_present    = true,
-		context_window            = 100000,
-		max_output_tokens_present = true,
-		max_output_tokens         = 4096,
-		tools_present             = true,
-		tools                     = true,
+		id                = "v2model",
+		context_window    = 100000,
+		max_output_tokens = 4096,
+		tools             = true,
 	}
 	sources[0] = {
-		id               = "v2provider",
-		base_url_present = true,
-		base_url         = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api_present      = true,
-		api              = "openai_chat_completions",
-		api_key_present  = true,
-		api_key          = "test-key",
-		models           = models,
+		id       = "v2provider",
+		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
 	}
-	defer delete(sources[0].base_url, context.allocator)
+	defer delete(sources[0].base_url.?, context.allocator)
 
 	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
@@ -1389,28 +1377,21 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 	models := make([]agent.Catalog_Model_Source, 2, context.allocator)
 	defer delete(models, context.allocator)
 	models[0] = {
-		id                     = "buzzmodel",
-		context_window_present = true,
-		context_window         = 100000,
-		tools_present          = true,
-		tools                  = true,
+		id             = "buzzmodel",
+		context_window = 100000,
+		tools          = true,
 	}
 	models[1] = {
-		id                     = "buzzmodel-next",
-		context_window_present = true,
-		context_window         = 100000,
-		tools_present          = true,
-		tools                  = true,
+		id             = "buzzmodel-next",
+		context_window = 100000,
+		tools          = true,
 	}
 	sources[0] = {
-		id               = "buzzprovider",
-		base_url_present = true,
-		base_url         = "http://127.0.0.1:1/v1",
-		api_present      = true,
-		api              = "openai_chat_completions",
-		api_key_present  = true,
-		api_key          = "test-key",
-		models           = models,
+		id       = "buzzprovider",
+		base_url = "http://127.0.0.1:1/v1",
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
 	}
 
 	client: ACP_Test_Client
@@ -1514,21 +1495,16 @@ test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
 	defer delete(models, context.allocator)
 	models[0] = {
 		id = "effortmodel",
-		context_window_present = true,
 		context_window = 100000,
-		tools_present = true,
 		tools = true,
-		thinking = agent.Catalog_Thinking_Source{present = true, levels_present = true, levels = levels},
+		thinking = agent.Catalog_Thinking_Source{present = true, levels = levels},
 	}
 	sources[0] = {
-		id               = "effortprovider",
-		base_url_present = true,
-		base_url         = "http://127.0.0.1:1/v1",
-		api_present      = true,
-		api              = "openai_chat_completions",
-		api_key_present  = true,
-		api_key          = "test-key",
-		models           = models,
+		id       = "effortprovider",
+		base_url = "http://127.0.0.1:1/v1",
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
 	}
 
 	client: ACP_Test_Client

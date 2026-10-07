@@ -8,7 +8,7 @@ import "core:time"
 // Provider and model metadata: what a configuration source states, and what the runtime
 // reads once that configuration has been resolved.
 //
-// Every optional field carries an explicit presence flag, so an absent value stays
+// Every optional field is a Maybe, so an absent value stays
 // distinguishable from a present zero. Presence is independent of value: missing permits
 // enrichment, while false, zero, and empty are present and final.
 //
@@ -17,42 +17,33 @@ import "core:time"
 // case-sensitive pair of provider ID and model ID, never parsed out of a combined string.
 
 // A token-budget control form: the range of reasoning budgets the model accepts.
-// Each bound has its own presence, because upstream states neither, either, or
+// Each bound is a Maybe, because upstream states neither, either, or
 // both, and a stated bound is a fact rather than a default.
 Catalog_Thinking_Budget :: struct {
-	present:     bool,
-	min_present: bool,
-	min:         int,
-	max_present: bool,
-	max:         int,
+	present: bool,
+	min:     Maybe(int),
+	max:     Maybe(int),
 }
 
 Catalog_Thinking_Source :: struct {
-	present:           bool,
+	present:   bool,
 	// A terminal negative. A blocked source prohibits all later thinking
 	// enrichment, including its own toggle and level fields.
-	blocked:           bool,
-	supported_present: bool,
-	supported:         bool,
-	toggle_present:    bool,
-	toggle:            bool,
-	levels_present:    bool,
-	levels:            []string,
-	budget:            Catalog_Thinking_Budget,
+	blocked:   bool,
+	supported: Maybe(bool),
+	toggle:    Maybe(bool),
+	levels:    Maybe([]string),
+	budget:    Catalog_Thinking_Budget,
 }
 
-// Catalog_Cost is a model's price in US dollars per million tokens. Each price has its own
-// presence and merges on its own, so a source that states only input and output still
+// Catalog_Cost is a model's price in US dollars per million tokens. Each price is a Maybe
+// and merges on its own, so a source that states only input and output still
 // leaves the cache prices open to enrichment.
 Catalog_Cost :: struct {
-	input_present:       bool,
-	input:               f64,
-	output_present:      bool,
-	output:              f64,
-	cache_read_present:  bool,
-	cache_read:          f64,
-	cache_write_present: bool,
-	cache_write:         f64,
+	input:       Maybe(f64),
+	output:      Maybe(f64),
+	cache_read:  Maybe(f64),
+	cache_write: Maybe(f64),
 }
 
 CATALOG_COST_TOKENS_PER_UNIT :: 1_000_000
@@ -64,39 +55,32 @@ CATALOG_COST_TOKENS_PER_UNIT :: 1_000_000
 // without them would understate the cost.
 @(require_results)
 catalog_cost_of :: proc(cost: Catalog_Cost, input, output, cache_read, cache_write: Maybe(i64)) -> (dollars: f64, ok: bool) {
-	if !cost.input_present || !cost.output_present { return 0, false }
+	input_price := cost.input.? or_return
+	output_price := cost.output.? or_return
 	input_tokens := input.? or_return
 	output_tokens := output.? or_return
 	read := cache_read.? or_else 0
 	written := cache_write.? or_else 0
 	uncached := max(input_tokens - read - written, 0)
-	read_price := cost.cache_read if cost.cache_read_present else cost.input
-	write_price := cost.cache_write if cost.cache_write_present else cost.input
-	dollars = f64(uncached) * cost.input + f64(read) * read_price + f64(written) * write_price + f64(output_tokens) * cost.output
+	read_price := cost.cache_read.? or_else input_price
+	write_price := cost.cache_write.? or_else input_price
+	dollars = f64(uncached) * input_price + f64(read) * read_price + f64(written) * write_price + f64(output_tokens) * output_price
 	return dollars / CATALOG_COST_TOKENS_PER_UNIT, true
 }
 
 Catalog_Model_Source :: struct {
-	id:                        string,
-	disabled_present:          bool,
-	disabled:                  bool,
+	id:                string,
+	disabled:          Maybe(bool),
 	// Absent means the model is served through its provider's family.
-	api_present:               bool,
-	api:                       string,
-	display_name_present:      bool,
-	display_name:              string,
-	context_window_present:    bool,
-	context_window:            int,
-	max_output_tokens_present: bool,
-	max_output_tokens:         int,
-	input_modalities_present:  bool,
-	input_modalities:          []string,
-	output_modalities_present: bool,
-	output_modalities:         []string,
-	tools_present:             bool,
-	tools:                     bool,
-	thinking:                  Catalog_Thinking_Source,
-	cost:                      Catalog_Cost,
+	api:               Maybe(string),
+	display_name:      Maybe(string),
+	context_window:    Maybe(int),
+	max_output_tokens: Maybe(int),
+	input_modalities:  Maybe([]string),
+	output_modalities: Maybe([]string),
+	tools:             Maybe(bool),
+	thinking:          Catalog_Thinking_Source,
+	cost:              Catalog_Cost,
 }
 
 Provider_Transport :: enum {
@@ -118,26 +102,21 @@ provider_transport_name :: proc(transport: Provider_Transport) -> string {
 }
 
 Catalog_Provider_Source :: struct {
-	id:                          string,
-	base_url_present:            bool,
-	base_url:                    string,
-	api_present:                 bool,
-	api:                         string,
-	transport_present:           bool,
-	transport:                   Provider_Transport,
+	id:                  string,
+	base_url:            Maybe(string),
+	api:                 Maybe(string),
+	transport:           Maybe(Provider_Transport),
 	// stream_idle_timeout is the longest a response of this provider may go without a
 	// byte before the attempt is cut. Off by default (zero), because no provider
 	// documents an idle limit; the user opts in per provider. It restarts on every byte
 	// and never bounds the total time of a response.
-	stream_idle_timeout_present: bool,
-	stream_idle_timeout:         time.Duration,
+	stream_idle_timeout: Maybe(time.Duration),
 	// A literal secret, or `${NAME}` naming an environment variable. Resolved
 	// only when a connection is built, so no secret is ever held here.
-	api_key_present:             bool,
-	api_key:                     string,
+	api_key:             Maybe(string),
 	// Read-only during resolution: sources state models, they are not extended
 	// by it. The resolved catalog's own list is what grows.
-	models:                      []Catalog_Model_Source,
+	models:              []Catalog_Model_Source,
 }
 
 // Catalog_Model is one resolved model. `provider_id` is part of its identity
@@ -146,41 +125,29 @@ Catalog_Provider_Source :: struct {
 // `capacity` is derived, not stated: resolution fills it from the merged window and
 // output fields, and everything that needs a context budget reads it from here.
 Catalog_Model :: struct {
-	provider_id:               string,
-	id:                        string,
+	provider_id:       string,
+	id:                string,
 	// The family this model is served through: its own statement where it has
 	// one, otherwise the provider's.
-	api_present:               bool,
-	api:                       string,
-	display_name:              string,
-	display_name_present:      bool,
-	context_window:            int,
-	context_window_present:    bool,
-	max_output_tokens:         int,
-	max_output_tokens_present: bool,
-	capacity:                  Model_Capacity,
-	input_modalities:          []string,
-	input_modalities_present:  bool,
-	output_modalities:         []string,
-	output_modalities_present: bool,
-	tools:                     bool,
-	tools_present:             bool,
-	thinking:                  Catalog_Thinking_Source,
-	cost:                      Catalog_Cost,
+	api:               Maybe(string),
+	display_name:      Maybe(string),
+	context_window:    Maybe(int),
+	max_output_tokens: Maybe(int),
+	capacity:          Model_Capacity,
+	input_modalities:  Maybe([]string),
+	output_modalities: Maybe([]string),
+	tools:             Maybe(bool),
+	thinking:          Catalog_Thinking_Source,
+	cost:              Catalog_Cost,
 }
 
 Catalog_Provider :: struct {
-	id:                          string,
-	base_url:                    string,
-	base_url_present:            bool,
-	api:                         string,
-	api_present:                 bool,
-	transport:                   Provider_Transport,
-	transport_present:           bool,
-	stream_idle_timeout_present: bool,
-	stream_idle_timeout:         time.Duration,
-	api_key_present:             bool,
-	api_key:                     string,
+	id:                  string,
+	base_url:            Maybe(string),
+	api:                 Maybe(string),
+	transport:           Maybe(Provider_Transport),
+	stream_idle_timeout: Maybe(time.Duration),
+	api_key:             Maybe(string),
 }
 
 Catalog_Error :: enum {
@@ -235,8 +202,7 @@ catalog_provider_idle_timeout :: proc(catalog: ^Catalog, provider_id: string) ->
 	index, found := catalog_find_provider(catalog, provider_id)
 	if !found { return STREAM_IDLE_TIMEOUT_DEFAULT }
 	provider := &catalog.providers[index]
-	if !provider.stream_idle_timeout_present { return STREAM_IDLE_TIMEOUT_DEFAULT }
-	return provider.stream_idle_timeout
+	return provider.stream_idle_timeout.? or_else STREAM_IDLE_TIMEOUT_DEFAULT
 }
 
 @(require_results)
@@ -264,7 +230,7 @@ catalog_has_disabled :: proc(provider_id, model_id: string, user: []Catalog_Prov
 	for provider in user {
 		if provider.id != provider_id { continue }
 		for model in provider.models {
-			if model.id == model_id && model.disabled_present && model.disabled { return true }
+			if model.id == model_id && (model.disabled.? or_else false) { return true }
 		}
 	}
 	return false
@@ -273,18 +239,18 @@ catalog_has_disabled :: proc(provider_id, model_id: string, user: []Catalog_Prov
 @(require_results)
 catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 	return(
-		model.api_present ||
-		model.display_name_present ||
-		model.context_window_present ||
-		model.max_output_tokens_present ||
-		model.input_modalities_present ||
-		model.output_modalities_present ||
-		model.tools_present ||
+		model.api != nil ||
+		model.display_name != nil ||
+		model.context_window != nil ||
+		model.max_output_tokens != nil ||
+		model.input_modalities != nil ||
+		model.output_modalities != nil ||
+		model.tools != nil ||
 		model.thinking.present ||
-		model.cost.input_present ||
-		model.cost.output_present ||
-		model.cost.cache_read_present ||
-		model.cost.cache_write_present \
+		model.cost.input != nil ||
+		model.cost.output != nil ||
+		model.cost.cache_read != nil ||
+		model.cost.cache_write != nil \
 	)
 }
 
@@ -293,7 +259,7 @@ catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 catalog_validate_user :: proc(user: []Catalog_Provider_Source) -> Catalog_Error {
 	for provider in user {
 		for model in provider.models {
-			if model.disabled_present && model.disabled && catalog_model_has_customization(model) {
+			if (model.disabled.? or_else false) && catalog_model_has_customization(model) {
 				return .Invalid_Disabled_Model
 			}
 		}
@@ -324,40 +290,36 @@ catalog_clone_strings :: proc(values: []string, allocator: mem.Allocator) -> ([]
 // the negative.
 @(require_results)
 catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Thinking_Source, allocator: mem.Allocator) -> Catalog_Error {
-	if !src.present || dst.blocked || (dst.supported_present && !dst.supported) { return .None }
-	if src.blocked || (src.supported_present && !src.supported) {
+	dst_supported := dst.supported.? or_else true
+	if !src.present || dst.blocked || !dst_supported { return .None }
+	src_supported := src.supported.? or_else true
+	if src.blocked || !src_supported {
 		if !dst.present {
 			dst^ = Catalog_Thinking_Source {
-				present           = true,
-				blocked           = src.blocked,
-				supported_present = src.supported_present,
-				supported         = src.supported,
+				present   = true,
+				blocked   = src.blocked,
+				supported = src.supported,
 			}
 		}
 		return .None
 	}
 	if !dst.present { dst.present = true }
-	if !dst.supported_present && src.supported_present {
-		dst.supported_present = true
+	if dst.supported == nil && src.supported != nil {
 		dst.supported = src.supported
 	}
-	if !dst.toggle_present && src.toggle_present {
-		dst.toggle_present = true
+	if dst.toggle == nil && src.toggle != nil {
 		dst.toggle = src.toggle
 	}
-	if !dst.levels_present && src.levels_present {
-		levels, levels_error := catalog_clone_strings(src.levels, allocator)
+	if dst.levels == nil && src.levels != nil {
+		levels, levels_error := catalog_clone_strings(src.levels.?, allocator)
 		if levels_error != nil { return .Allocation }
-		dst.levels_present = true
 		dst.levels = levels
 	}
 	if src.budget.present && !dst.budget.present { dst.budget.present = true }
-	if !dst.budget.min_present && src.budget.min_present {
-		dst.budget.min_present = true
+	if dst.budget.min == nil && src.budget.min != nil {
 		dst.budget.min = src.budget.min
 	}
-	if !dst.budget.max_present && src.budget.max_present {
-		dst.budget.max_present = true
+	if dst.budget.max == nil && src.budget.max != nil {
 		dst.budget.max = src.budget.max
 	}
 	return .None
@@ -367,60 +329,49 @@ catalog_apply_thinking :: proc(dst: ^Catalog_Thinking_Source, src: Catalog_Think
 // its own, so a source that states only input and output still leaves the cache
 // prices open to a later source.
 catalog_apply_cost :: proc(dst: ^Catalog_Cost, src: Catalog_Cost) {
-	if !dst.input_present && src.input_present {
-		dst.input_present = true
+	if dst.input == nil && src.input != nil {
 		dst.input = src.input
 	}
-	if !dst.output_present && src.output_present {
-		dst.output_present = true
+	if dst.output == nil && src.output != nil {
 		dst.output = src.output
 	}
-	if !dst.cache_read_present && src.cache_read_present {
-		dst.cache_read_present = true
+	if dst.cache_read == nil && src.cache_read != nil {
 		dst.cache_read = src.cache_read
 	}
-	if !dst.cache_write_present && src.cache_write_present {
-		dst.cache_write_present = true
+	if dst.cache_write == nil && src.cache_write != nil {
 		dst.cache_write = src.cache_write
 	}
 }
 
 @(require_results)
 catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allocator: mem.Allocator) -> Catalog_Error {
-	if !dst.api_present && src.api_present {
-		api, api_error := strings.clone(src.api, allocator)
+	if dst.api == nil && src.api != nil {
+		api, api_error := strings.clone(src.api.?, allocator)
 		if api_error != nil { return .Allocation }
-		dst.api_present = true
 		dst.api = api
 	}
-	if !dst.display_name_present && src.display_name_present {
-		display_name, display_name_error := strings.clone(src.display_name, allocator)
+	if dst.display_name == nil && src.display_name != nil {
+		display_name, display_name_error := strings.clone(src.display_name.?, allocator)
 		if display_name_error != nil { return .Allocation }
-		dst.display_name_present = true
 		dst.display_name = display_name
 	}
-	if !dst.context_window_present && src.context_window_present {
-		dst.context_window_present = true
+	if dst.context_window == nil && src.context_window != nil {
 		dst.context_window = src.context_window
 	}
-	if !dst.max_output_tokens_present && src.max_output_tokens_present {
-		dst.max_output_tokens_present = true
+	if dst.max_output_tokens == nil && src.max_output_tokens != nil {
 		dst.max_output_tokens = src.max_output_tokens
 	}
-	if !dst.input_modalities_present && src.input_modalities_present {
-		modalities, modalities_error := catalog_clone_strings(src.input_modalities, allocator)
+	if dst.input_modalities == nil && src.input_modalities != nil {
+		modalities, modalities_error := catalog_clone_strings(src.input_modalities.?, allocator)
 		if modalities_error != nil { return .Allocation }
-		dst.input_modalities_present = true
 		dst.input_modalities = modalities
 	}
-	if !dst.output_modalities_present && src.output_modalities_present {
-		modalities, modalities_error := catalog_clone_strings(src.output_modalities, allocator)
+	if dst.output_modalities == nil && src.output_modalities != nil {
+		modalities, modalities_error := catalog_clone_strings(src.output_modalities.?, allocator)
 		if modalities_error != nil { return .Allocation }
-		dst.output_modalities_present = true
 		dst.output_modalities = modalities
 	}
-	if !dst.tools_present && src.tools_present {
-		dst.tools_present = true
+	if dst.tools == nil && src.tools != nil {
 		dst.tools = src.tools
 	}
 	catalog_apply_thinking(&dst.thinking, src.thinking, allocator) or_return
@@ -430,30 +381,25 @@ catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allo
 
 @(require_results)
 catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: Catalog_Provider_Source, allocator: mem.Allocator) -> Catalog_Error {
-	if !dst.base_url_present && src.base_url_present {
-		base_url, base_url_error := strings.clone(src.base_url, allocator)
+	if dst.base_url == nil && src.base_url != nil {
+		base_url, base_url_error := strings.clone(src.base_url.?, allocator)
 		if base_url_error != nil { return .Allocation }
-		dst.base_url_present = true
 		dst.base_url = base_url
 	}
-	if !dst.api_present && src.api_present {
-		api, api_error := strings.clone(src.api, allocator)
+	if dst.api == nil && src.api != nil {
+		api, api_error := strings.clone(src.api.?, allocator)
 		if api_error != nil { return .Allocation }
-		dst.api_present = true
 		dst.api = api
 	}
-	if !dst.transport_present && src.transport_present {
-		dst.transport_present = true
+	if dst.transport == nil && src.transport != nil {
 		dst.transport = src.transport
 	}
-	if !dst.stream_idle_timeout_present && src.stream_idle_timeout_present {
-		dst.stream_idle_timeout_present = true
+	if dst.stream_idle_timeout == nil && src.stream_idle_timeout != nil {
 		dst.stream_idle_timeout = src.stream_idle_timeout
 	}
-	if !dst.api_key_present && src.api_key_present {
-		api_key, api_key_error := strings.clone(src.api_key, allocator)
+	if dst.api_key == nil && src.api_key != nil {
+		api_key, api_key_error := strings.clone(src.api_key.?, allocator)
 		if api_key_error != nil { return .Allocation }
-		dst.api_key_present = true
 		dst.api_key = api_key
 	}
 	return .None
@@ -537,18 +483,18 @@ catalog_destroy :: proc(catalog: ^Catalog) {
 	allocator := catalog.allocator
 	for &provider in catalog.providers {
 		delete(provider.id, allocator)
-		if provider.base_url_present { delete(provider.base_url, allocator) }
-		if provider.api_present { delete(provider.api, allocator) }
-		if provider.api_key_present { delete(provider.api_key, allocator) }
+		if provider.base_url != nil { delete(provider.base_url.?, allocator) }
+		if provider.api != nil { delete(provider.api.?, allocator) }
+		if provider.api_key != nil { delete(provider.api_key.?, allocator) }
 	}
 	for &model in catalog.models {
 		delete(model.provider_id, allocator)
 		delete(model.id, allocator)
-		if model.api_present { delete(model.api, allocator) }
-		if model.display_name_present { delete(model.display_name, allocator) }
-		if model.input_modalities_present { catalog_strings_destroy(model.input_modalities, allocator) }
-		if model.output_modalities_present { catalog_strings_destroy(model.output_modalities, allocator) }
-		if model.thinking.levels_present { catalog_strings_destroy(model.thinking.levels, allocator) }
+		if model.api != nil { delete(model.api.?, allocator) }
+		if model.display_name != nil { delete(model.display_name.?, allocator) }
+		if model.input_modalities != nil { catalog_strings_destroy(model.input_modalities.?, allocator) }
+		if model.output_modalities != nil { catalog_strings_destroy(model.output_modalities.?, allocator) }
+		if model.thinking.levels != nil { catalog_strings_destroy(model.thinking.levels.?, allocator) }
 	}
 	delete(catalog.models)
 	delete(catalog.providers)
@@ -565,11 +511,11 @@ catalog_strings_destroy :: proc(values: []string, allocator: mem.Allocator) {
 catalog_model_source_destroy :: proc(model: ^Catalog_Model_Source, allocator: mem.Allocator) {
 	if model == nil { return }
 	delete(model.id, allocator)
-	if model.api_present { delete(model.api, allocator) }
-	if model.display_name_present { delete(model.display_name, allocator) }
-	if model.input_modalities_present { catalog_strings_destroy(model.input_modalities, allocator) }
-	if model.output_modalities_present { catalog_strings_destroy(model.output_modalities, allocator) }
-	if model.thinking.levels_present { catalog_strings_destroy(model.thinking.levels, allocator) }
+	if model.api != nil { delete(model.api.?, allocator) }
+	if model.display_name != nil { delete(model.display_name.?, allocator) }
+	if model.input_modalities != nil { catalog_strings_destroy(model.input_modalities.?, allocator) }
+	if model.output_modalities != nil { catalog_strings_destroy(model.output_modalities.?, allocator) }
+	if model.thinking.levels != nil { catalog_strings_destroy(model.thinking.levels.?, allocator) }
 	model^ = {}
 }
 
@@ -582,9 +528,9 @@ catalog_model_sources_destroy :: proc(models: []Catalog_Model_Source, allocator:
 catalog_provider_source_destroy :: proc(provider: ^Catalog_Provider_Source, allocator: mem.Allocator) {
 	if provider == nil { return }
 	delete(provider.id, allocator)
-	if provider.base_url_present { delete(provider.base_url, allocator) }
-	if provider.api_present { delete(provider.api, allocator) }
-	if provider.api_key_present { delete(provider.api_key, allocator) }
+	if provider.base_url != nil { delete(provider.base_url.?, allocator) }
+	if provider.api != nil { delete(provider.api.?, allocator) }
+	if provider.api_key != nil { delete(provider.api_key.?, allocator) }
 	catalog_model_sources_destroy(provider.models, allocator)
 	provider^ = {}
 }

@@ -24,46 +24,13 @@ test_enrichment_user_value_is_used_wherever_it_is_stated :: proc(test: ^testing.
 	// The user states a window, an output limit, and tool support. The provider and
 	// models.dev both disagree, and neither may change what the user chose.
 	user := []Catalog_Provider_Source {
-		catalog_source(
-			"proxy",
-			"gpt-4",
-			Catalog_Model_Source {
-				context_window_present = true,
-				context_window = 500000,
-				max_output_tokens_present = true,
-				max_output_tokens = 16000,
-				tools_present = true,
-				tools = false,
-			},
-		),
+		catalog_source("proxy", "gpt-4", Catalog_Model_Source{context_window = 500000, max_output_tokens = 16000, tools = false}),
 	}
 	provider := []Catalog_Provider_Source {
-		catalog_source(
-			"proxy",
-			"gpt-4",
-			Catalog_Model_Source {
-				context_window_present = true,
-				context_window = 1000000,
-				max_output_tokens_present = true,
-				max_output_tokens = 32000,
-				tools_present = true,
-				tools = true,
-			},
-		),
+		catalog_source("proxy", "gpt-4", Catalog_Model_Source{context_window = 1000000, max_output_tokens = 32000, tools = true}),
 	}
 	models_dev := []Catalog_Provider_Source {
-		catalog_source(
-			"proxy",
-			"gpt-4",
-			Catalog_Model_Source {
-				context_window_present = true,
-				context_window = 2000000,
-				max_output_tokens_present = true,
-				max_output_tokens = 65536,
-				tools_present = true,
-				tools = true,
-			},
-		),
+		catalog_source("proxy", "gpt-4", Catalog_Model_Source{context_window = 2000000, max_output_tokens = 65536, tools = true}),
 	}
 
 	resolved, error := resolve_catalog(user, provider, models_dev)
@@ -72,32 +39,21 @@ test_enrichment_user_value_is_used_wherever_it_is_stated :: proc(test: ^testing.
 
 	model := catalog_test_find(resolved, "proxy", "gpt-4")
 	testing.expect(test, model != nil)
-	testing.expect_value(test, model.context_window, 500000)
-	testing.expect_value(test, model.max_output_tokens, 16000)
+	testing.expect_value(test, model.context_window.?, 500000)
+	testing.expect_value(test, model.max_output_tokens.?, 16000)
 	// An explicit false is a stated value, so a later source cannot turn tools on.
-	testing.expect(test, model.tools_present)
-	testing.expect(test, !model.tools)
+	testing.expect(test, (model.tools != nil))
+	testing.expect(test, !model.tools.?)
 }
 
 @(test)
 test_enrichment_later_sources_fill_only_what_is_missing :: proc(test: ^testing.T) {
 	// Each source states a different field, so each stage is the one that resolves
 	// its own field while leaving the earlier values alone.
-	user := []Catalog_Provider_Source{catalog_source("proxy", "gpt-4", Catalog_Model_Source{display_name_present = true, display_name = "Configured Name"})}
-	provider := []Catalog_Provider_Source{catalog_source("proxy", "gpt-4", Catalog_Model_Source{context_window_present = true, context_window = 131072})}
+	user := []Catalog_Provider_Source{catalog_source("proxy", "gpt-4", Catalog_Model_Source{display_name = "Configured Name"})}
+	provider := []Catalog_Provider_Source{catalog_source("proxy", "gpt-4", Catalog_Model_Source{context_window = 131072})}
 	models_dev := []Catalog_Provider_Source {
-		catalog_source(
-			"proxy",
-			"gpt-4",
-			Catalog_Model_Source {
-				max_output_tokens_present = true,
-				max_output_tokens = 32768,
-				tools_present = true,
-				tools = true,
-				display_name_present = true,
-				display_name = "Catalog Name",
-			},
-		),
+		catalog_source("proxy", "gpt-4", Catalog_Model_Source{max_output_tokens = 32768, tools = true, display_name = "Catalog Name"}),
 	}
 
 	resolved, error := resolve_catalog(user, provider, models_dev)
@@ -106,10 +62,10 @@ test_enrichment_later_sources_fill_only_what_is_missing :: proc(test: ^testing.T
 
 	model := catalog_test_find(resolved, "proxy", "gpt-4")
 	testing.expect(test, model != nil)
-	testing.expect_value(test, model.display_name, "Configured Name") // the user's, not models.dev's
-	testing.expect_value(test, model.context_window, 131072) // the provider's
-	testing.expect_value(test, model.max_output_tokens, 32768) // models.dev's
-	testing.expect(test, model.tools_present && model.tools)
+	testing.expect_value(test, model.display_name.?, "Configured Name") // the user's, not models.dev's
+	testing.expect_value(test, model.context_window.?, 131072) // the provider's
+	testing.expect_value(test, model.max_output_tokens.?, 32768) // models.dev's
+	testing.expect(test, (model.tools.? or_else false))
 
 	// A model only the provider reports is still resolvable: the provider stage can
 	// introduce a model, not just fill fields on one the user named.
@@ -118,8 +74,8 @@ test_enrichment_later_sources_fill_only_what_is_missing :: proc(test: ^testing.T
 	defer catalog_destroy(&provider_only)
 	discovered := catalog_test_find(provider_only, "proxy", "gpt-4")
 	testing.expect(test, discovered != nil)
-	testing.expect_value(test, discovered.context_window, 131072)
-	testing.expect_value(test, discovered.display_name, "Catalog Name") // user stated nothing here
+	testing.expect_value(test, discovered.context_window.?, 131072)
+	testing.expect_value(test, discovered.display_name.?, "Catalog Name") // user stated nothing here
 }
 
 @(test)
@@ -127,24 +83,9 @@ test_enrichment_cost_merges_price_by_price :: proc(test: ^testing.T) {
 	// The user prices input and output, models.dev prices the cache. Each price is
 	// its own field, so the user's two prices stand while the cache is filled from
 	// a source that states no input price at all.
-	user := []Catalog_Provider_Source {
-		catalog_source("proxy", "gpt-4", Catalog_Model_Source{cost = Catalog_Cost{input_present = true, input = 3, output_present = true, output = 15}}),
-	}
+	user := []Catalog_Provider_Source{catalog_source("proxy", "gpt-4", Catalog_Model_Source{cost = Catalog_Cost{input = 3, output = 15}})}
 	models_dev := []Catalog_Provider_Source {
-		catalog_source(
-			"proxy",
-			"gpt-4",
-			Catalog_Model_Source {
-				cost = Catalog_Cost {
-					input_present = true,
-					input = 99,
-					cache_read_present = true,
-					cache_read = 0.3,
-					cache_write_present = true,
-					cache_write = 3.75,
-				},
-			},
-		),
+		catalog_source("proxy", "gpt-4", Catalog_Model_Source{cost = Catalog_Cost{input = 99, cache_read = 0.3, cache_write = 3.75}}),
 	}
 
 	resolved, error := resolve_catalog(user, {}, models_dev)
@@ -153,12 +94,12 @@ test_enrichment_cost_merges_price_by_price :: proc(test: ^testing.T) {
 
 	model := catalog_test_find(resolved, "proxy", "gpt-4")
 	testing.expect(test, model != nil)
-	testing.expect_value(test, model.cost.input, 3)
-	testing.expect_value(test, model.cost.output, 15)
-	testing.expect(test, model.cost.cache_read_present)
-	testing.expect_value(test, model.cost.cache_read, 0.3)
-	testing.expect(test, model.cost.cache_write_present)
-	testing.expect_value(test, model.cost.cache_write, 3.75)
+	testing.expect_value(test, model.cost.input.?, 3)
+	testing.expect_value(test, model.cost.output.?, 15)
+	testing.expect(test, (model.cost.cache_read != nil))
+	testing.expect_value(test, model.cost.cache_read.?, 0.3)
+	testing.expect(test, (model.cost.cache_write != nil))
+	testing.expect_value(test, model.cost.cache_write.?, 3.75)
 }
 
 @(test)
@@ -170,17 +111,15 @@ test_enrichment_a_models_api_family_outranks_its_providers :: proc(test: ^testin
 	user := []Catalog_Provider_Source {
 		{
 			id = "gateway",
-			api_present = true,
 			api = "openai_chat_completions",
-			models = []Catalog_Model_Source{{id = "gateway/plain"}, {id = "gateway/responses", api_present = true, api = "openai_responses"}},
+			models = []Catalog_Model_Source{{id = "gateway/plain"}, {id = "gateway/responses", api = "openai_responses"}},
 		},
 	}
 	models_dev := []Catalog_Provider_Source {
 		{
 			id = "gateway",
-			api_present = true,
 			api = "openai_chat_completions",
-			models = []Catalog_Model_Source{{id = "gateway/plain"}, {id = "gateway/responses", api_present = true, api = "anthropic_messages"}},
+			models = []Catalog_Model_Source{{id = "gateway/plain"}, {id = "gateway/responses", api = "anthropic_messages"}},
 		},
 	}
 
@@ -190,16 +129,16 @@ test_enrichment_a_models_api_family_outranks_its_providers :: proc(test: ^testin
 
 	plain := catalog_test_find(resolved, "gateway", "gateway/plain")
 	testing.expect(test, plain != nil)
-	testing.expect(test, !plain.api_present)
+	testing.expect(test, (plain.api == nil))
 	responses := catalog_test_find(resolved, "gateway", "gateway/responses")
 	testing.expect(test, responses != nil)
-	testing.expect_value(test, responses.api, "openai_responses")
+	testing.expect_value(test, responses.api.?, "openai_responses")
 
 	// The provider's own family is untouched, so it remains what its other models
 	// are served through.
 	provider_index, provider_found := catalog_find_provider(&resolved, "gateway")
 	testing.expect(test, provider_found)
-	testing.expect_value(test, resolved.providers[provider_index].api, "openai_chat_completions")
+	testing.expect_value(test, resolved.providers[provider_index].api.?, "openai_chat_completions")
 }
 
 @(test)
@@ -220,9 +159,9 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(test: ^testing.
 
 	// A window a source stated is used as stated, including an explicit zero, which
 	// stays zero and is refused by admission rather than becoming the default.
-	stated := model_capacity(Catalog_Model{context_window_present = true, context_window = 8192})
+	stated := model_capacity(Catalog_Model{context_window = 8192})
 	testing.expect_value(test, stated.window, 8192)
-	zeroed := model_capacity(Catalog_Model{context_window_present = true, context_window = 0})
+	zeroed := model_capacity(Catalog_Model{context_window = 0})
 	testing.expect_value(test, zeroed.window, 0)
 	testing.expect_value(test, chat_capacity_input_ceiling(zeroed), 0)
 }

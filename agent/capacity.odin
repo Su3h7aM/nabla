@@ -43,12 +43,11 @@ CHAT_COMPACT_RESERVE_PERCENT :: 10
 // a stated one is used as stated, including an explicit zero, which admission then
 // refuses rather than quietly running with the default.
 model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
-	window := model.context_window
-	if !model.context_window_present { window = CHAT_DEFAULT_CONTEXT_WINDOW }
+	window := model.context_window.? or_else CHAT_DEFAULT_CONTEXT_WINDOW
 	if window <= 0 { return {} }
 
-	stated := model.max_output_tokens
-	if !model.max_output_tokens_present || stated <= 0 { stated = CHAT_DEFAULT_OUTPUT_TOKENS }
+	stated := model.max_output_tokens.? or_else CHAT_DEFAULT_OUTPUT_TOKENS
+	if stated <= 0 { stated = CHAT_DEFAULT_OUTPUT_TOKENS }
 
 	capacity := Model_Capacity {
 		window           = window,

@@ -49,7 +49,7 @@ model_selection_effort :: proc(target: Model_Selection, preferred: string) -> st
 // provider_usable reports whether a provider states everything a connection needs.
 @(require_results)
 provider_usable :: proc(provider: ^Catalog_Provider) -> bool {
-	return provider.base_url_present && provider.base_url != "" && provider.api_present && provider.api != "" && provider.api_key_present
+	return (provider.base_url.? or_else "") != "" && (provider.api.? or_else "") != "" && provider.api_key != nil
 }
 
 // model_selection_resolve builds the selection for one serving identity. problem says why the
@@ -68,14 +68,14 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 	model := &catalog.models[model_index]
 	// Routing is per model: a model that states its own API family is served through it,
 	// and the provider's family is what its other models use.
-	api_name := provider.api
-	if model.api_present { api_name = model.api }
+	api_name := provider.api.?
+	if api, ok := model.api.?; ok { api_name = api }
 	api, api_ok := chat_api_kind(api_name)
 	if !api_ok { return {}, fmt.tprintf("unsupported api: %s", api_name) }
 	if provider.transport == .WebSocket && .WebSocket not_in ai.Provider_API_Transports(api) {
 		return {}, fmt.tprintf("provider %s requires WebSocket, which the %s API has no transport for", provider_id, api_name)
 	}
-	credential, credential_ok := config_resolve_credential(provider.api_key, allocator)
+	credential, credential_ok := config_resolve_credential(provider.api_key.?, allocator)
 	if !credential_ok {
 		return {}, fmt.tprintf("provider %s needs api_key: name an environment variable that is set, or provide the key", provider_id)
 	}
@@ -89,15 +89,15 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 		API        = api,
 		Credential = credential,
 	}
-	built.transport = provider.transport
+	built.transport = provider.transport.? or_else .HTTP
 	built.capacity = model.capacity
 	built.cost = model.cost
-	built.tools = model.tools_present && model.tools && chat_supports_tools(api)
-	if model_selection_clone_identity(&built, provider_id, model_id, provider.base_url, allocator) != nil {
+	built.tools = (model.tools.? or_else false) && chat_supports_tools(api)
+	if model_selection_clone_identity(&built, provider_id, model_id, provider.base_url.?, allocator) != nil {
 		return {}, "the model selection could not be held"
 	}
-	if model.thinking.levels_present {
-		levels, levels_error := model_selection_clone_levels(model.thinking.levels, allocator)
+	if model.thinking.levels != nil {
+		levels, levels_error := model_selection_clone_levels(model.thinking.levels.?, allocator)
 		if levels_error != nil { return {}, "the model's effort levels could not be held" }
 		built.effort_levels = levels
 	}

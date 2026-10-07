@@ -82,9 +82,7 @@ chat_notice_log_count :: proc(log: ^Chat_Notice_Log, contains: string) -> int {
 // window and output bound would carry. It goes through model_capacity, so a test
 // states the model it means rather than the window arithmetic.
 chat_test_capacity :: proc(chat: ^Chat_Session, window: int, output := 0) {
-	chat.capacity = model_capacity(
-		Catalog_Model{context_window_present = true, context_window = window, max_output_tokens_present = output > 0, max_output_tokens = output},
-	)
+	chat.capacity = model_capacity(Catalog_Model{context_window = window, max_output_tokens = output > 0 ? output : nil})
 }
 
 chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string) {

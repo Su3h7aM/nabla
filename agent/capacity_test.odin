@@ -11,9 +11,7 @@ import "nabla:ai"
 // an output bound. It is the test's way of naming a model rather than arithmetic.
 @(private)
 capacity_of :: proc(window: int, output := 0, window_stated := true) -> Model_Capacity {
-	return model_capacity(
-		Catalog_Model{context_window_present = window_stated, context_window = window, max_output_tokens_present = output > 0, max_output_tokens = output},
-	)
+	return model_capacity(Catalog_Model{context_window = window_stated ? window : nil, max_output_tokens = output > 0 ? output : nil})
 }
 
 @(test)

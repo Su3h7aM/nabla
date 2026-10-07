@@ -14,9 +14,7 @@ selection_test_target :: proc(test: ^testing.T, api: ai.API_Kind, window: int) -
 		provider_id = strings.clone("target-provider", context.allocator) or_else "",
 		model_id = strings.clone("target-model", context.allocator) or_else "",
 		connection = {API = api, Endpoint = strings.clone("https://target.invalid", context.allocator) or_else ""},
-		capacity = model_capacity(
-			Catalog_Model{context_window_present = true, context_window = window, max_output_tokens_present = true, max_output_tokens = 1024},
-		),
+		capacity = model_capacity(Catalog_Model{context_window = window, max_output_tokens = 1024}),
 		tools = false,
 	}
 	if selection.provider_id == "" || selection.model_id == "" || selection.connection.Endpoint == "" {

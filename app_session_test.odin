@@ -30,9 +30,7 @@ import "nabla:tui/widgets"
 // and output bound would carry, so a fixture never states the window arithmetic
 // itself.
 app_session_capacity :: proc(app: ^App, window: int, output := 0) {
-	app.setup.session.capacity = agent.model_capacity(
-		agent.Catalog_Model{context_window_present = true, context_window = window, max_output_tokens_present = output > 0, max_output_tokens = output},
-	)
+	app.setup.session.capacity = agent.model_capacity(agent.Catalog_Model{context_window = window, max_output_tokens = output > 0 ? output : nil})
 }
 
 app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
@@ -356,23 +354,10 @@ app_test_catalog :: proc(allocator: mem.Allocator, base_url := "http://127.0.0.1
 	sources := []agent.Catalog_Provider_Source {
 		{
 			id = "test-provider",
-			base_url_present = true,
 			base_url = base_url,
-			api_present = true,
 			api = "openai_chat_completions",
-			api_key_present = true,
 			api_key = "test-key",
-			models = []agent.Catalog_Model_Source {
-				{
-					id = "test-model",
-					context_window_present = true,
-					context_window = 128_000,
-					max_output_tokens_present = true,
-					max_output_tokens = 4_096,
-					tools_present = true,
-					tools = true,
-				},
-			},
+			models = []agent.Catalog_Model_Source{{id = "test-model", context_window = 128_000, max_output_tokens = 4_096, tools = true}},
 		},
 	}
 	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
@@ -1236,14 +1221,10 @@ test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T
 	// The price a resolved selection would carry, so the turn prices the usage it
 	// commits from the session's own copy.
 	app.setup.session.cost = agent.Catalog_Cost {
-		input_present       = true,
-		input               = 3,
-		output_present      = true,
-		output              = 15,
-		cache_read_present  = true,
-		cache_read          = 0.3,
-		cache_write_present = true,
-		cache_write         = 3.75,
+		input       = 3,
+		output      = 15,
+		cache_read  = 0.3,
+		cache_write = 3.75,
 	}
 	app.run.connection = ai.Provider_Connection {
 		API        = .Anthropic_Messages,
@@ -1447,17 +1428,7 @@ test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 	app.setup.owns_selection = true
 
-	user := []agent.Catalog_Provider_Source {
-		{
-			id = "test-provider",
-			base_url_present = true,
-			base_url = "http://127.0.0.1:1",
-			api_present = true,
-			api = "openai_chat_completions",
-			api_key_present = true,
-			api_key = "test-key",
-		},
-	}
+	user := []agent.Catalog_Provider_Source{{id = "test-provider", base_url = "http://127.0.0.1:1", api = "openai_chat_completions", api_key = "test-key"}}
 	provider := []agent.Catalog_Provider_Source{{id = "test-provider", models = []agent.Catalog_Model_Source{{id = "discovered-model"}}}}
 	models_dev := []agent.Catalog_Provider_Source {
 		{
@@ -1465,19 +1436,10 @@ test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
 			models = []agent.Catalog_Model_Source {
 				{
 					id = "discovered-model",
-					context_window_present = true,
 					context_window = 128_000,
-					max_output_tokens_present = true,
 					max_output_tokens = 4_096,
-					tools_present = true,
 					tools = true,
-					thinking = agent.Catalog_Thinking_Source {
-						present = true,
-						supported_present = true,
-						supported = true,
-						levels_present = true,
-						levels = []string{"low", "high"},
-					},
+					thinking = agent.Catalog_Thinking_Source{present = true, supported = true, levels = []string{"low", "high"}},
 				},
 			},
 		},
@@ -1513,33 +1475,12 @@ app_test_switch_catalog :: proc(allocator: mem.Allocator, target_window: int) ->
 	sources := []agent.Catalog_Provider_Source {
 		{
 			id = "test-provider",
-			base_url_present = true,
 			base_url = "http://127.0.0.1:1",
-			api_present = true,
 			api = "openai_chat_completions",
-			api_key_present = true,
 			api_key = "test-key",
 			models = []agent.Catalog_Model_Source {
-				{
-					id = "test-model",
-					context_window_present = true,
-					context_window = 128_000,
-					max_output_tokens_present = true,
-					max_output_tokens = 4_096,
-					tools_present = true,
-					tools = true,
-				},
-				{
-					id = "target-model",
-					api_present = true,
-					api = "openai_responses",
-					context_window_present = true,
-					context_window = target_window,
-					max_output_tokens_present = true,
-					max_output_tokens = 4_096,
-					tools_present = true,
-					tools = true,
-				},
+				{id = "test-model", context_window = 128_000, max_output_tokens = 4_096, tools = true},
+				{id = "target-model", api = "openai_responses", context_window = target_window, max_output_tokens = 4_096, tools = true},
 			},
 		},
 	}
@@ -1673,7 +1614,7 @@ test_a_headless_follower_returns_the_answer_of_the_turn_that_delivered_its_line 
 	chat.skill_instructions = agent.test_skill_instructions(&chat)
 	chat.provider_id = strings.clone("test-provider", chat.allocator)
 	chat.model_id = strings.clone("test-model", chat.allocator)
-	chat.capacity = agent.model_capacity(agent.Catalog_Model{context_window_present = true, context_window = 128_000})
+	chat.capacity = agent.model_capacity(agent.Catalog_Model{context_window = 128_000})
 	runner := Follow_Runner {
 		chat = &chat,
 		connection = {

@@ -180,7 +180,6 @@ load_model :: proc(
 		value, ok := lua_bool(state, -1)
 		if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "disabled", "boolean", state, -1, allocator) }
 		out^.disabled = value
-		out^.disabled_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "api")
@@ -189,7 +188,6 @@ load_model :: proc(
 		if value_error == .Invalid { return value_error, config_model_field_detail(provider_id, model_id, "api", "string", state, -1, allocator) }
 		if value_error != .None { return value_error, "" }
 		out^.api = value
-		out^.api_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "display_name")
@@ -198,7 +196,6 @@ load_model :: proc(
 		if value_error == .Invalid { return value_error, config_model_field_detail(provider_id, model_id, "display_name", "string", state, -1, allocator) }
 		if value_error != .None { return value_error, "" }
 		out^.display_name = value
-		out^.display_name_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "context_window")
@@ -206,7 +203,6 @@ load_model :: proc(
 		value, ok := lua_int(state, -1)
 		if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "context_window", "non-negative integer", state, -1, allocator) }
 		out^.context_window = value
-		out^.context_window_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "max_output_tokens")
@@ -214,7 +210,6 @@ load_model :: proc(
 		value, ok := lua_int(state, -1)
 		if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "max_output_tokens", "non-negative integer", state, -1, allocator) }
 		out^.max_output_tokens = value
-		out^.max_output_tokens_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "tools")
@@ -222,7 +217,6 @@ load_model :: proc(
 		value, ok := lua_bool(state, -1)
 		if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "tools", "boolean", state, -1, allocator) }
 		out^.tools = value
-		out^.tools_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "input_modalities")
@@ -245,7 +239,6 @@ load_model :: proc(
 			lua.pop(state, 1)
 		}
 		out^.input_modalities = input_modalities[:]
-		out^.input_modalities_present = true
 		// Ownership moved to out; the failure cleanup below must not free it twice.
 		input_modalities = nil
 	}
@@ -270,7 +263,6 @@ load_model :: proc(
 			lua.pop(state, 1)
 		}
 		out^.output_modalities = output_modalities[:]
-		out^.output_modalities_present = true
 		// Ownership moved to out; the failure cleanup below must not free it twice.
 		output_modalities = nil
 	}
@@ -279,9 +271,9 @@ load_model :: proc(
 	if lua.type(state, -1) != .NIL {
 		out^.thinking.present = true
 		if lua.type(state, -1) == .BOOLEAN {
-			out^.thinking.supported = lua.toboolean(state, -1) != false
-			out^.thinking.supported_present = true
-			if !out^.thinking.supported { out^.thinking.blocked = true }
+			supported := lua.toboolean(state, -1) != false
+			out^.thinking.supported = supported
+			if !supported { out^.thinking.blocked = true }
 		} else if lua_plain_table(state, -1) {
 			thinking_base := lua.gettop(state)
 			lua_field(state, -1, "supported")
@@ -289,8 +281,7 @@ load_model :: proc(
 				value, ok := lua_bool(state, -1)
 				if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "thinking.supported", "boolean", state, -1, allocator) }
 				out^.thinking.supported = value
-				out^.thinking.supported_present = true
-				if !out^.thinking.supported { out^.thinking.blocked = true }
+				if !value { out^.thinking.blocked = true }
 			}
 			lua.settop(state, thinking_base)
 			lua_field(state, -1, "toggle")
@@ -298,7 +289,6 @@ load_model :: proc(
 				value, ok := lua_bool(state, -1)
 				if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "thinking.toggle", "boolean", state, -1, allocator) }
 				out^.thinking.toggle = value
-				out^.thinking.toggle_present = true
 			}
 			lua.settop(state, thinking_base)
 			lua_field(state, -1, "levels")
@@ -321,7 +311,6 @@ load_model :: proc(
 					lua.pop(state, 1)
 				}
 				out^.thinking.levels = thinking_levels[:]
-				out^.thinking.levels_present = true
 				// Ownership moved to out; the failure cleanup below must not free it twice.
 				thinking_levels = nil
 			}
@@ -343,7 +332,6 @@ load_model :: proc(
 			value, ok := lua_number(state, -1)
 			if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "cost.input", "finite non-negative number", state, -1, allocator) }
 			out^.cost.input = value
-			out^.cost.input_present = true
 		}
 		lua.settop(state, cost_base)
 		lua_field(state, -1, "output")
@@ -351,7 +339,6 @@ load_model :: proc(
 			value, ok := lua_number(state, -1)
 			if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "cost.output", "finite non-negative number", state, -1, allocator) }
 			out^.cost.output = value
-			out^.cost.output_present = true
 		}
 		lua.settop(state, cost_base)
 		lua_field(state, -1, "cache_read")
@@ -359,7 +346,6 @@ load_model :: proc(
 			value, ok := lua_number(state, -1)
 			if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "cost.cache_read", "finite non-negative number", state, -1, allocator) }
 			out^.cost.cache_read = value
-			out^.cost.cache_read_present = true
 		}
 		lua.settop(state, cost_base)
 		lua_field(state, -1, "cache_write")
@@ -367,7 +353,6 @@ load_model :: proc(
 			value, ok := lua_number(state, -1)
 			if !ok { return .Invalid, config_model_field_detail(provider_id, model_id, "cost.cache_write", "finite non-negative number", state, -1, allocator) }
 			out^.cost.cache_write = value
-			out^.cost.cache_write_present = true
 		}
 		lua.settop(state, cost_base)
 	}
@@ -411,7 +396,6 @@ load_provider :: proc(
 		if value_error == .Invalid { return value_error, config_provider_field_detail(provider_id, "base_url", "string", state, -1, allocator) }
 		if value_error != .None { return value_error, "" }
 		out^.base_url = value
-		out^.base_url_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "api")
@@ -420,7 +404,6 @@ load_provider :: proc(
 		if value_error == .Invalid { return value_error, config_provider_field_detail(provider_id, "api", "string", state, -1, allocator) }
 		if value_error != .None { return value_error, "" }
 		out^.api = value
-		out^.api_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "transport")
@@ -441,7 +424,6 @@ load_provider :: proc(
 			return .Invalid, config_provider_field_detail(provider_id, "transport", "http, websocket, or auto", state, -1, allocator)
 		}
 		delete(value, allocator)
-		out^.transport_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "stream_idle_timeout_ms")
@@ -458,7 +440,6 @@ load_provider :: proc(
 			)
 		}
 		out^.stream_idle_timeout = time.Duration(milliseconds) * time.Millisecond
-		out^.stream_idle_timeout_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "api_key")
@@ -467,7 +448,6 @@ load_provider :: proc(
 		if value_error == .Invalid { return value_error, config_provider_field_detail(provider_id, "api_key", "string", state, -1, allocator) }
 		if value_error != .None { return value_error, "" }
 		out^.api_key = value
-		out^.api_key_present = true
 	}
 	lua.settop(state, base)
 	lua_field(state, idx, "models")

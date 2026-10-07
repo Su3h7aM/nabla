@@ -277,26 +277,13 @@ Subagent_Test_Catalog :: struct {
 }
 
 subagent_test_catalog_add :: proc(fixture: ^Subagent_Test_Catalog, provider_id, model_id, endpoint: string, levels: []string) {
-	append(
-		&fixture.catalog.providers,
-		Catalog_Provider {
-			id = provider_id,
-			base_url = endpoint,
-			base_url_present = true,
-			api = "openai_chat_completions",
-			api_present = true,
-			api_key = "test-key",
-			api_key_present = true,
-		},
-	)
+	append(&fixture.catalog.providers, Catalog_Provider{id = provider_id, base_url = endpoint, api = "openai_chat_completions", api_key = "test-key"})
 	model := Catalog_Model {
 		provider_id = provider_id,
 		id = model_id,
 		tools = true,
-		tools_present = true,
 		context_window = CHAT_DEFAULT_CONTEXT_WINDOW,
-		context_window_present = true,
-		thinking = {levels = levels, levels_present = len(levels) > 0},
+		thinking = {levels = len(levels) > 0 ? levels : nil},
 	}
 	model.capacity = model_capacity(model)
 	append(&fixture.catalog.models, model)
