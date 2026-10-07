@@ -78,7 +78,9 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		completed: journal.Turn_Completed
 		decoded := journal.payload_decode(record.data, &completed, context.temp_allocator) == nil
 		outcome := journal.Turn_Outcome.Failed
-		if decoded { outcome, _ = journal.enum_from_name(journal.TURN_OUTCOME_NAMES, completed.outcome) }
+		if decoded {
+			if named, known := journal.enum_from_name(journal.TURN_OUTCOME_NAMES, completed.outcome); known { outcome = named }
+		}
 		if follow.turn != 0 && record.turn == follow.turn {
 			follow.ended = true
 			follow.outcome = outcome
