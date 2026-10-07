@@ -101,35 +101,30 @@ Agent_Provider :: struct {
 // takes the lock, so a recorded request is published to the reader that observes it rather
 // than raced with it.
 agent_provider_record :: proc(provider: ^Agent_Provider, request: string) {
-	sync.mutex_lock(&provider.lock)
-	defer sync.mutex_unlock(&provider.lock)
+	sync.mutex_guard(&provider.lock)
 	append(&provider.requests, request)
 }
 
 agent_provider_note_failure :: proc(provider: ^Agent_Provider) {
-	sync.mutex_lock(&provider.lock)
-	defer sync.mutex_unlock(&provider.lock)
+	sync.mutex_guard(&provider.lock)
 	provider.failed = true
 }
 
 agent_provider_request_count :: proc(provider: ^Agent_Provider) -> int {
-	sync.mutex_lock(&provider.lock)
-	defer sync.mutex_unlock(&provider.lock)
+	sync.mutex_guard(&provider.lock)
 	return len(provider.requests)
 }
 
 // agent_provider_request is one recorded request's bytes, or empty when the fixture has not
 // recorded that many. The bytes are borrowed and live until the fixture stops.
 agent_provider_request :: proc(provider: ^Agent_Provider, index: int) -> string {
-	sync.mutex_lock(&provider.lock)
-	defer sync.mutex_unlock(&provider.lock)
+	sync.mutex_guard(&provider.lock)
 	if index < 0 || index >= len(provider.requests) { return "" }
 	return provider.requests[index]
 }
 
 agent_provider_failed :: proc(provider: ^Agent_Provider) -> bool {
-	sync.mutex_lock(&provider.lock)
-	defer sync.mutex_unlock(&provider.lock)
+	sync.mutex_guard(&provider.lock)
 	return provider.failed
 }
 
@@ -181,10 +176,11 @@ agent_provider_stop :: proc(provider: ^Agent_Provider) {
 		// itself once, which is what an accept that is waiting returns from. The wake
 		// connection is closed here, so the read the serve thread enters on it meets the
 		// end of its stream at once.
-		sync.mutex_lock(&provider.lock)
-		connection := provider.connection
-		provider.connection = {}
-		sync.mutex_unlock(&provider.lock)
+		connection: net.TCP_Socket
+		if sync.mutex_guard(&provider.lock) {
+			connection = provider.connection
+			provider.connection = {}
+		}
 		if connection != {} { net.shutdown(connection, .Both) }
 		wake_endpoint := net.Endpoint {
 			address = net.IP4_Address{127, 0, 0, 1},
@@ -238,8 +234,7 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 // agent_provider_publish marks the connection this thread is about to read, so a stop
 // that arrives while that read waits can end it.
 agent_provider_publish :: proc(provider: ^Agent_Provider, socket: net.TCP_Socket) {
-	sync.mutex_lock(&provider.lock)
-	defer sync.mutex_unlock(&provider.lock)
+	sync.mutex_guard(&provider.lock)
 	provider.connection = socket
 }
 
@@ -247,10 +242,11 @@ agent_provider_publish :: proc(provider: ^Agent_Provider, socket: net.TCP_Socket
 // agent_provider_stop took the connection first: then the socket is the stop's to shut
 // down and close, and neither thread touches a descriptor the other may have closed.
 agent_provider_release :: proc(provider: ^Agent_Provider, socket: net.TCP_Socket) {
-	sync.mutex_lock(&provider.lock)
-	owned := provider.connection == socket
-	if owned { provider.connection = {} }
-	sync.mutex_unlock(&provider.lock)
+	owned: bool
+	if sync.mutex_guard(&provider.lock) {
+		owned = provider.connection == socket
+		if owned { provider.connection = {} }
+	}
 	if owned { net.close(socket) }
 }
 

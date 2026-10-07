@@ -224,8 +224,7 @@ STREAM_IDLE_TIMEOUT_DEFAULT :: time.Duration(0)
 catalog_stream_idle_timeout :: proc(ref: Catalog_Ref, provider_id: string) -> time.Duration {
 	if ref.catalog == nil { return STREAM_IDLE_TIMEOUT_DEFAULT }
 	if ref.mutex != nil {
-		sync.mutex_lock(ref.mutex)
-		defer sync.mutex_unlock(ref.mutex)
+		sync.mutex_guard(ref.mutex)
 		return catalog_provider_idle_timeout(ref.catalog, provider_id)
 	}
 	return catalog_provider_idle_timeout(ref.catalog, provider_id)

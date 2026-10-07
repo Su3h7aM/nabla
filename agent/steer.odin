@@ -42,9 +42,10 @@ steer_queue_destroy :: proc(queue: ^Steer_Queue) {
 steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
 	line, clone_error := strings.clone(text, queue.allocator)
 	if clone_error != nil { return false }
-	sync.mutex_lock(&queue.mu)
-	_, append_error := append(&queue.items, line)
-	sync.mutex_unlock(&queue.mu)
+	append_error: mem.Allocator_Error
+	if sync.mutex_guard(&queue.mu) {
+		_, append_error = append(&queue.items, line)
+	}
 	if append_error != nil {
 		delete(line, queue.allocator)
 		return false
@@ -56,8 +57,7 @@ steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
 // steer_pop transfers ownership of the oldest line. False means empty.
 @(require_results)
 steer_pop :: proc(queue: ^Steer_Queue) -> (string, bool) {
-	sync.mutex_lock(&queue.mu)
-	defer sync.mutex_unlock(&queue.mu)
+	sync.mutex_guard(&queue.mu)
 	if len(queue.items) == 0 { return "", false }
 	line := queue.items[0]
 	ordered_remove(&queue.items, 0)
@@ -74,8 +74,7 @@ steer_pending :: proc(queue: ^Steer_Queue) -> bool {
 // queue could not take it back and the line was released.
 @(require_results)
 steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
-	sync.mutex_lock(&queue.mu)
-	defer sync.mutex_unlock(&queue.mu)
+	sync.mutex_guard(&queue.mu)
 	if !inject_at(&queue.items, 0, line) {
 		delete(line, queue.allocator)
 		return false
@@ -87,8 +86,7 @@ steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
 // owns, released by steer_taken_destroy. On failure the lines stay queued.
 @(require_results)
 steer_take_all :: proc(queue: ^Steer_Queue) -> (taken: [dynamic]string, ok: bool) {
-	sync.mutex_lock(&queue.mu)
-	defer sync.mutex_unlock(&queue.mu)
+	sync.mutex_guard(&queue.mu)
 	lines, allocation_error := make([dynamic]string, 0, len(queue.items), queue.allocator)
 	if allocation_error != nil { return {}, false }
 	for line in queue.items {

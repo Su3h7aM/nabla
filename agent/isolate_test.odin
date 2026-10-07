@@ -54,14 +54,18 @@ test_isolate_process :: proc(t: ^testing.T, procedure: string) -> bool {
 	append(&child_env, ..current_env)
 	append(&child_env, ISOLATED_CHILD_VARIABLE + "=1")
 
-	sync.mutex_lock(&test_isolate_guard)
-	state, child_out, child_err, exec_err := os.process_exec({command = {executable, filter}, env = child_env[:]}, context.allocator)
-	// The guard is released before every fail path, so a failed child can
-	// never wedge the tests behind it.
-	spawned := exec_err == nil
-	ran_once := spawned && (strings.contains(string(child_out), "Finished 1 test in ") || strings.contains(string(child_err), "Finished 1 test in "))
-	passed := ran_once && state.exit_code == 0
-	sync.mutex_unlock(&test_isolate_guard)
+	state: os.Process_State
+	child_out, child_err: []byte
+	exec_err: os.Error
+	spawned, ran_once, passed: bool
+	if sync.mutex_guard(&test_isolate_guard) {
+		state, child_out, child_err, exec_err = os.process_exec({command = {executable, filter}, env = child_env[:]}, context.allocator)
+		// The guard is released before every fail path, so a failed child can
+		// never wedge the tests behind it.
+		spawned = exec_err == nil
+		ran_once = spawned && (strings.contains(string(child_out), "Finished 1 test in ") || strings.contains(string(child_err), "Finished 1 test in "))
+		passed = ran_once && state.exit_code == 0
+	}
 	if !spawned {
 		test_isolate_release(executable, child_out, child_err)
 		testing.fail_now(t, fmt.tprintf("the isolated child could not start: %v", exec_err))

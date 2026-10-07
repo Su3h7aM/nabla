@@ -24,9 +24,10 @@ mailbox_init :: proc(mailbox: ^Owner_Mailbox, allocator: mem.Allocator) {
 // mailbox_push takes ownership of event, or returns false and leaves it with the caller.
 @(require_results)
 mailbox_push :: proc(mailbox: ^Owner_Mailbox, event: Chat_Event) -> bool {
-	sync.mutex_lock(&mailbox.mutex)
-	_, err := append(&mailbox.events, event)
-	sync.mutex_unlock(&mailbox.mutex)
+	err: mem.Allocator_Error
+	if sync.mutex_guard(&mailbox.mutex) {
+		_, err = append(&mailbox.events, event)
+	}
 	if err != nil { return false }
 	owner_wake_signal()
 	return true
