@@ -107,10 +107,8 @@ writer_destroy :: proc(writer: ^Writer, patience: time.Duration) -> bool {
 writer_failed :: proc(writer: ^Writer) -> bool {
 	state := writer.state
 	if state == nil { return true }
-	sync.mutex_lock(&state.mutex)
-	failed := state.failed
-	sync.mutex_unlock(&state.mutex)
-	return failed
+	sync.mutex_guard(&state.mutex)
+	return state.failed
 }
 
 // writer_submit_value serializes value and transfers its complete response frame to
@@ -228,8 +226,7 @@ writer_encode_request :: proc(state: ^Writer_State, id: i64, method: string, bod
 writer_submit_frame :: proc(state: ^Writer_State, frame: string, response: bool) -> bool {
 	transferred := false
 	defer if !transferred { delete(frame, state.allocator) }
-	sync.mutex_lock(&state.mutex)
-	defer sync.mutex_unlock(&state.mutex)
+	sync.mutex_guard(&state.mutex)
 	if state.out.procedure == nil || state.closed || state.closing { return false }
 	if response && state.batch_mode {
 		if append(&state.batch, frame) != 1 { return false }
@@ -246,8 +243,7 @@ writer_submit_frame :: proc(state: ^Writer_State, frame: string, response: bool)
 writer_begin_batch :: proc(writer: ^Writer) -> bool {
 	state := writer.state
 	if state == nil { return false }
-	sync.mutex_lock(&state.mutex)
-	defer sync.mutex_unlock(&state.mutex)
+	sync.mutex_guard(&state.mutex)
 	if state.closed || state.closing || state.batch_mode { return false }
 	state.batch_mode = true
 	return true
@@ -257,8 +253,7 @@ writer_begin_batch :: proc(writer: ^Writer) -> bool {
 writer_end_batch :: proc(writer: ^Writer) -> bool {
 	state := writer.state
 	if state == nil { return false }
-	sync.mutex_lock(&state.mutex)
-	defer sync.mutex_unlock(&state.mutex)
+	sync.mutex_guard(&state.mutex)
 	if !state.batch_mode { return false }
 	if state.closed || state.closing {
 		writer_batch_clear_locked(state)
@@ -370,7 +365,7 @@ writer_run :: proc(thread_handle: ^thread.Thread) {
 		delete(frame, state.allocator)
 		free_all(context.temp_allocator)
 		if write_error != nil || written != frame_length {
-			sync.mutex_lock(&state.mutex)
+			sync.mutex_guard(&state.mutex)
 			state.closed = true
 			state.failed = true
 			state.closing = true
@@ -379,7 +374,6 @@ writer_run :: proc(thread_handle: ^thread.Thread) {
 			state.batch_mode = false
 			state.finished = true
 			sync.cond_broadcast(&state.ready)
-			sync.mutex_unlock(&state.mutex)
 			return
 		}
 	}
