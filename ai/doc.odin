@@ -48,7 +48,7 @@
 // # Failures
 //
 // A failed attempt returns a Provider_Operation_Error. Its kind is what this attempt did,
-// its Provider_Delivery_State and delivery_present say how far a model send observably
+// its delivery says how far a model send observably
 // progressed, and its Provider_Failure_Class is the provider's own meaning for the
 // refusal, read from what the provider said and what the transport observed. A refusal
 // this package recognizes but cannot name stays Unknown rather than becoming retryable by

@@ -125,10 +125,9 @@ Provider_Operation_Error :: struct {
 	kind:                Provider_Operation_Error_Kind,
 	// delivery is how far a model request observably progressed. Once sending
 	// starts, replay is ambiguous even when no model output reached the caller.
-	delivery:            Provider_Delivery_State,
-	// delivery_present separates "the model send was not entered" from "no attempt
-	// to establish it was made". Only a present state may authorize recovery.
-	delivery_present:    bool,
+	// It is nil when no attempt to establish it was made; only a present state
+	// may authorize recovery.
+	delivery:            Maybe(Provider_Delivery_State),
 	// failure_class is the provider's normalized meaning for this failure, and None
 	// when no provider classification applies: a local refusal, or an attempt that
 	// never reached the provider. Neither is a success signal.
@@ -156,8 +155,7 @@ Provider_Operation_Error :: struct {
 	detail:              string,
 	// transfer is the transport's own account of the attempt, in this package's
 	// vocabulary, and is present whenever the request reached the transport.
-	transfer:            Provider_Transfer_Summary,
-	transfer_present:    bool,
+	transfer:            Maybe(Provider_Transfer_Summary),
 	// transport_cause distinguishes a peer that never authenticated from a
 	// connection that broke after the request went out.
 	transport_cause:     Provider_Transport_Cause,
@@ -601,13 +599,11 @@ Provider_Request_Stream_State :: struct {
 	// error_body_truncated says the refused response's body could not be kept in full,
 	// so what the classification reads is a prefix. Nothing is grown for it again.
 	error_body_truncated:   bool,
-	transfer:               Provider_Transfer_Summary,
-	transfer_present:       bool,
-	// delivery and delivery_present are the model-send evidence this attempt
-	// established. Evidence first established on a failure reaches the caller
-	// through provider_terminal_error.
-	delivery:               Provider_Delivery_State,
-	delivery_present:       bool,
+	transfer:               Maybe(Provider_Transfer_Summary),
+	// delivery is the model-send evidence this attempt established. Evidence
+	// first established on a failure reaches the caller through
+	// provider_terminal_error.
+	delivery:               Maybe(Provider_Delivery_State),
 	transport_cause:        Provider_Transport_Cause,
 }
 
@@ -641,7 +637,6 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 	// happens to the stream after it.
 	if head.usable {
 		state.delivery = .Response_Observed
-		state.delivery_present = true
 	}
 	if name := provider_request_id_header(state.api); name != "" {
 		if value, present := http.headers_get_unsafe(headers, name); present {
@@ -672,12 +667,12 @@ provider_response_head :: proc(user_data: rawptr, head: client.Response_Head, he
 // when it arrives: one that accepted the stream proves delivery, and one that refused it
 // is the provider's own answer, so classification decides what happens there.
 provider_record_delivery :: proc(state: ^Provider_Request_Stream_State, failure: client.Failure) {
-	if !state.transfer_present || !state.transfer.request_write_started { return }
-	if state.delivery_present || state.response_head.seen { return }
+	transfer, transfer_ok := state.transfer.?
+	if !transfer_ok || !transfer.request_write_started { return }
+	if state.delivery != nil || state.response_head.seen { return }
 	switch failure.kind {
 	case .Transport, .Truncated, .Closed:
 		state.delivery = .Model_Send_Started
-		state.delivery_present = true
 	case .None, .Cancelled, .Timed_Out, .TLS, .Invalid_URL, .Invalid_Request, .HTTP_Status, .Content_Type:
 	}
 }
@@ -688,7 +683,6 @@ provider_transfer_summary :: proc(user_data: rawptr, summary: Provider_Transfer_
 	state := cast(^Provider_Request_Stream_State)user_data
 	if state == nil { return }
 	state.transfer = summary
-	state.transfer_present = true
 }
 
 // provider_state_release frees what the state still owns once an operation is over.
@@ -776,9 +770,7 @@ provider_terminal_error :: proc(state: ^Provider_Request_Stream_State, kind: Pro
 		retry_directive     = state.response_head.retry_directive,
 		detail              = provider_take_failure_detail(state),
 		delivery            = state.delivery,
-		delivery_present    = state.delivery_present,
 		transfer            = state.transfer,
-		transfer_present    = state.transfer_present,
 		transport_cause     = state.transport_cause,
 	}
 	// What the caller now owns is no longer the state's, so the release path cannot

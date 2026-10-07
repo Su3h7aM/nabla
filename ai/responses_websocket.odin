@@ -226,7 +226,6 @@ provider_websocket_exchange :: proc(
 				provider_drain_events(state)
 				failure := provider_terminal_error(state, .Allocation)
 				failure.delivery = delivery
-				failure.delivery_present = true
 				return failure, false
 			}
 			state.response_bytes += u64(count)
@@ -248,7 +247,6 @@ provider_websocket_exchange :: proc(
 			provider_websocket_drop(session)
 			err := provider_terminal_error(state, .Stream)
 			err.delivery = delivery
-			err.delivery_present = true
 			return err, false
 		}
 		if state.stream.Phase == .Completed && state.completion != nil {
@@ -367,7 +365,6 @@ provider_websocket_error :: proc(
 	provider_drain_events(state)
 	err := provider_terminal_error(state, kind)
 	err.delivery = delivery
-	err.delivery_present = true
 	return err
 }
 

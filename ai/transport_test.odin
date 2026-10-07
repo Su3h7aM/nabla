@@ -608,9 +608,9 @@ test_a_quota_refusal_keeps_its_evidence :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(job.error.detail, "exceeded your current quota"), job.error.detail)
 	// The transport's own account of the attempt is an independent fact from all of
 	// the above, and it is collected whether or not diagnostics are on.
-	testing.expect(t, job.error.transfer_present)
-	testing.expect_value(t, job.error.transfer.status, 429)
-	testing.expect_value(t, job.error.transfer.stopped_at, Provider_Transfer_Phase.Response_Body)
+	testing.expect(t, job.error.transfer != nil)
+	testing.expect_value(t, job.error.transfer.?.status, 429)
+	testing.expect_value(t, job.error.transfer.?.stopped_at, Provider_Transfer_Phase.Response_Body)
 	testing.expect_value(t, observed.chunk_bytes, len(body))
 	testing.expect_value(t, job.texts, 0)
 	testing.expect_value(t, job.completions, 0)
@@ -712,10 +712,10 @@ test_a_request_with_no_answer_reports_delivery_evidence :: proc(t: ^testing.T) {
 	defer transport_job_destroy(&job, job.allocator)
 
 	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.Transport)
-	testing.expect(t, job.error.transfer_present)
-	testing.expect(t, job.error.transfer.request_write_started, "the request writer was entered")
-	testing.expect(t, job.error.delivery_present)
-	testing.expect_value(t, job.error.delivery, Provider_Delivery_State.Model_Send_Started)
+	testing.expect(t, job.error.transfer != nil)
+	testing.expect(t, job.error.transfer.?.request_write_started, "the request writer was entered")
+	testing.expect(t, job.error.delivery != nil)
+	testing.expect_value(t, job.error.delivery.?, Provider_Delivery_State.Model_Send_Started)
 }
 
 // A stream that framed cleanly but never reached its terminal event is incomplete,
@@ -735,8 +735,8 @@ test_an_unfinished_stream_is_incomplete :: proc(t: ^testing.T) {
 	testing.expect_value(t, job.error.kind, Provider_Operation_Error_Kind.Stream)
 	testing.expect_value(t, job.error.failure_class, Provider_Failure_Class.Incomplete_Stream)
 	testing.expect_value(t, job.error.transport_cause, Provider_Transport_Cause.None)
-	testing.expect(t, job.error.transfer_present)
-	testing.expect_value(t, job.error.transfer.stopped_at, Provider_Transfer_Phase.Complete)
+	testing.expect(t, job.error.transfer != nil)
+	testing.expect_value(t, job.error.transfer.?.stopped_at, Provider_Transfer_Phase.Complete)
 	testing.expect_value(t, job.texts, 1)
 	testing.expect_value(t, job.completions, 0)
 }

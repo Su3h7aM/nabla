@@ -336,7 +336,7 @@ chat_run_turn :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, p
 }
 
 chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
-	if err.delivery != .None { return false }
+	if err.delivery != nil { return false }
 	if err.transport_cause == .Trust || err.transport_cause == .Configuration { return false }
 	if err.kind == .Transport { return true }
 	if err.kind != .HTTP { return false }
