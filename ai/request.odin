@@ -53,8 +53,7 @@ Provider_Transfer_Summary :: struct {
 	request_write_started:       bool,
 	response_head_received:      bool,
 	status:                      int,
-	declared_body_bytes:         u64,
-	declared_body_bytes_present: bool,
+	declared_body_bytes:         Maybe(u64),
 }
 
 // Provider_Operation_Report is one observation of a provider operation. body and

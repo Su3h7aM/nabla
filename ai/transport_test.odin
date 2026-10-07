@@ -851,8 +851,8 @@ test_transport_reports_where_a_completed_request_stopped :: proc(t: ^testing.T) 
 	testing.expect_value(t, observed.transfer.status, 200)
 	// The head stated how much body follows, which is a different fact from how
 	// much of it was read.
-	testing.expect(t, observed.transfer.declared_body_bytes_present, "the head declared a length")
-	testing.expect_value(t, observed.transfer.declared_body_bytes, u64(len(TRANSPORT_RESPONSE_BODY)))
+	testing.expect(t, observed.transfer.declared_body_bytes != nil, "the head declared a length")
+	testing.expect_value(t, observed.transfer.declared_body_bytes.?, u64(len(TRANSPORT_RESPONSE_BODY)))
 }
 
 @(test)
@@ -916,7 +916,7 @@ test_transport_reports_a_request_that_never_left :: proc(t: ^testing.T) {
 		testing.expect_value(t, observed.transfer.request_bytes_accepted, u64(0))
 		testing.expect(t, !observed.transfer.request_complete, "nothing was taken, so the request is not complete")
 		testing.expect(t, !observed.transfer.response_head_received, "no head arrives without a connection")
-		testing.expect(t, !observed.transfer.declared_body_bytes_present, "an absent head declares nothing")
+		testing.expect(t, observed.transfer.declared_body_bytes == nil, "an absent head declares nothing")
 		transport_job_destroy(&job, job.allocator)
 		return
 	}

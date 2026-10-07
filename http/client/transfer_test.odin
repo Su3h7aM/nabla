@@ -111,7 +111,7 @@ test_transfer_reports_a_request_that_was_never_written :: proc(t: ^testing.T) {
 		testing.expect_value(t, log.summary.request_body_bytes_accepted, u64(0))
 		testing.expect(t, !log.summary.request_complete, "nothing was written")
 		testing.expect(t, !log.summary.response_head_received, "nothing was read")
-		testing.expect(t, !log.summary.declared_body_bytes_present, "an absent head declares nothing")
+		testing.expect(t, log.summary.declared_body_bytes == nil, "an absent head declares nothing")
 		failure_destroy(&failure, context.allocator)
 	}
 

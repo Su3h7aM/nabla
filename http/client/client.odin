@@ -98,7 +98,6 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	framing, length, framing_err := response_framing(status, head.version, request.method, headers)
 	if framing_err == .None && framing == Body_Framing.Exact {
 		summary.declared_body_bytes = u64(length)
-		summary.declared_body_bytes_present = true
 	}
 
 	// The head is reported before its body, so a caller that has to read the

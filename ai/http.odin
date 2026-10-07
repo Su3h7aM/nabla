@@ -130,7 +130,6 @@ http_relay_transfer :: proc(user_data: rawptr, summary: client.Transfer_Summary)
 		response_head_received      = summary.response_head_received,
 		status                      = summary.status,
 		declared_body_bytes         = summary.declared_body_bytes,
-		declared_body_bytes_present = summary.declared_body_bytes_present,
 	}
 	if relay.facts.transfer != nil { relay.facts.transfer(relay.facts.user_data, mapped) }
 	if relay.observer.report != nil {

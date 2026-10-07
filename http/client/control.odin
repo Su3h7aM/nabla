@@ -106,8 +106,7 @@ Transfer_Summary :: struct {
 	// declared_body_bytes is what the response head stated, which is a different
 	// fact from how much of the body was read. It is present only when the head
 	// gave a Content-Length: a chunked or close-delimited body declares nothing.
-	declared_body_bytes:         u64,
-	declared_body_bytes_present: bool,
+	declared_body_bytes:         Maybe(u64),
 }
 
 // Transfer_Observer is told once how one request ended, on success and on every
