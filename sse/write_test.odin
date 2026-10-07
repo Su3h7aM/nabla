@@ -44,7 +44,7 @@ test_write_read_round_trip :: proc(t: ^testing.T) {
 	recorder_init(&all_recorder)
 	defer recorder_destroy(&all_recorder)
 	parse(&all_recorder, all)
-	expect_events(t, &all_recorder, {{type = "add", data = "body", id = "42", retry_ms = 1500, retry_present = true}})
+	expect_events(t, &all_recorder, {{type = "add", data = "body", id = "42", retry_ms = 1500}})
 }
 
 @(test)

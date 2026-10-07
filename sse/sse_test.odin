@@ -9,11 +9,10 @@ import "core:testing"
 // marked "standard example" are the standard's own worked examples.
 
 Recorded_Event :: struct {
-	type:          string,
-	data:          string,
-	id:            string,
-	retry_ms:      i64,
-	retry_present: bool,
+	type:     string,
+	data:     string,
+	id:       string,
+	retry_ms: Maybe(i64),
 }
 
 Recorder :: struct {
@@ -45,7 +44,6 @@ record_event :: proc(user_data: rawptr, event: Event) {
 			data = strings.clone(event.data, recorder.allocator),
 			id = strings.clone(event.id, recorder.allocator),
 			retry_ms = event.retry_ms,
-			retry_present = event.retry_present,
 		},
 	)
 }
@@ -74,16 +72,12 @@ expect_events :: proc(t: ^testing.T, recorder: ^Recorder, expected: []Recorded_E
 		testing.expectf(t, got.type == want.type, "%v: event %d type: expected %q, got %q", loc, i, want.type, got.type)
 		testing.expectf(t, got.data == want.data, "%v: event %d data: expected %q, got %q", loc, i, want.data, got.data)
 		testing.expectf(t, got.id == want.id, "%v: event %d id: expected %q, got %q", loc, i, want.id, got.id)
-		testing.expectf(
-			t,
-			got.retry_present == want.retry_present,
-			"%v: event %d retry_present: expected %v, got %v",
-			loc,
-			i,
-			want.retry_present,
-			got.retry_present,
-		)
-		testing.expectf(t, got.retry_ms == want.retry_ms, "%v: event %d retry_ms: expected %d, got %d", loc, i, want.retry_ms, got.retry_ms)
+		retry_got, retry_got_ok := got.retry_ms.?
+		retry_want, retry_want_ok := want.retry_ms.?
+		testing.expectf(t, retry_got_ok == retry_want_ok, "%v: event %d retry_present: expected %v, got %v", loc, i, retry_want_ok, retry_got_ok)
+		if retry_got_ok && retry_want_ok {
+			testing.expectf(t, retry_got == retry_want, "%v: event %d retry_ms: expected %d, got %d", loc, i, retry_want, retry_got)
+		}
 	}
 }
 
@@ -204,14 +198,14 @@ test_retry_state :: proc(t: ^testing.T) {
 		&recorder,
 		{
 			{type = "message", data = "before"},
-			{type = "message", data = "after", retry_ms = 5000, retry_present = true},
-			{type = "message", data = "b", retry_ms = 5000, retry_present = true},
-			{type = "message", data = "c", retry_ms = 5000, retry_present = true},
-			{type = "message", data = "d", retry_ms = 5000, retry_present = true},
-			{type = "message", data = "e", retry_ms = 5000, retry_present = true},
-			{type = "message", data = "f", retry_ms = max(i64), retry_present = true},
-			{type = "message", data = "i", retry_ms = max(i64), retry_present = true},
-			{type = "message", data = "g", retry_ms = 0, retry_present = true},
+			{type = "message", data = "after", retry_ms = 5000},
+			{type = "message", data = "b", retry_ms = 5000},
+			{type = "message", data = "c", retry_ms = 5000},
+			{type = "message", data = "d", retry_ms = 5000},
+			{type = "message", data = "e", retry_ms = 5000},
+			{type = "message", data = "f", retry_ms = max(i64)},
+			{type = "message", data = "i", retry_ms = max(i64)},
+			{type = "message", data = "g", retry_ms = 0},
 		},
 	)
 }
@@ -271,7 +265,7 @@ test_end_of_stream_and_chunk_boundaries :: proc(t: ^testing.T) {
 	// Pending data is discarded at the end of the stream, and where the reader's
 	// buffers fall must not change the events produced.
 	stream := "\xEF\xBB\xBF: comment\r\nevent: add\rdata: one\r\ndata: two\n\nretry: 250\n\ndata\n\n"
-	expected := []Recorded_Event{{type = "add", data = "one\ntwo"}, {type = "message", data = "", retry_ms = 250, retry_present = true}}
+	expected := []Recorded_Event{{type = "add", data = "one\ntwo"}, {type = "message", data = "", retry_ms = 250}}
 
 	whole: Recorder
 	recorder_init(&whole)

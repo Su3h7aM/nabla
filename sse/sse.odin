@@ -15,11 +15,10 @@ DEFAULT_EVENT_TYPE :: "message"
 // "message"; id is the stream's last event ID, which persists across events;
 // retry_ms is the reconnection time currently in force.
 Event :: struct {
-	type:          string,
-	data:          string,
-	id:            string,
-	retry_ms:      i64,
-	retry_present: bool,
+	type:     string,
+	data:     string,
+	id:       string,
+	retry_ms: Maybe(i64),
 }
 
 // Event_Callback runs synchronously during parser_feed/parser_finish. Event
@@ -28,18 +27,17 @@ Event :: struct {
 Event_Callback :: #type proc(user_data: rawptr, event: Event)
 
 Parser :: struct {
-	line:          [dynamic]u8,
-	event_type:    [dynamic]u8,
-	event_data:    [dynamic]u8,
-	event_id:      [dynamic]u8,
-	retry_ms:      i64,
-	retry_present: bool,
-	callback:      Event_Callback,
-	user_data:     rawptr,
-	bom:           [3]u8,
-	bom_len:       int,
-	pending_cr:    bool,
-	finished:      bool,
+	line:       [dynamic]u8,
+	event_type: [dynamic]u8,
+	event_data: [dynamic]u8,
+	event_id:   [dynamic]u8,
+	retry_ms:   Maybe(i64),
+	callback:   Event_Callback,
+	user_data:  rawptr,
+	bom:        [3]u8,
+	bom_len:    int,
+	pending_cr: bool,
+	finished:   bool,
 }
 
 // parser_init prepares parser for one stream. callback may be nil. user_data is
@@ -197,7 +195,6 @@ parser_field :: proc(parser: ^Parser, line: []u8) -> (err: runtime.Allocator_Err
 		// keeps whatever value it already had.
 		if retry, ok := parse_retry(value); ok {
 			parser.retry_ms = retry
-			parser.retry_present = true
 		}
 	}
 	return nil
@@ -326,11 +323,10 @@ parser_dispatch :: proc(parser: ^Parser) {
 	// event state: it holds its value until the stream changes it, so every
 	// event reports the value currently in force.
 	event := Event {
-		type          = event_type,
-		data          = string(data),
-		id            = string(parser.event_id[:]),
-		retry_ms      = parser.retry_ms,
-		retry_present = parser.retry_present,
+		type     = event_type,
+		data     = string(data),
+		id       = string(parser.event_id[:]),
+		retry_ms = parser.retry_ms,
 	}
 	if parser.callback != nil { parser.callback(parser.user_data, event) }
 	clear(&parser.event_type)
