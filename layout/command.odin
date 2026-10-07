@@ -2,13 +2,7 @@ package layout
 
 import "core:math"
 
-/*
-Scale four corner radii so no pair exceeds the side it shares.
-
-The CSS proportional-reduction rule: one common factor is applied to all four
-radii, so their relative proportions survive and every backend derives the same
-rounded rectangle from the published command.
-*/
+// _normalize_radius scales corner radii by one common factor so no pair exceeds its side.
 @(private)
 _normalize_radius :: proc "contextless" (radius: Radius, size: Vec2) -> Radius {
 	values := [4]Scalar{radius.tl, radius.tr, radius.br, radius.bl}
@@ -41,12 +35,7 @@ _normalize_radius :: proc "contextless" (radius: Radius, size: Vec2) -> Radius {
 	}
 }
 
-/*
-Scale border widths so opposite sides cannot overlap.
-
-Like the radius rule this is a single common factor, so a border never covers
-more than the element it belongs to and never extends coverage outside `bounds`.
-*/
+// _normalize_border_width scales border widths by one common factor so opposite sides cannot overlap.
 @(private)
 _normalize_border_width :: proc "contextless" (width: Edges, size: Vec2) -> Edges {
 	values := [4]Scalar{width.left, width.top, width.right, width.bottom}
@@ -82,13 +71,7 @@ _border_has_width :: proc "contextless" (width: Edges) -> bool {
 	return width.left > 0 || width.top > 0 || width.right > 0 || width.bottom > 0
 }
 
-/*
-Normalize an image source region into a positive rectangle inside the unit square.
-
-Both corners are derived first, then ordered and clamped, so a flipped or
-out-of-range authored rectangle becomes the region it overlaps rather than a
-negative size. A zero-area result is an empty source and emits no command.
-*/
+// _normalize_image_source clamps a source region into the unit square. A zero-area result emits no command.
 @(private, require_results)
 _normalize_image_source :: proc "contextless" (source: Image_Source) -> (Image_Source, bool) {
 	if source.mode == .Whole {
@@ -147,14 +130,6 @@ _emit_command :: proc(state: ^_Context_State, node: Node_Handle, bounds: Rect, c
 	return true
 }
 
-/*
-Emit the paint a node contributes before its children.
-
-`Fill` covers the border box, while image and custom content cover the content
-box: content shares the inner box with any children rather than displacing them.
-Text lines are content too, so they precede structural children for the same
-reason, and each resolved line is its own command.
-*/
 @(private, require_results)
 _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	input := &state._node_inputs[node]
@@ -218,16 +193,6 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	return true
 }
 
-/*
-Emit the axis-aligned rule that `Border_Style.between_children` places in each gap.
-
-The rule consumes no layout space: it is derived from the gap the placed
-children actually left, so justification spacing widens the gap rather than
-moving the rule. It is clipped by the same handle the children use, and it
-tracks scroll on both axes: the main axis follows from the displaced child
-boxes, and the cross axis subtracts the offset this node applied, so a rule
-never detaches from the children it separates.
-*/
 @(private, require_results)
 _emit_between_children :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	input := &state._node_inputs[node]
@@ -273,12 +238,7 @@ _emit_between_children :: proc(state: ^_Context_State, node: Node_Handle) -> boo
 	return true
 }
 
-/*
-Emit the paint a node contributes after its children.
-
-A border drawn last covers the edge its descendants may have overdrawn, which
-is why the border phase closes a subtree rather than opening it.
-*/
+// _emit_node_exit emits the border after children so it covers any overdrawn edge.
 @(private, require_results)
 _emit_node_exit :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	if !_emit_between_children(state, node) {
@@ -302,17 +262,6 @@ _emit_node_exit :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	return _emit_command(state, node, resolved.outer, resolved.clip, data)
 }
 
-/*
-Mark where each node's subtree ends inside its paint root's slice.
-
-The slice is declaration pre-order and an overlay leaves for its own root, so
-every remaining subtree is one contiguous run. Recording its end lets emission
-close subtrees by walking structural parents instead of carrying a stack.
-
-Extents stay inside the root: a root's own node is never folded into its
-structural parent, because that parent belongs to a different slice where the
-same integer means a different position.
-*/
 @(private)
 _mark_subtree_extents :: proc(state: ^_Context_State, root_index: i32) {
 	nodes := _root_nodes_of(state, root_index)
@@ -332,13 +281,7 @@ _mark_subtree_extents :: proc(state: ^_Context_State, root_index: i32) {
 	}
 }
 
-/*
-Emit every command in exact paint order.
-
-Roots paint in `(layer, declaration sequence)` order and each is atomic, so no
-root interleaves with another. Within a root the traversal is declaration-order
-depth-first: a node opens, its children run, then it closes.
-*/
+// _emit_commands emits every command in exact paint order.
 @(private)
 _emit_commands :: proc(state: ^_Context_State) {
 	for key in state._root_paint {

@@ -48,17 +48,8 @@ with_alpha :: proc "contextless" (color: Color, alpha: u8) -> Color {
 	return Color{color.r, color.g, color.b, alpha}
 }
 
-/*
-Linearly interpolate between two colors, `amount == 0` returning `from` and
-`amount == 1` returning `to`. An `amount` outside `[0, 1]` extrapolates rather
-than clamping, matching `math.lerp`.
-
-This is the building block for a hover or pressed style: the application blends
-toward a target color using `hovered`, rather than the library owning a
-subtree-wide tint the way Clay's `overlayColor` does. Keeping the blend a pure
-function here, instead of a second paint pass in the core, keeps command
-emission a single deterministic walk.
-*/
+// mix linearly interpolates between two colors. An amount outside [0, 1]
+// extrapolates rather than clamping, matching math.lerp.
 mix :: proc(from, to: Color, amount: Scalar) -> Color {
 	blend := proc(from, to: u8, amount: Scalar) -> u8 {
 		value := f32(from) + (f32(to) - f32(from)) * f32(amount)

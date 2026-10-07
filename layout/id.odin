@@ -143,8 +143,6 @@ _remember_debug_label :: proc(ctx: ^Context, identifier: Id, label: string) {
 	if len(state._debug_label_entries) >= cap(state._debug_label_entries) || len(label) > cap(state._debug_labels) - len(state._debug_labels) {
 		return
 	}
-	// The room check above is what makes the append unable to fail, so the label
-	// goes in with one call instead of a byte at a time.
 	start := len(state._debug_labels)
 	_, append_error := append(&state._debug_labels, ..transmute([]byte)label)
 	assert(append_error == nil)
