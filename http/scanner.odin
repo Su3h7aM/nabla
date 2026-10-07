@@ -7,29 +7,29 @@ import "core:nbio"
 import "core:net"
 
 Scan_Callback :: #type proc(user_data: rawptr, token: string, err: bufio.Scanner_Error)
-Split_Proc :: #type proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool)
+// Split_Bytes makes a token of exactly that many bytes.
+Split_Bytes :: distinct int
 
-// scan_lines splits on LF and drops a CR before it. RFC 9112 2.2 lets a
-// recipient treat a bare LF as a line terminator.
-@(require_results)
-scan_lines :: proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool) {
-	return bufio.scan_lines(data, at_eof)
+// Split is how the scanner cuts a token: nil splits on LF and drops a CR before
+// it, which RFC 9112 2.2 lets a recipient do for a bare LF.
+Split :: union {
+	Split_Bytes,
 }
 
-// scan_num_bytes takes exactly the byte count carried in split_data.
 @(require_results)
-scan_num_bytes :: proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool) {
-	expected := int(uintptr(split_data))
-	if len(data) < expected { return }
-	return expected, data[:expected], nil, false
+split_token :: proc(split: Split, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool) {
+	if count, ok := split.(Split_Bytes); ok {
+		if len(data) < int(count) { return }
+		return int(count), data[:count], nil, false
+	}
+	return bufio.scan_lines(data, at_eof)
 }
 
 // Scanner splits a connection's bytes into tokens as they arrive, reading
 // through the connection's event loop.
 Scanner :: struct {
 	connection:     ^Connection,
-	split:          Split_Proc,
-	split_data:     rawptr,
+	split:          Split,
 	buffer:         [dynamic]byte,
 	// max_token_size is the caller's bound on one token; zero or less is no
 	// bound. HTTP itself sets none (RFC 9110 5.4).
@@ -48,7 +48,6 @@ INIT_BUF_SIZE :: 1024
 
 scanner_init :: proc(scanner: ^Scanner, connection: ^Connection, buffer_allocator := context.allocator) {
 	scanner.connection = connection
-	scanner.split = scan_lines
 	scanner.buffer.allocator = buffer_allocator
 }
 
@@ -60,8 +59,7 @@ scanner_destroy :: proc(scanner: ^Scanner) {
 // past the last token: a pipelined request may have arrived with the last one.
 scanner_reset :: proc(scanner: ^Scanner) {
 	scanner_compact(scanner)
-	scanner.split = scan_lines
-	scanner.split_data = nil
+	scanner.split = nil
 	scanner.max_token_size = 0
 	scanner._err = nil
 	scanner.done = false
@@ -91,7 +89,7 @@ scanner_scan :: proc(scanner: ^Scanner, user_data: rawptr, callback: Scan_Callba
 	// A token may already be buffered, and a read error still lets the split
 	// procedure take what is left.
 	if scanner.start < scanner.end || scanner._err != nil {
-		advance, token, err, final_token := scanner.split(scanner.split_data, scanner.buffer[scanner.start:scanner.end], scanner._err != nil)
+		advance, token, err, final_token := split_token(scanner.split, scanner.buffer[scanner.start:scanner.end], scanner._err != nil)
 		if final_token {
 			scanner.done = true
 			callback(user_data, "", .EOF)

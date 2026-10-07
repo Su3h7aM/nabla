@@ -183,8 +183,7 @@ _body_length :: proc(request: ^Request, max_length: int = -1, user_data: rawptr,
 
 	request._scanner.max_token_size = length
 
-	request._scanner.split = scan_num_bytes
-	request._scanner.split_data = rawptr(uintptr(length))
+	request._scanner.split = Split_Bytes(length)
 
 	request._body_ok = true
 	scanner_scan(request._scanner, user_data, callback)
@@ -225,10 +224,7 @@ _body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr
 
 		state.request._scanner.max_token_size = size
 
-		state.request._scanner.split = scan_num_bytes
-
-		#assert(size_of(int) == size_of(uintptr))
-		state.request._scanner.split_data = rawptr(uintptr(size))
+		state.request._scanner.split = Split_Bytes(size)
 
 		scanner_scan(state.request._scanner, state_data, on_scan_chunk)
 	}
@@ -242,7 +238,7 @@ _body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr
 		}
 
 		state.request._scanner.max_token_size = 0
-		state.request._scanner.split = scan_lines
+		state.request._scanner.split = nil
 
 		// A builder reports the growth it could not make as a short write, which
 		// would silently truncate the body a handler sees.
@@ -343,6 +339,6 @@ _body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr
 	state.user_data = user_data
 	state.callback = callback
 
-	state.request._scanner.split = scan_lines
+	state.request._scanner.split = nil
 	scanner_scan(state.request._scanner, state, on_scan)
 }
