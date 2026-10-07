@@ -55,7 +55,7 @@ models_dev_parse :: proc(data: []u8, providers: []string = {}, allocator := cont
 	}
 
 	for provider_id, provider_value in root_object {
-		if len(providers) > 0 && !_models_dev_wanted(providers, provider_id) { continue }
+		if len(providers) > 0 && !models_dev_wanted(providers, provider_id) { continue }
 		provider_object, provider_is_object := provider_value.(json.Object)
 		if !provider_is_object { return {}, .Invalid_Structure }
 
@@ -320,10 +320,10 @@ models_dev_api_family :: proc(npm: string) -> (api: string, known: bool) {
 	return "", false
 }
 
-// _models_dev_wanted reports whether a provider id is one of the ids the caller
+// models_dev_wanted reports whether a provider id is one of the ids the caller
 // asked for. The configured set is small, so a scan beats a lookup structure.
 @(private, require_results)
-_models_dev_wanted :: proc(providers: []string, id: string) -> bool {
+models_dev_wanted :: proc(providers: []string, id: string) -> bool {
 	for provider in providers {
 		if provider == id { return true }
 	}
