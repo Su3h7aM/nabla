@@ -4,6 +4,18 @@
 
 NABLA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# NABLA_ODIN is the Odin compiler every task runs. When ODIN_ROOT is set it names an Odin
+# checkout, and its own compiler is used; the compiler reads ODIN_ROOT for core, base, and
+# vendor, so binary and libraries always come from the same tree. Otherwise odin comes
+# from PATH, which is the version mise installs.
+if [[ -n "${ODIN_ROOT:-}" ]]; then
+	NABLA_ODIN="${ODIN_ROOT%/}/odin"
+	[[ -x "$NABLA_ODIN" ]] || { printf 'error: ODIN_ROOT=%s has no odin binary\n' "$ODIN_ROOT" >&2; exit 1; }
+	export ODIN_ROOT
+else
+	NABLA_ODIN=odin
+fi
+
 # Defines every build, check, and test runs with.
 #
 # A temporary arena is where the standard library and this harness put memory that

@@ -67,7 +67,7 @@ for config in "${configs[@]}"; do
 		[[ "$pkg" == term ]] && extra+=(-define:NABLA_TERM_TEST_HOOKS=true)
 		nabla_step "test $pkg ($config)"
 		status=0
-		nabla_contained timeout "$timeout_secs" odin test "$pkg" "$collection" "${extra[@]}" || status=$?
+		nabla_contained timeout "$timeout_secs" "$NABLA_ODIN" test "$pkg" "$collection" "${extra[@]}" || status=$?
 		if ((status)); then
 			failed+=("$pkg ($config)")
 			((status != 124)) || printf 'hint: %s timed out after %ss; rerun with --log-state and --test <names> to find the stalled test\n' "$pkg" "$timeout_secs" >&2
