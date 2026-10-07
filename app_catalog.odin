@@ -179,10 +179,11 @@ catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provid
 		return
 	}
 
-	sync.mutex_lock(&app.catalog_mu)
-	replaced := app.setup.catalog
-	app.setup.catalog = catalog
-	sync.mutex_unlock(&app.catalog_mu)
+	replaced: agent.Catalog
+	if sync.mutex_guard(&app.catalog_mu) {
+		replaced = app.setup.catalog
+		app.setup.catalog = catalog
+	}
 	// The catalog this one replaces is released rather than kept: everything read out
 	// of a catalog is copied while the lock is held, and the running connection owns
 	// its endpoint. Nothing borrows a replaced catalog after this returns.
@@ -204,9 +205,10 @@ catalog_selection_refresh_request :: proc(app: ^App) {
 catalog_selection_sync :: proc(app: ^App) {
 	revision := sync.atomic_load(&app.catalog_revision)
 	if revision == app.run.catalog_applied_revision { return }
-	sync.mutex_lock(&app.run.mu)
-	explicit_pending := app.run.pending != nil
-	sync.mutex_unlock(&app.run.mu)
+	explicit_pending := false
+	if sync.mutex_guard(&app.run.mu) {
+		explicit_pending = app.run.pending != nil
+	}
 	if explicit_pending || app.run.pending_target != nil { return }
 	if app.setup.provider_id == "" || app.setup.model_id == "" {
 		app.run.catalog_applied_revision = revision

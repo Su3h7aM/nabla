@@ -524,27 +524,27 @@ acp_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, cwd: stri
 	live_infos: [ACP_MAX_SESSIONS]acp.Session_Info
 	live_count := 0
 	live_copy_failed := false
-	sync.mutex_lock(&server.table_mu)
-	for session in server.sessions {
-		if session == nil || session.closing || session.id == "" || (cwd != "" && session.workspace != cwd) { continue }
-		id, id_error := strings.clone(session.id, context.temp_allocator)
-		workspace, workspace_error := strings.clone(session.workspace, context.temp_allocator)
-		title, title_error := strings.clone(session.title, context.temp_allocator)
-		if id_error != nil || workspace_error != nil || title_error != nil {
-			delete(id)
-			delete(workspace)
-			delete(title)
-			live_copy_failed = true
-			break
+	if sync.mutex_guard(&server.table_mu) {
+		for session in server.sessions {
+			if session == nil || session.closing || session.id == "" || (cwd != "" && session.workspace != cwd) { continue }
+			id, id_error := strings.clone(session.id, context.temp_allocator)
+			workspace, workspace_error := strings.clone(session.workspace, context.temp_allocator)
+			title, title_error := strings.clone(session.title, context.temp_allocator)
+			if id_error != nil || workspace_error != nil || title_error != nil {
+				delete(id)
+				delete(workspace)
+				delete(title)
+				live_copy_failed = true
+				break
+			}
+			live_infos[live_count] = acp.Session_Info {
+				session_id = id,
+				cwd        = workspace,
+				title      = title,
+			}
+			live_count += 1
 		}
-		live_infos[live_count] = acp.Session_Info {
-			session_id = id,
-			cwd        = workspace,
-			title      = title,
-		}
-		live_count += 1
 	}
-	sync.mutex_unlock(&server.table_mu)
 	if live_copy_failed {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be allocated")
 		return
@@ -603,13 +603,13 @@ acp_request_session_close :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) 
 	acp_cancel_session(session)
 	// Marking the session closing refuses every later request for it, and the worker runs
 	// the close after what is already queued.
-	sync.mutex_lock(&server.table_mu)
-	session.closing = true
-	sync.mutex_unlock(&server.table_mu)
+	if sync.mutex_guard(&server.table_mu) {
+		session.closing = true
+	}
 	if !acp_enqueue(session, work) {
-		sync.mutex_lock(&server.table_mu)
-		session.closing = false
-		sync.mutex_unlock(&server.table_mu)
+		if sync.mutex_guard(&server.table_mu) {
+			session.closing = false
+		}
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}
 }
@@ -817,11 +817,11 @@ acp_enqueue_open_session :: proc(
 	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 		if created {
-			sync.mutex_lock(&server.table_mu)
-			for entry, index in server.sessions {
-				if entry == session { server.sessions[index] = nil }
+			if sync.mutex_guard(&server.table_mu) {
+				for entry, index in server.sessions {
+					if entry == session { server.sessions[index] = nil }
+				}
 			}
-			sync.mutex_unlock(&server.table_mu)
 			acp_session_drop(server, session)
 		}
 	}

@@ -196,8 +196,7 @@ session_refresh_rows :: proc(app: ^App) {
 	defer journal.session_summaries_destroy(sessions, app.run.alloc)
 	listed := session_listing(app.setup.store, sessions)
 
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	for &row in app.run.snap.sessions {
 		delete(row.title, app.run.alloc)
 	}
@@ -694,8 +693,7 @@ session_replay_queued :: proc(app: ^App) {
 // snapshot_clear drops the rendered transcript. The history lives in the store;
 // this is only what the screen shows.
 snapshot_clear :: proc(app: ^App) {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	for &entry in app.run.snap.entries {
 		if entry.text != nil { delete(entry.text) }
 	}
@@ -714,8 +712,7 @@ refresh_status :: proc(app: ^App) {
 	totals: journal.Usage_Totals
 	totals_error: journal.Error = journal.Journal_Error.Not_Found
 	if running.store != nil { totals, totals_error = journal.usage_totals(running.store, running.session) }
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	status := &app.run.snap.status
 	// The estimate is the one the agent measured when it built the last request;
 	// the main thread never reads the store, so it cannot compute one itself.
@@ -791,8 +788,7 @@ snap_status_replace :: proc(app: ^App, field: ^string, text: string) {
 // --- hooks into the snapshot ----------------------------------------------
 
 set_running :: proc(app: ^App, running: bool) {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	status := &app.run.snap.status
 	if running && !status.running {
 		status.working_since = time.tick_now()
@@ -803,8 +799,7 @@ set_running :: proc(app: ^App, running: bool) {
 
 @(require_results)
 runtime_busy :: proc(app: ^App) -> bool {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	return app.run.snap.status.running
 }
 
@@ -812,8 +807,7 @@ runtime_busy :: proc(app: ^App) -> bool {
 // the worker publishes the status with.
 @(require_results)
 runtime_following :: proc(app: ^App) -> bool {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	return app.run.snap.status.following
 }
 
@@ -821,8 +815,7 @@ runtime_following :: proc(app: ^App) -> bool {
 // worker publishes the status with.
 @(require_results)
 runtime_model_selected :: proc(app: ^App) -> bool {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	return app.run.snap.status.model_id != ""
 }
 
@@ -830,11 +823,10 @@ runtime_model_selected :: proc(app: ^App) -> bool {
 // under the lock the worker publishes it with. The copy is temp-allocated, which
 // is the lifetime of one keypress on the front-end.
 runtime_selection_provider :: proc(app: ^App) -> string {
-	sync.mutex_lock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	provider, provider_error := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
-	sync.mutex_unlock(&app.run.mu)
 	if provider_error != nil {
-		snap_report_dropped(app)
+		snap_report_dropped_locked(app)
 	}
 	return provider
 }
@@ -856,8 +848,7 @@ run_wake :: proc(app: ^App) {
 }
 
 generation_changed :: proc(app: ^App) -> bool {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	if app.run.snap.generation != app.generation_seen {
 		app.generation_seen = app.run.snap.generation
 		return true
@@ -866,8 +857,7 @@ generation_changed :: proc(app: ^App) -> bool {
 }
 
 snap_append :: proc(app: ^App, kind: Entry_Kind, text: string) {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	snap_append_locked(app, kind, text)
 }
 
@@ -920,9 +910,8 @@ snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 
 // snap_report_dropped records one display failure while holding the snapshot lock.
 snap_report_dropped :: proc(app: ^App) {
-	sync.mutex_lock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	snap_report_dropped_locked(app)
-	sync.mutex_unlock(&app.run.mu)
 }
 
 // snap_report_dropped_locked marks the display incomplete once, without allocating or
@@ -1006,16 +995,14 @@ observer_request_prepared :: proc(user_data: rawptr) {
 observer_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
 	app := cast(^App)user_data
 	snap_append(app, .Notice, retry_display_text(event))
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	status := &app.run.snap.status
 	status.retry_present = true
 	snap_publish_locked(app)
 }
 
 clear_retry :: proc(app: ^App) {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	if !app.run.snap.status.retry_present { return }
 	app.run.snap.status.retry_present = false
 	snap_publish_locked(app)
@@ -1027,15 +1014,13 @@ observer_request_finished :: proc(user_data: rawptr) {
 
 observer_assistant_begin :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	snap_push_locked(app, snap_entry_make(app, .Assistant, ""))
 }
 
 observer_assistant_text :: proc(user_data: rawptr, text: string) {
 	app := cast(^App)user_data
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	count := len(app.run.snap.entries)
 	if count > 0 {
 		last := &app.run.snap.entries[count - 1]
@@ -1053,8 +1038,7 @@ observer_assistant_text :: proc(user_data: rawptr, text: string) {
 
 observer_assistant_end :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	count := len(app.run.snap.entries)
 	if count > 0 {
 		app.run.snap.entries[count - 1].complete = true
@@ -1075,8 +1059,7 @@ observer_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Too
 // result, and the outcome its border is colored by. The live turn and the
 // replayed session both arrive here, so the box is the same either way.
 snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: journal.Tool_Outcome) {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	entry := snap_entry_make(app, .Tool, tool_entry_text(name, content, fallback))
 	entry.tool_outcome = outcome
 	snap_push_locked(app, entry)
@@ -1098,8 +1081,7 @@ observer_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text:
 
 observer_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event) {
 	app := cast(^App)user_data
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	status := &app.run.snap.status
 	if usage.Input_Tokens_Present {
 		status.last_input = usage.Input_Tokens

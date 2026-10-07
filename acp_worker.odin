@@ -117,25 +117,21 @@ acp_is_v2 :: proc(conn: ^ACP_Server) -> bool {
 
 @(require_results)
 acp_session_has_work :: proc(session: ^ACP_Session) -> bool {
-	sync.mutex_lock(&session.queue_mu)
-	pending := session.pending_work > 0
-	sync.mutex_unlock(&session.queue_mu)
-	return pending
+	sync.mutex_guard(&session.queue_mu)
+	return session.pending_work > 0
 }
 
 acp_queue_add :: proc(session: ^ACP_Session) {
-	sync.mutex_lock(&session.queue_mu)
+	sync.mutex_guard(&session.queue_mu)
 	session.pending_work += 1
-	sync.mutex_unlock(&session.queue_mu)
 }
 
 acp_queue_remove :: proc(session: ^ACP_Session) {
-	sync.mutex_lock(&session.queue_mu)
+	sync.mutex_guard(&session.queue_mu)
 	session.pending_work -= 1
 	if session.pending_work <= 0 {
 		session.pending_work = 0
 	}
-	sync.mutex_unlock(&session.queue_mu)
 }
 
 acp_model_request_destroy :: proc(request: ^ACP_Model_Request, allocator: mem.Allocator) {
@@ -151,11 +147,12 @@ acp_model_request_destroy :: proc(request: ^ACP_Model_Request, allocator: mem.Al
 // acp_model_request_submit replaces only a not-yet-claimed intent. The caller transfers
 // ownership whether it is superseded or accepted.
 acp_model_request_submit :: proc(session: ^ACP_Session, request: ACP_Model_Request) {
-	sync.mutex_lock(&session.model_mu)
-	previous := session.model_request
-	session.model_request = request
-	session.model_cancel = false
-	sync.mutex_unlock(&session.model_mu)
+	previous: ACP_Model_Request
+	if sync.mutex_guard(&session.model_mu) {
+		previous = session.model_request
+		session.model_request = request
+		session.model_cancel = false
+	}
 	if previous.active {
 		_ = acp.writer_write_error(&session.conn.writer, previous.id, acp.ERROR_INVALID_REQUEST, "a newer model selection replaced this request")
 		acp_model_request_destroy(&previous, session.conn.alloc)
@@ -165,39 +162,34 @@ acp_model_request_submit :: proc(session: ^ACP_Session, request: ACP_Model_Reque
 
 @(require_results)
 acp_model_request_take :: proc(session: ^ACP_Session) -> ACP_Model_Request {
-	sync.mutex_lock(&session.model_mu)
+	sync.mutex_guard(&session.model_mu)
 	request := session.model_request
 	session.model_request = {}
-	sync.mutex_unlock(&session.model_mu)
 	return request
 }
 
 @(require_results)
 acp_model_request_pending :: proc(session: ^ACP_Session) -> bool {
-	sync.mutex_lock(&session.model_mu)
-	pending := session.model_request.active
-	sync.mutex_unlock(&session.model_mu)
-	return pending
+	sync.mutex_guard(&session.model_mu)
+	return session.model_request.active
 }
 
 @(require_results)
 acp_model_owner_work_pending :: proc(session: ^ACP_Session) -> bool {
-	sync.mutex_lock(&session.model_mu)
-	pending := session.model_request.active || session.model_cancel
-	sync.mutex_unlock(&session.model_mu)
-	return pending
+	sync.mutex_guard(&session.model_mu)
+	return session.model_request.active || session.model_cancel
 }
 
 acp_model_cancel_signal :: proc(session: ^ACP_Session) {
-	sync.mutex_lock(&session.model_mu)
-	session.model_cancel = true
-	sync.mutex_unlock(&session.model_mu)
+	if sync.mutex_guard(&session.model_mu) {
+		session.model_cancel = true
+	}
 	agent.owner_wake_signal()
 }
 
 @(require_results)
 acp_model_cancel_take :: proc(session: ^ACP_Session) -> (bool, ACP_Model_Request) {
-	sync.mutex_lock(&session.model_mu)
+	sync.mutex_guard(&session.model_mu)
 	cancel := session.model_cancel
 	session.model_cancel = false
 	request: ACP_Model_Request
@@ -205,7 +197,6 @@ acp_model_cancel_take :: proc(session: ^ACP_Session) -> (bool, ACP_Model_Request
 		request = session.model_request
 		session.model_request = {}
 	}
-	sync.mutex_unlock(&session.model_mu)
 	return cancel, request
 }
 
@@ -259,15 +250,15 @@ acp_model_request_resolve :: proc(session: ^ACP_Session) {
 	app := &session.app
 	provider_id := ""
 	provider_error := false
-	sync.mutex_lock(&app.catalog_mu)
-	for provider in app.setup.catalog.providers {
-		if _, found := agent.catalog_find_model(&app.setup.catalog, provider.id, request.model_id); !found { continue }
-		provider_copy, clone_error := strings.clone(provider.id, app.setup.alloc)
-		provider_id = provider_copy
-		provider_error = clone_error != nil
-		break
+	if sync.mutex_guard(&app.catalog_mu) {
+		for provider in app.setup.catalog.providers {
+			if _, found := agent.catalog_find_model(&app.setup.catalog, provider.id, request.model_id); !found { continue }
+			provider_copy, clone_error := strings.clone(provider.id, app.setup.alloc)
+			provider_id = provider_copy
+			provider_error = clone_error != nil
+			break
+		}
 	}
-	sync.mutex_unlock(&app.catalog_mu)
 	if provider_error {
 		_ = acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INTERNAL, "the provider id could not be allocated")
 		acp_model_request_destroy(&request, session.conn.alloc)
@@ -387,8 +378,7 @@ acp_model_selection_service :: proc(session: ^ACP_Session) -> ai.Provider_Connec
 acp_model_selection_steer :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 	session := cast(^ACP_Session)steer.apply_data
 	_ = acp_model_selection_service(session)
-	sync.mutex_lock(&session.app.run.mu)
-	defer sync.mutex_unlock(&session.app.run.mu)
+	sync.mutex_guard(&session.app.run.mu)
 	return session.app.run.connection
 }
 
@@ -396,8 +386,7 @@ acp_model_selection_steer :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Co
 // decides whether a model selection still has a session to apply to.
 @(require_results)
 acp_session_live :: proc(session: ^ACP_Session) -> bool {
-	sync.mutex_lock(&session.conn.table_mu)
-	defer sync.mutex_unlock(&session.conn.table_mu)
+	sync.mutex_guard(&session.conn.table_mu)
 	return session.id != "" && !session.closing
 }
 
@@ -406,9 +395,10 @@ acp_session_live :: proc(session: ^ACP_Session) -> bool {
 // conversation waits for the open that makes one. Owner thread only.
 @(require_results)
 acp_work_session_valid :: proc(session: ^ACP_Session, work: ACP_Work) -> bool {
-	sync.mutex_lock(&session.conn.table_mu)
-	closing := session.closing
-	sync.mutex_unlock(&session.conn.table_mu)
+	closing := false
+	if sync.mutex_guard(&session.conn.table_mu) {
+		closing = session.closing
+	}
 	switch _ in work.variant {
 	case ACP_Work_Open_Session:
 		return !closing
@@ -530,9 +520,9 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 			agent.owner_wake_wait(seen, nil)
 			continue
 		}
-		sync.mutex_lock(&session.conn.table_mu)
-		session.owner_active = true
-		sync.mutex_unlock(&session.conn.table_mu)
+		if sync.mutex_guard(&session.conn.table_mu) {
+			session.owner_active = true
+		}
 		acp_run_work(session, work)
 		acp_owner_service_end(session)
 		retiring := false
@@ -672,14 +662,14 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 		_ = acp.writer_write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the session directory could not be allocated")
 		return
 	}
-	sync.mutex_lock(&session.conn.table_mu)
-	delete(session.id, session.conn.alloc)
-	session.id = owned_session_id
-	delete(session.title, session.conn.alloc)
-	session.title = owned_title
-	delete(session.workspace, session.conn.alloc)
-	session.workspace = owned_workspace
-	sync.mutex_unlock(&session.conn.table_mu)
+	if sync.mutex_guard(&session.conn.table_mu) {
+		delete(session.id, session.conn.alloc)
+		session.id = owned_session_id
+		delete(session.title, session.conn.alloc)
+		session.title = owned_title
+		delete(session.workspace, session.conn.alloc)
+		session.workspace = owned_workspace
+	}
 	session.opened = true
 
 	if warning := app_tools_refresh(&session.app); warning != "" {
@@ -855,8 +845,7 @@ acp_candidates_destroy :: proc(candidates: [dynamic]Model_Choice, allocator: mem
 acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Model_Choice, bool) {
 	candidates: [dynamic]Model_Choice
 	candidates.allocator = allocator
-	sync.mutex_lock(&app.catalog_mu)
-	defer sync.mutex_unlock(&app.catalog_mu)
+	sync.mutex_guard(&app.catalog_mu)
 	for &provider in app.setup.catalog.providers {
 		if !provider_usable(&provider) { continue }
 		if !provider_configured(app, provider.id) { continue }

@@ -298,29 +298,29 @@ acp_session_create :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^A
 
 	slot := -1
 	victim: ^ACP_Session
-	sync.mutex_lock(&conn.table_mu)
-	for entry, index in conn.sessions {
-		if entry == nil {
-			slot = index
-			break
-		}
-	}
-	if slot < 0 {
+	if sync.mutex_guard(&conn.table_mu) {
 		for entry, index in conn.sessions {
-			if entry.closing || !acp_session_idle(entry) { continue }
-			if victim == nil || entry.last_used < victim.last_used {
-				victim = entry
+			if entry == nil {
 				slot = index
+				break
 			}
 		}
+		if slot < 0 {
+			for entry, index in conn.sessions {
+				if entry.closing || !acp_session_idle(entry) { continue }
+				if victim == nil || entry.last_used < victim.last_used {
+					victim = entry
+					slot = index
+				}
+			}
+		}
+		if slot >= 0 {
+			if victim != nil { victim.closing = true }
+			conn.sessions[slot] = made
+			conn.use_clock += 1
+			made.last_used = conn.use_clock
+		}
 	}
-	if slot >= 0 {
-		if victim != nil { victim.closing = true }
-		conn.sessions[slot] = made
-		conn.use_clock += 1
-		made.last_used = conn.use_clock
-	}
-	sync.mutex_unlock(&conn.table_mu)
 	if slot < 0 {
 		acp_session_free(made)
 		return nil, "this connection is running its maximum number of sessions and all of them are busy; wait for one to finish or close one"
@@ -345,8 +345,7 @@ acp_session_create :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^A
 @(require_results)
 acp_session_find :: proc(conn: ^ACP_Server, id: string) -> ^ACP_Session {
 	if id == "" { return nil }
-	sync.mutex_lock(&conn.table_mu)
-	defer sync.mutex_unlock(&conn.table_mu)
+	sync.mutex_guard(&conn.table_mu)
 	for session in conn.sessions {
 		if session != nil && !session.closing && session.id == id { return session }
 	}
@@ -355,10 +354,9 @@ acp_session_find :: proc(conn: ^ACP_Server, id: string) -> ^ACP_Session {
 
 // acp_session_touch records a use, which is what eviction orders by.
 acp_session_touch :: proc(session: ^ACP_Session) {
-	sync.mutex_lock(&session.conn.table_mu)
+	sync.mutex_guard(&session.conn.table_mu)
 	session.conn.use_clock += 1
 	session.last_used = session.conn.use_clock
-	sync.mutex_unlock(&session.conn.table_mu)
 }
 
 // acp_session_idle reports whether a session has no turn running and no request queued.
@@ -387,9 +385,9 @@ acp_owner_service_end :: proc(session: ^ACP_Session) {
 // acp_session_retire is the worker's last decision: the session has nothing left to serve.
 // Closing the queue turns a request that raced the retirement into a refusal.
 acp_session_retire :: proc(session: ^ACP_Session) {
-	sync.mutex_lock(&session.conn.table_mu)
-	session.closing = true
-	sync.mutex_unlock(&session.conn.table_mu)
+	if sync.mutex_guard(&session.conn.table_mu) {
+		session.closing = true
+	}
 	chan.close(&session.work)
 	sync.atomic_store(&session.retired, true)
 }
@@ -493,12 +491,11 @@ acp_session_release :: proc(session: ^ACP_Session) {
 	setup.model_id = ""
 	delete(session.active_message_id, session.conn.alloc)
 	session.active_message_id = ""
-	sync.mutex_lock(&session.conn.table_mu)
+	sync.mutex_guard(&session.conn.table_mu)
 	delete(session.id, session.conn.alloc)
 	session.id = ""
 	delete(session.title, session.conn.alloc)
 	session.title = ""
 	delete(session.workspace, session.conn.alloc)
 	session.workspace = ""
-	sync.mutex_unlock(&session.conn.table_mu)
 }

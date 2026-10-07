@@ -68,11 +68,16 @@ menu_open_model :: proc(app: ^App) {
 menu_rebuild_model :: proc(app: ^App) {
 	// Catalog publication has its own lock. The current selection is snapshot
 	// state, so it is read under the lock the worker writes it with.
-	sync.mutex_lock(&app.run.mu)
-	current_provider, provider_error := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
-	current_model, model_error := strings.clone(app.run.snap.status.model_id, context.temp_allocator)
-	sync.mutex_unlock(&app.run.mu)
-	if provider_error != nil || model_error != nil {
+	current_provider, current_model := "", ""
+	provider_failed := false
+	if sync.mutex_guard(&app.run.mu) {
+		cloned_provider, provider_error := strings.clone(app.run.snap.status.provider_id, context.temp_allocator)
+		cloned_model, model_error := strings.clone(app.run.snap.status.model_id, context.temp_allocator)
+		current_provider = cloned_provider
+		current_model = cloned_model
+		provider_failed = provider_error != nil || model_error != nil
+	}
+	if provider_failed {
 		// The list is still usable; only the cursor cannot be placed on the
 		// selection that could not be copied.
 		snap_append(app, .Warning, "the current model could not be read for its menu")
@@ -89,31 +94,31 @@ menu_rebuild_model :: proc(app: ^App) {
 		delete(model.model_id, context.temp_allocator)
 	}
 	failed := false
-	sync.mutex_lock(&app.catalog_mu)
-	for &provider in app.setup.catalog.providers {
-		if !agent.provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
-		for &model in app.setup.catalog.models {
-			if model.provider_id != provider.id { continue }
-			// The names are copied while the lock is held: a publication releases the
-			// catalog they were read from, and the list below outlives this scope.
-			provider_id, provider_id_error := strings.clone(provider.id, context.temp_allocator)
-			model_id, model_id_error := strings.clone(model.id, context.temp_allocator)
-			if provider_id_error != nil || model_id_error != nil {
-				delete(provider_id, context.temp_allocator)
-				delete(model_id, context.temp_allocator)
-				failed = true
-				break
+	if sync.mutex_guard(&app.catalog_mu) {
+		for &provider in app.setup.catalog.providers {
+			if !agent.provider_usable(&provider) || !provider_configured(app, provider.id) { continue }
+			for &model in app.setup.catalog.models {
+				if model.provider_id != provider.id { continue }
+				// The names are copied while the lock is held: a publication releases the
+				// catalog they were read from, and the list below outlives this scope.
+				provider_id, provider_id_error := strings.clone(provider.id, context.temp_allocator)
+				model_id, model_id_error := strings.clone(model.id, context.temp_allocator)
+				if provider_id_error != nil || model_id_error != nil {
+					delete(provider_id, context.temp_allocator)
+					delete(model_id, context.temp_allocator)
+					failed = true
+					break
+				}
+				if _, append_error := append(&models, Model_Choice{provider_id = provider_id, model_id = model_id}); append_error != nil {
+					delete(provider_id, context.temp_allocator)
+					delete(model_id, context.temp_allocator)
+					failed = true
+					break
+				}
 			}
-			if _, append_error := append(&models, Model_Choice{provider_id = provider_id, model_id = model_id}); append_error != nil {
-				delete(provider_id, context.temp_allocator)
-				delete(model_id, context.temp_allocator)
-				failed = true
-				break
-			}
+			if failed { break }
 		}
-		if failed { break }
 	}
-	sync.mutex_unlock(&app.catalog_mu)
 	if failed {
 		snap_append(app, .Warning, "the model menu could not be built")
 		return
@@ -201,30 +206,30 @@ menu_open_effort :: proc(app: ^App) {
 	defer delete(levels)
 	current := ""
 	failed := false
-	sync.mutex_lock(&app.run.mu)
-	cloned_current, current_error := strings.clone(app.run.snap.status.effort, context.temp_allocator)
-	if current_error != nil {
-		failed = true
-	}
-	current = cloned_current
-	if _, append_error := append(&levels, "provider default"); append_error != nil {
-		failed = true
-	}
-	if !failed {
-		for level in app.run.snap.status.effort_levels {
-			cloned, clone_error := strings.clone(level, context.temp_allocator)
-			if clone_error != nil {
-				failed = true
-				break
-			}
-			if _, append_error := append(&levels, cloned); append_error != nil {
-				delete(cloned, context.temp_allocator)
-				failed = true
-				break
+	if sync.mutex_guard(&app.run.mu) {
+		cloned_current, current_error := strings.clone(app.run.snap.status.effort, context.temp_allocator)
+		if current_error != nil {
+			failed = true
+		}
+		current = cloned_current
+		if _, append_error := append(&levels, "provider default"); append_error != nil {
+			failed = true
+		}
+		if !failed {
+			for level in app.run.snap.status.effort_levels {
+				cloned, clone_error := strings.clone(level, context.temp_allocator)
+				if clone_error != nil {
+					failed = true
+					break
+				}
+				if _, append_error := append(&levels, cloned); append_error != nil {
+					delete(cloned, context.temp_allocator)
+					failed = true
+					break
+				}
 			}
 		}
 	}
-	sync.mutex_unlock(&app.run.mu)
 	if failed {
 		snap_append(app, .Warning, "the effort menu could not be built")
 		return
@@ -279,32 +284,32 @@ menu_open_session :: proc(app: ^App) {
 	// them the moment the lock is released, so the labels are copied while the lock
 	// that protects them is still held.
 	failed := false
-	sync.mutex_lock(&app.run.mu)
-	active = app.run.snap.active_session
-	for &row in app.run.snap.sessions {
-		label := row.title if row.title != "" else "(untitled)"
-		hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
-		hex := journal.session_id_to_hex(row.id, hex_text[:])
-		row_label, label_error := strings.concatenate({"  " if row.child else "", label}, app.run.alloc)
-		row_detail, detail_error := strings.clone(hex[:SESSION_ID_SHORT_LENGTH], app.run.alloc)
-		if label_error != nil || detail_error != nil {
-			delete(row_label, app.run.alloc)
-			delete(row_detail, app.run.alloc)
-			failed = true
-			break
-		}
-		choice := Choice {
-			label = row_label,
-			detail = row_detail,
-			action = Session_Choice{id = row.id},
-		}
-		if _, append_error := append(&choices, choice); append_error != nil {
-			choice_destroy(&choice, app.run.alloc)
-			failed = true
-			break
+	if sync.mutex_guard(&app.run.mu) {
+		active = app.run.snap.active_session
+		for &row in app.run.snap.sessions {
+			label := row.title if row.title != "" else "(untitled)"
+			hex_text: [journal.SESSION_ID_HEX_LENGTH]u8
+			hex := journal.session_id_to_hex(row.id, hex_text[:])
+			row_label, label_error := strings.concatenate({"  " if row.child else "", label}, app.run.alloc)
+			row_detail, detail_error := strings.clone(hex[:SESSION_ID_SHORT_LENGTH], app.run.alloc)
+			if label_error != nil || detail_error != nil {
+				delete(row_label, app.run.alloc)
+				delete(row_detail, app.run.alloc)
+				failed = true
+				break
+			}
+			choice := Choice {
+				label = row_label,
+				detail = row_detail,
+				action = Session_Choice{id = row.id},
+			}
+			if _, append_error := append(&choices, choice); append_error != nil {
+				choice_destroy(&choice, app.run.alloc)
+				failed = true
+				break
+			}
 		}
 	}
-	sync.mutex_unlock(&app.run.mu)
 	if failed {
 		snap_append(app, .Warning, "the session menu could not be built")
 		return
@@ -390,8 +395,7 @@ handle_menu_key :: proc(app: ^App, key: input.Key_Event) {
 // id, then an explicit "provider/model" pair.
 @(require_results)
 resolve_model_reference :: proc(app: ^App, text: string) -> (provider_id, model_id: string, ok: bool) {
-	sync.mutex_lock(&app.catalog_mu)
-	defer sync.mutex_unlock(&app.catalog_mu)
+	sync.mutex_guard(&app.catalog_mu)
 	// The selection is worker state, so it is read through the lock that publishes
 	// it rather than from the live session.
 	current_provider := runtime_selection_provider(app)

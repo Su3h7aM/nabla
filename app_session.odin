@@ -800,10 +800,11 @@ pending_target_clear :: proc(pending: ^Maybe(Pending_Target), allocator: mem.All
 }
 
 selection_intent_clear :: proc(app: ^App) {
-	sync.mutex_lock(&app.run.mu)
-	pending := app.run.pending
-	app.run.pending = nil
-	sync.mutex_unlock(&app.run.mu)
+	pending: Maybe(Pending_Selection)
+	if sync.mutex_guard(&app.run.mu) {
+		pending = app.run.pending
+		app.run.pending = nil
+	}
 	pending_selection_clear(&pending, app.run.alloc)
 	pending_target_clear(&app.run.pending_target, app.run.alloc)
 }
@@ -826,13 +827,14 @@ selection_request :: proc(app: ^App, provider_id, model_id: string) {
 		snap_append(app, .Error, "the model selection could not be stored")
 		return
 	}
-	sync.mutex_lock(&app.run.mu)
-	previous := app.run.pending
-	app.run.pending = Pending_Selection {
-		provider = provider,
-		model    = model,
+	previous: Maybe(Pending_Selection)
+	if sync.mutex_guard(&app.run.mu) {
+		previous = app.run.pending
+		app.run.pending = Pending_Selection {
+			provider = provider,
+			model    = model,
+		}
 	}
-	sync.mutex_unlock(&app.run.mu)
 	pending_selection_clear(&previous, app.run.alloc)
 	enqueue(app, .Model)
 }
@@ -842,10 +844,11 @@ selection_request :: proc(app: ^App, provider_id, model_id: string) {
 @(require_results)
 app_selection_service :: proc(app: ^App) -> bool {
 	if runtime_stopping(app) { return false }
-	sync.mutex_lock(&app.run.mu)
-	newer := app.run.pending
-	app.run.pending = nil
-	sync.mutex_unlock(&app.run.mu)
+	newer: Maybe(Pending_Selection)
+	if sync.mutex_guard(&app.run.mu) {
+		newer = app.run.pending
+		app.run.pending = nil
+	}
 	if selected, newer_ok := newer.?; newer_ok {
 		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		defer pending_selection_clear(&newer, app.run.alloc)
@@ -854,9 +857,10 @@ app_selection_service :: proc(app: ^App) -> bool {
 		}
 		target, problem := selection_target_resolve(app, selected.provider, selected.model, app.run.alloc)
 		defer if problem != "" { delete(problem, context.temp_allocator) }
-		sync.mutex_lock(&app.run.mu)
-		superseded := app.run.pending != nil
-		sync.mutex_unlock(&app.run.mu)
+		superseded := false
+		if sync.mutex_guard(&app.run.mu) {
+			superseded = app.run.pending != nil
+		}
 		if superseded {
 			agent.model_selection_destroy(&target, app.run.alloc)
 			return false
@@ -888,9 +892,10 @@ app_selection_service :: proc(app: ^App) -> bool {
 		return false
 	}
 	// A newer UI request may arrive while the gate commits or advances compaction.
-	sync.mutex_lock(&app.run.mu)
-	superseded := app.run.pending != nil
-	sync.mutex_unlock(&app.run.mu)
+	superseded := false
+	if sync.mutex_guard(&app.run.mu) {
+		superseded = app.run.pending != nil
+	}
 	if superseded {
 		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		return false
@@ -920,8 +925,7 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 	app := cast(^App)steer.apply_data
 	catalog_selection_sync(app)
 	if app_selection_service(app) { refresh_status(app) }
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	return app.run.connection
 }
 
@@ -931,9 +935,8 @@ app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
 selection_target_resolve :: proc(app: ^App, provider_id, model_id: string, allocator: mem.Allocator) -> (agent.Model_Selection, string) {
 	// The catalog entry is copied out while it is the published one: a refresh releases the
 	// catalog it lives in, and the connection built from it outlives that moment.
-	sync.mutex_lock(&app.catalog_mu)
+	sync.mutex_guard(&app.catalog_mu)
 	resolved, problem := agent.model_selection_resolve(&app.setup.catalog, provider_id, model_id, allocator)
-	sync.mutex_unlock(&app.catalog_mu)
 	return resolved, problem
 }
 
@@ -988,36 +991,36 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 		return false
 	}
 
-	sync.mutex_lock(&app.run.mu)
-	if app.setup.credential != "" {
-		if _, append_error := append(&app.retired_connection_strings, app.setup.credential); append_error != nil {
-			// Keep the old credential rather than freeing it under an operation that
-			// may still be using it.
-			snap_report_dropped_locked(app)
+	if sync.mutex_guard(&app.run.mu) {
+		if app.setup.credential != "" {
+			if _, append_error := append(&app.retired_connection_strings, app.setup.credential); append_error != nil {
+				// Keep the old credential rather than freeing it under an operation that
+				// may still be using it.
+				snap_report_dropped_locked(app)
+			}
 		}
-	}
-	app.setup.credential = credential
-	app.setup.api = api
-	// The endpoint the connection being replaced borrowed stays valid for any turn
-	// that already holds it.
-	if app.endpoint != "" {
-		if _, append_error := append(&app.retired_connection_strings, app.endpoint); append_error != nil {
-			// The endpoint is left unfreed rather than freed under a turn that may
-			// still be talking to it, which is a leak and not a dangling pointer.
-			snap_report_dropped_locked(app)
+		app.setup.credential = credential
+		app.setup.api = api
+		// The endpoint the connection being replaced borrowed stays valid for any turn
+		// that already holds it.
+		if app.endpoint != "" {
+			if _, append_error := append(&app.retired_connection_strings, app.endpoint); append_error != nil {
+				// The endpoint is left unfreed rather than freed under a turn that may
+				// still be talking to it, which is a leak and not a dangling pointer.
+				snap_report_dropped_locked(app)
+			}
 		}
+		app.endpoint = setup_endpoint
+		app.run.connection = ai.Provider_Connection {
+			API        = api,
+			Endpoint   = app.endpoint,
+			Credential = credential,
+		}
+		delete(app.setup.provider_id, app.setup.alloc)
+		app.setup.provider_id = setup_provider
+		delete(app.setup.model_id, app.setup.alloc)
+		app.setup.model_id = setup_model
 	}
-	app.endpoint = setup_endpoint
-	app.run.connection = ai.Provider_Connection {
-		API        = api,
-		Endpoint   = app.endpoint,
-		Credential = credential,
-	}
-	delete(app.setup.provider_id, app.setup.alloc)
-	app.setup.provider_id = setup_provider
-	delete(app.setup.model_id, app.setup.alloc)
-	app.setup.model_id = setup_model
-	sync.mutex_unlock(&app.run.mu)
 	// A follower never records a selection: it would rewrite the user's default model
 	// for a session whose model it does not choose.
 	if app.setup.owns_selection && announce && !app_following(app) {
@@ -1028,9 +1031,8 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 		}
 	}
 	if app.setup.owns_selection {
-		sync.mutex_lock(&app.run.mu)
+		sync.mutex_guard(&app.run.mu)
 		selection_publish_locked(app, target.provider_id, target.model_id, announce)
-		sync.mutex_unlock(&app.run.mu)
 	}
 
 	return true
@@ -1126,8 +1128,7 @@ setup_error_text :: proc(app: ^App) -> string {
 // selection_fail records why a selection could not apply. The model menu shows it
 // directly; chat mode sees it as a transcript warning.
 selection_fail :: proc(app: ^App, message: string) {
-	sync.mutex_lock(&app.run.mu)
-	defer sync.mutex_unlock(&app.run.mu)
+	sync.mutex_guard(&app.run.mu)
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
 	app.run.snap.setup_error_failed = false

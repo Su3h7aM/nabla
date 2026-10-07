@@ -242,9 +242,11 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	// and survives this reset. The previous frame was already presented, so its
 	// remaining borrows are dead and the pool can be recycled.
 	free_all(context.temp_allocator)
-	sync.mutex_lock(&app.run.mu)
-	cursor, err := render_frame(app, storage)
-	sync.mutex_unlock(&app.run.mu)
+	cursor: term.Cursor
+	err: Render_Status
+	if sync.mutex_guard(&app.run.mu) {
+		cursor, err = render_frame(app, storage)
+	}
 	if err != .None {
 		return
 	}
