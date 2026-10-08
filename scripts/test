@@ -41,6 +41,13 @@ done
 timeout_secs=300
 collection="-collection:nabla=$NABLA_ROOT"
 
+# odin test writes its binary to ./<package>.bin and deletes it after the run, so two runs
+# of one package, from two shells or two agents, overwrite and unlink each other's running
+# binary: the tests then fail with Not_Exist, or the binary crashes. Every run builds into
+# a directory of its own instead.
+out_directory="$(mktemp -d "${TMPDIR:-/tmp}/nabla-test.XXXXXX")"
+trap 'rm -rf "$out_directory"' EXIT
+
 # Both configurations run: -debug carries extra contract asserts (notably in
 # layout and tui) that release compiles out, while release tests the exact
 # codegen that ships. One mode cannot stand in for the other.
@@ -56,6 +63,7 @@ for config in "${configs[@]}"; do
 		[[ -n "$target" && "$target" != "$pkg" ]] && continue
 		extra=(
 			-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+			"-out:$out_directory/${pkg//\//_}-$config.bin"
 			"${NABLA_DEFINES[@]}"
 		)
 		[[ $config == debug ]] && extra+=(-debug)
