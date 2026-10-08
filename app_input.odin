@@ -66,6 +66,24 @@ command_split :: proc(text: string) -> (name, argument: string) {
 	return trimmed[:space], strings.trim_space(trimmed[space + 1:])
 }
 
+// command_shaped reports whether text starts with a word shaped like a command name: a
+// slash followed by letters, digits, '-', or '_'. Such a word is read as a command, known
+// or not, so a typo is reported rather than sent. Any other text that starts with a slash,
+// such as a path, is a prompt.
+@(require_results)
+command_shaped :: proc(text: string) -> bool {
+	name, _ := command_split(text)
+	if len(name) < 2 || name[0] != '/' { return false }
+	for character in name[1:] {
+		switch character {
+		case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '-', '_':
+		case:
+			return false
+		}
+	}
+	return true
+}
+
 // command_prefixed reports whether the typed text is a prefix of a command,
 // ignoring case so a capital is a typo rather than a miss.
 @(require_results)
@@ -469,8 +487,12 @@ submit :: proc(app: ^App) {
 		completion_reset(app)
 		return
 	}
-	if strings.has_prefix(text, "/") {
-		dispatch_command(app, text)
+	if command_shaped(text) {
+		if !dispatch_command(app, text) {
+			// An unknown command stays in the prompt, so a typo is fixed rather than retyped.
+			completion_reset(app)
+			return
+		}
 	} else {
 		// A follower has no turn of its own to steer: its line goes to the runner as a
 		// prompt, and the runner delivers it at its next settled point.
@@ -533,20 +555,20 @@ restore_steering :: proc(app: ^App) {
 // dispatch_command routes one slash command. The name comes from the command
 // table, so a command that completion and help know about is always one dispatch
 // can run; the switch decides what that command does. Everything else is reported
-// as unknown rather than sent to the model.
-dispatch_command :: proc(app: ^App, text: string) {
+// as unknown rather than sent to the model, and dispatch_command returns false.
+dispatch_command :: proc(app: ^App, text: string) -> bool {
 	name, argument := command_split(text)
 	command, found := command_find(name)
 	if !found {
 		snap_append(app, .Notice, fmt.tprintf("unknown command: %s (try /help)", name))
-		return
+		return false
 	}
 	// A command whose argument is chosen from a list opens that list when given no
 	// argument. One rule covers every such command, and it is the same rule
 	// completion applies to a completed name.
 	if argument == "" && command.open_menu != nil {
 		command.open_menu(app)
-		return
+		return true
 	}
 	switch command.id {
 	case .Quit:
@@ -573,6 +595,7 @@ dispatch_command :: proc(app: ^App, text: string) {
 			selection_request(app, provider_id, model_id)
 		}
 	}
+	return true
 }
 
 enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {

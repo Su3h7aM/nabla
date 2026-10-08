@@ -142,6 +142,32 @@ test_an_unknown_command_is_reported :: proc(t: ^testing.T) {
 	testing.expect(t, !app.menu_open, "an unknown command opens nothing")
 }
 
+// Only a word shaped like a command name is a command. A prompt that starts with a path
+// is sent like any prompt, while an unknown command is reported and stays in the prompt.
+@(test)
+test_a_leading_path_is_a_prompt_and_an_unknown_command_stays :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+
+	if !testing.expect(t, widgets.input_insert(&app.input, "/tmp/shot.png what is this?")) { return }
+	submit(&app)
+	work, received := chan.try_recv(app.run.work)
+	if !testing.expect(t, received, "the prompt should be queued for the worker") { return }
+	testing.expect_value(t, work.kind, Work_Kind.Prompt)
+	testing.expect_value(t, work.text, "/tmp/shot.png what is this?")
+	work_destroy(&app, work)
+	for entry in app.run.snap.entries {
+		testing.expect(t, entry.kind != .Notice, "a path is not an unknown command")
+	}
+
+	if !testing.expect(t, widgets.input_insert(&app.input, "/hepl")) { return }
+	submit(&app)
+	testing.expect_value(t, widgets.input_text(&app.input), "/hepl")
+	_, queued := chan.try_recv(app.run.work)
+	testing.expect(t, !queued, "an unknown command is not sent")
+}
+
 @(test)
 test_effort_menu_offers_the_default_and_every_level :: proc(t: ^testing.T) {
 	app: App
