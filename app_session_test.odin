@@ -811,8 +811,7 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 	testing.expect(t, !recorded, "a takeover must not rewrite the default model")
 }
 
-// app_entries returns every entry the screen shows, after the window has caught up with the
-// head the session has committed.
+// app_entries returns every entry on screen once the window has caught up with the committed head.
 app_entries :: proc(app: ^App) -> []^Entry {
 	storage := app_frame_storage(40)
 	defer frame_storage_destroy(storage)
@@ -876,8 +875,7 @@ app_has_text :: proc(entries: []Entry, text: string) -> bool {
 SCROLL_ROWS :: 40
 SCROLL_PAGE :: SCROLL_ROWS - 3
 
-// Paging up through a session far longer than the window reaches its first prompt while
-// the window stays within its budget, and paging down returns to the newest answer.
+// Paging up reaches the first prompt of a session far longer than the window, within its budget, and paging down returns to the newest answer.
 @(test)
 test_scrolling_reaches_the_first_prompt_with_a_bounded_window :: proc(t: ^testing.T) {
 	app: App
@@ -915,8 +913,7 @@ test_scrolling_reaches_the_first_prompt_with_a_bounded_window :: proc(t: ^testin
 	testing.expect(t, app_has_text(app.transcript.entries[:], fmt.tprintf("answer %d", TURNS)), "paging down returns to the newest answer")
 }
 
-// A prompt that came before a compaction checkpoint is still reachable, and the checkpoint
-// shows as a notice where it happened.
+// A prompt before a compaction checkpoint is reachable, and the checkpoint shows as a notice.
 @(test)
 test_scrolling_reaches_the_prompts_before_a_checkpoint :: proc(t: ^testing.T) {
 	app: App
@@ -949,8 +946,7 @@ test_scrolling_reaches_the_prompts_before_a_checkpoint :: proc(t: ^testing.T) {
 	testing.expect(t, noticed, "the checkpoint shows where it happened")
 }
 
-// A result that carries a large picture does not cost the entries around it: every earlier
-// entry, the box, and the answer after it stay reachable.
+// A result with a large picture keeps every entry around it reachable.
 @(test)
 test_a_large_picture_keeps_every_entry_reachable :: proc(t: ^testing.T) {
 	app: App
@@ -1002,8 +998,7 @@ test_a_large_picture_keeps_every_entry_reachable :: proc(t: ^testing.T) {
 	}
 }
 
-// An answer being streamed shows live, and shows once when its node is committed; a call
-// running shows live, and its box settles in place and shows once when its results are committed.
+// Live entries give way to their committed form, and a running box settles in place.
 @(test)
 test_live_entries_give_way_to_their_committed_form :: proc(t: ^testing.T) {
 	app: App

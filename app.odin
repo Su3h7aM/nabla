@@ -23,9 +23,7 @@ import "nabla:tui/widgets"
 
 WORK_CAPACITY :: 16
 
-// Entry is one rendered conversation line group: a role or diagnostic plus
-// its text, owned by the layer that holds it: the snapshot for a live entry, the
-// transcript window for an entry made from a journal node.
+// Entry is one rendered conversation line group. The snapshot owns a live entry, the transcript window an entry made from a node.
 Entry_Kind :: enum u8 {
 	User,
 	Assistant,
@@ -39,10 +37,7 @@ Entry_Kind :: enum u8 {
 Entry :: struct {
 	kind:            Entry_Kind,
 	text:            [dynamic]u8, // owned,
-	// id names this entry for as long as it is on screen. The frame carries it on
-	// a tool box, and the mouse report is answered by id rather than by position,
-	// which is what keeps a box under the pointer its own after the transcript
-	// slid to other nodes. Zero is not an entry.
+	// id names an entry while it is on screen and travels on a tool box to the mouse. Zero is not an entry.
 	id:              u64,
 	// node is the journal node a window entry was made from; zero for a live entry.
 	node:            journal.Node_Id,
@@ -73,8 +68,7 @@ Entry :: struct {
 	// scroll, which is what tells the wheel the transcript behind it owns the
 	// report.
 	tool_scroll_max: int,
-	// image is the picture the call's result carried, drawn inside the box. Its
-	// id is zero when the entry has none.
+	// image is the picture of the call's result; its id is zero when there is none.
 	image:           Entry_Image,
 }
 
@@ -114,8 +108,7 @@ Status :: struct {
 	retrying:             bool,
 }
 
-// TRANSCRIPT_IMAGE_MAX_BYTES bounds the picture pixels live entries hold. Past it the
-// oldest pictures are released and their boxes keep the text preview. Window pictures are bounded by the window.
+// TRANSCRIPT_IMAGE_MAX_BYTES bounds the picture pixels live entries hold; past it the oldest are released. Window pictures are bounded by the window.
 TRANSCRIPT_IMAGE_MAX_BYTES :: 64 * mem.Megabyte
 
 // snapshot_transcript_own points the transcript at the run's allocator, so every
@@ -158,18 +151,15 @@ Snapshot :: struct {
 	image_bytes:        int,
 	// display_incomplete records that a line or status field could not be kept.
 	display_incomplete: bool,
-	// head_session and head are the session shown and its committed head, which the
-	// transcript window reads up to. after is the in-memory head, which new live entries follow.
+	// head_session and head are the session shown and its committed head; after is the in-memory head new live entries follow.
 	head_session:       journal.Session_Id,
 	head:               journal.Node_Id,
 	after:              journal.Node_Id,
 	// next_entry_id numbers the live entries.
 	next_entry_id:      u64,
-	// images_enabled says the terminal draws images, so a tool result's picture is
-	// kept for the box. It is set once before the first entry is shown.
+	// images_enabled says the terminal draws images; it is set once before the first entry.
 	images_enabled:     bool,
-	// next_image_id numbers the pictures the live entries and the window keep; a number
-	// is never reused, so a terminal image is never mistaken for a later one.
+	// next_image_id numbers pictures; a number is never reused.
 	next_image_id:      u32,
 	status:             Status,
 	// sessions is what the /resume menu offers. Only the worker reads the store,
@@ -461,9 +451,7 @@ tui_run :: proc(
 	snapshot_transcript_own(app)
 	// Only a terminal that draws images keeps the pictures of tool results.
 	app.run.snap.images_enabled = term.graphics_detect(term.profile_default().color_depth)
-	// The resumed conversation is shown before the first prompt, so the screen
-	// matches the history the next request will be built from: the transcript window
-	// reads it from the journal up to the head published here.
+	// The window reads the resumed conversation from the journal up to this head.
 	head_publish(app)
 	session_opened_show(app)
 	app.home = os.get_env("HOME", app.run.alloc)
@@ -675,8 +663,7 @@ tui_wait_ms :: proc(app: ^App) -> i64 {
 	return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
 }
 
-// viewport_adopt records the terminal's size in cells and, when it reports pixels, the
-// size of one cell, which a picture's size in cells follows from.
+// viewport_adopt records the terminal's size in cells and the size of a cell in pixels.
 viewport_adopt :: proc(app: ^App, viewport: term.Viewport) {
 	app.columns, app.rows = viewport.columns, viewport.rows
 	if viewport.columns > 0 && viewport.rows > 0 {

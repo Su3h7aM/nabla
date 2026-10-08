@@ -194,16 +194,11 @@ Frame_Storage :: struct {
 	// outgrows it, and this is the base a raise is computed from.
 	capacities:        layout.Capacities,
 	measure:           tui.Measure_Context,
-	// conversation_rows is the height of the transcript's area in the frame being
-	// drawn, which bounds the height of a picture in it.
+	// conversation_rows is the transcript area's height in the frame being drawn, which bounds a picture.
 	conversation_rows: int,
-	// cell_pixels is the size of one terminal cell in pixels, zero when the terminal
-	// reports none. A picture's size in cells follows from it.
+	// cell_pixels is the size of a terminal cell in pixels, zero when unknown.
 	cell_pixels:       [2]int,
-	// shown is the images this frame draws and their sizes in cells. placed is what
-	// the terminal holds, the main thread's record of what it was sent. uploads is
-	// the pictures taken from their entries and not yet accepted by the terminal,
-	// and stale is the placed images whose entries left the transcript.
+	// shown is the images this frame draws; placed is what the terminal holds; uploads and stale are the work images_collect found between them.
 	shown:             [dynamic]Image_Placement,
 	placed:            [dynamic]Image_Placement,
 	uploads:           [dynamic]Image_Upload,
@@ -597,11 +592,7 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 	return true
 }
 
-// draw_conversation_image draws one picture's placeholder cells and records the
-// image as shown at its size. The picture can reach past the transcript's bottom
-// edge, where the prompt and footer are drawn after it, so it draws into a view
-// of the grid that ends at the transcript's last row: tui clips a rect to its
-// buffer, and the rows of the picture that remain are the visible ones.
+// draw_conversation_image draws a picture's placeholder cells into a view of the grid that ends at the transcript's last row, so the part below it is clipped, and records it as shown.
 @(require_results)
 draw_conversation_image :: proc(storage: ^Frame_Storage, bounds: layout.Rect, id: term.Image_Id, viewport: tui.Cell_Rect) -> bool {
 	rect, project_err := tui.project_rect_integral(bounds)
@@ -882,10 +873,7 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	}
 }
 
-// declare_tool_image reserves the rows of a box's picture below its text, inside the
-// border: a bar column on each side and, between them, the picture one cell in from
-// the left bar, the way a text row is inset. The picture is a layout image whose
-// solved rect is where draw_conversation_image places its cells.
+// declare_tool_image reserves a box's picture rows below its text, inside the border.
 declare_tool_image :: proc(ctx: ^layout.Context, id: term.Image_Id, columns, rows, content_width: int, border: layout.Text_Style, vertical: string) {
 	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
 		declare_tool_bars(ctx, rows, border, vertical)

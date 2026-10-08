@@ -627,8 +627,7 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	return true
 }
 
-// session_opened_show says what a just opened session shows besides its journal history: that
-// it is followed, and the lines the runner has not delivered. It consumes follow_pending.
+// session_opened_show says that the session is followed and shows the lines the runner has not delivered, consuming follow_pending.
 session_opened_show :: proc(app: ^App) {
 	defer {
 		journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
@@ -988,8 +987,7 @@ observer_assistant_end :: proc(user_data: rawptr) {
 	snap_publish_locked(app)
 }
 
-// snap_after_update_locked makes the entries made next follow the head in memory. Only
-// the worker calls it, since only the worker may read the session.
+// snap_after_update_locked makes new live entries follow the in-memory head. Worker thread only.
 snap_after_update_locked :: proc(app: ^App) {
 	app.run.snap.after = max(app.run.snap.head, app.setup.session.head)
 }

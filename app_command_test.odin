@@ -142,8 +142,7 @@ test_an_unknown_command_is_reported :: proc(t: ^testing.T) {
 	testing.expect(t, !app.menu_open, "an unknown command opens nothing")
 }
 
-// Only a word shaped like a command name is a command. A prompt that starts with a path
-// is sent like any prompt, while an unknown command is reported and stays in the prompt.
+// Only a word shaped like a command name is a command; a path is a prompt, and an unknown command stays in the prompt.
 @(test)
 test_a_leading_path_is_a_prompt_and_an_unknown_command_stays :: proc(t: ^testing.T) {
 	app: App

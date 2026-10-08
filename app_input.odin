@@ -66,10 +66,7 @@ command_split :: proc(text: string) -> (name, argument: string) {
 	return trimmed[:space], strings.trim_space(trimmed[space + 1:])
 }
 
-// command_shaped reports whether text starts with a word shaped like a command name: a
-// slash followed by letters, digits, '-', or '_'. Such a word is read as a command, known
-// or not, so a typo is reported rather than sent. Any other text that starts with a slash,
-// such as a path, is a prompt.
+// command_shaped reports whether text starts with a slash and a word of letters, digits, '-' or '_'; such a word is a command, known or not.
 @(require_results)
 command_shaped :: proc(text: string) -> bool {
 	name, _ := command_split(text)

@@ -11,8 +11,7 @@ import "nabla:ai"
 import "nabla:term"
 import "nabla:tui/widgets"
 
-// image_test_png is a black 8-bit RGB PNG file of the given size, written with stored
-// deflate blocks because core:image has no encoder.
+// image_test_png is a black 8-bit RGB PNG of the given size, with stored deflate blocks.
 image_test_png :: proc(width, height: u32) -> []byte {
 	STORED_BLOCK_MAX :: 65535
 	file := make([dynamic]byte, context.temp_allocator)
@@ -78,9 +77,7 @@ image_test_app :: proc(app: ^App, enabled: bool, columns, rows: int, width, heig
 	observer_tool_result(app, 5, 0, "read", `{"path":"a.png"}`, &result)
 }
 
-// A picture the read tool attached is drawn inside its box, scaled down to the box's
-// width and half the conversation's rows at the terminal's cell size, and clipped by
-// the transcript like the text around it.
+// A picture is drawn inside its box, scaled to the box width and half the conversation's rows, and clipped with the transcript.
 @(test)
 test_tool_image_is_drawn_inside_the_box :: proc(t: ^testing.T) {
 	app := new(App)
@@ -113,8 +110,7 @@ test_tool_image_is_drawn_inside_the_box :: proc(t: ^testing.T) {
 	testing.expect_value(t, storage.buffer.cells[prompt_top + 1].grapheme, "╭")
 }
 
-// A large picture stays within the maximums and leaves the prompt alone, and a tiny
-// one is enlarged to the minimum height with its aspect ratio kept.
+// A large picture stays within the maximums, and a tiny one is enlarged to the minimum height.
 @(test)
 test_tool_image_size_is_bounded :: proc(t: ^testing.T) {
 	app := new(App)
@@ -156,8 +152,7 @@ test_tool_image_size_is_bounded :: proc(t: ^testing.T) {
 	testing.expect_value(t, small_storage.shown[0].rows, IMAGE_MIN_ROWS)
 }
 
-// A picture the terminal did not take stays pending and is sent again by the next frame,
-// and the failure is reported once.
+// A picture the terminal did not take is sent again by the next frame; the failure is reported once.
 @(test)
 test_failed_transmit_is_retried :: proc(t: ^testing.T) {
 	app := new(App)
@@ -184,8 +179,7 @@ test_failed_transmit_is_retried :: proc(t: ^testing.T) {
 	testing.expect_value(t, warnings, 1)
 }
 
-// A terminal without graphics keeps the text preview only: the entry holds no picture
-// and the frame has no placeholder.
+// A terminal without graphics keeps the text preview only.
 @(test)
 test_tool_image_is_not_kept_without_graphics :: proc(t: ^testing.T) {
 	app := new(App)
@@ -203,8 +197,7 @@ test_tool_image_is_not_kept_without_graphics :: proc(t: ^testing.T) {
 	testing.expect_value(t, image_test_count_placeholders(storage), 0)
 }
 
-// A picture larger than IMAGE_MAX_EDGE is shrunk with its aspect ratio kept, so the
-// entry holds and the terminal is sent no more than the shrunk pixels.
+// A picture larger than IMAGE_MAX_EDGE is shrunk with its aspect ratio kept.
 @(test)
 test_large_picture_is_shrunk :: proc(t: ^testing.T) {
 	app := new(App)
@@ -269,8 +262,7 @@ test_unreadable_jpeg_leaves_the_text_preview :: proc(t: ^testing.T) {
 	testing.expect_value(t, image_test_count_placeholders(storage), 0)
 }
 
-// A photo the read tool attached charges only the picture budget: the entries before it,
-// its box, and the answer after it all stay.
+// A large picture charges only the picture budget; the entries around it stay.
 @(test)
 test_large_picture_keeps_the_transcript :: proc(t: ^testing.T) {
 	app := new(App)
@@ -290,8 +282,7 @@ test_large_picture_keeps_the_transcript :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.run.snap.image_bytes, app.run.snap.entries[2].image.bytes)
 }
 
-// A picture that does not fit the picture budget releases the oldest pictures, oldest
-// first. Every entry stays, and the released box's picture is deleted from the terminal.
+// A picture past the budget releases the oldest pictures; every entry stays.
 @(test)
 test_picture_budget_releases_the_oldest_picture :: proc(t: ^testing.T) {
 	PICTURE_BYTES :: 48
@@ -339,8 +330,7 @@ test_picture_budget_releases_the_oldest_picture :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.run.snap.image_bytes, 2 * PICTURE_BYTES)
 }
 
-// Releasing a picture that is placed on the terminal or waiting in an upload deletes the
-// terminal image on the next frame and frees the pending pixels.
+// Releasing a placed or pending picture deletes the terminal image on the next frame.
 @(test)
 test_released_picture_is_deleted_from_the_terminal :: proc(t: ^testing.T) {
 	app := new(App)

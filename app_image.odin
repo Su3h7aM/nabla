@@ -1,10 +1,7 @@
 #+build linux
 package main
 
-// The pictures a tool result carries, drawn inside the call's box on a terminal
-// that supports Kitty graphics placeholders. The entry owns the picture and the
-// main thread owns what the terminal holds: the frame draws placeholder cells,
-// and present_frame sends, resizes, and frees terminal images to match them.
+// Pictures of tool results, drawn inside the call's box on a terminal with Kitty graphics placeholders.
 
 import "base:runtime"
 import "core:fmt"
@@ -17,38 +14,26 @@ import "core:sync"
 import "nabla:ai"
 import "nabla:term"
 
-// IMAGE_MAX_ROWS is the tallest a picture is drawn, and half the conversation's
-// rows is the tallest on a short terminal. A screenshot stays readable at 24 rows,
-// and the text around the picture stays on screen.
+// IMAGE_MAX_ROWS is the tallest a picture is drawn; half the conversation's rows is the tallest on a short terminal.
 IMAGE_MAX_ROWS :: 24
 #assert(IMAGE_MAX_ROWS <= term.GRAPHICS_MAX_ROWS)
 
-// IMAGE_MIN_ROWS is the height a smaller picture is enlarged to, because an icon
-// at its natural size is a few cells and cannot be read. The maximums win when
-// they are smaller.
+// IMAGE_MIN_ROWS is the height a smaller picture is enlarged to so an icon stays readable; the maximums win.
 IMAGE_MIN_ROWS :: 8
 #assert(IMAGE_MIN_ROWS <= IMAGE_MAX_ROWS)
 
-// IMAGE_MAX_COLUMNS is the widest a picture is drawn. A wide terminal would
-// otherwise stretch a picture across the whole screen, far past a readable size.
+// IMAGE_MAX_COLUMNS is the widest a picture is drawn.
 IMAGE_MAX_COLUMNS :: 80
 #assert(IMAGE_MAX_COLUMNS <= term.GRAPHICS_MAX_COLUMNS)
 
-// IMAGE_CELL_WIDTH and IMAGE_CELL_HEIGHT are the pixels assumed for one cell when
-// the terminal reports no pixel size.
+// IMAGE_CELL_WIDTH and IMAGE_CELL_HEIGHT are the pixels assumed for a cell when the terminal reports none.
 IMAGE_CELL_WIDTH :: 8
 IMAGE_CELL_HEIGHT :: 16
 
-// IMAGE_MAX_EDGE is the longest side, in pixels, a prepared picture keeps. A
-// picture of IMAGE_MAX_COLUMNS cells at a large HiDPI cell width is about this
-// wide, so a larger picture only costs transfer time and memory.
+// IMAGE_MAX_EDGE is the longest side, in pixels, a prepared picture keeps; a larger one only costs transfer time and memory.
 IMAGE_MAX_EDGE :: 1024
 
-// Entry_Image is the picture of one tool box. The terminal names it by id, which
-// is zero when the entry has none. pixels is what the terminal is sent, the RGB or RGBA
-// pixels the picture decoded to, at most IMAGE_MAX_EDGE on a side, owned by the
-// run's allocator. bytes is what the picture charged to Snapshot.image_bytes. It stays
-// after images_collect moves the pixels to an upload, which holds bytes already counted.
+// Entry_Image is the picture of one tool box. id is zero when there is none. pixels are RGB or RGBA, at most IMAGE_MAX_EDGE on a side, owned by the run's allocator; bytes is what it charged to Snapshot.image_bytes.
 Entry_Image :: struct {
 	id:     term.Image_Id,
 	pixels: [dynamic]u8, // owned,
@@ -65,11 +50,7 @@ Image_Placement :: struct {
 	rows:    int,
 }
 
-// Image_Upload is an image the terminal does not have yet. It owns the pixels
-// that images_collect moved out of the entry under the lock, so the lock never
-// copies them and the entry can be dropped while they are sent. The frame storage
-// frees them when the terminal takes the image, when the entry is gone, or when
-// the storage is destroyed.
+// Image_Upload is an image the terminal does not have yet; it owns the pixels images_collect moved out of the entry.
 Image_Upload :: struct {
 	pixels:    [dynamic]u8, // owned,
 	format:    term.Image_Format,
@@ -85,13 +66,8 @@ entry_destroy :: proc(entry: ^Entry) {
 	delete(entry.image.pixels)
 }
 
-// image_prepare makes the picture of the first PNG or JPEG among attachments,
-// decoded to 8-bit RGB or RGBA pixels and shrunk to IMAGE_MAX_EDGE. GIF, WebP,
-// and PDF keep the text preview only, and so does a file that cannot be read.
-// It runs on the calling thread before the runtime mutex is taken. The result
-// owns its pixels with the run's allocator and has no id yet; its pixels are
-// empty when there is no picture. images_enabled is set before any thread that
-// calls this starts, so it is read without the lock.
+// image_prepare returns the picture of the first PNG or JPEG among attachments, shrunk to IMAGE_MAX_EDGE; its pixels are empty when there is none.
+// The result is owned by the run's allocator and has no id yet. Call it outside the runtime mutex.
 image_prepare :: proc(app: ^App, attachments: []ai.Provider_Attachment) -> (image: Entry_Image) {
 	if !app.run.snap.images_enabled { return }
 	for attachment in attachments {
@@ -105,14 +81,8 @@ image_prepare :: proc(app: ^App, attachments: []ai.Provider_Attachment) -> (imag
 	return
 }
 
-// snap_entry_image_set_locked moves a prepared picture into an entry and numbers
-// it, leaving image empty. A picture it cannot take stays with the caller, who
-// frees it: one larger than budget, one for an entry that has a picture, or one
-// with no id left. Otherwise the oldest pictures are released until this one fits
-// in budget. The picture is charged to Snapshot.image_bytes here, and the charge
-// ends when the picture is released or its entry leaves the transcript; pixels
-// moved into Frame_Storage.uploads stay charged until then. The caller holds the
-// runtime mutex.
+// snap_entry_image_set_locked numbers a prepared picture and moves it into a live entry, releasing the oldest pictures until it fits budget.
+// A picture it cannot take stays with the caller. The caller holds the runtime mutex.
 snap_entry_image_set_locked :: proc(app: ^App, entry: ^Entry, image: ^Entry_Image, budget := TRANSCRIPT_IMAGE_MAX_BYTES) {
 	if image == nil || len(image.pixels) == 0 || entry.image.id != 0 || app.run.snap.next_image_id + 1 >= u32(term.IMAGE_ID_LIMIT) {
 		return
@@ -127,11 +97,7 @@ snap_entry_image_set_locked :: proc(app: ^App, entry: ^Entry, image: ^Entry_Imag
 	app.run.snap.image_bytes += entry.image.bytes
 }
 
-// snap_images_release_locked releases the pictures of the oldest entries, oldest
-// first, until the snapshot holds at most limit bytes of pictures. The boxes keep
-// their text. The next frame deletes the terminal image of each: images_collect
-// finds its id gone from the entries, deletes the placed image, and frees pixels
-// still waiting in an upload. The caller holds the runtime mutex.
+// snap_images_release_locked releases the oldest pictures until at most limit bytes remain; the boxes keep their text. The caller holds the runtime mutex.
 snap_images_release_locked :: proc(app: ^App, limit: int) {
 	for &entry in app.run.snap.entries {
 		if app.run.snap.image_bytes <= limit { return }
@@ -144,9 +110,7 @@ snap_images_release_locked :: proc(app: ^App, limit: int) {
 	}
 }
 
-// image_decode decodes a PNG or JPEG file into prepared, whose pixels the decoder
-// allocates with the run's allocator, and shrinks it to IMAGE_MAX_EDGE. prepared
-// stays empty when it cannot.
+// image_decode decodes a PNG or JPEG into prepared, shrunk to IMAGE_MAX_EDGE; prepared stays empty on failure.
 image_decode :: proc(app: ^App, data: []byte, prepared: ^Entry_Image) {
 	// image.destroy frees the metadata with the context's allocator.
 	context.allocator = app.run.alloc
@@ -174,10 +138,7 @@ image_decode :: proc(app: ^App, data: []byte, prepared: ^Entry_Image) {
 	}
 }
 
-// image_shrink scales image down to new_width by new_height, which are no larger
-// than its size, and replaces its pixels with a buffer allocated with allocator.
-// Each new pixel is the mean of the old pixels it covers. False means the
-// allocation failed and image is unchanged.
+// image_shrink scales image down to new_width by new_height, averaging the pixels each covers. False means the allocation failed and image is unchanged.
 image_shrink :: proc(image: ^Entry_Image, new_width, new_height: int, allocator: runtime.Allocator) -> bool {
 	channels := 3 if image.format == .RGB else 4
 	pixels, allocation_error := make([dynamic]u8, new_width * new_height * channels, allocator)
@@ -206,12 +167,7 @@ image_shrink :: proc(image: ^Entry_Image, new_width, new_height: int, allocator:
 	return true
 }
 
-// image_cells sizes a picture in cells: its natural size at the given pixels per
-// cell (a zero size assumes the default), enlarged with its aspect ratio kept
-// until it is IMAGE_MIN_ROWS tall when it is smaller, and shrunk to fit
-// available_columns, IMAGE_MAX_COLUMNS, IMAGE_MAX_ROWS, and half of
-// conversation_rows. The maximums win over the minimum. The result is at least
-// one cell. image must be prepared.
+// image_cells sizes a picture in cells from its natural size at cell_pixels, within the minimum and maximum rows and columns. image must be prepared.
 image_cells :: proc(image: Entry_Image, available_columns, conversation_rows: int, cell_pixels: [2]int) -> (columns, rows: int) {
 	cell_width := cell_pixels.x if cell_pixels.x > 0 else IMAGE_CELL_WIDTH
 	cell_height := cell_pixels.y if cell_pixels.y > 0 else IMAGE_CELL_HEIGHT
@@ -226,9 +182,7 @@ image_cells :: proc(image: Entry_Image, available_columns, conversation_rows: in
 	return
 }
 
-// image_attach numbers a prepared picture and moves it into a window entry, leaving image
-// empty. A picture it cannot number stays with the caller, who frees it. The window's
-// pictures are not charged to the live budget.
+// image_attach numbers a prepared picture and moves it into a window entry, leaving image empty. A picture it cannot number stays with the caller.
 image_attach :: proc(app: ^App, entry: ^Entry, image: ^Entry_Image) {
 	if len(image.pixels) == 0 { return }
 	sync.mutex_guard(&app.run.mu)
@@ -251,12 +205,8 @@ snap_image_entry_locked :: proc(app: ^App, id: term.Image_Id) -> ^Entry {
 	return nil
 }
 
-// images_collect works out, from the frame just composed, what the terminal must
-// be told: the shown images it does not hold yet, whose pixels move from their
-// entries to storage.uploads, and the images it holds whose entries left the
-// transcript. Moving is a slice header, so the lock covers no copy of the pixels.
-// A pending upload whose entry left is freed. A failed allocation skips the item,
-// and the next frame finds it again. The caller holds the runtime mutex.
+// images_collect works out what the terminal must be told after a frame: the shown images it does not hold, whose pixels move to storage.uploads,
+// and the held images whose entries left. The caller holds the runtime mutex.
 images_collect :: proc(app: ^App, storage: ^Frame_Storage) {
 	clear(&storage.stale)
 	for placed in storage.placed {
@@ -304,11 +254,7 @@ image_upload_find :: proc(uploads: []Image_Upload, id: term.Image_Id) -> int {
 	return -1
 }
 
-// images_sync brings the terminal to what images_collect found: it frees stale
-// images, sends new ones, and re-places a shown image whose size changed. It runs
-// on the main thread before the frame is presented and holds no lock. A failed
-// write is reported once and never stops the frame; the image stays pending or
-// keeps its old size, so the next frame tries it again while its entry exists.
+// images_sync brings the terminal to what images_collect found. It runs on the main thread without the lock; a failed write is reported once and retried next frame.
 images_sync :: proc(app: ^App, storage: ^Frame_Storage) {
 	for id in storage.stale {
 		_, delete_error := term.graphics_delete(app.terminal, id, context.temp_allocator)
@@ -341,8 +287,7 @@ images_sync :: proc(app: ^App, storage: ^Frame_Storage) {
 	}
 }
 
-// images_report says once that a terminal image write failed. The text of the
-// result stays in the box, so nothing is lost.
+// images_report says once that a terminal image write failed.
 images_report :: proc(app: ^App, storage: ^Frame_Storage, err: term.Error) {
 	if err == nil || storage.graphics_failed { return }
 	storage.graphics_failed = true

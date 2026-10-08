@@ -12,9 +12,7 @@ import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:layout"
 
-// TRANSCRIPT_WINDOW_SCREENS is the screens of the conversation area the window holds: the
-// visible one, two above, and two below. The user asked to scroll back to the first prompt
-// of any session without memory growing with it, so memory follows what can be seen next.
+// TRANSCRIPT_WINDOW_SCREENS is the screens of history kept in memory (the visible one, two above, two below), so scrolling back to the first prompt costs memory only for what can be seen next.
 TRANSCRIPT_WINDOW_SCREENS :: 5
 
 // TRANSCRIPT_LOAD_SCREENS is how near the window's edge the view may come before the next page is read.
@@ -23,15 +21,13 @@ TRANSCRIPT_LOAD_SCREENS :: 1
 // TRANSCRIPT_PAGE_NODES is how many whole nodes one read adds to the window.
 TRANSCRIPT_PAGE_NODES :: 16
 
-// WINDOW_ENTRY_FLAG marks window entry ids, which are made from the node and the entry's
-// place in it. Live entry ids count from one and never carry the flag.
+// WINDOW_ENTRY_FLAG marks window entry ids, made from the node and the entry's place in it; live ids never carry it.
 WINDOW_ENTRY_FLAG :: u64(1) << 63
 WINDOW_ORDINAL_BITS :: 20
 
 CHECKPOINT_NOTICE :: "(earlier turns are summarized)"
 
-// Transcript is the committed history on screen: a window onto the session's node path.
-// Only the main thread uses it. The zero value shows nothing.
+// Transcript is the window onto the shown session's node path. Main thread only.
 Transcript :: struct {
 	store:         journal.Journal, // read-only, opened by the first read
 	session:       journal.Session_Id,
@@ -60,8 +56,7 @@ entries_destroy :: proc(entries: ^[dynamic]Entry) {
 	entries^ = nil
 }
 
-// transcript_sync brings the window to the session and head the worker published, then
-// drops the live entries the window covers. It reads the first page only.
+// transcript_sync moves the window to the published session and head and drops the live entries it covers. It reads the first page only.
 transcript_sync :: proc(app: ^App) {
 	transcript := &app.transcript
 	session, head := transcript_published(app)
@@ -163,8 +158,7 @@ transcript_page_older :: proc(app: ^App) {
 	transcript.first = first
 }
 
-// transcript_page_newer reads the window's last node again with the page, because the
-// results of its tool calls may have been committed since.
+// transcript_page_newer reads the window's last node again, because its tool results may have been committed since.
 transcript_page_newer :: proc(app: ^App) {
 	transcript := &app.transcript
 	last := transcript.end - 1
@@ -208,8 +202,7 @@ transcript_read :: proc(app: ^App, first, end: int) -> (entries: [dynamic]Entry,
 	return entries, nil
 }
 
-// window_entries maps a projection to the entries a live turn shows. A call with no
-// committed completion has no entry: only the live layer shows it running.
+// window_entries maps a projection to entries. A call with no committed completion has none: only the live layer shows it running.
 @(require_results)
 window_entries :: proc(app: ^App, projection: agent.Projection, entries: ^[dynamic]Entry) -> mem.Allocator_Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -350,8 +343,7 @@ window_children :: proc(
 	return nil
 }
 
-// codemode_inner_list lists the calls of parent_call for its box. The list and the strings
-// it borrows live as long as nested and the temporary allocator.
+// codemode_inner_list lists the calls of parent_call; it borrows nested and the temporary allocator.
 codemode_inner_list :: proc(nested: []agent.Projected_Nested_Call, parent_call: journal.Call_Id) -> []Codemode_Inner {
 	list := make([dynamic]Codemode_Inner, context.temp_allocator)
 	for child in nested {
@@ -367,9 +359,7 @@ codemode_inner_list :: proc(nested: []agent.Projected_Nested_Call, parent_call: 
 	return list[:]
 }
 
-// transcript_order lists the entries a frame draws, oldest first, in the temporary
-// allocator. A live entry follows the entries of its node, and is not drawn while the
-// window has not reached it.
+// transcript_order returns the entries a frame draws, oldest first, in the temporary allocator. A live entry follows its node's entries and is hidden until the window reaches it.
 transcript_order :: proc(app: ^App) -> []^Entry {
 	transcript := &app.transcript
 	live := app.run.snap.entries[:]
@@ -390,7 +380,7 @@ transcript_order :: proc(app: ^App) -> []^Entry {
 	return order[:]
 }
 
-// transcript_measure records the rows each entry of order took in the solved frame, which declared them in that order.
+// transcript_measure records the rows each entry of order took; the frame declared them in that order.
 transcript_measure :: proc(app: ^App, order: []^Entry, frame_result: layout.Frame_Result, viewport_rows: int) {
 	app.transcript.measured = true
 	app.transcript.viewport_rows = viewport_rows
@@ -404,11 +394,7 @@ transcript_measure :: proc(app: ^App, order: []^Entry, frame_result: layout.Fram
 	}
 }
 
-// transcript_slide moves the window after a frame was laid out and reports whether the
-// frame has to be laid out again. Within a screen of the window's edge it reads the next
-// page there, and it drops whole nodes more than two screens beyond the other side. The
-// scroll, which counts rows from the bottom, changes by the rows added or removed below
-// the view, so the view does not move.
+// transcript_slide reads or releases pages after a layout and reports whether the frame must be laid out again. It adjusts scroll so the view does not move.
 transcript_slide :: proc(app: ^App) -> bool {
 	moved := transcript_slide_step(app)
 	if moved { transcript_reduce(app) }
@@ -466,10 +452,7 @@ transcript_node_rows :: proc(transcript: ^Transcript, node: journal.Node_Id) -> 
 	return rows
 }
 
-// transcript_reduce drops the live entries whose committed form the window shows: a
-// finished box whose call has a box there, a complete answer once the window holds a newer
-// node, and a sent line the window shows. It also drops the entries that are not running or
-// streaming when the window starts after their node, since notices are never journaled.
+// transcript_reduce drops the live entries the window now shows, and those not running or streaming that lie before the window.
 transcript_reduce :: proc(app: ^App) {
 	transcript := &app.transcript
 	last: journal.Node_Id
