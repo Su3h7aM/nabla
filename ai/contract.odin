@@ -70,9 +70,61 @@ Provider_Tool_Def :: struct {
 	Parameters_JSON: string, // borrowed until operation retirement,
 }
 
+// Provider_Media is a file format a message can carry beside its text. The images are
+// the formats the Messages API accepts, which the OpenAI APIs accept too, and PDF is the
+// one document format all three API families read.
+Provider_Media :: enum {
+	PNG,
+	JPEG,
+	GIF,
+	WebP,
+	PDF,
+}
+
+// PROVIDER_MEDIA_TYPES is the media type each format is named by on the wire.
+PROVIDER_MEDIA_TYPES := [Provider_Media]string {
+	.PNG  = "image/png",
+	.JPEG = "image/jpeg",
+	.GIF  = "image/gif",
+	.WebP = "image/webp",
+	.PDF  = "application/pdf",
+}
+
+// Provider_Attachment is one file a user message or a tool result carries beside its
+// text. The encoder writes Data as base64, so a caller holds the file's own bytes.
+Provider_Attachment :: struct {
+	Media: Provider_Media,
+	Name:  string, // borrowed until operation retirement; the file name the model is told,
+	Data:  []u8, // borrowed until operation retirement; the file's bytes,
+}
+
+// Provider_Media_Detect names the format of data from the signature it starts with, and
+// reports false for data that starts with none of them. The signature decides, never a
+// file name or a stated media type, so what is sent is what the endpoint is told it is.
+@(require_results)
+Provider_Media_Detect :: proc(data: []u8) -> (media: Provider_Media, ok: bool) {
+	text := string(data)
+	switch {
+	case strings.has_prefix(text, "\x89PNG\r\n\x1a\n"):
+		return .PNG, true
+	case strings.has_prefix(text, "\xff\xd8\xff"):
+		return .JPEG, true
+	case strings.has_prefix(text, "GIF87a"), strings.has_prefix(text, "GIF89a"):
+		return .GIF, true
+	case len(text) >= 12 && text[:4] == "RIFF" && text[8:12] == "WEBP":
+		return .WebP, true
+	case strings.has_prefix(text, "%PDF-"):
+		return .PDF, true
+	}
+	return {}, false
+}
+
 Provider_Message :: struct {
 	Role:                Provider_Role,
 	Content:             string, // borrowed until operation retirement,
+	// Attachments are the files a .User message or a .Tool result carries after its
+	// text. A user message with attachments may have empty Content.
+	Attachments:         []Provider_Attachment, // borrowed until operation retirement,
 	Tool_Call_ID:        string, // borrowed; set on .Tool results, matches a call ID,
 	// Tool_Is_Error marks a tool result the model should read as a failure. The
 	// harness sets it for every outcome other than .Success: a nonzero exit is
@@ -210,8 +262,14 @@ Provider_Validate_Request :: proc(request: Provider_Request) -> Provider_Request
 			if message.Tool_Call_ID == "" { return .Invalid_Message }
 		case .Reasoning:
 			if message.Reasoning_ID == "" { return .Invalid_Message }
+		case .User:
+			if message.Content == "" && len(message.Attachments) == 0 { return .Invalid_Message }
 		case:
 			if message.Content == "" { return .Invalid_Message }
+		}
+		if len(message.Attachments) > 0 && message.Role != .User && message.Role != .Tool { return .Invalid_Message }
+		for attachment in message.Attachments {
+			if len(attachment.Data) == 0 || attachment.Name == "" { return .Invalid_Message }
 		}
 		for call in message.Tool_Calls {
 			if call.ID == "" || call.Name == "" { return .Invalid_Tool_Call }

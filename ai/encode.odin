@@ -1,5 +1,6 @@
 package ai
 
+import "core:encoding/base64"
 import "core:encoding/json"
 import "core:io"
 import "core:mem"
@@ -331,6 +332,24 @@ encode_write_text :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: 
 	encode_write_raw(cursor, body, strings.to_string(slot.bytes))
 }
 
+// encode_write_base64 writes the base64 characters of data. The caller writes the quotes
+// and any prefix around them. The characters are not cached: comparing a file against a
+// cached copy costs about what encoding it does.
+@(private = "package")
+encode_write_base64 :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, data: []u8) {
+	if base64.encode_into(strings.to_writer(body), data) != .None { encode_fail(cursor, .Allocation) }
+}
+
+// encode_write_data_url writes an attachment as the quoted data URL the OpenAI APIs take.
+@(private = "package")
+encode_write_data_url :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, attachment: Provider_Attachment) {
+	encode_write_raw(cursor, body, "\"data:")
+	encode_write_raw(cursor, body, PROVIDER_MEDIA_TYPES[attachment.Media])
+	encode_write_raw(cursor, body, ";base64,")
+	encode_write_base64(cursor, body, attachment.Data)
+	encode_write_byte(cursor, body, '"')
+}
+
 // encode_write_object writes a text the wire carries as a JSON object and reports whether
 // it is one. The object is written with the keys of every object in it sorted, which is
 // how the standard library's writer writes a parsed value, and it is written once: a tool
@@ -410,4 +429,30 @@ encode_write_cache_fields :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder
 		}
 		encode_write_raw(cursor, body, "}")
 	}
+}
+
+// encode_write_breakpoint writes the explicit cache breakpoint field of a content part.
+@(private = "package")
+encode_write_breakpoint :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, field_first: ^bool) {
+	encode_write_field(cursor, body, field_first, "prompt_cache_breakpoint")
+	encode_write_raw(cursor, body, "{")
+	breakpoint_first := true
+	encode_write_field(cursor, body, &breakpoint_first, "mode")
+	encode_write_literal_string(cursor, body, "explicit")
+	encode_write_raw(cursor, body, "}")
+}
+
+// encode_write_text_part writes one text content part of the given type, "text" for Chat
+// Completions and "input_text" for Responses.
+@(private = "package")
+encode_write_text_part :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, part_first: ^bool, type_name, text: string, breakpoint: bool) {
+	encode_write_item(cursor, body, part_first)
+	field_first := true
+	encode_write_raw(cursor, body, "{")
+	if breakpoint { encode_write_breakpoint(cursor, body, &field_first) }
+	encode_write_field(cursor, body, &field_first, "text")
+	encode_write_text(cursor, body, text)
+	encode_write_field(cursor, body, &field_first, "type")
+	encode_write_literal_string(cursor, body, type_name)
+	encode_write_raw(cursor, body, "}")
 }

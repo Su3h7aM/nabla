@@ -533,3 +533,43 @@ test_anthropic_opens_with_a_user_turn_for_a_summary :: proc(t: ^testing.T) {
 	content, _, _ := provider_json_string(first, "content")
 	testing.expect(t, strings.has_prefix(content, "Summary of the conversation so far:"))
 }
+
+@(test)
+test_anthropic_encode_attachments_in_user_and_tool_messages :: proc(t: ^testing.T) {
+	user_files := []Provider_Attachment {
+		{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")},
+		{Media = .PDF, Name = "b.pdf", Data = transmute([]u8)string("xyz")},
+	}
+	tool_files := []Provider_Attachment{{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")}}
+	calls := []Provider_Tool_Call{{ID = "c1", Name = "shell", Arguments = "{}"}}
+	messages := []Provider_Message {
+		{Role = .User, Content = "look", Attachments = user_files},
+		{Role = .Assistant, Tool_Calls = calls},
+		{Role = .Tool, Content = "seen", Tool_Call_ID = "c1", Attachments = tool_files},
+	}
+	request := Provider_Request {
+		API                       = .Anthropic_Messages,
+		Model_Present             = true,
+		Model                     = "m",
+		Messages_Present          = true,
+		Messages                  = messages,
+		Max_Output_Tokens_Present = true,
+		Max_Output_Tokens         = 100,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"content":[{"text":"look","type":"text"},{"source":{"data":"YWJj","media_type":"image/png","type":"base64"},"type":"image"},{"source":{"data":"eHl6","media_type":"application/pdf","type":"base64"},"type":"document"}],"role":"user"}`,
+		),
+	)
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"content":[{"content":[{"text":"seen","type":"text"},{"source":{"data":"YWJj","media_type":"image/png","type":"base64"},"type":"image"}],"tool_use_id":"c1","type":"tool_result"}],"role":"user"}`,
+		),
+	)
+}

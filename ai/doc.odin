@@ -27,6 +27,13 @@
 // copies what it keeps, and at most one terminal event arrives: an error, or the
 // completion once the transport has finished cleanly.
 //
+// # Attachments
+//
+// A user message or a tool result carries images and PDF files in Attachments, after its
+// text. Each encoder writes them in its API family's own shape, as base64. Chat
+// Completions tool messages take text only, so the files of a run of adjacent tool
+// results follow it in one user message.
+//
 // # Encoding cache
 //
 // A conversation carries most of the previous request again, so Provider_Encode_Cache

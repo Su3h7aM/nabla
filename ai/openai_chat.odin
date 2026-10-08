@@ -1,6 +1,7 @@
 package ai
 
 import "core:encoding/json"
+import "core:mem"
 import "core:strings"
 
 // openai_chat_encode_request writes one Chat Completions request body, with a cache reusing
@@ -48,31 +49,39 @@ openai_chat_encode_request :: proc(
 		encode_write_literal_string(&cursor, body, "system")
 		encode_write_raw(&cursor, body, "}")
 	}
-	for message in request.Messages {
+	// A run of adjacent tool messages is written as it comes, and its files follow it as
+	// one user message when the next message is not a tool result. Reasoning items are
+	// dropped below, so they never end a run.
+	run_start, run_end := 0, 0
+	for message, message_index in request.Messages {
 		// Chat Completions has no reasoning input; reasoning continuity is
 		// a Responses replay contract, so these items are dropped here.
 		if message.Role == .Reasoning { continue }
+		if message.Role == .Tool {
+			if run_end == run_start { run_start = message_index }
+			run_end = message_index + 1
+		} else {
+			openai_chat_write_tool_attachments(&cursor, body, &item_first, request.Messages[run_start:run_end], allocator)
+			run_start, run_end = 0, 0
+		}
 		encode_write_item(&cursor, body, &item_first)
 		field_first := true
 		encode_write_raw(&cursor, body, "{")
+		// Only a user message carries its attachments in its own content: a tool message
+		// accepts text only, so a tool result's files follow its run of tool messages.
+		attachments := message.Role == .User ? message.Attachments : nil
 		switch {
 		case message.Role == .Assistant && message.Content == "" && len(message.Tool_Calls) > 0:
 		// content is optional beside tool_calls, and compatible endpoints disagree on an empty one.
-		case message.Cache_Breakpoint:
+		case message.Cache_Breakpoint, len(attachments) > 0:
 			encode_write_field(&cursor, body, &field_first, "content")
-			encode_write_raw(&cursor, body, "[{")
+			encode_write_raw(&cursor, body, "[")
 			part_first := true
-			encode_write_field(&cursor, body, &part_first, "prompt_cache_breakpoint")
-			encode_write_raw(&cursor, body, "{")
-			breakpoint_first := true
-			encode_write_field(&cursor, body, &breakpoint_first, "mode")
-			encode_write_literal_string(&cursor, body, "explicit")
-			encode_write_raw(&cursor, body, "}")
-			encode_write_field(&cursor, body, &part_first, "text")
-			encode_write_text(&cursor, body, message.Content)
-			encode_write_field(&cursor, body, &part_first, "type")
-			encode_write_literal_string(&cursor, body, "text")
-			encode_write_raw(&cursor, body, "}]")
+			if message.Content != "" || len(attachments) == 0 {
+				encode_write_text_part(&cursor, body, &part_first, "text", message.Content, message.Cache_Breakpoint && len(attachments) == 0)
+			}
+			openai_chat_write_attachments(&cursor, body, &part_first, attachments, message.Cache_Breakpoint)
+			encode_write_raw(&cursor, body, "]")
 		case:
 			encode_write_field(&cursor, body, &field_first, "content")
 			encode_write_text(&cursor, body, message.Content)
@@ -108,6 +117,7 @@ openai_chat_encode_request :: proc(
 		}
 		encode_write_raw(&cursor, body, "}")
 	}
+	openai_chat_write_tool_attachments(&cursor, body, &item_first, request.Messages[run_start:run_end], allocator)
 	encode_write_raw(&cursor, body, "]")
 	encode_write_field(&cursor, body, &first, "model")
 	encode_write_text(&cursor, body, request.Model)
@@ -159,6 +169,76 @@ openai_chat_encode_request :: proc(
 	}
 	encode_write_raw(&cursor, body, "}")
 	return encode_finish_take(&cursor)
+}
+
+// openai_chat_write_attachments writes each attachment as the image or file content part
+// Chat Completions takes. Every part type accepts a cache breakpoint, so a marked list
+// carries it on its last part.
+@(private)
+openai_chat_write_attachments :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, part_first: ^bool, attachments: []Provider_Attachment, marked: bool) {
+	for attachment, index in attachments {
+		breakpoint := marked && index == len(attachments) - 1
+		encode_write_item(cursor, body, part_first)
+		field_first := true
+		encode_write_raw(cursor, body, "{")
+		switch attachment.Media {
+		case .PNG, .JPEG, .GIF, .WebP:
+			encode_write_field(cursor, body, &field_first, "image_url")
+			encode_write_raw(cursor, body, "{")
+			url_first := true
+			encode_write_field(cursor, body, &url_first, "url")
+			encode_write_data_url(cursor, body, attachment)
+			encode_write_raw(cursor, body, "}")
+			if breakpoint { encode_write_breakpoint(cursor, body, &field_first) }
+			encode_write_field(cursor, body, &field_first, "type")
+			encode_write_literal_string(cursor, body, "image_url")
+		case .PDF:
+			encode_write_field(cursor, body, &field_first, "file")
+			encode_write_raw(cursor, body, "{")
+			file_first := true
+			encode_write_field(cursor, body, &file_first, "file_data")
+			encode_write_data_url(cursor, body, attachment)
+			encode_write_field(cursor, body, &file_first, "filename")
+			encode_write_text(cursor, body, attachment.Name)
+			encode_write_raw(cursor, body, "}")
+			if breakpoint { encode_write_breakpoint(cursor, body, &field_first) }
+			encode_write_field(cursor, body, &field_first, "type")
+			encode_write_literal_string(cursor, body, "file")
+		}
+		encode_write_raw(cursor, body, "}")
+	}
+}
+
+// openai_chat_write_tool_attachments writes the files of a run of adjacent tool results as
+// one user message, after the run. Tool messages accept text only, and every tool message
+// answering an assistant message has to stay adjacent, so the files cannot sit between them.
+@(private)
+openai_chat_write_tool_attachments :: proc(
+	cursor: ^Encode_Cursor,
+	body: ^strings.Builder,
+	item_first: ^bool,
+	run: []Provider_Message,
+	allocator: mem.Allocator,
+) {
+	opened := false
+	part_first := true
+	for message in run {
+		if len(message.Attachments) == 0 { continue }
+		if !opened {
+			encode_write_item(cursor, body, item_first)
+			encode_write_raw(cursor, body, "{\"content\":[")
+			opened = true
+		}
+		label, label_error := strings.concatenate({"Files attached to the result of call ", message.Tool_Call_ID, ":"}, allocator)
+		if label_error != nil {
+			encode_fail(cursor, .Allocation)
+			return
+		}
+		defer delete(label, allocator)
+		encode_write_text_part(cursor, body, &part_first, "text", label, false)
+		openai_chat_write_attachments(cursor, body, &part_first, message.Attachments, false)
+	}
+	if opened { encode_write_raw(cursor, body, "],\"role\":\"user\"}") }
 }
 
 openai_chat_calls_open :: proc(state: ^Provider_Stream_State) -> bool {

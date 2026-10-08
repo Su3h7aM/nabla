@@ -105,7 +105,15 @@ openai_responses_encode_request_body :: proc(
 			encode_write_field(&cursor, body, &field_first, "call_id")
 			encode_write_text(&cursor, body, message.Tool_Call_ID)
 			encode_write_field(&cursor, body, &field_first, "output")
-			encode_write_text(&cursor, body, message.Content)
+			if len(message.Attachments) > 0 {
+				encode_write_raw(&cursor, body, "[")
+				part_first := true
+				if message.Content != "" { encode_write_text_part(&cursor, body, &part_first, "input_text", message.Content, false) }
+				openai_responses_write_attachments(&cursor, body, &part_first, message.Attachments, false)
+				encode_write_raw(&cursor, body, "]")
+			} else {
+				encode_write_text(&cursor, body, message.Content)
+			}
 			encode_write_field(&cursor, body, &field_first, "type")
 			encode_write_literal_string(&cursor, body, "function_call_output")
 			encode_write_raw(&cursor, body, "}")
@@ -145,21 +153,15 @@ openai_responses_encode_request_body :: proc(
 		encode_write_item(&cursor, body, &item_first)
 		field_first := true
 		encode_write_raw(&cursor, body, "{")
-		if message.Cache_Breakpoint {
+		if message.Cache_Breakpoint || len(message.Attachments) > 0 {
 			encode_write_field(&cursor, body, &field_first, "content")
-			encode_write_raw(&cursor, body, "[{")
+			encode_write_raw(&cursor, body, "[")
 			part_first := true
-			encode_write_field(&cursor, body, &part_first, "prompt_cache_breakpoint")
-			encode_write_raw(&cursor, body, "{")
-			breakpoint_first := true
-			encode_write_field(&cursor, body, &breakpoint_first, "mode")
-			encode_write_literal_string(&cursor, body, "explicit")
-			encode_write_raw(&cursor, body, "}")
-			encode_write_field(&cursor, body, &part_first, "text")
-			encode_write_text(&cursor, body, message.Content)
-			encode_write_field(&cursor, body, &part_first, "type")
-			encode_write_literal_string(&cursor, body, "input_text")
-			encode_write_raw(&cursor, body, "}]")
+			if message.Content != "" || len(message.Attachments) == 0 {
+				encode_write_text_part(&cursor, body, &part_first, "input_text", message.Content, message.Cache_Breakpoint && len(message.Attachments) == 0)
+			}
+			openai_responses_write_attachments(&cursor, body, &part_first, message.Attachments, message.Cache_Breakpoint)
+			encode_write_raw(&cursor, body, "]")
 		} else {
 			encode_write_field(&cursor, body, &field_first, "content")
 			encode_write_text(&cursor, body, message.Content)
@@ -230,6 +232,42 @@ openai_responses_encode_request_body :: proc(
 	}
 	encode_write_raw(&cursor, body, "}")
 	return encode_finish_take(&cursor)
+}
+
+// openai_responses_write_attachments writes each attachment as the input_image or
+// input_file part the Responses API takes. Every part type accepts a cache breakpoint, so
+// a marked list carries it on its last part.
+@(private)
+openai_responses_write_attachments :: proc(
+	cursor: ^Encode_Cursor,
+	body: ^strings.Builder,
+	part_first: ^bool,
+	attachments: []Provider_Attachment,
+	marked: bool,
+) {
+	for attachment, index in attachments {
+		breakpoint := marked && index == len(attachments) - 1
+		encode_write_item(cursor, body, part_first)
+		field_first := true
+		encode_write_raw(cursor, body, "{")
+		switch attachment.Media {
+		case .PNG, .JPEG, .GIF, .WebP:
+			encode_write_field(cursor, body, &field_first, "image_url")
+			encode_write_data_url(cursor, body, attachment)
+			if breakpoint { encode_write_breakpoint(cursor, body, &field_first) }
+			encode_write_field(cursor, body, &field_first, "type")
+			encode_write_literal_string(cursor, body, "input_image")
+		case .PDF:
+			encode_write_field(cursor, body, &field_first, "file_data")
+			encode_write_data_url(cursor, body, attachment)
+			encode_write_field(cursor, body, &field_first, "filename")
+			encode_write_text(cursor, body, attachment.Name)
+			if breakpoint { encode_write_breakpoint(cursor, body, &field_first) }
+			encode_write_field(cursor, body, &field_first, "type")
+			encode_write_literal_string(cursor, body, "input_file")
+		}
+		encode_write_raw(cursor, body, "}")
+	}
 }
 
 // openai_responses_record_write writes the items one response record replays as, where

@@ -2,6 +2,7 @@
 package ai
 
 import "core:encoding/json"
+import "core:strings"
 import "core:testing"
 
 @(test)
@@ -112,4 +113,72 @@ test_chat_encode_keeps_prompt_cache_options_ttl :: proc(t: ^testing.T) {
 	testing.expect(t, ttl_ok && ttl_present && ttl == "30m")
 	_, retention_present := object["prompt_cache_retention"]
 	testing.expect(t, !retention_present)
+}
+
+@(test)
+test_chat_encode_attachments_in_user_and_tool_messages :: proc(t: ^testing.T) {
+	user_files := []Provider_Attachment {
+		{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")},
+		{Media = .PDF, Name = "b.pdf", Data = transmute([]u8)string("xyz")},
+	}
+	tool_files := []Provider_Attachment{{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")}}
+	calls := []Provider_Tool_Call{{ID = "c1", Name = "shell", Arguments = "{}"}}
+	messages := []Provider_Message {
+		{Role = .User, Content = "look", Attachments = user_files},
+		{Role = .Assistant, Tool_Calls = calls},
+		{Role = .Tool, Content = "seen", Tool_Call_ID = "c1", Attachments = tool_files},
+	}
+	request := Provider_Request {
+		API                       = .OpenAI_Chat_Completions,
+		Model_Present             = true,
+		Model                     = "m",
+		Messages_Present          = true,
+		Messages                  = messages,
+		Max_Output_Tokens_Present = true,
+		Max_Output_Tokens         = 100,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"content":[{"text":"look","type":"text"},{"image_url":{"url":"data:image/png;base64,YWJj"},"type":"image_url"},{"file":{"file_data":"data:application/pdf;base64,eHl6","filename":"b.pdf"},"type":"file"}],"role":"user"}`,
+		),
+	)
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"content":"seen","role":"tool","tool_call_id":"c1"},{"content":[{"text":"Files attached to the result of call c1:","type":"text"},{"image_url":{"url":"data:image/png;base64,YWJj"},"type":"image_url"}],"role":"user"}]`,
+		),
+	)
+}
+
+@(test)
+test_chat_encode_attachments_of_adjacent_tool_results_share_one_user_message :: proc(t: ^testing.T) {
+	files := []Provider_Attachment{{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")}}
+	calls := []Provider_Tool_Call{{ID = "c1", Name = "shell", Arguments = "{}"}, {ID = "c2", Name = "shell", Arguments = "{}"}}
+	messages := []Provider_Message {
+		{Role = .User, Content = "go"},
+		{Role = .Assistant, Tool_Calls = calls},
+		{Role = .Tool, Content = "one", Tool_Call_ID = "c1", Attachments = files},
+		{Role = .Tool, Content = "two", Tool_Call_ID = "c2", Attachments = files},
+	}
+	request := Provider_Request {
+		API              = .OpenAI_Chat_Completions,
+		Model_Present    = true,
+		Model            = "m",
+		Messages_Present = true,
+		Messages         = messages,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"content":"one","role":"tool","tool_call_id":"c1"},{"content":"two","role":"tool","tool_call_id":"c2"},{"content":[{"text":"Files attached to the result of call c1:","type":"text"},{"image_url":{"url":"data:image/png;base64,YWJj"},"type":"image_url"},{"text":"Files attached to the result of call c2:","type":"text"},{"image_url":{"url":"data:image/png;base64,YWJj"},"type":"image_url"}],"role":"user"}]`,
+		),
+	)
 }

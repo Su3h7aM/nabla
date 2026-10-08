@@ -134,7 +134,7 @@ anthropic_write_messages :: proc(
 	// after the loop is always the last one.
 	last_written := -1
 	#reverse for message, index in messages {
-		if message.Role == .Assistant || message.Role == .Tool || (message.Role == .User && message.Content != "") {
+		if message.Role == .Assistant || message.Role == .Tool || (message.Role == .User && (message.Content != "" || len(message.Attachments) > 0)) {
 			last_written = index
 			break
 		}
@@ -185,10 +185,13 @@ anthropic_write_messages :: proc(
 			// item has no representation here. Neither may be sent as a turn.
 			continue
 		case .User:
-			if message.Content == "" { continue }
+			if message.Content == "" && len(message.Attachments) == 0 { continue }
 			if open < 0 { open = index }
-			open_blocks += 1
-			open_texts += 1
+			if message.Content != "" {
+				open_blocks += 1
+				open_texts += 1
+			}
+			open_blocks += len(message.Attachments)
 		case .Tool:
 			if message.Tool_Call_ID == "" { return .Invalid_Message }
 			if open < 0 { open = index }
@@ -322,10 +325,16 @@ anthropic_write_user_turn :: proc(
 		for message in turn {
 			switch message.Role {
 			case .User:
-				if message.Content == "" { continue }
-				written += 1
-				encode_write_item(cursor, body, &block_first)
-				anthropic_write_text_block(cursor, body, message.Content, marked && written == blocks)
+				if message.Content != "" {
+					written += 1
+					encode_write_item(cursor, body, &block_first)
+					anthropic_write_text_block(cursor, body, message.Content, marked && written == blocks)
+				}
+				for attachment in message.Attachments {
+					written += 1
+					encode_write_item(cursor, body, &block_first)
+					anthropic_write_attachment_block(cursor, body, attachment, marked && written == blocks)
+				}
 			case .Tool:
 				written += 1
 				encode_write_item(cursor, body, &block_first)
@@ -361,6 +370,35 @@ anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builde
 	encode_write_text(cursor, body, text)
 	encode_write_field(cursor, body, &field_first, "type")
 	encode_write_literal_string(cursor, body, ANTHROPIC_BLOCK_TEXT)
+	encode_write_raw(cursor, body, "}")
+}
+
+// anthropic_write_attachment_block writes an attachment as the image or document block
+// the Messages API takes.
+@(private)
+anthropic_write_attachment_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, attachment: Provider_Attachment, marked: bool) {
+	field_first := true
+	encode_write_raw(cursor, body, "{")
+	if marked { anthropic_write_cache_control(cursor, body, &field_first) }
+	encode_write_field(cursor, body, &field_first, "source")
+	encode_write_raw(cursor, body, "{")
+	source_first := true
+	encode_write_field(cursor, body, &source_first, "data")
+	encode_write_byte(cursor, body, '"')
+	encode_write_base64(cursor, body, attachment.Data)
+	encode_write_byte(cursor, body, '"')
+	encode_write_field(cursor, body, &source_first, "media_type")
+	encode_write_literal_string(cursor, body, PROVIDER_MEDIA_TYPES[attachment.Media])
+	encode_write_field(cursor, body, &source_first, "type")
+	encode_write_literal_string(cursor, body, "base64")
+	encode_write_raw(cursor, body, "}")
+	encode_write_field(cursor, body, &field_first, "type")
+	switch attachment.Media {
+	case .PNG, .JPEG, .GIF, .WebP:
+		encode_write_literal_string(cursor, body, "image")
+	case .PDF:
+		encode_write_literal_string(cursor, body, "document")
+	}
 	encode_write_raw(cursor, body, "}")
 }
 
@@ -444,7 +482,21 @@ anthropic_write_tool_result :: proc(cursor: ^Encode_Cursor, body: ^strings.Build
 	encode_write_raw(cursor, body, "{")
 	if marked { anthropic_write_cache_control(cursor, body, &field_first) }
 	encode_write_field(cursor, body, &field_first, "content")
-	encode_write_text(cursor, body, message.Content)
+	if len(message.Attachments) > 0 {
+		encode_write_raw(cursor, body, "[")
+		block_first := true
+		if message.Content != "" {
+			encode_write_item(cursor, body, &block_first)
+			anthropic_write_text_block(cursor, body, message.Content, false)
+		}
+		for attachment in message.Attachments {
+			encode_write_item(cursor, body, &block_first)
+			anthropic_write_attachment_block(cursor, body, attachment, false)
+		}
+		encode_write_raw(cursor, body, "]")
+	} else {
+		encode_write_text(cursor, body, message.Content)
+	}
 	if message.Tool_Is_Error {
 		encode_write_field(cursor, body, &field_first, "is_error")
 		encode_write_bool(cursor, body, true)

@@ -1094,3 +1094,43 @@ test_chat_encode_output_bound_uses_the_current_field :: proc(t: ^testing.T) {
 	_, deprecated := object["max_tokens"]
 	testing.expect(t, !deprecated, "the deprecated field must not be sent")
 }
+
+@(test)
+test_responses_encode_attachments_in_user_and_tool_messages :: proc(t: ^testing.T) {
+	user_files := []Provider_Attachment {
+		{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")},
+		{Media = .PDF, Name = "b.pdf", Data = transmute([]u8)string("xyz")},
+	}
+	tool_files := []Provider_Attachment{{Media = .PNG, Name = "a.png", Data = transmute([]u8)string("abc")}}
+	calls := []Provider_Tool_Call{{ID = "c1", Name = "shell", Arguments = "{}"}}
+	messages := []Provider_Message {
+		{Role = .User, Content = "look", Attachments = user_files},
+		{Role = .Assistant, Tool_Calls = calls},
+		{Role = .Tool, Content = "seen", Tool_Call_ID = "c1", Attachments = tool_files},
+	}
+	request := Provider_Request {
+		API                       = .OpenAI_Responses,
+		Model_Present             = true,
+		Model                     = "m",
+		Messages_Present          = true,
+		Messages                  = messages,
+		Max_Output_Tokens_Present = true,
+		Max_Output_Tokens         = 100,
+	}
+	body, err := Provider_Encode_Request(request, context.temp_allocator)
+	if !testing.expect_value(t, err, Provider_Request_Error.None) { return }
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"content":[{"text":"look","type":"input_text"},{"image_url":"data:image/png;base64,YWJj","type":"input_image"},{"file_data":"data:application/pdf;base64,eHl6","filename":"b.pdf","type":"input_file"}],"role":"user"}`,
+		),
+	)
+	testing.expect(
+		t,
+		strings.contains(
+			body,
+			`{"call_id":"c1","output":[{"text":"seen","type":"input_text"},{"image_url":"data:image/png;base64,YWJj","type":"input_image"}],"type":"function_call_output"}`,
+		),
+	)
+}
