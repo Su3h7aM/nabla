@@ -1046,13 +1046,19 @@ snap_after_update_locked :: proc(app: ^App) {
 	app.run.snap.after = max(app.run.snap.head, app.setup.session.head)
 }
 
-// user_entry_kind maps a user-role text's origin to its transcript kind: what another
-// agent sent shows as its own kind of entry, anything else as the user's own.
-user_entry_kind :: proc(origin: journal.User_Origin) -> Entry_Kind {
-	if origin == .Agent {
-		return .Subagent
+// user_entry_kind maps a user-role text's origin to its transcript kind, live and
+// replayed: what another agent sent shows as its own kind of entry, text the harness
+// wrote as a notice, and a prompt or steering line as the user's own.
+user_entry_kind :: proc(origin: journal.User_Origin) -> (kind: Entry_Kind) {
+	switch origin {
+	case .Prompt, .Steering:
+		kind = .User
+	case .Harness:
+		kind = .Notice
+	case .Agent:
+		kind = .Subagent
 	}
-	return .User
+	return
 }
 
 observer_user_text :: proc(user_data: rawptr, text: string, origin: journal.User_Origin) {

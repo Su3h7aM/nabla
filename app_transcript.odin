@@ -231,9 +231,7 @@ window_entries :: proc(app: ^App, projection: agent.Projection, entries: ^[dynam
 		}
 		#partial switch payload in item.payload {
 		case agent.Projected_User:
-			kind := Entry_Kind.Notice
-			if payload.origin == .Prompt || payload.origin == .Agent { kind = user_entry_kind(payload.origin) }
-			_ = window_push(app, entries, item.node, kind, payload.text) or_return
+			_ = window_push(app, entries, item.node, user_entry_kind(payload.origin), payload.text) or_return
 		case agent.Projected_Assistant:
 			_ = window_push(app, entries, item.node, .Assistant, payload.text) or_return
 		case agent.Projected_Call:

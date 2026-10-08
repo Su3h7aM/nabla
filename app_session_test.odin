@@ -2833,42 +2833,49 @@ app_entry_kind :: proc(app: ^App, text: string) -> (kind: Entry_Kind, found: boo
 	return .Notice, false
 }
 
-// A text another agent sent shows as its own kind of entry, live and replayed: the
-// observer maps an .Agent origin to .Subagent, and so does the replay of the User
-// node the delivery committed.
-@(test)
-test_agent_origin_text_shows_as_a_subagent_entry_live_and_replayed :: proc(t: ^testing.T) {
+// A text delivered with an origin shows as the same kind of entry, once, live and
+// replayed: the observer and the replay of the User node the delivery committed
+// share one mapping.
+app_expect_delivered_origin_kind :: proc(t: ^testing.T, origin: journal.User_Origin, text: string, want: Entry_Kind) {
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 
-	observer_user_text(&app, "agent-1 answered\nforty-two", .Agent)
 	observer_user_text(&app, "a prompt", .Prompt)
-	kind, found := app_entry_kind(&app, "agent-1 answered\nforty-two")
-	testing.expect(t, found, "the live agent text shows")
-	testing.expect_value(t, kind, Entry_Kind.Subagent)
-	kind, found = app_entry_kind(&app, "a prompt")
+	kind, found := app_entry_kind(&app, "a prompt")
 	testing.expect(t, found, "the live prompt shows")
 	testing.expect_value(t, kind, Entry_Kind.User)
 
-	// Another process's line with an .Agent origin is what a subagent's report
-	// looks like on the wire; accepting it delivers a User node of that origin.
+	// Another process's line is what a subagent's report or a steering line looks like
+	// on the wire; accepting it delivers a User node of that origin.
 	sender: journal.Journal
 	if error := journal.open(&sender, directory, directory, journal.run_id_create(), .Read_Write); error != nil {
 		testing.fail_now(t, "the sender journal did not open")
 	}
 	defer _ = journal.close(&sender)
 	if error := journal.follow(&sender, app.setup.session.session); error != nil { testing.fail_now(t, "the sender could not follow") }
-	if error := journal.append_input(&sender, "agent-1 asks\nwhat next", .Agent); error != nil { testing.fail_now(t, "the agent line was not accepted") }
-	accepted := agent.chat_session_accept_message(&app.setup.session, "", .Agent, run_observer(&app))
+	if error := journal.append_input(&sender, text, origin); error != nil { testing.fail_now(t, "the line was not accepted") }
+	accepted := agent.chat_session_accept_message(&app.setup.session, "", origin, run_observer(&app))
 	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
-	kind, found = app_entry_kind(&app, "agent-1 asks\nwhat next")
-	testing.expect(t, found, "the delivered agent text shows")
-	testing.expect_value(t, kind, Entry_Kind.Subagent)
+	kind, found = app_entry_kind(&app, text)
+	testing.expect(t, found, "the delivered text shows")
+	testing.expect_value(t, kind, want)
+	testing.expect_value(t, app_entries_count(&app, text), 1)
 
 	snapshot_clear(&app)
 	session_opened_show(&app)
-	kind, found = app_entry_kind(&app, "agent-1 asks\nwhat next")
-	testing.expect(t, found, "the replayed agent text shows")
-	testing.expect_value(t, kind, Entry_Kind.Subagent)
+	kind, found = app_entry_kind(&app, text)
+	testing.expect(t, found, "the replayed text shows")
+	testing.expect_value(t, kind, want)
+	testing.expect_value(t, app_entries_count(&app, text), 1)
+}
+
+@(test)
+test_agent_origin_text_shows_as_a_subagent_entry_live_and_replayed :: proc(t: ^testing.T) {
+	app_expect_delivered_origin_kind(t, .Agent, "agent-1 asks\nwhat next", .Subagent)
+}
+
+@(test)
+test_steering_origin_text_shows_as_a_user_entry_live_and_replayed :: proc(t: ^testing.T) {
+	app_expect_delivered_origin_kind(t, .Steering, "steer left", .User)
 }
