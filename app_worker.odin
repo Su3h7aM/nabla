@@ -705,11 +705,14 @@ projected_is_call :: proc(item: agent.Projection_Item) -> bool {
 session_replay_call :: proc(app: ^App, stored: agent.Projected_Call, answer: Maybe(agent.Projected_Result), nested: []agent.Projected_Nested_Call) {
 	display := tool_display_call(stored.name, stored.proposed)
 	result, settled := answer.?
+	// The picture is read before the lock is taken: decoding is not memory access.
+	image := image_prepare(app, result.attachments)
+	defer delete(image.pixels)
 	content, fallback, outcome := "", "", journal.Tool_Outcome.Success
 	if settled { content, fallback, outcome = result.content, journal.TOOL_OUTCOME_NAMES[result.outcome], result.outcome }
 	sync.mutex_guard(&app.run.mu)
 	if stored.name != agent.TOOL_CODEMODE_NAME {
-		snap_push_tool_locked(app, .Tool, stored.call, tool_entry_text(display, content, fallback, outcome), result.outcome, !settled)
+		snap_push_tool_locked(app, .Tool, stored.call, tool_entry_text(display, content, fallback, outcome), result.outcome, !settled, &image)
 		return
 	}
 	inner := codemode_inner_list(app, nested, stored.call, settled)
@@ -791,8 +794,7 @@ session_replay_queued :: proc(app: ^App) {
 snapshot_clear :: proc(app: ^App) {
 	sync.mutex_guard(&app.run.mu)
 	for &entry in app.run.snap.entries {
-		delete(entry.stream)
-		if entry.text != nil { delete(entry.text) }
+		entry_destroy(&entry)
 	}
 	clear(&app.run.snap.entries)
 	app.run.snap.entries_bytes = 0
@@ -992,7 +994,7 @@ snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 // so a very long run of very short lines is bounded by the same number as a short
 // run of very long ones.
 snap_entry_account :: proc(entry: ^Entry) {
-	entry.bytes = size_of(Entry) + cap(entry.text) + cap(entry.stream)
+	entry.bytes = size_of(Entry) + cap(entry.text) + cap(entry.stream) + cap(entry.image.pixels)
 }
 
 // snap_entry_append_text adds display text to one entry. A buffer that cannot
@@ -1022,8 +1024,8 @@ snap_push_locked :: proc(app: ^App, entry: Entry) {
 		// Nothing holds the buffer now: the array did not take the entry. A
 		// dynamic array releases through its own allocator, which the entry's text
 		// was given when it was made.
-		delete(entry.text)
-		delete(entry.stream)
+		refused := entry
+		entry_destroy(&refused)
 		snap_report_dropped_locked(app)
 		return
 	}
@@ -1040,8 +1042,7 @@ snap_trim_locked :: proc(app: ^App) {
 		dropped := app.run.snap.entries[0]
 		app.run.snap.entries_bytes -= dropped.bytes
 		ordered_remove(&app.run.snap.entries, 0)
-		delete(dropped.text)
-		delete(dropped.stream)
+		entry_destroy(&dropped)
 		app.run.snap.transcript_trimmed = true
 	}
 	if app.run.snap.transcript_trimmed && !was_trimmed {
@@ -1191,6 +1192,8 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 	app := cast(^App)user_data
 	display := tool_display_call(name, arguments)
 	summary := tool_display_summary(result)
+	image := image_prepare(app, result.attachments)
+	defer delete(image.pixels)
 	sync.mutex_guard(&app.run.mu)
 	if shown := snap_tool_entry_locked(app, call); shown != nil && !shown.running { return }
 	switch {
@@ -1203,7 +1206,7 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 		}
 		codemode_inner_update_locked(app, parent_call, inner)
 		text := tool_entry_text_titled(display, codemode_inner_title(name), result.content, summary, result.outcome)
-		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome)
+		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome, &image)
 	case name == agent.TOOL_CODEMODE_NAME:
 		pending: Codemode_Pending
 		if call != 0 {
@@ -1214,7 +1217,7 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome)
 		codemode_pending_destroy_locked(app, &pending)
 	case:
-		snap_settle_tool_locked(app, .Tool, call, tool_entry_text(display, result.content, summary, result.outcome), result.outcome)
+		snap_settle_tool_locked(app, .Tool, call, tool_entry_text(display, result.content, summary, result.outcome), result.outcome, &image)
 	}
 }
 
@@ -1290,11 +1293,20 @@ snap_stream_release_locked :: proc(app: ^App, entry: ^Entry) {
 // snap_push_tool_locked appends a tool box under a held runtime mutex. kind is the box
 // the entry draws as: a Code Mode inner call draws as .Codemode even though its text
 // reads like a normal tool box. Live, follower, and replay build their boxes through it.
-snap_push_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_Id, text: string, outcome: journal.Tool_Outcome, running: bool) {
+snap_push_tool_locked :: proc(
+	app: ^App,
+	kind: Entry_Kind,
+	call: journal.Call_Id,
+	text: string,
+	outcome: journal.Tool_Outcome,
+	running: bool,
+	image: ^Entry_Image = nil,
+) {
 	entry := snap_entry_make(app, kind, text)
 	entry.call = call
 	entry.tool_outcome = outcome
 	entry.running = running
+	if snap_entry_image_set_locked(app, &entry, image) { snap_entry_account(&entry) }
 	snap_push_locked(app, entry)
 }
 
@@ -1311,16 +1323,17 @@ snap_tool_entry_locked :: proc(app: ^App, call: journal.Call_Id) -> ^Entry {
 // snap_settle_tool_locked replaces the text and outcome of the running box of call and
 // ends its running state. A call without a box gets a finished one. When the new text
 // cannot be set the box stays as it was, running.
-snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_Id, text: string, outcome: journal.Tool_Outcome) {
+snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_Id, text: string, outcome: journal.Tool_Outcome, image: ^Entry_Image = nil) {
 	entry := snap_tool_entry_locked(app, call)
 	if entry == nil {
-		snap_push_tool_locked(app, kind, call, text, outcome, false)
+		snap_push_tool_locked(app, kind, call, text, outcome, false, image)
 		return
 	}
 	if !snap_entry_rewrite_locked(app, entry, text) { return }
 	entry.tool_outcome = outcome
 	entry.running = false
 	snap_stream_release_locked(app, entry)
+	if snap_entry_image_set_locked(app, entry, image) { snap_entry_recharge_locked(app, entry) }
 	snap_publish_locked(app)
 	snap_trim_locked(app)
 }

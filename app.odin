@@ -69,6 +69,9 @@ Entry :: struct {
 	// scroll, which is what tells the wheel the transcript behind it owns the
 	// report.
 	tool_scroll_max: int,
+	// image is the picture the call's result carried, drawn inside the box. Its
+	// id is zero when the entry has none.
+	image:           Entry_Image,
 }
 
 // Status carries the runtime facts the footer shows. provider_id and cwd are borrowed
@@ -166,6 +169,12 @@ Snapshot :: struct {
 	// travels on its tool box node to the mouse, so a report still finds its box
 	// after older entries were dropped.
 	next_entry_id:      u64,
+	// images_enabled says the terminal draws images, so a tool result's picture is
+	// kept for the box. It is set once before the first entry is shown.
+	images_enabled:     bool,
+	// next_image_id numbers the pictures the transcript keeps; a number is never
+	// reused, so a terminal image is never mistaken for a later one.
+	next_image_id:      u32,
 	status:             Status,
 	// sessions is what the /resume menu offers. Only the worker reads the store,
 	// so only the worker rebuilds this.
@@ -454,6 +463,8 @@ tui_run :: proc(
 	// set before its first line. The slots grow with the transcript and are
 	// bounded by its budget.
 	snapshot_transcript_own(app)
+	// Only a terminal that draws images keeps the pictures of tool results.
+	app.run.snap.images_enabled = term.graphics_detect(term.profile_default().color_depth)
 	// The resumed conversation is shown before the first prompt, so the screen
 	// matches the history the next request will be built from.
 	session_replay(app, &app.setup.session)
@@ -753,10 +764,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 // anyway, so both callers release it the same way.
 snapshot_destroy :: proc(app: ^App) {
 	for &entry in app.run.snap.entries {
-		delete(entry.stream)
-		if entry.text != nil {
-			delete(entry.text)
-		}
+		entry_destroy(&entry)
 	}
 	delete(app.run.snap.entries)
 	codemode_pending_clear_locked(app)

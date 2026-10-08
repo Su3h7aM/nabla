@@ -180,20 +180,32 @@ Render_Status :: enum u8 {
 // Markdown presentation cache, the presentation scratch, and the layout
 // context, whose storage grows to the transcript it is given.
 Frame_Storage :: struct {
-	cells:      []term.Cell,
-	buffer:     term.Frame_Buffer,
-	output:     []byte,
-	alloc:      mem.Allocator,
-	markdown:   Markdown_Cache,
+	cells:           []term.Cell,
+	buffer:          term.Frame_Buffer,
+	output:          []byte,
+	alloc:           mem.Allocator,
+	markdown:        Markdown_Cache,
 	// links is this frame's hyperlink table (term.Frame_Buffer.links); the URIs are
 	// views into markdown's records, which live through the frame's present.
-	links:      [dynamic]string,
-	layout_ctx: layout.Context,
+	links:           [dynamic]string,
+	layout_ctx:      layout.Context,
 	// capacities is what layout_ctx is currently sized for. The context owns its
 	// storage, so the budget is raised through layout.reserve as the transcript
 	// outgrows it, and this is the base a raise is computed from.
-	capacities: layout.Capacities,
-	measure:    tui.Measure_Context,
+	capacities:      layout.Capacities,
+	measure:         tui.Measure_Context,
+	// cell_pixels is the size of one terminal cell in pixels, zero when the terminal
+	// reports none. A picture's size in cells follows from it.
+	cell_pixels:     [2]int,
+	// shown is the images this frame draws and their sizes in cells. placed is what
+	// the terminal holds, the main thread's record of what it was sent. uploads and
+	// stale are the work images_collect found between the two.
+	shown:           [dynamic]Image_Placement,
+	placed:          [dynamic]Image_Placement,
+	uploads:         [dynamic]Image_Upload,
+	stale:           [dynamic]term.Image_Id,
+	// graphics_failed latches the one warning a failing image write produces.
+	graphics_failed: bool,
 }
 
 @(require_results)
@@ -202,6 +214,10 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
 	storage.links = make([dynamic]string, alloc)
+	storage.shown = make([dynamic]Image_Placement, alloc)
+	storage.placed = make([dynamic]Image_Placement, alloc)
+	storage.uploads = make([dynamic]Image_Upload, alloc)
+	storage.stale = make([dynamic]term.Image_Id, alloc)
 	markdown_cache_init(&storage.markdown, alloc)
 	// Measurement and drawing share one width policy, so a tab or an
 	// emoji-presentation sequence measures the columns drawing produces.
@@ -218,10 +234,19 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	// context built on it cannot reserve.
 	if layout.init(&storage.layout_ctx, config, alloc) != nil {
 		markdown_cache_destroy(&storage.markdown)
+		frame_storage_tables_destroy(storage)
 		free(storage, alloc)
 		return nil
 	}
 	return storage
+}
+
+frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
+	delete(storage.links)
+	delete(storage.shown)
+	delete(storage.placed)
+	delete(storage.uploads)
+	delete(storage.stale)
 }
 
 frame_storage_destroy :: proc(storage: ^Frame_Storage) {
@@ -230,7 +255,7 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
 	markdown_cache_destroy(&storage.markdown)
-	delete(storage.links)
+	frame_storage_tables_destroy(storage)
 	layout.destroy(&storage.layout_ctx)
 	free(storage, storage.alloc)
 }
@@ -260,6 +285,9 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	// and survives this reset. The previous frame was already presented, so its
 	// remaining borrows are dead and the pool can be recycled.
 	free_all(context.temp_allocator)
+	if viewport, viewport_error := term.viewport(app.terminal); viewport_error == nil && viewport.columns > 0 && viewport.rows > 0 {
+		storage.cell_pixels = {viewport.width_pixels / viewport.columns, viewport.height_pixels / viewport.rows}
+	}
 	cursor: term.Cursor
 	err: Render_Status
 	if sync.mutex_guard(&app.run.mu) {
@@ -268,6 +296,7 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	if err != .None {
 		return
 	}
+	images_sync(app, storage)
 	_, required, present_err := term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
 	if present_err == term.General_Error.Presentation_Workspace_Too_Small {
 		// The encoder reports the exact required count before writing anything,
@@ -305,6 +334,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	if !tui.init(&storage.buffer, cols, rows, storage.cells) {
 		return {}, .Buffer_Too_Small
 	}
+	clear(&storage.shown)
 
 	// The prompt grows with wrapped input until five content rows, then keeps the
 	// caret visible by scrolling those rows inside its border.
@@ -349,6 +379,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		}
 		cursor = drawn_cursor
 	}
+	images_collect(app, storage)
 	draw_footer(app, storage, cwd_rect, status_rect)
 	storage.buffer.links = storage.links[:]
 	return cursor, .None
@@ -522,6 +553,10 @@ conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.P
 @(require_results)
 draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
 	for command in frame_result.commands {
+		if image, is_image := command.data.(layout.Image_Cmd); is_image {
+			if !draw_conversation_image(storage, command.bounds, term.Image_Id(image.handle), viewport) { return false }
+			continue
+		}
 		text_data, is_text := command.data.(layout.Text_Cmd)
 		if !is_text {
 			continue
@@ -542,6 +577,24 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		// A text node's user tag is its link id; zero draws plain cells.
 		_, _ = tui.draw_text_linked_rect(&storage.buffer, line, text_data.text, style, term.Link_Id(text_data.user))
 	}
+	return true
+}
+
+// draw_conversation_image draws one picture's placeholder cells and records the
+// image as shown at its size. The picture can reach past the transcript's bottom
+// edge, where the prompt and footer are drawn after it, so it draws into a view
+// of the grid that ends at the transcript's last row: tui clips a rect to its
+// buffer, and the rows of the picture that remain are the visible ones.
+@(require_results)
+draw_conversation_image :: proc(storage: ^Frame_Storage, bounds: layout.Rect, id: term.Image_Id, viewport: tui.Cell_Rect) -> bool {
+	rect, project_err := tui.project_rect_integral(bounds)
+	if project_err != nil { return false }
+	rect.x += viewport.x
+	rect.y += viewport.y
+	clipped := storage.buffer
+	clipped.rows = viewport.y + viewport.height
+	_ = tui.draw_image(&clipped, rect, id)
+	_, _ = append(&storage.shown, Image_Placement{id = id, columns = rect.width, rows = rect.height})
 	return true
 }
 
@@ -592,7 +645,9 @@ selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Alloca
 		}
 		if row > start.y { strings.write_byte(&builder, '\n') }
 		for column in first ..= last {
-			strings.write_string(&builder, buffer.cells[selection_index(app, buffer, row, column)].grapheme)
+			grapheme := buffer.cells[selection_index(app, buffer, row, column)].grapheme
+			// A picture's cells are not text, so a drag across one copies a space.
+			strings.write_string(&builder, " " if strings.has_prefix(grapheme, term.GRAPHICS_PLACEHOLDER) else grapheme)
 		}
 	}
 	return strings.to_string(builder), true
@@ -616,7 +671,7 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // pasted in at draw time.
 declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
 	if entry.kind == .Tool || entry.kind == .Codemode {
-		declare_tool_entry(ctx, entry, width, spin_frame)
+		declare_tool_entry(ctx, storage, entry, width, spin_frame)
 		return
 	}
 	if entry.kind == .Assistant {
@@ -730,7 +785,7 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // here too: a successful one in blue, any other outcome in the same red a tool box uses.
 // A running call draws the spinner frame before its name and the working border color,
 // whatever its kind.
-declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int, spin_frame: int) {
+declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
 	outline := widgets.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
@@ -801,10 +856,49 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int, spin
 			fill := strings.repeat(" ", content_width, context.temp_allocator) or_else ""
 			declare_tool_row(ctx, fmt.tprintf(" %s ", fill), border, body, outline.vertical)
 		}
+		if entry.image.id != 0 {
+			columns, rows := image_cells(entry.image, content_width, storage.cell_pixels)
+			declare_tool_image(ctx, entry.image.id, columns, rows, content_width, border, outline.vertical)
+		}
 		layout.text(ctx, layout.Text_Desc{text = bottom, style = border})
 	}
 }
 
+// declare_tool_image reserves the rows of a box's picture below its text, inside the
+// border: a bar column on each side and, between them, the picture one cell in from
+// the left bar, the way a text row is inset. The picture is a layout image whose
+// solved rect is where draw_conversation_image places its cells.
+declare_tool_image :: proc(ctx: ^layout.Context, id: term.Image_Id, columns, rows, content_width: int, border: layout.Text_Style, vertical: string) {
+	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
+		declare_tool_bars(ctx, rows, border, vertical)
+		picture_box := layout.Layout_Style {
+			sizing = layout.Sizing{width = layout.fixed(layout.Scalar(content_width + 2)), height = layout.fixed(layout.Scalar(rows))},
+			padding = layout.Edges{left = 1},
+		}
+		if layout.element(ctx, layout.Element_Desc{layout = picture_box}) {
+			picture := layout.Layout_Style {
+				sizing = layout.Sizing{width = layout.fixed(layout.Scalar(columns)), height = layout.fixed(layout.Scalar(rows))},
+			}
+			layout.content(
+				ctx,
+				layout.Element_Desc {
+					layout = picture,
+					content = layout.Image_Content{handle = layout.Image_Handle(id), intrinsic_size = {layout.Scalar(columns), layout.Scalar(rows)}},
+				},
+			)
+		}
+		declare_tool_bars(ctx, rows, border, vertical)
+	}
+}
+
+// declare_tool_bars declares a column of rows vertical bars.
+declare_tool_bars :: proc(ctx: ^layout.Context, rows: int, border: layout.Text_Style, vertical: string) {
+	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column}}) {
+		for _ in 0 ..< rows {
+			layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
+		}
+	}
+}
 // tool_row_next splits the first row a tool box draws from `value` and returns it with the
 // remainder. A row ends at a newline or at the content width; a grapheme wider than the
 // width still takes a row, so the split always advances. start_column is where the row
