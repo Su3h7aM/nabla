@@ -31,8 +31,12 @@ follow_log_call :: proc(user_data: rawptr, event: Chat_Tool_Event) {
 	follow_log_add(user_data, fmt.tprintf("call:%s", event.name))
 }
 
-follow_log_result :: proc(user_data: rawptr, name, arguments: string, result: ^Tool_Result) {
+follow_log_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^Tool_Result) {
 	follow_log_add(user_data, fmt.tprintf("result:%s:%s", name, result.content))
+}
+
+follow_log_turn_finished :: proc(user_data: rawptr) {
+	follow_log_add(user_data, "turn_finished")
 }
 
 follow_log_message :: proc(user_data: rawptr, kind: Chat_Message_Kind, text: string) {
@@ -151,7 +155,7 @@ test_a_follower_shows_a_delivered_agent_input_once :: proc(test: ^testing.T) {
 
 // A follower shows what the runner commits through the same callbacks a runner's own
 // front-end has, in order: a line it sent shows once, though the User node that delivers it
-// is committed later, and the records of a Lua script's child call are not shown.
+// is committed later, and a Lua child is reported only once it settles.
 @(test)
 test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -170,6 +174,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	log: Follow_Log
 	defer follow_log_destroy(&log)
 	observer := follow_log_observer(&log)
+	observer.turn_finished = follow_log_turn_finished
 
 	header := journal.Record {
 		session = session,
@@ -204,7 +209,12 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	proposed.node = assistant
 	proposed.request = 1
 	proposed.call = 1
-	journal.append_record(store, proposed, journal.Tool_Proposed{provider_id = "call_1", name = "shell"}, follow_body(`{"command":"ls"}`))
+	journal.append_record(
+		store,
+		proposed,
+		journal.Tool_Proposed{provider_id = "call_1", name = "codemode"},
+		follow_body(`{"code":"return tools.read({path = \"a.odin\"})"}`),
+	)
 	follow_commit(test, store)
 
 	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the first poll failed")
@@ -217,12 +227,14 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	completed.node = assistant
 	completed.request = 1
 	completed.call = 1
-	journal.append_record(store, completed, journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]}, follow_body("ok\nexit_code: 0"))
-	// A child of a script is not part of the conversation.
-	child := completed
+	child := proposed
+	child.node = 0
 	child.call = 2
 	child.parent_call = 1
+	journal.append_record(store, child, journal.Tool_Proposed{provider_id = "call_1/1", name = "read"}, follow_body(`{"path":"a.odin"}`))
+	child.kind = .Tool_Completed
 	journal.append_record(store, child, journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]}, follow_body("child result"))
+	journal.append_record(store, completed, journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]}, follow_body("ok\nvalue: 1"))
 	follow_commit(test, store)
 	follow_send(test, &follower, "from the follower")
 	ended := header
@@ -245,7 +257,15 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 
 	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the second poll failed")
 	testing.expect(test, !follow.working, "the turn completed")
-	expected := [?]string{"user:question:prompt", "assistant:looking", "call:shell", "result:shell:ok\nexit_code: 0", "user:from the follower:prompt"}
+	expected := [?]string {
+		"user:question:prompt",
+		"assistant:looking",
+		"call:codemode",
+		"result:read:child result",
+		"result:codemode:ok\nvalue: 1",
+		"user:from the follower:prompt",
+		"turn_finished",
+	}
 	if !testing.expect_value(test, len(log.events), len(expected)) { return }
 	for event, index in expected { testing.expect_value(test, log.events[index], event) }
 

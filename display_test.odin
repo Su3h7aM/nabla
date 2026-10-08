@@ -2,7 +2,24 @@
 #+private file
 package main
 
+import "core:strings"
 import "core:testing"
+
+@(test)
+test_codemode_arguments_preview_is_a_bounded_utf8_line :: proc(t: ^testing.T) {
+	testing.expect_value(t, codemode_arguments_preview(" \tfirst\u2003\n\u00a0 second\r "), "first second")
+	testing.expect_value(t, codemode_arguments_preview("a\xffb"), "a\uFFFDb")
+	prefix: [79]u8
+	for &byte in prefix { byte = 'a' }
+	testing.expect_value(
+		t,
+		codemode_arguments_preview(strings.concatenate({string(prefix[:]), "é"}, context.temp_allocator)),
+		strings.concatenate({string(prefix[:]), "…"}, context.temp_allocator),
+	)
+	huge := make([]u8, 1_000_000, context.temp_allocator)
+	for &byte in huge { byte = 'x' }
+	testing.expect_value(t, codemode_arguments_preview(string(huge)), strings.concatenate({string(huge[:80]), "…"}, context.temp_allocator))
+}
 
 _sanitize_one :: proc(t: ^testing.T, chunk: string) -> string {
 	sanitizer: Display_Sanitizer

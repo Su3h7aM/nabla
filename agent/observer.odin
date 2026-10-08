@@ -19,6 +19,9 @@ import "nabla:ai"
 // model produced them.
 Chat_Observer :: struct {
 	user_data:        rawptr,
+	// turn_finished runs after the turn's final events. No call from that turn can
+	// report afterward. Followers report it in journal order, before a later turn.
+	turn_finished:    proc(user_data: rawptr),
 	assistant_begin:  proc(user_data: rawptr),
 	assistant_text:   proc(user_data: rawptr, text: string),
 	assistant_flush:  proc(user_data: rawptr),
@@ -27,14 +30,15 @@ Chat_Observer :: struct {
 	// the front-end can show what another agent sent apart from the user's own
 	// lines.
 	user_text:        proc(user_data: rawptr, text: string, origin: journal.User_Origin),
-	// tool_call is called once for each call the harness admits, before the call runs
-	// and before its result exists. A call that is refused or cancelled announces itself
-	// here too and still reports a result, so a front-end sees every committed call
-	// exactly once as pending and exactly once as settled. Calls a Code Mode script makes
-	// are not reported: the script's own result is what the turn shows.
+	// tool_call reports a direct model call before it runs, including calls that
+	// are refused or cancelled. Code Mode children report only their settled
+	// tool_result, never a pending tool_call.
 	tool_call:        proc(user_data: rawptr, event: Chat_Tool_Event),
-	// tool_result borrows name and the proposed arguments for the duration of the callback.
-	tool_result:      proc(user_data: rawptr, name, arguments: string, result: ^Tool_Result),
+	// tool_result reports one committed result. call is the call's own journal id and
+	// parent_call the Code Mode call that ran it, or zero for a call the model made
+	// directly. name and the proposed arguments are borrowed for the duration of the
+	// callback. Code Mode children report only here, once they settle.
+	tool_result:      proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^Tool_Result),
 	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
 	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
 	// request_prepared is called once for each provider request the turn is about to
@@ -74,6 +78,11 @@ Chat_Message_Kind :: enum {
 }
 
 @(private)
+_observer_turn_finished :: proc(observer: Chat_Observer) {
+	if observer.turn_finished != nil { observer.turn_finished(observer.user_data) }
+}
+
+@(private)
 _observer_assistant_begin :: proc(observer: Chat_Observer) {
 	if observer.assistant_begin != nil { observer.assistant_begin(observer.user_data) }
 }
@@ -104,8 +113,8 @@ _observer_tool_call :: proc(observer: Chat_Observer, event: Chat_Tool_Event) {
 }
 
 @(private)
-_observer_tool_result :: proc(observer: Chat_Observer, name, arguments: string, result: ^Tool_Result) {
-	if observer.tool_result != nil { observer.tool_result(observer.user_data, name, arguments, result) }
+_observer_tool_result :: proc(observer: Chat_Observer, call, parent_call: journal.Call_Id, name, arguments: string, result: ^Tool_Result) {
+	if observer.tool_result != nil { observer.tool_result(observer.user_data, call, parent_call, name, arguments, result) }
 }
 
 @(private)

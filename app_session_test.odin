@@ -73,6 +73,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 		if entry.text != nil { delete(entry.text) }
 	}
 	delete(app.run.snap.entries)
+	codemode_pending_clear_locked(app)
 	for &row in app.run.snap.sessions {
 		delete(row.title, app.run.alloc)
 	}
@@ -963,7 +964,7 @@ test_resume_replays_an_agent_start_as_its_prompt :: proc(t: ^testing.T) {
 		reason  = "<agent> started",
 		outcome = .Success,
 	}
-	observer_tool_result(&app, "agent", arguments, &live)
+	observer_tool_result(&app, 0, 0, "agent", arguments, &live)
 	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
 	live_box := strings.clone(string(app.run.snap.entries[0].text[:]), context.allocator)
 	defer delete(live_box, context.allocator)
@@ -1032,7 +1033,7 @@ test_resume_replays_a_failed_agent_start_with_its_reason :: proc(t: ^testing.T) 
 		reason  = "unknown model 'fast'",
 		outcome = .Unknown,
 	}
-	observer_tool_result(&app, "agent", arguments, &live)
+	observer_tool_result(&app, 0, 0, "agent", arguments, &live)
 	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
 	live_box := strings.clone(string(app.run.snap.entries[0].text[:]), context.allocator)
 	defer delete(live_box, context.allocator)
@@ -1079,6 +1080,175 @@ test_resume_replays_a_failed_agent_start_with_its_reason :: proc(t: ^testing.T) 
 		testing.expect_value(t, string(entry.text[:]), live_box)
 	}
 	testing.expect(t, replayed, "resuming should replay the failed agent start")
+}
+
+// A Code Mode run shows the script and one line per inner call, and each inner call
+// keeps its own box titled for the script that ran it. A direct call keeps its own
+// title. The live observer and the replay share the text, so resuming shows the same
+// boxes the turn showed.
+@(test)
+test_resume_replays_codemode_boxes_like_the_live_turn :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	id := app.setup.session.session
+	accepted := agent.chat_session_accept_user(&app.setup.session, "run a script")
+	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
+
+	outer_arguments := `{"code":"return tools.read({path = \"a.odin\"})"}`
+	read_arguments := `{"path":"a.odin"}`
+	shell_arguments := `{"command":"exit 1"}`
+	direct_arguments := `{"path":"b.odin"}`
+	read_content := "ok\npath: a.odin\n\ncontent:\nhello\n"
+	shell_content := "error tool_failed: exit 1 failed"
+	outer_content := "ok\nvalue: 1\n\n1\n"
+
+	read_result := agent.Tool_Result {
+		content = read_content,
+		outcome = .Success,
+	}
+	shell_result := agent.Tool_Result {
+		content = shell_content,
+		reason  = "exit 1 failed",
+		outcome = .Tool_Failed,
+	}
+	outer_result := agent.Tool_Result {
+		content = outer_content,
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 8, 7, "read", read_arguments, &read_result)
+	observer_tool_result(&app, 9, 7, "shell", shell_arguments, &shell_result)
+	observer_tool_result(&app, 7, 0, "codemode", outer_arguments, &outer_result)
+	direct_result := agent.Tool_Result {
+		content = read_content,
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 10, 0, "read", direct_arguments, &direct_result)
+	if !testing.expect_value(t, len(app.run.snap.entries), 4) { return }
+
+	expected_kinds := [4]Entry_Kind{.Codemode, .Codemode, .Codemode, .Tool}
+	expected_outcomes := [4]journal.Tool_Outcome{.Success, .Tool_Failed, .Success, .Success}
+	expected_texts := [4]string {
+		"codemode · read\ncontent:\nhello\n",
+		"codemode · shell\nexit 1 failed",
+		"codemode\nreturn tools.read({path = \"a.odin\"})\n\n✓ read {\"path\":\"a.odin\"}\n✗ shell {\"command\":\"exit 1\"}\n\n1\n",
+		"read\ncontent:\nhello\n",
+	}
+	for index in 0 ..< 4 {
+		entry := &app.run.snap.entries[index]
+		testing.expect_value(t, entry.kind, expected_kinds[index])
+		testing.expect_value(t, entry.tool_outcome, expected_outcomes[index])
+		testing.expect_value(t, string(entry.text[:]), expected_texts[index])
+	}
+	live_boxes := make([dynamic]string, 0, 4, context.allocator)
+	defer {
+		for box in live_boxes { delete(box, context.allocator) }
+		delete(live_boxes)
+	}
+	for &entry in app.run.snap.entries {
+		append(&live_boxes, strings.clone(string(entry.text[:]), context.allocator))
+	}
+	snapshot_clear(&app)
+
+	store := app.setup.store
+	chat := &app.setup.session
+	assistant := journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	outer := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, request = 1, call = outer},
+		journal.Tool_Proposed{provider_id = "call_1", name = "codemode"},
+		transmute([]u8)outer_arguments,
+	)
+	direct := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, request = 1, call = direct},
+		journal.Tool_Proposed{provider_id = "call_2", name = "read"},
+		transmute([]u8)direct_arguments,
+	)
+	read := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = 0, turn = chat.turn, request = 1, call = read, parent_call = outer},
+		journal.Tool_Proposed{provider_id = "call_1/1", name = "read"},
+		transmute([]u8)read_arguments,
+	)
+	shell := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = 0, turn = chat.turn, request = 1, call = shell, parent_call = outer},
+		journal.Tool_Proposed{provider_id = "call_1/2", name = "shell"},
+		transmute([]u8)shell_arguments,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = 0, turn = chat.turn, call = read, parent_call = outer},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)read_content,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = 0, turn = chat.turn, call = shell, parent_call = outer},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Tool_Failed]},
+		transmute([]u8)shell_content,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, call = outer},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)outer_content,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, call = direct},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)read_content,
+	)
+	_ = journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
+		journal.Results{calls = []journal.Call_Id{outer, direct}},
+	)
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the tool calls could not be recorded") }
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil { testing.fail_now(t, "projection allocation failed") }
+	defer virtual.arena_destroy(&arena)
+	_, head, head_error := journal.session_head(store, id)
+	if head_error != nil { testing.fail_now(t, "session head read failed") }
+	projection, projection_error := agent.projection_load(store, id, head, virtual.arena_allocator(&arena))
+	if !testing.expect(t, projection_error == nil) { return }
+	testing.expect_value(t, len(projection.nested), 2)
+	for item in projection.items {
+		if call, ok := item.payload.(agent.Projected_Call);
+		   ok { testing.expect(t, call.parent_call == 0, "children must not enter the provider conversation") }
+		if result, ok := item.payload.(agent.Projected_Result); ok { testing.expect(t, result.parent_call == 0, "child results must remain display-only") }
+	}
+
+	testing.expect(t, session_switch(&app, Start_Fresh{}))
+	snapshot_clear(&app)
+	session_resume(&app, app_session_id_text(id)[:8])
+	testing.expect_value(t, app.setup.session.session, id)
+
+	boxes := make([dynamic]^Entry, 0, 4, context.allocator)
+	defer delete(boxes)
+	for &entry in app.run.snap.entries {
+		if entry.kind != .Codemode && entry.kind != .Tool { continue }
+		append(&boxes, &entry)
+	}
+	if !testing.expect_value(t, len(boxes), 4) { return }
+	for index in 0 ..< 4 {
+		entry := boxes[index]
+		testing.expect_value(t, entry.kind, expected_kinds[index])
+		testing.expect_value(t, entry.tool_outcome, expected_outcomes[index])
+		testing.expect_value(t, string(entry.text[:]), live_boxes[index])
+		testing.expect_value(t, string(entry.text[:]), expected_texts[index])
+	}
 }
 
 @(test)
@@ -1835,6 +2005,123 @@ test_follower_attachment_replays_captured_pending_input_once :: proc(t: ^testing
 	_ = app_follow_poll(&app, run_observer(&app))
 	testing.expect_value(t, app_entries_count(&app, "captured pending line"), 1)
 	testing.expect_value(t, len(app.setup.follow_pending), 0)
+}
+
+@(test)
+test_follower_attachment_keeps_inner_results_until_the_script_finishes :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	chat, tool_error := agent.chat_session_init(&runner, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "runner initialization failed") }
+	defer agent.chat_session_destroy(&chat)
+	chat.skill_instructions = agent.test_skill_instructions(&chat)
+	if agent.chat_session_accept_user(&chat, "run a script") != .Accepted { testing.fail_now(t, "runner prompt failed") }
+	arguments := `{"code":"return tools.read({path = \"a.odin\"})"}`
+	inner_arguments := `{"path":"a.odin"}`
+	assistant := journal.append_node(
+		&runner,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	outer := journal.next_call(&runner)
+	inner := journal.next_call(&runner)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = outer},
+		journal.Tool_Proposed{provider_id = "outer", name = "codemode"},
+		transmute([]u8)arguments,
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, turn = chat.turn, call = inner, parent_call = outer},
+		journal.Tool_Proposed{provider_id = "inner", name = "read"},
+		transmute([]u8)inner_arguments,
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, turn = chat.turn, call = inner, parent_call = outer},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)string("ok\n\nhello"),
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "inner result commit failed") }
+	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
+	if !testing.expect(t, app_following(&app)) { return }
+	session_replay(&app, &app.setup.session)
+	testing.expect_value(t, app_entries_count(&app, "codemode · read\nhello"), 1)
+	testing.expect_value(t, len(app.run.codemode_pending[outer]), 1)
+	observer := run_observer(&app)
+	_ = app_follow_poll(&app, observer)
+	testing.expect_value(t, app_entries_count(&app, "codemode · read\nhello"), 1)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = outer},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)string("ok\n\nfinished"),
+	)
+	_ = journal.append_node(
+		&runner,
+		{session = id, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
+		journal.Results{calls = []journal.Call_Id{outer}},
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Turn_Completed, session = id, turn = chat.turn},
+		journal.Turn_Completed{outcome = journal.TURN_OUTCOME_NAMES[.Completed]},
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "outer result commit failed") }
+	_ = app_follow_poll(&app, observer)
+	testing.expect_value(t, app_entries_count(&app, "codemode · read\nhello"), 1)
+	testing.expect_value(t, app_entries_count(&app, "codemode\nreturn tools.read({path = \"a.odin\"})\n\n✓ read {\"path\":\"a.odin\"}\n\nfinished"), 1)
+	testing.expect_value(t, len(app.run.codemode_pending), 0)
+
+	// A poll spanning the end of an unanswered script and a new turn must release
+	// the old list before the next turn's events, even though the follower stays busy.
+	journal.append_record(&runner, {kind = .Turn_Started, session = id, turn = chat.turn + 1}, journal.Turn_Started{})
+	orphan := journal.next_call(&runner)
+	orphan_inner := journal.next_call(&runner)
+	_, current_head, current_head_error := journal.session_head(&runner, id)
+	if current_head_error != nil { testing.fail_now(t, "runner head read failed") }
+	orphan_assistant := journal.append_node(
+		&runner,
+		{session = id, branch = chat.branch, parent = current_head, turn = chat.turn + 1, kind = .Assistant},
+		journal.Assistant{request = 2},
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, node = orphan_assistant, turn = chat.turn + 1, call = orphan},
+		journal.Tool_Proposed{provider_id = "orphan", name = "codemode"},
+		transmute([]u8)arguments,
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, turn = chat.turn + 1, call = orphan_inner, parent_call = orphan},
+		journal.Tool_Proposed{provider_id = "orphan_inner", name = "read"},
+		transmute([]u8)inner_arguments,
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Completed, session = id, turn = chat.turn + 1, call = orphan_inner, parent_call = orphan},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)string("ok\n\nother"),
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Turn_Completed, session = id, turn = chat.turn + 1},
+		journal.Turn_Completed{outcome = journal.TURN_OUTCOME_NAMES[.Failed]},
+	)
+	journal.append_record(&runner, {kind = .Turn_Started, session = id, turn = chat.turn + 2}, journal.Turn_Started{})
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "turn transitions commit failed") }
+	_ = app_follow_poll(&app, observer)
+	testing.expect(t, app.setup.follow.working)
+	testing.expect_value(t, len(app.run.codemode_pending), 0)
 }
 
 @(test)

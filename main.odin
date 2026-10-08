@@ -175,7 +175,7 @@ headless_assistant_end :: proc(user_data: rawptr) {
 	if out.answered { headless_answer_write(out, "\n") }
 }
 
-headless_tool_result :: proc(user_data: rawptr, name, arguments: string, result: ^agent.Tool_Result) {
+headless_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
 	fmt.eprintf("nabla: tool %s: %s\n", name, tool_display_summary(result))
 }
 

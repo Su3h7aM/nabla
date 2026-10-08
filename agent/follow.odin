@@ -43,15 +43,16 @@ follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (f
 
 // follow_poll renders the records of session committed after follow.last through the
 // observer, in seq order, and advances follow. Each record is reported as the live view
-// reports the same fact. Records of a Lua script's child calls and records whose payload
-// cannot be decoded are skipped. A journal error stops the poll with follow.last at the
-// last record rendered. Nothing here writes the journal.
+// reports the same fact: a Code Mode child's result carries its script's call as
+// parent_call, as the live view reports it. Records whose payload cannot be decoded
+// are skipped. A journal error stops the poll with follow.last at the last record
+// rendered. Nothing here writes the journal.
 @(require_results)
 follow_poll :: proc(store: ^journal.Journal, session: journal.Session_Id, follow: ^Follow, observer: Chat_Observer) -> journal.Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	records, _ := journal.read_records(store, {session = session}, follow.last, 0, context.temp_allocator) or_return
 	for record in records {
-		if record.parent_call == 0 { follow_record(store, follow, record, observer) or_return }
+		follow_record(store, follow, record, observer) or_return
 		follow.last = record.seq
 	}
 	return nil
@@ -66,6 +67,7 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .Node_Committed:
 		return follow_node(store, follow, record, observer)
 	case .Tool_Proposed:
+		if record.parent_call != 0 { return nil }
 		proposed: journal.Tool_Proposed
 		if journal.payload_decode(record.data, &proposed, context.temp_allocator) != nil { return nil }
 		_observer_tool_call(observer, Chat_Tool_Event{call_id = proposed.provider_id, name = proposed.name, arguments = body})
@@ -74,6 +76,7 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .Turn_Started:
 		follow.working = true
 	case .Turn_Completed:
+		defer _observer_turn_finished(observer)
 		follow.working = false
 		completed: journal.Turn_Completed
 		decoded := journal.payload_decode(record.data, &completed, context.temp_allocator) == nil
@@ -213,7 +216,7 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 		content   = string(record.body),
 		allocator = context.temp_allocator,
 	}
-	_observer_tool_result(observer, name, arguments, &result)
+	_observer_tool_result(observer, record.call, record.parent_call, name, arguments, &result)
 	return nil
 }
 

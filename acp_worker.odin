@@ -1417,7 +1417,7 @@ acp_obs_tool_call :: proc(user_data: rawptr, event: agent.Chat_Tool_Event) {
 	_ = acp_send_tool_call(session, event.call_id, event.name, event.arguments, .Pending, "")
 }
 
-acp_obs_tool_result :: proc(user_data: rawptr, name, arguments: string, result: ^agent.Tool_Result) {
+acp_obs_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
 	session := cast(^ACP_Session)user_data
 	text := tool_display_preview(result.content)
 	if text == "" { text = tool_display_summary(result) }

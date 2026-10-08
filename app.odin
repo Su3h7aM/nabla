@@ -30,6 +30,7 @@ Entry_Kind :: enum u8 {
 	Assistant,
 	Subagent,
 	Tool,
+	Codemode,
 	Notice,
 	Warning,
 	Error,
@@ -325,6 +326,12 @@ Runtime :: struct {
 	// catalog_applied_revision is the newest published catalog whose metadata the
 	// worker applied to the active selection. Only the worker reads and writes it.
 	catalog_applied_revision: u64,
+	// codemode_pending holds one inner-call list per running Code Mode call, by the
+	// outer call's journal id. An inner result appends to its script's list before
+	// its box is shown, and the outer result takes and frees the list when its box
+	// is shown. Owned by alloc; only the worker thread reads and writes it, under
+	// mu like the snapshot.
+	codemode_pending:         map[journal.Call_Id][dynamic]Codemode_Inner,
 }
 
 // stop_runtime refuses further work. The front-end is the only enqueuer, so once
@@ -732,6 +739,7 @@ snapshot_destroy :: proc(app: ^App) {
 		}
 	}
 	delete(app.run.snap.entries)
+	codemode_pending_clear_locked(app)
 	for &row in app.run.snap.sessions {
 		delete(row.title, app.run.alloc)
 	}

@@ -85,6 +85,11 @@ TOOL_BODY :: term.Style{}
 TOOL_SUCCESS :: term.Style {
 	foreground = term.Indexed_Color(2),
 }
+// A Code Mode box draws its border in blue, so a script and the calls it made read
+// apart from a direct tool call. Its content is ordinary text, like any tool box.
+CODEMODE_SUCCESS :: term.Style {
+	foreground = term.Indexed_Color(4),
+}
 TOOL_FAILURE :: term.Style {
 	foreground = term.Indexed_Color(1),
 }
@@ -610,7 +615,7 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
 declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int) {
-	if entry.kind == .Tool {
+	if entry.kind == .Tool || entry.kind == .Codemode {
 		declare_tool_entry(ctx, entry, width)
 		return
 	}
@@ -721,7 +726,8 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // declare_tool_entry draws one tool call as a bordered box: the call's name on the top
 // border, then a window of its result. A result taller than the window scrolls (see
 // `entry.tool_scroll`), and the bottom border says how many rows are held back. Only the
-// border carries the outcome color; the content is ordinary text.
+// border carries the outcome color; the content is ordinary text. Code Mode calls draw
+// here too: a successful one in blue, any other outcome in the same red a tool box uses.
 declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	outline := widgets.BORDER_ROUNDED
 	box_width := max(width, 4)
@@ -761,7 +767,9 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	entry.tool_scroll = clamp(entry.tool_scroll, 0, entry.tool_scroll_max)
 	bottom := tool_border_bottom(outline, border_inner_width, tool_window_label(entry.tool_scroll, entry.tool_scroll_max - entry.tool_scroll))
 	border_style := TOOL_FAILURE
-	if entry.tool_outcome == .Success { border_style = TOOL_SUCCESS }
+	if entry.tool_outcome == .Success {
+		border_style = CODEMODE_SUCCESS if entry.kind == .Codemode else TOOL_SUCCESS
+	}
 	if layout.element(
 		ctx,
 		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = layout.User_Tag(entry.id)},
@@ -1009,6 +1017,8 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 	case .Subagent:
 		return SUBAGENT_TEXT
 	case .Tool:
+		return TOOL_BODY
+	case .Codemode:
 		return TOOL_BODY
 	case .Notice:
 		return NOTICE_TEXT

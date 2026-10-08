@@ -840,10 +840,10 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	if job_published(&job.worker) { return }
 	message := fmt.tprintf("the tool did not stop within %v of its stop being requested; its outcome is unknown", TOOL_JOBS_STOP_PATIENCE)
 	result := tool_result_failure(&job.exec, .Unknown, message, "did not stop")
+	node, parent_call := tool_job_record_placement(chat, job)
 	recorded := false
 	if !result.allocation_failed {
 		if !job.nested { tool_result_keep(&result, &jobs.budget, chat_tool_output_path(chat, job.call.call)) }
-		node, parent_call := tool_job_record_placement(chat, job)
 		recorded = chat_record_tool_result(chat, job.call.call, node, parent_call, &result)
 	}
 
@@ -855,7 +855,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	// The unknown outcome is recorded before the abandonment, so recovery never sees an
 	// abandoned call that still has no answer.
 	tool_job_abandon(jobs, job)
-	if recorded { _observer_tool_result(observer, job.name, job.call.arguments, &result) }
+	if recorded { _observer_tool_result(observer, job.call.call, parent_call, job.name, job.call.arguments, &result) }
 	tool_result_destroy(&result)
 	if !recorded {
 		// The answer could not be recorded, so the session's storage failed. Recovery still
@@ -962,7 +962,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	if job.parent != nil {
 		codemode_job_child_committed(jobs, job, &result)
 	}
-	_observer_tool_result(observer, job.name, job.call.arguments, &result)
+	_observer_tool_result(observer, job.call.call, parent_call, job.name, job.call.arguments, &result)
 	tool_result_destroy(&result)
 	job.phase = .Retiring
 }

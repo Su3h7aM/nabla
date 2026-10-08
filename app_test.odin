@@ -294,13 +294,13 @@ test_agent_start_box_shows_only_the_prompt :: proc(t: ^testing.T) {
 				reason  = "agent-1 started",
 				outcome = .Success,
 			}
-			observer_tool_result(&app, "agent", arguments, &result)
+			observer_tool_result(&app, 0, 0, "agent", arguments, &result)
 		}
 	}
 	for entry in app.run.snap.entries {
 		testing.expect_value(t, string(entry.text[:]), "agent\ninspect the parser\nand report errors")
 	}
-	observer_tool_result(&app, "agent", `{"action":"stop","agent":"agent-1"}`, &agent.Tool_Result{content = "ok\n\nstopped"})
+	observer_tool_result(&app, 0, 0, "agent", `{"action":"stop","agent":"agent-1"}`, &agent.Tool_Result{content = "ok\n\nstopped"})
 	testing.expect_value(t, string(app.run.snap.entries[len(app.run.snap.entries) - 1].text[:]), "agent\nstopped")
 	// A start that fails keeps its prompt and appends the failure reason, so the live
 	// box reads the same as the replayed one.
@@ -309,7 +309,7 @@ test_agent_start_box_shows_only_the_prompt :: proc(t: ^testing.T) {
 		reason  = "unknown model",
 		outcome = .Unknown,
 	}
-	observer_tool_result(&app, "agent", calls[0], &failed)
+	observer_tool_result(&app, 0, 0, "agent", calls[0], &failed)
 	testing.expect_value(t, string(app.run.snap.entries[len(app.run.snap.entries) - 1].text[:]), "agent\ninspect the parser\nand report errors\nunknown model")
 }
 

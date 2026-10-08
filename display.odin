@@ -4,6 +4,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:time"
+import "core:unicode"
 import "core:unicode/utf8"
 
 import "nabla:agent"
@@ -215,27 +216,39 @@ display_duration :: proc(delay: time.Duration) -> string {
 }
 
 // Tool_Display_Call is the part of a tool call the transcript box shows. The name is
-// borrowed from the caller and the prompt is decoded into the temporary allocator, so a
-// caller that keeps the call past its own temporary scope must clone the prompt into
-// memory that lives as long as the call does.
+// borrowed from the caller and the prompt and the Code Mode program are decoded into
+// the temporary allocator, so a caller that keeps the call past its own temporary
+// scope must clone them into memory that lives as long as the call does.
 Tool_Display_Call :: struct {
 	name:   string,
 	prompt: Maybe(string),
+	code:   Maybe(string),
 }
 
-// tool_display_call borrows name and decodes a start prompt into the temporary allocator. A
-// start without a prompt text has none to show, so its box falls back to the result.
+// tool_display_call borrows name and decodes a start prompt, or a Code Mode program,
+// into the temporary allocator. A start without a prompt text has none to show, so its
+// box falls back to the result, and a codemode call without a program text does the same.
 tool_display_call :: proc(name, arguments: string) -> Tool_Display_Call {
 	call := Tool_Display_Call {
 		name = name,
 	}
-	if name != agent.TOOL_AGENT_NAME { return call }
-	args: struct {
-		action: string,
-		prompt: Maybe(string),
+	if name == agent.TOOL_AGENT_NAME {
+		args: struct {
+			action: string,
+			prompt: Maybe(string),
+		}
+		if json.unmarshal_string(arguments, &args, allocator = context.temp_allocator) != nil { return call }
+		if prompt, present := args.prompt.?; present && args.action == "start" && strings.trim_space(prompt) != "" { call.prompt = prompt }
+		return call
 	}
-	if json.unmarshal_string(arguments, &args, allocator = context.temp_allocator) != nil { return call }
-	if prompt, present := args.prompt.?; present && args.action == "start" && strings.trim_space(prompt) != "" { call.prompt = prompt }
+	if name == agent.TOOL_CODEMODE_NAME {
+		args: struct {
+			code: Maybe(string),
+		}
+		if json.unmarshal_string(arguments, &args, allocator = context.temp_allocator) != nil { return call }
+		if code, present := args.code.?; present && strings.trim_space(code) != "" { call.code = code }
+		return call
+	}
 	return call
 }
 
@@ -243,13 +256,111 @@ tool_display_call :: proc(name, arguments: string) -> Tool_Display_Call {
 // A failed start shows the prompt and then the same preview a non-start box would show,
 // so the failure reason is not lost behind the prompt.
 tool_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome) -> string {
+	return tool_entry_text_titled(call, call.name, content, fallback, outcome)
+}
+
+// tool_entry_text_titled renders the same box under another title. A Code Mode inner
+// call keeps its own result preview, so its box reads like a normal tool box that is
+// titled for the script that ran it.
+tool_entry_text_titled :: proc(call: Tool_Display_Call, title, content, fallback: string, outcome: journal.Tool_Outcome) -> string {
 	preview := tool_display_preview(content)
 	if preview == "" { preview = fallback }
 	if prompt, present := call.prompt.?; present {
-		if outcome == .Success { return fmt.tprintf("%s\n%s", call.name, prompt) }
-		return fmt.tprintf("%s\n%s\n%s", call.name, prompt, preview)
+		if outcome == .Success { return fmt.tprintf("%s\n%s", title, prompt) }
+		return fmt.tprintf("%s\n%s\n%s", title, prompt, preview)
 	}
-	return fmt.tprintf("%s\n%s", call.name, preview)
+	return fmt.tprintf("%s\n%s", title, preview)
+}
+
+// Codemode_Inner is one call a Code Mode script made, as the script's box lists it:
+// the tool, the arguments it ran with, and how it ended. The strings are borrowed.
+Codemode_Inner :: struct {
+	name:      string,
+	arguments: string,
+	outcome:   journal.Tool_Outcome,
+}
+
+// codemode_inner_title is the title of one inner call's box: the script and the tool
+// it ran. Live and replay share it so the two boxes read the same.
+codemode_inner_title :: proc(name: string) -> string {
+	return fmt.tprintf("codemode · %s", name)
+}
+
+// CODEMODE_ARGUMENT_PREVIEW_BYTES is how much of an inner call's arguments its
+// script's box lists: the collapsed text, cut at a UTF-8 boundary.
+CODEMODE_ARGUMENT_PREVIEW_BYTES :: 80
+
+// codemode_arguments_preview collapses an inner call's arguments to one line: newlines
+// and runs of whitespace become single spaces, and text past the preview budget is cut
+// with an ellipsis. The result is temporary, like every other display helper.
+codemode_arguments_preview :: proc(arguments: string) -> string {
+	builder, builder_error := strings.builder_make(0, CODEMODE_ARGUMENT_PREVIEW_BYTES + len("…"), context.temp_allocator)
+	if builder_error != nil { return "" }
+	pending_space := false
+	remaining := arguments
+	for len(remaining) > 0 && len(builder.buf) < CODEMODE_ARGUMENT_PREVIEW_BYTES {
+		character, width := utf8.decode_rune_in_string(remaining)
+		if unicode.is_space(character) {
+			pending_space = len(builder.buf) > 0
+			remaining = remaining[width:]
+			continue
+		}
+		// Decoding an invalid byte returns RUNE_ERROR with width one; encoding it
+		// writes a valid replacement rune instead of passing invalid UTF-8 through.
+		encoded, encoded_width := utf8.encode_rune(character)
+		space_bytes := 1 if pending_space else 0
+		if len(builder.buf) + space_bytes + encoded_width > CODEMODE_ARGUMENT_PREVIEW_BYTES { break }
+		if pending_space {
+			if strings.write_byte(&builder, ' ') != 1 { return "" }
+			pending_space = false
+		}
+		if strings.write_string(&builder, string(encoded[:encoded_width])) != encoded_width { return "" }
+		remaining = remaining[width:]
+	}
+	if len(remaining) > 0 {
+		if strings.write_string(&builder, "…") != len("…") { return "" }
+	}
+	return strings.to_string(builder)
+}
+
+// codemode_entry_text renders a Code Mode call's box: the title, the program, one
+// line per inner call in commit order, and the result preview. A script with no
+// inner calls omits the call lines and their blank line, and a call without a
+// program text falls back to the preview-only box other calls show. Live and replay
+// share it so the two boxes read the same.
+codemode_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome, inner: []Codemode_Inner) -> string {
+	preview := tool_display_preview(content)
+	if preview == "" { preview = fallback }
+	code, present := call.code.?
+	if !present { return tool_entry_text(call, content, fallback, outcome) }
+	builder, builder_error := strings.builder_make(context.temp_allocator)
+	if builder_error != nil { return tool_entry_text(call, content, fallback, outcome) }
+	strings.write_string(&builder, call.name)
+	strings.write_byte(&builder, '\n')
+	strings.write_string(&builder, code)
+	strings.write_byte(&builder, '\n')
+	if len(inner) > 0 {
+		strings.write_byte(&builder, '\n')
+		for entry in inner {
+			glyph := "✗"
+			switch entry.outcome {
+			case .Success:
+				glyph = "✓"
+			case .Cancelled:
+				glyph = "⊘"
+			case .Tool_Failed, .Invalid_Arguments, .Denied, .Unavailable, .Not_Executed, .Transport_Failed, .Timed_Out, .Unknown:
+			}
+			strings.write_string(&builder, glyph)
+			strings.write_byte(&builder, ' ')
+			strings.write_string(&builder, entry.name)
+			strings.write_byte(&builder, ' ')
+			strings.write_string(&builder, codemode_arguments_preview(entry.arguments))
+			strings.write_byte(&builder, '\n')
+		}
+	}
+	strings.write_byte(&builder, '\n')
+	strings.write_string(&builder, preview)
+	return strings.to_string(builder)
 }
 
 tool_display_preview :: proc(content: string) -> string {

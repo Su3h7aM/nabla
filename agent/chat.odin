@@ -377,6 +377,7 @@ chat_turn_drive :: proc(
 	steer: ^Steer_Context,
 	control: ^Turn_Control,
 ) -> bool {
+	defer _observer_turn_finished(observer)
 	// The turn's usage log holds nothing yet and allocates nothing; it carries the allocator
 	// the reports it collects grow from.
 	usages: [dynamic]Chat_Request_Usage

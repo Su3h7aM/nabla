@@ -652,8 +652,13 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		return
 	}
 
-	calls := make(map[journal.Call_Id]Tool_Display_Call, len(replayed.items), app.run.alloc)
+	calls := make(map[journal.Call_Id]agent.Projected_Call, len(replayed.items), app.run.alloc)
 	defer delete(calls)
+	// inners holds one inner-call list per Code Mode call, by the outer call's id,
+	// so an outer box lists its inner calls like the live view lists them. The
+	// replay arena owns the lists and every string they borrow, and releases them
+	// as a whole when the replay ends.
+	inners := make(map[journal.Call_Id][dynamic]Codemode_Inner, virtual.arena_allocator(&arena))
 
 	if replayed.summary != "" {
 		snap_append(app, .Notice, "(earlier turns are summarized)")
@@ -670,21 +675,79 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		case agent.Projected_Assistant:
 			snap_append(app, .Assistant, payload.text)
 		case agent.Projected_Call:
-			call := tool_display_call(payload.name, payload.proposed)
-			// The prompt points into temporary memory, but the call waits in the map
-			// for its result, so the prompt moves into the replay arena, which lives
-			// as long as the map does. The name already points into that arena.
-			if prompt, present := call.prompt.?; present {
-				if owned, clone_error := strings.clone(prompt, virtual.arena_allocator(&arena)); clone_error == nil {
-					call.prompt = owned
-				}
-			}
-			calls[payload.call] = call
+			calls[payload.call] = payload
 		case agent.Projected_Result:
-			snap_append_tool(app, calls[payload.call], payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
+			for nested in replayed.nested {
+				if nested.parent_call == payload.call { session_replay_nested(app, &inners, nested, virtual.arena_allocator(&arena)) }
+			}
+			session_replay_tool(app, &inners, calls[payload.call], payload, virtual.arena_allocator(&arena))
+			delete_key(&calls, payload.call)
 		}
 	}
-	if following { session_replay_queued(app) }
+	for nested in replayed.nested {
+		if _, pending := calls[nested.parent_call]; pending { session_replay_nested(app, &inners, nested, virtual.arena_allocator(&arena)) }
+	}
+	if following {
+		sync.mutex_lock(&app.run.mu)
+		for parent_call, list in inners {
+			for inner in list { codemode_pending_append_locked(app, parent_call, inner.name, inner.arguments, inner.outcome) }
+		}
+		sync.mutex_unlock(&app.run.mu)
+		session_replay_queued(app)
+	}
+}
+
+session_replay_nested :: proc(app: ^App, inners: ^map[journal.Call_Id][dynamic]Codemode_Inner, nested: agent.Projected_Nested_Call, arena: mem.Allocator) {
+	session_replay_tool(
+		app,
+		inners,
+		agent.Projected_Call{call = nested.call, parent_call = nested.parent_call, name = nested.name, proposed = nested.proposed},
+		agent.Projected_Result{call = nested.call, parent_call = nested.parent_call, content = nested.content, outcome = nested.outcome},
+		arena,
+	)
+}
+
+// session_replay_tool shows one replayed call: an inner call joins its script's list
+// and gets its own box at once, an outer Code Mode call gets its box with the list,
+// and any other call gets the box the live turn showed.
+session_replay_tool :: proc(
+	app: ^App,
+	inners: ^map[journal.Call_Id][dynamic]Codemode_Inner,
+	stored: agent.Projected_Call,
+	payload: agent.Projected_Result,
+	arena: mem.Allocator,
+) {
+	display := tool_display_call(stored.name, stored.proposed)
+	if payload.parent_call != 0 {
+		list := inners[payload.parent_call]
+		allocation_error: mem.Allocator_Error
+		if list == nil { list, allocation_error = make([dynamic]Codemode_Inner, 0, 4, arena) }
+		if allocation_error == nil {
+			_, allocation_error = append(&list, Codemode_Inner{name = stored.name, arguments = stored.proposed, outcome = payload.outcome})
+		}
+		if allocation_error == nil {
+			inners[payload.parent_call] = list
+		} else {
+			snap_report_dropped(app)
+		}
+		snap_append_titled_tool(
+			app,
+			.Codemode,
+			display,
+			codemode_inner_title(stored.name),
+			payload.content,
+			journal.TOOL_OUTCOME_NAMES[payload.outcome],
+			payload.outcome,
+		)
+		return
+	}
+	if stored.name == agent.TOOL_CODEMODE_NAME {
+		inner := inners[payload.call]
+		delete_key(inners, payload.call)
+		snap_append_codemode(app, display, payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome, inner[:])
+		return
+	}
+	snap_append_tool(app, .Tool, display, payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
 }
 
 // session_replay_queued shows the lines the session accepted and the runner has not
@@ -708,6 +771,7 @@ snapshot_clear :: proc(app: ^App) {
 	clear(&app.run.snap.entries)
 	app.run.snap.entries_bytes = 0
 	app.run.snap.transcript_trimmed = false
+	codemode_pending_clear_locked(app)
 	snap_publish_locked(app)
 }
 
@@ -977,6 +1041,7 @@ run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 		assistant_end = observer_assistant_end,
 		user_text = observer_user_text,
 		tool_result = observer_tool_result,
+		turn_finished = observer_turn_finished,
 		message = observer_message,
 		usage = observer_usage,
 		request_prepared = observer_request_prepared,
@@ -1067,17 +1132,134 @@ observer_user_text :: proc(user_data: rawptr, text: string, origin: journal.User
 	snap_append(cast(^App)user_data, user_entry_kind(origin), text)
 }
 
-observer_tool_result :: proc(user_data: rawptr, name, arguments: string, result: ^agent.Tool_Result) {
+observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
 	app := cast(^App)user_data
-	snap_append_tool(app, tool_display_call(name, arguments), result.content, tool_display_summary(result), result.outcome)
+	if parent_call != 0 {
+		snap_append_codemode_inner(app, call, parent_call, name, arguments, result)
+		return
+	}
+	if name == agent.TOOL_CODEMODE_NAME {
+		snap_append_codemode_outer(app, call, tool_display_call(name, arguments), result)
+		return
+	}
+	_ = call
+	snap_append_tool(app, .Tool, tool_display_call(name, arguments), result.content, tool_display_summary(result), result.outcome)
 }
 
 // snap_append_tool records the same tool box for a live turn and a replayed session.
-snap_append_tool :: proc(app: ^App, call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome) {
+// kind is the box the entry draws as: a Code Mode inner call draws as .Codemode
+// even though its text reads like a normal tool box.
+snap_append_tool :: proc(app: ^App, kind: Entry_Kind, call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome) {
 	sync.mutex_guard(&app.run.mu)
-	entry := snap_entry_make(app, .Tool, tool_entry_text(call, content, fallback, outcome))
+	snap_append_titled_tool_locked(app, kind, call, call.name, content, fallback, outcome)
+}
+
+// snap_append_titled_tool records a tool box under another title. A Code Mode inner
+// call keeps its own result preview, so its box reads like a normal tool box that is
+// titled for the script that ran it.
+snap_append_titled_tool :: proc(app: ^App, kind: Entry_Kind, call: Tool_Display_Call, title, content, fallback: string, outcome: journal.Tool_Outcome) {
+	sync.mutex_guard(&app.run.mu)
+	snap_append_titled_tool_locked(app, kind, call, title, content, fallback, outcome)
+}
+
+// snap_append_titled_tool_locked appends under a held runtime mutex.
+snap_append_titled_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: Tool_Display_Call, title, content, fallback: string, outcome: journal.Tool_Outcome) {
+	entry := snap_entry_make(app, kind, tool_entry_text_titled(call, title, content, fallback, outcome))
 	entry.tool_outcome = outcome
 	snap_push_locked(app, entry)
+}
+
+// snap_append_codemode records a Code Mode call's own box: the program, one line per
+// inner call, and the result preview. Live and replay share the text, so the two
+// boxes read the same.
+snap_append_codemode :: proc(app: ^App, call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome, inner: []Codemode_Inner) {
+	sync.mutex_guard(&app.run.mu)
+	entry := snap_entry_make(app, .Codemode, codemode_entry_text(call, content, fallback, outcome, inner))
+	entry.tool_outcome = outcome
+	snap_push_locked(app, entry)
+}
+
+// snap_append_codemode_inner records one call a Code Mode script made. Its summary
+// joins the script's pending list, and its own box is shown at once, in commit order,
+// so the transcript reads the script's work as it happens.
+snap_append_codemode_inner :: proc(app: ^App, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
+	_ = call
+	sync.mutex_guard(&app.run.mu)
+	display := tool_display_call(name, arguments)
+	snap_append_titled_tool_locked(app, .Codemode, display, codemode_inner_title(name), result.content, tool_display_summary(result), result.outcome)
+	codemode_pending_append_locked(app, parent_call, name, arguments, result.outcome)
+}
+
+// codemode_pending_append_locked clones an inner summary into the worker-owned
+// list. Both replay and live results cross this ownership boundary once.
+codemode_pending_append_locked :: proc(app: ^App, parent_call: journal.Call_Id, name, arguments: string, outcome: journal.Tool_Outcome) {
+	owned_name, owned_name_error := strings.clone(name, app.run.alloc)
+	owned_arguments, owned_arguments_error := strings.clone(arguments, app.run.alloc)
+	if owned_name_error != nil || owned_arguments_error != nil {
+		delete(owned_name, app.run.alloc)
+		delete(owned_arguments, app.run.alloc)
+		snap_report_dropped_locked(app)
+		return
+	}
+	if app.run.codemode_pending == nil {
+		app.run.codemode_pending = make(map[journal.Call_Id][dynamic]Codemode_Inner, app.run.alloc)
+	}
+	list := app.run.codemode_pending[parent_call]
+	if list == nil {
+		created, created_error := make([dynamic]Codemode_Inner, 0, 4, app.run.alloc)
+		if created_error != nil {
+			delete(owned_name, app.run.alloc)
+			delete(owned_arguments, app.run.alloc)
+			snap_report_dropped_locked(app)
+			return
+		}
+		list = created
+		app.run.codemode_pending[parent_call] = list
+	}
+	if _, append_error := append(&list, Codemode_Inner{name = owned_name, arguments = owned_arguments, outcome = outcome}); append_error != nil {
+		delete(owned_name, app.run.alloc)
+		delete(owned_arguments, app.run.alloc)
+		snap_report_dropped_locked(app)
+		return
+	}
+	app.run.codemode_pending[parent_call] = list
+}
+
+// snap_append_codemode_outer shows the script's own box with the inner calls its
+// results committed before it. The pending list is taken and freed with the box.
+snap_append_codemode_outer :: proc(app: ^App, call: journal.Call_Id, display: Tool_Display_Call, result: ^agent.Tool_Result) {
+	sync.mutex_guard(&app.run.mu)
+	inner := app.run.codemode_pending[call]
+	delete_key(&app.run.codemode_pending, call)
+	entry := snap_entry_make(app, .Codemode, codemode_entry_text(display, result.content, tool_display_summary(result), result.outcome, inner[:]))
+	entry.tool_outcome = result.outcome
+	snap_push_locked(app, entry)
+	for recorded in inner {
+		delete(recorded.name, app.run.alloc)
+		delete(recorded.arguments, app.run.alloc)
+	}
+	delete(inner)
+}
+
+observer_turn_finished :: proc(user_data: rawptr) {
+	app := cast(^App)user_data
+	sync.mutex_guard(&app.run.mu)
+	codemode_pending_clear_locked(app)
+}
+
+// codemode_pending_clear_locked releases the lists whose scripts can no longer
+// report, when their turn ends or their transcript is discarded. The caller holds
+// the runtime mutex.
+codemode_pending_clear_locked :: proc(app: ^App) {
+	for _, list in app.run.codemode_pending {
+		for recorded in list {
+			delete(recorded.name, app.run.alloc)
+			delete(recorded.arguments, app.run.alloc)
+		}
+		delete(list)
+	}
+	delete(app.run.codemode_pending)
+	app.run.codemode_pending = nil
 }
 
 observer_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
