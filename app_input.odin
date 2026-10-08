@@ -188,8 +188,9 @@ command_help :: proc(app: ^App) {
 // MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls.
 MOUSE_WHEEL_LINES :: 3
 
-// tool_box_entry_id returns the entry id of the tool box covering a screen cell,
-// or 0 when the cell is not on one.
+// tool_box_entry_id returns the entry id of the front-most tool box covering a
+// screen cell, or 0 when the cell is not on one. A node hidden by a clip or
+// covered by an opaque node is not hit.
 //
 // It asks the frame that is on screen rather than a rectangle remembered from a previous
 // frame, so a box that scrolled or resized cannot take a report aimed at whatever now
@@ -199,12 +200,13 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
 	if frame_error != .None { return 0 }
 	point := layout.Vec2{layout.Scalar(x - app.conversation_rect.x), layout.Scalar(y - app.conversation_rect.y)}
-	for node in frame_result.nodes {
-		if node.user == 0 { continue }
-		if point.x < node.outer.position.x || point.y < node.outer.position.y { continue }
-		if point.x >= node.outer.position.x + node.outer.size.x { continue }
-		if point.y >= node.outer.position.y + node.outer.size.y { continue }
-		return u64(node.user)
+	// The innermost hit is usually a text row inside the box, which carries no entry id.
+	stack_storage: [32]layout.Node_Handle
+	hits, _ := layout.hit_stack(frame_result, point, stack_storage[:])
+	for handle in hits {
+		if hit, found := layout.node(frame_result, handle); found && hit.user != 0 {
+			return u64(hit.user)
+		}
 	}
 	return 0
 }
