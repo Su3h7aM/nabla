@@ -1093,6 +1093,7 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 	app := cast(^App)user_data
 	display := tool_display_call(name, arguments)
 	summary := tool_display_summary(result)
+	preview := tool_preview(result.content, summary)
 	// Only the boxes of a single call draw a picture; the Code Mode outer box has none.
 	image: Entry_Image
 	if parent_call != 0 || name != agent.TOOL_CODEMODE_NAME { image = image_prepare(app, result.attachments) }
@@ -1110,7 +1111,7 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 		}
 		codemode_inner_update_locked(app, parent_call, inner)
 		text := tool_entry_text_titled(display, codemode_inner_title(name), result.content, summary, result.outcome)
-		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome, &image)
+		snap_settle_tool_locked(app, .Codemode, call, text, preview, result.outcome, &image)
 	case name == agent.TOOL_CODEMODE_NAME:
 		pending: Codemode_Pending
 		if call != 0 {
@@ -1118,10 +1119,10 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 			delete_key(&app.run.codemode_pending, call)
 		}
 		text := codemode_entry_text(display, result.content, summary, result.outcome, pending.inner[:])
-		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome)
+		snap_settle_tool_locked(app, .Codemode, call, text, preview, result.outcome)
 		codemode_pending_destroy_locked(app, &pending)
 	case:
-		snap_settle_tool_locked(app, .Tool, call, tool_entry_text(display, result.content, summary, result.outcome), result.outcome, &image)
+		snap_settle_tool_locked(app, .Tool, call, tool_entry_text(display, result.content, summary, result.outcome), preview, result.outcome, &image)
 	}
 }
 
@@ -1192,8 +1193,13 @@ snap_push_tool_locked :: proc(
 	outcome: journal.Tool_Outcome,
 	running: bool,
 	image: ^Entry_Image = nil,
+	preview := "",
 ) {
-	entry := snap_entry_make(app, kind, text)
+	shown, preview_at, hidden := text, 0, 0
+	if !running && preview != "" { shown, preview_at, hidden = tool_text_collapse(text, preview) }
+	entry := snap_entry_make(app, kind, shown)
+	entry.preview_at = preview_at
+	entry.hidden_lines = hidden
 	entry.call = call
 	entry.tool_outcome = outcome
 	entry.running = running
@@ -1212,15 +1218,25 @@ snap_tool_entry_locked :: proc(app: ^App, call: journal.Call_Id) -> ^Entry {
 }
 
 // snap_settle_tool_locked replaces the text and outcome of the running box of call and
-// ends its running state. A call without a box gets a finished one. When the new text
-// cannot be set the box stays as it was, running.
-snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_Id, text: string, outcome: journal.Tool_Outcome, image: ^Entry_Image = nil) {
+// ends its running state, keeping only the first lines of the result preview that ends text.
+// A call without a box gets a finished one. When the new text cannot be set the box stays as it was, running.
+snap_settle_tool_locked :: proc(
+	app: ^App,
+	kind: Entry_Kind,
+	call: journal.Call_Id,
+	text, preview: string,
+	outcome: journal.Tool_Outcome,
+	image: ^Entry_Image = nil,
+) {
 	entry := snap_tool_entry_locked(app, call)
 	if entry == nil {
-		snap_push_tool_locked(app, kind, call, text, outcome, false, image)
+		snap_push_tool_locked(app, kind, call, text, outcome, false, image, preview)
 		return
 	}
-	if !snap_entry_rewrite_locked(app, entry, text) { return }
+	kept, preview_at, hidden := tool_text_collapse(text, preview)
+	if !snap_entry_rewrite_locked(app, entry, kept) { return }
+	entry.preview_at = preview_at
+	entry.hidden_lines = hidden
 	entry.tool_outcome = outcome
 	entry.running = false
 	snap_stream_release_locked(app, entry)

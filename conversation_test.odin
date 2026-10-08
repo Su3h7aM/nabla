@@ -534,13 +534,21 @@ tool_result_fixture :: proc(lines: int, scratch: []byte) -> string {
 	return string(scratch[:count])
 }
 
-// A tool result taller than the box's window is a preview, and the box says so:
-// the bottom border counts the rows the window is holding back, and the window
-// shows the first of them.
+// tool_box_fixture adds a settled box with call 5 whose result is body. A collapsed box keeps
+// its first lines, and an expanded one holds the whole text.
+tool_box_fixture :: proc(app: ^App, body: string, expanded: bool) {
+	full := fmt.tprintf("shell\n%s", body)
+	snap_push_tool_locked(app, .Tool, 5, full, .Success, false, nil, body)
+	if expanded { app.transcript.expanded[5] = strings.clone(full, app.run.alloc) }
+}
+
+// A collapsed box keeps the first lines of its result, and the bottom border counts the lines it hides.
 @(test)
-test_tool_box_window_says_what_it_hides :: proc(t: ^testing.T) {
+test_a_collapsed_tool_box_says_what_it_hides :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
+		boxes_collapse_all(app)
+		delete(app.transcript.expanded)
 		snapshot_destroy(app)
 		free(app)
 	}
@@ -549,8 +557,7 @@ test_tool_box_window_says_what_it_hides :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("shell\n%s", body))
-	app.run.snap.entries[0].tool_outcome = .Success
+	tool_box_fixture(app, body, false)
 
 	storage := frame_storage_new(context.allocator)
 	defer frame_storage_destroy(storage)
@@ -562,7 +569,7 @@ test_tool_box_window_says_what_it_hides :: proc(t: ^testing.T) {
 	testing.expect_value(t, conversation_row_with(storage, "shell"), 0)
 	testing.expect_value(t, conversation_row_with(storage, "line 1"), 1)
 	testing.expect_value(t, conversation_row_with(storage, "line 10"), 10)
-	testing.expect_value(t, conversation_row_with(storage, "↓ 15 more lines"), 11)
+	testing.expect_value(t, conversation_row_with(storage, "15 more lines"), 11)
 	testing.expect_value(t, conversation_row_with(storage, "line 11"), -1)
 }
 
@@ -573,6 +580,8 @@ test_tool_box_window_says_what_it_hides :: proc(t: ^testing.T) {
 test_tool_box_window_scrolls_and_clamps :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
+		boxes_collapse_all(app)
+		delete(app.transcript.expanded)
 		snapshot_destroy(app)
 		free(app)
 	}
@@ -581,8 +590,7 @@ test_tool_box_window_scrolls_and_clamps :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("shell\n%s", body))
-	app.run.snap.entries[0].tool_outcome = .Success
+	tool_box_fixture(app, body, true)
 
 	storage := frame_storage_new(context.allocator)
 	defer frame_storage_destroy(storage)
@@ -645,6 +653,8 @@ test_tool_box_window_without_hidden_rows_has_no_label :: proc(t: ^testing.T) {
 test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
+		boxes_collapse_all(app)
+		delete(app.transcript.expanded)
 		snapshot_destroy(app)
 		free(app)
 	}
@@ -654,8 +664,7 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	scratch: [8192]byte
 	snap_append(app, .Notice, "notice")
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("shell\n%s", body))
-	app.run.snap.entries[1].tool_outcome = .Success
+	tool_box_fixture(app, body, true)
 
 	// The wheel asks the frame that is on screen, so the app's own storage is the
 	// one it has to be rendered into.
@@ -726,6 +735,8 @@ test_wheel_ignores_a_stale_tool_box_ordinal :: proc(t: ^testing.T) {
 test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
+		boxes_collapse_all(app)
+		delete(app.transcript.expanded)
 		snapshot_destroy(app)
 		free(app)
 	}
@@ -734,8 +745,7 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	app.rows = 20
 	scratch: [8192]byte
 	body := tool_result_fixture(25, scratch[:])
-	snap_append(app, .Tool, fmt.tprintf("shell\n%s", body))
-	app.run.snap.entries[0].tool_outcome = .Success
+	tool_box_fixture(app, body, true)
 
 	app.storage = frame_storage_new(context.allocator)
 	defer frame_storage_destroy(app.storage)
@@ -775,6 +785,35 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	wheel_scroll(app, report)
 	testing.expect_value(t, entry.tool_scroll, 5 + MOUSE_WHEEL_LINES)
 	testing.expect_value(t, app.scroll, 10)
+}
+
+// A collapsed box never captures the wheel: over it the wheel scrolls the session.
+@(test)
+test_a_collapsed_tool_box_never_captures_the_wheel :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		boxes_collapse_all(app)
+		delete(app.transcript.expanded)
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	app.columns = 40
+	app.rows = 20
+	scratch: [8192]byte
+	tool_box_fixture(app, tool_result_fixture(25, scratch[:]), false)
+	app.storage = frame_storage_new(context.allocator)
+	defer frame_storage_destroy(app.storage)
+	_, frame_error := render_frame(app, app.storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	box_row := conversation_row_with(app.storage, "shell")
+	box_column := frame_glyph_column(app.storage, box_row, "╭")
+	for button in ([]input.Mouse_Button{.Wheel_Up, .Wheel_Down}) {
+		app.scroll = 10
+		wheel_scroll(app, input.Mouse_Event{button = button, x = box_column + 2, y = box_row + 2})
+		testing.expect_value(t, app.run.snap.entries[0].tool_scroll, 0)
+		testing.expect_value(t, app.scroll, 10 + MOUSE_WHEEL_LINES if button == .Wheel_Up else 10 - MOUSE_WHEEL_LINES)
+	}
 }
 
 // selection_report builds a mouse report for a screen cell. The terminal's

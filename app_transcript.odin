@@ -5,6 +5,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:mem/virtual"
+import "core:strings"
 import "core:sync"
 
 import "nabla:agent"
@@ -41,12 +42,17 @@ Transcript :: struct {
 	measured:      bool, // the transcript was laid out since the last slide
 	viewport_rows: int,
 	anchor:        Maybe(int), // rows above the view when a page was loaded below it
+	expanded:      map[journal.Call_Id]string, // owned; the whole text of each expanded box
+	focused:       bool, // the keyboard drives the transcript instead of the prompt
+	selected:      journal.Call_Id, // the box the keyboard selected
 }
 
 transcript_destroy :: proc(app: ^App) {
 	transcript := &app.transcript
 	entries_destroy(&transcript.entries)
 	delete(transcript.path, app.run.alloc)
+	boxes_collapse_all(app)
+	delete(transcript.expanded)
 	_ = journal.close(&transcript.store)
 	transcript^ = {}
 }
@@ -70,6 +76,9 @@ transcript_sync :: proc(app: ^App) {
 		transcript.failed = false
 		transcript.measured = false
 		transcript.anchor = nil
+		transcript.focused = false
+		transcript.selected = 0
+		boxes_collapse_all(app)
 		app.scroll = 0
 	}
 	if head != transcript.head { transcript_follow(app, head) }
@@ -291,13 +300,10 @@ window_call :: proc(
 	if stored.name == agent.TOOL_CODEMODE_NAME {
 		inner := codemode_inner_list(nested, stored.call)
 		text := codemode_entry_text(display, result.content, fallback, result.outcome, inner)
-		entry := window_push(app, entries, node, .Codemode, text) or_return
-		entry.call = stored.call
-		entry.tool_outcome = result.outcome
-		return nil
+		return window_tool(app, entries, node, .Codemode, stored.call, text, tool_preview(result.content, fallback), result.outcome, nil)
 	}
 	text := tool_entry_text(display, result.content, fallback, result.outcome)
-	return window_tool(app, entries, node, .Tool, stored.call, text, result.outcome, result.attachments)
+	return window_tool(app, entries, node, .Tool, stored.call, text, tool_preview(result.content, fallback), result.outcome, result.attachments)
 }
 
 @(require_results)
@@ -307,13 +313,16 @@ window_tool :: proc(
 	node: journal.Node_Id,
 	kind: Entry_Kind,
 	call: journal.Call_Id,
-	text: string,
+	text, preview: string,
 	outcome: journal.Tool_Outcome,
 	attachments: []ai.Provider_Attachment,
 ) -> mem.Allocator_Error {
 	image := image_prepare(app, attachments)
 	defer delete(image.pixels)
-	entry := window_push(app, entries, node, kind, text) or_return
+	kept, preview_at, hidden := tool_text_collapse(text, preview)
+	entry := window_push(app, entries, node, kind, kept) or_return
+	entry.preview_at = preview_at
+	entry.hidden_lines = hidden
 	entry.call = call
 	entry.tool_outcome = outcome
 	image_attach(app, entry, &image)
@@ -336,8 +345,19 @@ window_children :: proc(
 			stored, is_call := item.payload.(agent.Projected_Call)
 			if !is_call || stored.call != child.parent_call { continue }
 			display := tool_display_call(child.name, child.proposed)
-			text := tool_entry_text_titled(display, codemode_inner_title(child.name), child.content, journal.TOOL_OUTCOME_NAMES[child.outcome], child.outcome)
-			window_tool(app, entries, item.node, .Codemode, child.call, text, child.outcome, child.attachments) or_return
+			fallback := journal.TOOL_OUTCOME_NAMES[child.outcome]
+			text := tool_entry_text_titled(display, codemode_inner_title(child.name), child.content, fallback, child.outcome)
+			window_tool(
+				app,
+				entries,
+				item.node,
+				.Codemode,
+				child.call,
+				text,
+				tool_preview(child.content, fallback),
+				child.outcome,
+				child.attachments,
+			) or_return
 			break
 		}
 	}
@@ -378,6 +398,10 @@ transcript_order :: proc(app: ^App) -> []^Entry {
 	}
 	for ; next < len(live); next += 1 {
 		if live[next].after < unloaded { append(&order, &live[next]) }
+	}
+	for entry in order {
+		entry.full = transcript.expanded[entry.call] or_else ""
+		entry.selected = transcript.focused && entry.call != 0 && entry.call == transcript.selected
 	}
 	return order[:]
 }
@@ -480,6 +504,7 @@ transcript_reduce :: proc(app: ^App) {
 		entry_destroy(entry)
 		ordered_remove(entries, index)
 	}
+	boxes_prune(app)
 }
 
 transcript_has_call :: proc(transcript: ^Transcript, call: journal.Call_Id) -> bool {
@@ -507,4 +532,155 @@ entry_find :: proc(app: ^App, id: u64) -> ^Entry {
 		if entry.id == id { return &entry }
 	}
 	return nil
+}
+
+// boxes_collapse_all frees the whole text of every expanded box.
+boxes_collapse_all :: proc(app: ^App) {
+	for _, full in app.transcript.expanded { delete(full, app.run.alloc) }
+	clear(&app.transcript.expanded)
+}
+
+// boxes_prune collapses the boxes that left the window and the live layer. The caller holds the runtime mutex.
+boxes_prune :: proc(app: ^App) {
+	transcript := &app.transcript
+	gone := make([dynamic]journal.Call_Id, context.temp_allocator)
+	for call in transcript.expanded {
+		if transcript_has_call(transcript, call) || snap_tool_entry_locked(app, call) != nil { continue }
+		append(&gone, call)
+	}
+	for call in gone {
+		delete(transcript.expanded[call], app.run.alloc)
+		delete_key(&transcript.expanded, call)
+	}
+}
+
+// box_prefix returns a copy in the temporary allocator of the text of the settled box of
+// call that precedes its result, or false when the box cannot be expanded.
+box_prefix :: proc(app: ^App, call: journal.Call_Id) -> (prefix: string, found: bool) {
+	sync.mutex_guard(&app.run.mu)
+	for &entry in app.transcript.entries {
+		if entry.call == call { return box_prefix_of(&entry) }
+	}
+	if entry := snap_tool_entry_locked(app, call); entry != nil { return box_prefix_of(entry) }
+	return "", false
+}
+
+box_prefix_of :: proc(entry: ^Entry) -> (prefix: string, found: bool) {
+	if entry.running || entry.preview_at <= 0 || entry.preview_at > len(entry.text) { return "", false }
+	return strings.clone(string(entry.text[:entry.preview_at]), context.temp_allocator) or_else "", true
+}
+
+// box_toggle collapses the box of call if it is expanded. Otherwise it reads the call's
+// completion from the journal and keeps the box's whole text until it is collapsed or
+// leaves the transcript. Main thread only; it reads the journal, so the runtime mutex must not be held.
+box_toggle :: proc(app: ^App, call: journal.Call_Id) {
+	transcript := &app.transcript
+	if call == 0 { return }
+	if full, expanded := transcript.expanded[call]; expanded {
+		delete(full, app.run.alloc)
+		delete_key(&transcript.expanded, call)
+		return
+	}
+	prefix, found := box_prefix(app, call)
+	if !found || !transcript_open(app) { return }
+	records, _, read_error := journal.read_records(
+		&transcript.store,
+		{session = transcript.session, kinds = {.Tool_Completed}, call = call},
+		0,
+		1,
+		context.temp_allocator,
+	)
+	if read_error != nil {
+		snap_append(app, .Error, fmt.tprintf("cannot read the result: %s", journal.error_text(read_error, context.temp_allocator)))
+		return
+	}
+	if len(records) == 0 {
+		snap_append(app, .Warning, "the result of that call is not in the journal")
+		return
+	}
+	completion: journal.Tool_Completed
+	if decode_error := journal.payload_decode(records[0].data, &completion, context.temp_allocator); decode_error != nil {
+		snap_append(app, .Error, "cannot read the result: the record is damaged")
+		return
+	}
+	outcome, _ := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+	content := string(records[0].body)
+	if content == "" { content = completion.detail }
+	full, concatenate_error := strings.concatenate({prefix, tool_preview(content, journal.TOOL_OUTCOME_NAMES[outcome])}, app.run.alloc)
+	if concatenate_error != nil {
+		snap_append(app, .Error, "cannot read the result: out of memory")
+		return
+	}
+	if transcript.expanded.allocator.procedure == nil { transcript.expanded.allocator = app.run.alloc }
+	_, slot, _, map_error := map_entry(&transcript.expanded, call)
+	if map_error != nil {
+		delete(full, app.run.alloc)
+		snap_append(app, .Error, "cannot read the result: out of memory")
+		return
+	}
+	slot^ = full
+}
+
+Box_Row :: struct {
+	call: journal.Call_Id,
+	top:  int,
+	rows: int,
+}
+
+// transcript_boxes lists the tool boxes with a call, oldest first, with the row each starts at
+// in the laid out transcript, in the temporary allocator. The caller holds the runtime mutex.
+transcript_boxes :: proc(app: ^App) -> []Box_Row {
+	boxes := make([dynamic]Box_Row, context.temp_allocator)
+	top := 0
+	for entry in transcript_order(app) {
+		if (entry.kind == .Tool || entry.kind == .Codemode) && entry.call != 0 {
+			append(&boxes, Box_Row{call = entry.call, top = top, rows = entry.rows})
+		}
+		top += entry.rows
+	}
+	return boxes[:]
+}
+
+// transcript_focus gives the keyboard to the transcript and selects the first box in view,
+// or the box nearest to the view when none is in it.
+transcript_focus :: proc(app: ^App) {
+	sync.mutex_guard(&app.run.mu)
+	transcript := &app.transcript
+	transcript.focused = true
+	boxes := transcript_boxes(app)
+	view_top := app.conv_scroll_range - app.scroll
+	view_bottom := view_top + transcript.viewport_rows
+	best, best_distance := -1, max(int)
+	for box, index in boxes {
+		distance := max(view_top - (box.top + box.rows), box.top - view_bottom, 0)
+		if distance < best_distance { best, best_distance = index, distance }
+	}
+	if best >= 0 { transcript.selected = boxes[best].call }
+}
+
+// transcript_select_move selects the box after (delta 1) or before (delta -1) the selected one and
+// scrolls it into view. Past the last or first box loaded it scrolls a page, which loads more.
+transcript_select_move :: proc(app: ^App, delta: int) {
+	sync.mutex_guard(&app.run.mu)
+	transcript := &app.transcript
+	boxes := transcript_boxes(app)
+	current := -1
+	for box, index in boxes {
+		if box.call == transcript.selected { current = index }
+	}
+	next := current + delta if current >= 0 else (0 if delta > 0 else len(boxes) - 1)
+	if next < 0 || next >= len(boxes) {
+		scroll_page(app, up = delta < 0)
+		return
+	}
+	box := boxes[next]
+	transcript.selected = box.call
+	height := transcript.viewport_rows
+	view_top := app.conv_scroll_range - app.scroll
+	switch {
+	case box.top < view_top:
+		app.scroll = app.conv_scroll_range - box.top
+	case box.top + box.rows > view_top + height:
+		app.scroll = max(app.conv_scroll_range - (box.top + box.rows - height), 0)
+	}
 }

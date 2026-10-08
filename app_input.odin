@@ -7,6 +7,7 @@ import "core:sync"
 import "core:unicode/utf8"
 
 import "nabla:agent"
+import "nabla:agent/journal"
 import input "nabla:input"
 import "nabla:layout"
 import "nabla:term"
@@ -93,11 +94,11 @@ command_prefixed :: proc(command, typed: string) -> bool {
 // reaches the first match of what is typed and the next moves to the one after it,
 // wrapping around. A completed name whose command takes a list opens that list. Matching
 // ignores case; the command's own lowercase name is written back.
-complete_command :: proc(app: ^App) {
+complete_command :: proc(app: ^App) -> (handled: bool) {
 	typed := widgets.input_text(&app.input)
 	if !strings.has_prefix(typed, "/") || strings.contains_rune(typed, ' ') {
 		completion_reset(app)
-		return
+		return false
 	}
 
 	// A second Tab still refers to the prefix the cycle began with, because the
@@ -112,13 +113,13 @@ complete_command :: proc(app: ^App) {
 	index, found := command_next_match(query, after)
 	if !found {
 		completion_reset(app)
-		return
+		return false
 	}
 	command := COMMANDS[index]
 	if !app.completion_active && query == command.name {
 		completion_reset(app)
 		if command.open_menu != nil { command.open_menu(app) }
-		return
+		return true
 	}
 
 	// The query is stored only when a cycle begins, because the stored copy is
@@ -130,6 +131,7 @@ complete_command :: proc(app: ^App) {
 	if !widgets.input_insert(&app.input, command.name) {
 		snap_append(app, .Warning, "the completed command could not be written into the prompt")
 	}
+	return true
 }
 
 // command_next_match finds the next command after `after` whose name starts with
@@ -176,8 +178,11 @@ command_help :: proc(app: ^App) {
 	snap_append(app, .Notice, "  a command that names a list opens it when given no argument")
 	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
 	snap_append(app, .Notice, "  the wheel and page up/page down scroll the transcript")
-	snap_append(app, .Notice, "  over a tool box the wheel scrolls that box's output")
 	snap_append(app, .Notice, "  dragging over the transcript copies the rows it covers")
+	snap_append(app, .Notice, "tool boxes show their first lines; click a box to expand it and click again to collapse it")
+	snap_append(app, .Notice, "  over an expanded box the wheel scrolls its output, and a drag inside it copies the rows it covers")
+	snap_append(app, .Notice, "  tab (when it completes nothing) moves the keyboard between the prompt and the transcript")
+	snap_append(app, .Notice, "  in the transcript: up/down select a box, enter expands it, escape or tab returns to the prompt")
 }
 
 // MOUSE_WHEEL_LINES is how many rows one wheel tick scrolls.
@@ -233,7 +238,7 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 		sync.mutex_lock(&app.run.mu)
 		consumed := false
 		if entry := entry_find(app, entry_id); entry != nil {
-			consumed = tool_box_scroll(entry, mouse.button)
+			consumed = entry.full != "" && tool_box_scroll(entry, mouse.button)
 		}
 		sync.mutex_unlock(&app.run.mu)
 		if consumed { return }
@@ -288,11 +293,24 @@ selection_mouse :: proc(app: ^App, mouse: input.Mouse_Event) {
 	point, inside := selection_point(app, mouse)
 	switch {
 	case mouse.motion:
-		if app.selecting { app.selection_cursor = point }
+		if app.box_drag.active {
+			box_drag_move(app, mouse)
+		} else if app.selecting {
+			app.selection_cursor = point
+		}
 	case mouse.release:
-		if app.selecting { selection_copy(app) }
+		switch {
+		case app.box_drag.active:
+			box_drag_end(app)
+		case app.selecting && app.selection_anchor == app.selection_cursor:
+			box_click(app, mouse)
+		case app.selecting:
+			selection_copy(app)
+		}
 		app.selecting = false
+		app.box_drag = {}
 	case inside:
+		if box_drag_begin(app, mouse) { return }
 		app.selecting = true
 		app.selection_anchor = point
 		app.selection_cursor = point
@@ -312,12 +330,124 @@ selection_copy :: proc(app: ^App) {
 		snap_append(app, .Error, "the selection could not be copied: out of memory")
 		return
 	}
+	clipboard_copy(app, text)
+}
+
+// clipboard_copy puts text on the terminal's clipboard and says how many lines it was.
+clipboard_copy :: proc(app: ^App, text: string) {
 	if text == "" { return }
 	if _, copy_err := term.clipboard_set(app.terminal, text); copy_err != nil {
 		snap_append(app, .Error, fmt.tprintf("the selection could not be copied: %v", copy_err))
 		return
 	}
 	snap_append(app, .Notice, fmt.tprintf("copied %d line(s) to the clipboard", strings.count(text, "\n") + 1))
+}
+
+// Box_Drag is a drag that began on the result rows of an expanded box. anchor and cursor
+// are rows of the box's whole result, so the box can scroll under the drag. moved says the
+// pointer left the press, which tells a drag from a click.
+Box_Drag :: struct {
+	active:         bool,
+	moved:          bool,
+	id:             u64,
+	anchor, cursor: int,
+}
+
+// tool_box_rect returns where the last frame put the tool box with entry id, in transcript cells.
+tool_box_rect :: proc(app: ^App, id: u64) -> (rect: layout.Rect, found: bool) {
+	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
+	if frame_error != .None { return {}, false }
+	for node in frame_result.nodes {
+		if u64(node.user) == id { return node.outer, true }
+	}
+	return {}, false
+}
+
+// box_click toggles the tool box under a released click.
+box_click :: proc(app: ^App, mouse: input.Mouse_Event) {
+	id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1)
+	if id == 0 { return }
+	sync.mutex_lock(&app.run.mu)
+	call: journal.Call_Id
+	if entry := entry_find(app, id); entry != nil { call = entry.call }
+	sync.mutex_unlock(&app.run.mu)
+	box_toggle(app, call)
+}
+
+// box_result_row is the row of the box's result a mouse report is on, relative to the first
+// row the box shows; it is outside 0 ..< entry.tool_rows when the report is above or below them.
+box_result_row :: proc(app: ^App, id: u64, mouse: input.Mouse_Event) -> (row: int, found: bool) {
+	rect, rect_found := tool_box_rect(app, id)
+	if !rect_found { return 0, false }
+	return mouse.y - 1 - app.conversation_rect.y - int(rect.position.y) - 1, true
+}
+
+// box_drag_begin starts a drag on the result rows of an expanded box and reports whether it did.
+box_drag_begin :: proc(app: ^App, mouse: input.Mouse_Event) -> bool {
+	id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1)
+	row, found := box_result_row(app, id, mouse)
+	if id == 0 || !found { return false }
+	sync.mutex_guard(&app.run.mu)
+	entry := entry_find(app, id)
+	if entry == nil || entry.full == "" || row < 0 || row >= entry.tool_rows { return false }
+	app.box_drag = {
+		active = true,
+		id     = id,
+		anchor = entry.tool_scroll + row,
+		cursor = entry.tool_scroll + row,
+	}
+	return true
+}
+
+// box_drag_move extends the drag, and scrolls the box by a wheel step when the pointer is above or below its rows.
+box_drag_move :: proc(app: ^App, mouse: input.Mouse_Event) {
+	drag := &app.box_drag
+	row, found := box_result_row(app, drag.id, mouse)
+	sync.mutex_guard(&app.run.mu)
+	entry := entry_find(app, drag.id)
+	if entry == nil || !found { return }
+	drag.moved = true
+	switch {
+	case row < 0:
+		entry.tool_scroll = max(entry.tool_scroll - MOUSE_WHEEL_LINES, 0)
+		drag.cursor = entry.tool_scroll
+	case row >= entry.tool_rows:
+		entry.tool_scroll = min(entry.tool_scroll + MOUSE_WHEEL_LINES, entry.tool_scroll_max)
+		drag.cursor = entry.tool_scroll + entry.tool_rows - 1
+	case:
+		drag.cursor = entry.tool_scroll + row
+	}
+}
+
+// box_drag_end copies the rows the drag covered from the box's whole result, or toggles the box when the drag was a click.
+box_drag_end :: proc(app: ^App) {
+	drag := app.box_drag
+	sync.mutex_lock(&app.run.mu)
+	call: journal.Call_Id
+	rows: string
+	if entry := entry_find(app, drag.id); entry != nil {
+		call = entry.call
+		rows = box_rows_text(entry.full, max(app.conversation_rect.width, 4) - 4, min(drag.anchor, drag.cursor), max(drag.anchor, drag.cursor))
+	}
+	sync.mutex_unlock(&app.run.mu)
+	if drag.moved { clipboard_copy(app, rows) } else { box_toggle(app, call) }
+}
+
+// box_rows_text returns rows first through last of the result of an expanded box's full text, as the
+// box wraps them at content_width, one per line, in the temporary allocator.
+box_rows_text :: proc(full: string, content_width, first, last: int) -> string {
+	split := strings.index_byte(full, '\n')
+	if split < 0 { return "" }
+	remaining := display_clean(full[split + 1:], context.temp_allocator)
+	builder := strings.builder_make(context.temp_allocator)
+	for index := 0; len(remaining) > 0 && index <= last; index += 1 {
+		piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
+		remaining = rest
+		if index < first { continue }
+		if index > first { strings.write_byte(&builder, '\n') }
+		strings.write_string(&builder, piece)
+	}
+	return strings.to_string(builder)
 }
 
 // handle_mouse routes a mouse report: the wheel scrolls, and the left button
@@ -382,7 +512,39 @@ interrupt :: proc(app: ^App) {
 	cancel_or_quit(app)
 }
 
+// scroll_page scrolls the transcript by a screen.
+scroll_page :: proc(app: ^App, up: bool) {
+	page := max(app.rows - 3, 1)
+	app.scroll = app.scroll + page if up else max(app.scroll - page, 0)
+}
+
+// handle_key sends a key to the prompt, or to the transcript while it has the keyboard.
+// A key the transcript does not use returns the keyboard to the prompt and is typed there.
 handle_key :: proc(app: ^App, key: input.Key_Event) {
+	if !app.transcript.focused {
+		handle_prompt_key(app, key)
+		return
+	}
+	#partial switch key.code {
+	case .Tab, .Escape:
+		app.transcript.focused = false
+	case .Up:
+		transcript_select_move(app, -1)
+	case .Down:
+		transcript_select_move(app, 1)
+	case .Enter:
+		box_toggle(app, app.transcript.selected)
+	case .Page_Up:
+		scroll_page(app, up = true)
+	case .Page_Down:
+		scroll_page(app, up = false)
+	case:
+		app.transcript.focused = false
+		handle_prompt_key(app, key)
+	}
+}
+
+handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 	switch key.code {
 	case .Enter:
 		if .Shift in key.modifiers {
@@ -428,22 +590,11 @@ handle_key :: proc(app: ^App, key: input.Key_Event) {
 			prompt_clear(app)
 		}
 	case .Page_Up:
-		page := app.rows - 3
-		if page < 1 {
-			page = 1
-		}
-		app.scroll += page
+		scroll_page(app, up = true)
 	case .Page_Down:
-		page := app.rows - 3
-		if page < 1 {
-			page = 1
-		}
-		app.scroll -= page
-		if app.scroll < 0 {
-			app.scroll = 0
-		}
+		scroll_page(app, up = false)
 	case .Tab:
-		complete_command(app)
+		if !complete_command(app) { transcript_focus(app) }
 	case .Character:
 		if .Control in key.modifiers {
 			switch key.character {

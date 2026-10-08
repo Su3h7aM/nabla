@@ -68,6 +68,15 @@ Entry :: struct {
 	// scroll, which is what tells the wheel the transcript behind it owns the
 	// report.
 	tool_scroll_max: int,
+	// A settled box keeps only the first TOOL_WINDOW_ROWS lines of its result. preview_at is the
+	// offset in text where the result starts, hidden_lines the lines cut, and tool_rows the result rows drawn.
+	preview_at:      int,
+	hidden_lines:    int,
+	tool_rows:       int,
+	// full is the whole text of an expanded box, borrowed from the transcript for one frame.
+	// selected marks the box the keyboard selected.
+	full:            string,
+	selected:        bool,
 	// image is the picture of the call's result; its id is zero when there is none.
 	image:           Entry_Image,
 }

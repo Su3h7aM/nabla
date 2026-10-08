@@ -20,6 +20,7 @@ import "nabla:agent"
 import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:db"
+import input "nabla:input"
 import "nabla:term"
 import "nabla:tui"
 import "nabla:tui/widgets"
@@ -1061,6 +1062,108 @@ test_live_entries_give_way_to_their_committed_form :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, len(entries), 3) { return }
 	for entry in entries { testing.expect(t, entry.node != 0, "every entry is the journal's now") }
 	testing.expect_value(t, len(app.run.snap.entries), 0)
+}
+
+// app_history_shell appends an assistant node that ran a shell call whose result has lines numbered lines, and returns the results node.
+app_history_shell :: proc(app: ^App, parent: journal.Node_Id, lines: int) -> journal.Node_Id {
+	store := app.setup.store
+	chat := &app.setup.session
+	assistant := app_history_node(app, parent, .Assistant, "running")
+	call := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = chat.session, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
+		journal.Tool_Proposed{provider_id = "call", name = "shell"},
+		transmute([]u8)string(`{"command":"ls"}`),
+	)
+	body := strings.builder_make(context.temp_allocator)
+	strings.write_string(&body, "ok\nexit_code: 0\n\nstdout:\n")
+	for line in 1 ..= lines { fmt.sbprintf(&body, "line %d\n", line) }
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = chat.session, branch = chat.branch, node = assistant, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)strings.to_string(body),
+	)
+	return journal.append_node(
+		store,
+		{session = chat.session, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
+		journal.Results{calls = []journal.Call_Id{call}},
+	)
+}
+
+// app_row_with returns the first screen row whose text contains needle, or -1.
+app_row_with :: proc(storage: ^Frame_Storage, needle: string) -> int {
+	for row in 0 ..< storage.buffer.rows {
+		line := strings.builder_make(context.temp_allocator)
+		for column in 0 ..< storage.buffer.columns {
+			strings.write_string(&line, storage.buffer.cells[row * storage.buffer.columns + column].grapheme)
+		}
+		if strings.contains(strings.to_string(line), needle) { return row }
+	}
+	return -1
+}
+
+// app_click presses and releases the left button on the first screen row containing needle.
+app_click :: proc(app: ^App, storage: ^Frame_Storage, needle: string) {
+	row := app_row_with(storage, needle)
+	press := input.Mouse_Event {
+		button = .Left,
+		x      = 4,
+		y      = row + 1,
+	}
+	handle_mouse(app, press)
+	press.release = true
+	handle_mouse(app, press)
+}
+
+// A box is collapsed by default and never takes the wheel. A click expands it with its whole result read
+// from the journal and a second click collapses it, and the keyboard reaches the same boxes through Tab, Down and Enter.
+@(test)
+test_a_click_expands_a_tool_box_from_the_journal :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	head := app_history_node(&app, 0, .User, "list")
+	head = app_history_shell(&app, head, 30)
+	head = app_history_shell(&app, head, 30)
+	if _, commit_error := journal.commit(app.setup.store); commit_error != nil { testing.fail_now(t, "the history could not be committed") }
+	storage := app_frame_storage(SCROLL_ROWS + 3)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 3
+	app.conversation_rect = {
+		width  = 80,
+		height = SCROLL_ROWS,
+	}
+	app_settle(&app, storage, SCROLL_ROWS)
+
+	boxes := 0
+	for entry in transcript_order(&app) { if entry.kind == .Tool { boxes += 1 } }
+	testing.expect_value(t, boxes, 2)
+	testing.expect_value(t, app_row_with(storage, "line 11"), -1)
+	testing.expect_value(t, len(app.transcript.expanded), 0)
+
+	app_click(&app, storage, "shell")
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, len(app.transcript.expanded), 1)
+	testing.expect(t, app_row_with(storage, "line 9") >= 0, "the expanded box shows its window")
+
+	app_click(&app, storage, "shell")
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, len(app.transcript.expanded), 0)
+
+	handle_key(&app, {code = .Tab})
+	testing.expect(t, app.transcript.focused, "tab with nothing to complete moves the keyboard to the transcript")
+	handle_key(&app, {code = .Up})
+	handle_key(&app, {code = .Enter})
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, len(app.transcript.expanded), 1)
+	handle_key(&app, {code = .Down})
+	handle_key(&app, {code = .Enter})
+	testing.expect_value(t, len(app.transcript.expanded), 2)
+	handle_key(&app, {code = .Escape})
+	testing.expect(t, !app.transcript.focused, "escape returns the keyboard to the prompt")
 }
 
 // app_entries_count is how many transcript entries carry exactly text.

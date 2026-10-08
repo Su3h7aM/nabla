@@ -116,6 +116,12 @@ PICKED_STYLE :: term.Style {
 // how many rows it is holding back.
 TOOL_WINDOW_ROWS :: 10
 
+// TOOL_CONTENT_START is the column a box's result row starts at, which its tabs expand from.
+TOOL_CONTENT_START :: 1
+
+// FOCUS_HINT is on the prompt's border while the keyboard drives the transcript.
+FOCUS_HINT :: " ↑↓ box · enter expand · tab prompt "
+
 // STARTUP_HINT is what an empty transcript shows under the title.
 STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
 
@@ -423,6 +429,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			transcript_measure(app, order, frame_result, rect.height)
 			if !draw_conversation_commands(storage, frame_result, rect) { return false }
 			selection_paint(app, storage, rect)
+			box_drag_paint(app, storage, frame_result, rect)
 			return true
 		}
 		offset = corrected
@@ -623,6 +630,27 @@ selection_paint :: proc(app: ^App, storage: ^Frame_Storage, viewport: tui.Cell_R
 	}
 }
 
+// box_drag_paint marks the rows of the whole result that a drag inside an expanded box covers, where the box shows them.
+box_drag_paint :: proc(app: ^App, storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) {
+	drag := app.box_drag
+	entry := entry_find(app, drag.id)
+	if !drag.active || !drag.moved || entry == nil { return }
+	for node in frame_result.nodes {
+		if u64(node.user) != drag.id { continue }
+		for shown in 0 ..< entry.tool_rows {
+			row := entry.tool_scroll + shown
+			if row < min(drag.anchor, drag.cursor) || row > max(drag.anchor, drag.cursor) { continue }
+			y := int(node.outer.position.y) + 1 + shown
+			if y < 0 || y >= viewport.height { continue }
+			for x in int(node.outer.position.x) + 1 ..< int(node.outer.position.x + node.outer.size.x) - 1 {
+				if x < 0 || x >= viewport.width { continue }
+				storage.buffer.cells[(viewport.y + y) * storage.buffer.columns + viewport.x + x].style.modifiers += {.Reverse}
+			}
+		}
+		return
+	}
+}
+
 // selection_row_range returns the columns one row of the selection covers, both
 // ends included. The first row starts at the drag's anchor and the last ends at
 // its cursor; the rows between are covered whole.
@@ -789,24 +817,21 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 }
 
 // declare_tool_entry draws one tool call as a bordered box: the call's name on the top
-// border, then a window of its result. A result taller than the window scrolls (see
-// `entry.tool_scroll`), and the bottom border says how many rows are held back. Only the
-// border carries the outcome color; the content is ordinary text. Code Mode calls draw
-// here too: a successful one in blue, any other outcome in the same red a tool box uses.
-// A running call draws the spinner frame before its name and the working border color,
-// whatever its kind.
+// border, then a window of its result. A collapsed box shows the first rows its entry kept and
+// the bottom border counts the lines hidden. An expanded box (entry.full) scrolls its whole
+// text in the window (see `entry.tool_scroll`) and draws its border in the bright color.
+// Only the border carries the outcome color. Code Mode calls draw here too, in blue on success.
+// A running call draws the spinner frame before its name and the working border color.
 declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
 	outline := widgets.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
 	content_width := max(box_width - 4, 1)
-	// A content row is " piece fill ": the piece starts one cell in, so its
-	// tabs expand from column 1. The top and bottom labels sit after the
-	// corner, one rule, and one space, so theirs expand from column 3. Width
-	// math uses those starts, or a tab puts the border in the wrong column.
-	TOOL_CONTENT_START :: 1
+	// The top and bottom labels sit after the corner, one rule, and one space, so their
+	// tabs expand from column 3. Width math uses those starts, or a tab puts the border in the wrong column.
 	TOOL_LABEL_START :: 3
-	value := string(entry.text[:])
+	expanded := entry.full != ""
+	value := entry.full if expanded else string(entry.text[:])
 	name := value
 	preview := ""
 	if split := strings.index(value, "\n"); split >= 0 {
@@ -831,9 +856,17 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	visible_rows := min(content_rows, TOOL_WINDOW_ROWS)
 	// The bound is kept on the entry because the wheel asks whether the window has
 	// room left before it decides who owns the report.
-	entry.tool_scroll_max = max(content_rows - visible_rows, 0)
+	scrolls := expanded || entry.running
+	entry.tool_scroll_max = max(content_rows - visible_rows, 0) if scrolls else 0
 	entry.tool_scroll = clamp(entry.tool_scroll, 0, entry.tool_scroll_max)
-	bottom := tool_border_bottom(outline, border_inner_width, tool_window_label(entry.tool_scroll, entry.tool_scroll_max - entry.tool_scroll))
+	entry.tool_rows = visible_rows
+	label: string
+	if scrolls {
+		label = tool_window_label(entry.tool_scroll, entry.tool_scroll_max - entry.tool_scroll)
+	} else if hidden := entry.hidden_lines + content_rows - visible_rows; hidden > 0 {
+		label = fmt.tprintf("%d more line%s", hidden, "" if hidden == 1 else "s")
+	}
+	bottom := tool_border_bottom(outline, border_inner_width, label)
 	border_style := TOOL_FAILURE
 	switch {
 	case entry.running:
@@ -841,6 +874,8 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	case entry.tool_outcome == .Success:
 		border_style = CODEMODE_SUCCESS if entry.kind == .Codemode else TOOL_SUCCESS
 	}
+	if expanded { border_style = tool_border_bright(border_style) }
+	if entry.selected { border_style.modifiers += {.Bold} }
 	if layout.element(
 		ctx,
 		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = layout.User_Tag(entry.id)},
@@ -872,6 +907,13 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 		}
 		layout.text(ctx, layout.Text_Desc{text = bottom, style = border})
 	}
+}
+
+// tool_border_bright returns style in the bright variant of its indexed color.
+tool_border_bright :: proc(style: term.Style) -> term.Style {
+	bright := style
+	if index, indexed := style.foreground.(term.Indexed_Color); indexed && index < 8 { bright.foreground = index + 8 }
+	return bright
 }
 
 // declare_tool_image reserves a box's picture rows below its text, inside the border.
@@ -1214,7 +1256,14 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (
 	if rect.height < 3 || rect.width <= 4 { return {}, nil }
 	border_style := RULE_STYLE
 	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = widgets.BORDER_ROUNDED, style = border_style})
-	if app.run.snap.status.running {
+	if app.transcript.focused {
+		_, _ = tui.draw_text(
+			&storage.buffer,
+			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(FOCUS_HINT), rect.width - 4), height = 1},
+			FOCUS_HINT,
+			HINT_STYLE,
+		)
+	} else if app.run.snap.status.running {
 		title := fmt.tprintf(" %s %s ", spinner_glyph(app.spin_frame), working_label(app))
 		_, _ = tui.draw_text(
 			&storage.buffer,
@@ -1230,6 +1279,10 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (
 		height = rect.height - 2,
 	}
 	if content.width <= 0 || content.height <= 0 { return {}, nil }
+	if app.transcript.focused {
+		_, input_error := widgets.draw_input(&storage.buffer, content, &app.input, HINT_STYLE)
+		return {}, input_error
+	}
 	return widgets.draw_input(&storage.buffer, content, &app.input, INPUT_TEXT)
 }
 

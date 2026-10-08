@@ -119,6 +119,8 @@ App :: struct {
 	raw:                        [dynamic]input.Event, // owned; the latest input batch,
 	run:                        Runtime,
 	storage:                    ^Frame_Storage,
+	// box_drag is a drag that started on the result rows of an expanded box.
+	box_drag:                   Box_Drag,
 	// transcript is the committed history on screen, which only the main thread touches.
 	transcript:                 Transcript,
 	home:                       string, // owned; shortens the footer path,

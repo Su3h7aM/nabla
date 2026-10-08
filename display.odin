@@ -263,8 +263,7 @@ tool_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, outc
 // call keeps its own result preview, so its box reads like a normal tool box that is
 // titled for the script that ran it.
 tool_entry_text_titled :: proc(call: Tool_Display_Call, title, content, fallback: string, outcome: journal.Tool_Outcome) -> string {
-	preview := tool_display_preview(content)
-	if preview == "" { preview = fallback }
+	preview := tool_preview(content, fallback)
 	if prompt, present := call.prompt.?; present {
 		if outcome == .Success { return fmt.tprintf("%s\n%s", title, prompt) }
 		return fmt.tprintf("%s\n%s\n%s", title, prompt, preview)
@@ -347,8 +346,7 @@ codemode_arguments_preview :: proc(arguments: string) -> string {
 // preview-only box other calls show. Live, follower, and replay share it so the boxes
 // read the same.
 codemode_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome, inner: []Codemode_Inner) -> string {
-	preview := tool_display_preview(content)
-	if preview == "" { preview = fallback }
+	preview := tool_preview(content, fallback)
 	code, present := call.code.?
 	if !present { return tool_entry_text(call, content, fallback, outcome) }
 	builder, builder_error := strings.builder_make(context.temp_allocator)
@@ -383,6 +381,31 @@ codemode_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, 
 	strings.write_byte(&builder, '\n')
 	strings.write_string(&builder, preview)
 	return strings.to_string(builder)
+}
+
+// tool_preview is the result text a box ends with: the body of content, or fallback when it has none.
+tool_preview :: proc(content, fallback: string) -> string {
+	preview := tool_display_preview(content)
+	if preview == "" { return fallback }
+	return preview
+}
+
+// tool_text_collapse cuts the result preview that ends text to its first TOOL_WINDOW_ROWS lines.
+// It returns the kept text, the offset where the preview starts, and the number of lines cut.
+tool_text_collapse :: proc(text, preview: string) -> (kept: string, preview_at: int, hidden: int) {
+	if !strings.has_suffix(text, preview) { return text, len(text), 0 }
+	preview_at = len(text) - len(preview)
+	counted := preview
+	if strings.has_suffix(counted, "\n") { counted = counted[:len(counted) - 1] }
+	cut := 0
+	for _ in 0 ..< TOOL_WINDOW_ROWS {
+		newline := strings.index_byte(counted[cut:], '\n')
+		if newline < 0 { return text, preview_at, 0 }
+		cut += newline + 1
+	}
+	remaining := counted[cut:]
+	if remaining == "" { return text, preview_at, 0 }
+	return text[:preview_at + cut - 1], preview_at, strings.count(remaining, "\n") + 1
 }
 
 tool_display_preview :: proc(content: string) -> string {
