@@ -119,6 +119,8 @@ App :: struct {
 	raw:                        [dynamic]input.Event, // owned; the latest input batch,
 	run:                        Runtime,
 	storage:                    ^Frame_Storage,
+	// transcript is the committed history on screen, which only the main thread touches.
+	transcript:                 Transcript,
 	home:                       string, // owned; shortens the footer path,
 	input:                      widgets.Input,
 	scroll:                     int, // rows scrolled back; 0 follows the bottom,

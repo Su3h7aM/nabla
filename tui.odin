@@ -292,11 +292,13 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	free_all(context.temp_allocator)
 	cursor: term.Cursor
 	err: Render_Status
-	if sync.mutex_guard(&app.run.mu) {
-		cursor, err = render_frame(app, storage)
-	}
-	if err != .None {
-		return
+	transcript_sync(app)
+	for {
+		if sync.mutex_guard(&app.run.mu) {
+			cursor, err = render_frame(app, storage)
+		}
+		if err != .None { return }
+		if !transcript_slide(app) { break }
 	}
 	images_sync(app, storage)
 	_, required, present_err := term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
@@ -403,9 +405,10 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	offset := app.conv_scroll_range - app.scroll
 	viewport := layout.Vec2{layout.Scalar(rect.width), layout.Scalar(rect.height)}
 	storage.conversation_rows = rect.height
+	order := transcript_order(app)
 
 	for pass in 0 ..< 2 {
-		frame_result, solved := conversation_solve(app, storage, viewport, rect.width, offset)
+		frame_result, solved := conversation_solve(app, storage, viewport, rect.width, offset, order)
 		if !solved {
 			return false
 		}
@@ -422,6 +425,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			// The last solve declared every entry this frame draws, so the
 			// Markdown it did not ask for belongs to entries that are gone.
 			markdown_cache_sweep(&storage.markdown)
+			transcript_measure(app, order, frame_result, rect.height)
 			if !draw_conversation_commands(storage, frame_result, rect) { return false }
 			selection_paint(app, storage, rect)
 			return true
@@ -436,8 +440,18 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 // per session, so the storage settles at what this session used instead of a worst-case
 // reservation. False means the budget could not be raised.
 @(require_results)
-conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) -> (layout.Frame_Result, bool) {
-	declare_conversation(app, storage, viewport, width, offset)
+conversation_solve :: proc(
+	app: ^App,
+	storage: ^Frame_Storage,
+	viewport: layout.Vec2,
+	width: int,
+	offset: int,
+	order: []^Entry,
+) -> (
+	layout.Frame_Result,
+	bool,
+) {
+	declare_conversation(app, storage, viewport, width, offset, order)
 	frame_result, frame_error := layout.result(&storage.layout_ctx)
 	for _ in 0 ..< CONVERSATION_GROW_ATTEMPTS {
 		if frame_error != .Capacity_Exhausted {
@@ -446,7 +460,7 @@ conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.
 		if !conversation_budget_raise(storage) {
 			return {}, false
 		}
-		declare_conversation(app, storage, viewport, width, offset)
+		declare_conversation(app, storage, viewport, width, offset, order)
 		frame_result, frame_error = layout.result(&storage.layout_ctx)
 	}
 	if frame_error != .None {
@@ -458,7 +472,7 @@ conversation_solve :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.
 // declare_conversation declares one frame's tree: the transcript column, the startup hint
 // when there is nothing to show, and one element per entry. The declarations live inside
 // the frame's own `if` block, because that block is what layout closes the frame on.
-declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int) {
+declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int, order: []^Entry) {
 	clear(&storage.links)
 	// Services bind for one frame only, so every solve re-binds them.
 	layout.set_services(
@@ -478,14 +492,14 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 				clip = layout.Clip_Style{axes = {.X, .Y}, offset = {0, layout.Scalar(offset)}},
 			},
 		) {
-			if len(app.run.snap.entries) == 0 {
+			if len(order) == 0 {
 				if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
 					layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = layout_text_style(TITLE_STYLE)})
 					layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
 				}
 			} else {
-				for &entry in app.run.snap.entries {
-					declare_entry(&storage.layout_ctx, storage, &entry, width, app.spin_frame)
+				for entry in order {
+					declare_entry(&storage.layout_ctx, storage, entry, width, app.spin_frame)
 				}
 			}
 		}

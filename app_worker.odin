@@ -4,7 +4,6 @@ package main
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
-import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
@@ -257,7 +256,7 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			snap_append(app, .Warning, "chat is busy; input dropped")
 			return
 		}
-		snap_append(app, .User, work.text)
+		refresh_status(app)
 		run_accepted_turn(app, observer)
 	// Steering lines left queued here arrived after the turn recorded what it was sent,
 	// so they are not part of its history. Its end is still the caller's to report, and
@@ -574,7 +573,7 @@ session_resume :: proc(app: ^App, reference: string) {
 	if !session_switch(app, Start_Resume_Id(matched_text)) { return }
 	snapshot_clear(app)
 	snap_append(app, .Notice, fmt.tprintf("resumed session %s", matched_text))
-	session_replay(app, &app.setup.session)
+	session_opened_show(app)
 }
 
 // session_switch replaces the running session with the one start names, settling
@@ -628,162 +627,15 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	return true
 }
 
-// session_replay shows the tail of a resumed conversation. The store keeps every
-// entry; this is the part a person needs to recognise where they left off.
-session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
+// session_opened_show says what a just opened session shows besides its journal history: that
+// it is followed, and the lines the runner has not delivered. It consumes follow_pending.
+session_opened_show :: proc(app: ^App) {
 	defer {
 		journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
 		app.setup.follow_pending = nil
 	}
-	following := chat.store.followed != {}
-	if following { snap_append(app, .Notice, "the session runs in another process; this one follows it") }
-	arena: virtual.Arena
-	if virtual.arena_init_growing(&arena) != nil {
-		snap_append(app, .Error, "cannot read the session history: out of memory")
-		return
-	}
-	defer virtual.arena_destroy(&arena)
-	replayed, replay_error := agent.projection_load(chat.store, chat.session, chat.head, virtual.arena_allocator(&arena))
-	if replay_error != nil {
-		// Resuming a session and showing nothing would look like an empty
-		// conversation rather than a failure to read one.
-		detail := journal.error_text(replay_error, context.temp_allocator)
-		snap_append(app, .Error, fmt.tprintf("cannot read the session history: %s", detail))
-		return
-	}
-
-	// answers holds what each call reported. A call without an answer is unfinished, and
-	// only a followed session can still finish it, so the answers the Results node has
-	// not caught up with are read only then.
-	answers := make(map[journal.Call_Id]agent.Projected_Result, len(replayed.items), app.run.alloc)
-	defer delete(answers)
-	for item in replayed.items {
-		if result, is_result := item.payload.(agent.Projected_Result); is_result { answers[result.call] = result }
-	}
-	if following {
-		for result in replayed.unanswered { answers[result.call] = result }
-	}
-
-	if replayed.summary != "" {
-		snap_append(app, .Notice, "(earlier turns are summarized)")
-	}
-	group_start := 0
-	for &item, index in replayed.items {
-		// A native response replays only to the model; its text and calls are items of their own.
-		#partial switch payload in item.payload {
-		case agent.Projected_User:
-			if payload.origin == .Prompt || payload.origin == .Agent {
-				snap_append(app, user_entry_kind(payload.origin), payload.text)
-			} else {
-				snap_append(app, .Notice, payload.text)
-			}
-		case agent.Projected_Assistant:
-			snap_append(app, .Assistant, payload.text)
-		case agent.Projected_Call:
-			if index == 0 || !projected_is_call(replayed.items[index - 1]) { group_start = index }
-			answer: Maybe(agent.Projected_Result)
-			if result, answered := answers[payload.call]; answered { answer = result }
-			if answer != nil || following { session_replay_call(app, payload, answer, replayed.nested) }
-			// A script's calls are admitted after every call of its response, so the live
-			// turn showed them after the response's last call.
-			if index + 1 == len(replayed.items) || !projected_is_call(replayed.items[index + 1]) {
-				session_replay_children(app, replayed.nested, replayed.items[group_start:index + 1], answers, following)
-			}
-		}
-	}
-	if following { session_replay_queued(app) }
-}
-
-projected_is_call :: proc(item: agent.Projection_Item) -> bool {
-	_, is_call := item.payload.(agent.Projected_Call)
-	return is_call
-}
-
-// session_replay_call shows one replayed call as the live turn showed it: a call with an
-// answer as its finished box and any other as a running box. A running Code Mode call also
-// restores its pending record, so the events a follower reads next update the box.
-session_replay_call :: proc(app: ^App, stored: agent.Projected_Call, answer: Maybe(agent.Projected_Result), nested: []agent.Projected_Nested_Call) {
-	display := tool_display_call(stored.name, stored.proposed)
-	result, settled := answer.?
-	// The picture is read before the lock is taken: decoding is not memory access.
-	image := image_prepare(app, result.attachments)
-	defer delete(image.pixels)
-	content, fallback, outcome := "", "", journal.Tool_Outcome.Success
-	if settled { content, fallback, outcome = result.content, journal.TOOL_OUTCOME_NAMES[result.outcome], result.outcome }
-	sync.mutex_guard(&app.run.mu)
-	if stored.name != agent.TOOL_CODEMODE_NAME {
-		snap_push_tool_locked(app, .Tool, stored.call, tool_entry_text(display, content, fallback, outcome), result.outcome, !settled, &image)
-		return
-	}
-	inner := codemode_inner_list(app, nested, stored.call, settled)
-	snap_push_tool_locked(app, .Codemode, stored.call, codemode_entry_text(display, content, fallback, outcome, inner), result.outcome, !settled)
-	if settled { return }
-	codemode_pending_start_locked(app, stored.call, display.code)
-	for item in inner { codemode_pending_upsert_locked(app, stored.call, item) }
-}
-
-// session_replay_children shows the calls the Code Mode calls of one response made, in
-// admission order. A session that is not followed shows only the children of a script that
-// has an answer; a followed one shows them all. A child still unsettled under a script that
-// has an answer will never settle, so it shows as settled unknown, as turn_finished does.
-session_replay_children :: proc(
-	app: ^App,
-	nested: []agent.Projected_Nested_Call,
-	response: []agent.Projection_Item,
-	answers: map[journal.Call_Id]agent.Projected_Result,
-	following: bool,
-) {
-	for child in nested {
-		_, parent_settled := answers[child.parent_call]
-		if !parent_settled && !following { continue }
-		for item in response {
-			if stored, is_call := item.payload.(agent.Projected_Call); is_call && stored.call == child.parent_call {
-				session_replay_child(app, child, parent_settled)
-				break
-			}
-		}
-	}
-}
-
-session_replay_child :: proc(app: ^App, child: agent.Projected_Nested_Call, parent_settled: bool) {
-	display := tool_display_call(child.name, child.proposed)
-	settled := child.settled || parent_settled
-	content, fallback, outcome := "", "", journal.Tool_Outcome.Success
-	if settled { content, fallback, outcome = child.content, journal.TOOL_OUTCOME_NAMES[child.outcome], child.outcome }
-	text := tool_entry_text_titled(display, codemode_inner_title(child.name), content, fallback, outcome)
-	image := image_prepare(app, child.attachments)
-	defer delete(image.pixels)
-	sync.mutex_guard(&app.run.mu)
-	snap_push_tool_locked(app, .Codemode, child.call, text, child.outcome, !settled, &image)
-}
-
-// codemode_inner_list lists the calls the Code Mode call parent_call made, in admission
-// order, for its box. When the script is settled, a call that never settled lists as
-// unknown. The list and the strings it borrows live as long as nested and the temporary
-// allocator do. The caller holds the runtime mutex.
-codemode_inner_list :: proc(app: ^App, nested: []agent.Projected_Nested_Call, parent_call: journal.Call_Id, parent_settled: bool) -> []Codemode_Inner {
-	list := make([dynamic]Codemode_Inner, context.temp_allocator)
-	for child in nested {
-		if child.parent_call != parent_call { continue }
-		inner := Codemode_Inner {
-			call      = child.call,
-			name      = child.name,
-			arguments = child.proposed,
-			outcome   = child.outcome,
-			running   = !child.settled && !parent_settled,
-		}
-		if _, append_error := append(&list, inner); append_error != nil {
-			snap_report_dropped_locked(app)
-			break
-		}
-	}
-	return list[:]
-}
-
-// session_replay_queued shows the lines the session accepted and the runner has not
-// delivered yet. They are no node, so the replay above has none of them, and the node that
-// delivers one later is skipped as a repeat of the line (see follow_poll).
-session_replay_queued :: proc(app: ^App) {
+	if app.setup.session.store.followed == {} { return }
+	snap_append(app, .Notice, "the session runs in another process; this one follows it")
 	for record in app.setup.follow_pending {
 		if record.kind == .User_Input {
 			snap_append(app, user_entry_kind(agent.user_input_origin(record)), string(record.body))
@@ -791,17 +643,35 @@ session_replay_queued :: proc(app: ^App) {
 	}
 }
 
+// head_publish publishes the session shown and its committed head for the transcript window.
+head_publish :: proc(app: ^App) {
+	running := &app.setup.session
+	session: journal.Session_Id
+	head: journal.Node_Id
+	if running.store != nil {
+		session = running.session
+		_, committed, head_error := journal.session_head(running.store, session)
+		if head_error != nil { return }
+		head = committed
+	}
+	sync.mutex_guard(&app.run.mu)
+	snap := &app.run.snap
+	snap.after = max(head, running.head)
+	if snap.head_session == session && snap.head == head { return }
+	snap.head_session, snap.head = session, head
+	snap_publish_locked(app)
+}
+
 // snapshot_clear drops the rendered transcript. The history lives in the store;
 // this is only what the screen shows.
 snapshot_clear :: proc(app: ^App) {
+	head_publish(app)
 	sync.mutex_guard(&app.run.mu)
 	for &entry in app.run.snap.entries {
 		entry_destroy(&entry)
 	}
 	clear(&app.run.snap.entries)
-	app.run.snap.entries_bytes = 0
 	app.run.snap.image_bytes = 0
-	app.run.snap.transcript_trimmed = false
 	codemode_pending_clear_locked(app)
 	snap_publish_locked(app)
 }
@@ -811,14 +681,14 @@ snapshot_clear :: proc(app: ^App) {
 // visible.
 
 refresh_status :: proc(app: ^App) {
+	head_publish(app)
 	running := &app.setup.session
 	totals: journal.Usage_Totals
 	totals_error: journal.Error = journal.Journal_Error.Not_Found
 	if running.store != nil { totals, totals_error = journal.usage_totals(running.store, running.session) }
 	sync.mutex_guard(&app.run.mu)
 	status := &app.run.snap.status
-	// The estimate is the one the agent measured when it built the last request;
-	// the main thread never reads the store, so it cannot compute one itself.
+	// The estimate is the one the agent measured when it built the last request.
 	status.est_input = running.last_estimate
 	status.context_window = running.capacity.window
 	// The footer shows the session's token-weighted hit rate beside the estimate.
@@ -964,11 +834,11 @@ snap_append :: proc(app: ^App, kind: Entry_Kind, text: string) {
 	snap_append_locked(app, kind, text)
 }
 
-// snap_entry_make builds one transcript entry: the allocator its text belongs to,
-// a fresh identity, and the display text when there is any.
+// snap_entry_make builds a live entry with a fresh id that follows the current head.
 snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
 	entry := Entry {
-		kind = kind,
+		kind  = kind,
+		after = app.run.snap.after,
 	}
 	entry.text.allocator = app.run.alloc
 	entry.stream.allocator = app.run.alloc
@@ -978,9 +848,7 @@ snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
 	return entry
 }
 
-// snap_entry_set_text writes text that arrived in one piece. The buffer is sized for
-// the text exactly, because a buffer grown to reach it holds up to twice the text and
-// the transcript budget counts the capacity an entry holds.
+// snap_entry_set_text writes text that arrived in one piece.
 snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	if len(text) == 0 { return }
 	if resize_error := resize(&entry.text, len(text)); resize_error != nil {
@@ -989,15 +857,6 @@ snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	}
 	copy(entry.text[:], text)
 	entry.revision += 1
-	snap_entry_account(entry)
-}
-
-// snap_entry_account charges one entry for everything it holds: its own slot in
-// the transcript and the text buffer behind it. One budget then covers both costs,
-// so a very long run of very short lines is bounded by the same number as a short
-// run of very long ones. Pictures have their own budget, TRANSCRIPT_IMAGE_MAX_BYTES.
-snap_entry_account :: proc(entry: ^Entry) {
-	entry.bytes = size_of(Entry) + cap(entry.text) + cap(entry.stream)
 }
 
 // snap_entry_append_text adds display text to one entry. A buffer that cannot
@@ -1009,7 +868,6 @@ snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 			snap_report_dropped_locked(app)
 		}
 	}
-	snap_entry_account(entry)
 }
 
 // snap_report_dropped_locked marks the display incomplete once, without allocating or
@@ -1022,9 +880,7 @@ snap_report_dropped_locked :: proc(app: ^App) {
 
 snap_push_locked :: proc(app: ^App, entry: Entry) {
 	entry := entry // a parameter is not addressable, and the refused entry is destroyed
-	app.run.snap.entries_bytes += entry.bytes
 	if _, append_error := append(&app.run.snap.entries, entry); append_error != nil {
-		app.run.snap.entries_bytes -= entry.bytes
 		app.run.snap.image_bytes -= entry.image.bytes
 		// Nothing holds the buffer now: the array did not take the entry. A
 		// dynamic array releases through its own allocator, which the entry's text
@@ -1034,25 +890,6 @@ snap_push_locked :: proc(app: ^App, entry: Entry) {
 		return
 	}
 	snap_publish_locked(app)
-	snap_trim_locked(app)
-}
-
-// snap_trim_locked drops the oldest entries, and their text, while the transcript
-// passes its budget, and says once that it did. The newest entry is always kept:
-// one entry larger than the budget is still the newest thing said.
-snap_trim_locked :: proc(app: ^App) {
-	was_trimmed := app.run.snap.transcript_trimmed
-	for len(app.run.snap.entries) > 1 && app.run.snap.entries_bytes > TRANSCRIPT_MAX_BYTES {
-		dropped := app.run.snap.entries[0]
-		app.run.snap.entries_bytes -= dropped.bytes
-		app.run.snap.image_bytes -= dropped.image.bytes
-		ordered_remove(&app.run.snap.entries, 0)
-		entry_destroy(&dropped)
-		app.run.snap.transcript_trimmed = true
-	}
-	if app.run.snap.transcript_trimmed && !was_trimmed {
-		snap_push_locked(app, snap_entry_make(app, .Notice, TRANSCRIPT_TRIMMED_NOTICE))
-	}
 }
 
 // snap_append_locked appends under a held runtime mutex.
@@ -1119,20 +956,20 @@ observer_request_finished :: proc(user_data: rawptr) {
 observer_assistant_begin :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
+	if app.run.snap.status.following { return }
+	snap_after_update_locked(app)
 	snap_push_locked(app, snap_entry_make(app, .Assistant, ""))
 }
 
 observer_assistant_text :: proc(user_data: rawptr, text: string) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
+	if app.run.snap.status.following { return }
 	count := len(app.run.snap.entries)
 	if count > 0 {
 		last := &app.run.snap.entries[count - 1]
 		if last.kind == .Assistant && !last.complete {
-			before := last.bytes
 			snap_entry_append_text(app, last, text)
-			app.run.snap.entries_bytes += last.bytes - before
-			snap_trim_locked(app)
 			snap_publish_locked(app)
 			return
 		}
@@ -1143,11 +980,18 @@ observer_assistant_text :: proc(user_data: rawptr, text: string) {
 observer_assistant_end :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
+	if app.run.snap.status.following { return }
 	count := len(app.run.snap.entries)
 	if count > 0 {
 		app.run.snap.entries[count - 1].complete = true
 	}
 	snap_publish_locked(app)
+}
+
+// snap_after_update_locked makes the entries made next follow the head in memory. Only
+// the worker calls it, since only the worker may read the session.
+snap_after_update_locked :: proc(app: ^App) {
+	app.run.snap.after = max(app.run.snap.head, app.setup.session.head)
 }
 
 // user_entry_kind maps a user-role text's origin to its transcript kind: what another
@@ -1167,8 +1011,8 @@ observer_tool_call :: proc(user_data: rawptr, event: agent.Chat_Tool_Event) {
 	app := cast(^App)user_data
 	display := tool_display_call(event.name, event.arguments)
 	sync.mutex_guard(&app.run.mu)
-	// A box already shown for the call came from a replay of a record the poll reads again.
 	if snap_tool_entry_locked(app, event.call) != nil { return }
+	snap_after_update_locked(app)
 	switch {
 	case event.parent_call != 0:
 		inner := Codemode_Inner {
@@ -1190,7 +1034,7 @@ observer_tool_call :: proc(user_data: rawptr, event: agent.Chat_Tool_Event) {
 
 // observer_tool_result settles the running box of the call and, for a call whose pending
 // event was never observed, shows the finished box. A call with a finished box already
-// is ignored: a replay showed it, or its turn finished and settled the box as unknown, so
+// is ignored: the window showed it, or its turn finished and settled the box as unknown, so
 // a completion that arrives after turn_finished does not change what the box says. Call 0
 // is no identity and always gets a box of its own.
 observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
@@ -1203,6 +1047,7 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 	defer delete(image.pixels)
 	sync.mutex_guard(&app.run.mu)
 	if shown := snap_tool_entry_locked(app, call); shown != nil && !shown.running { return }
+	snap_after_update_locked(app)
 	switch {
 	case parent_call != 0:
 		inner := Codemode_Inner {
@@ -1261,10 +1106,6 @@ observer_tool_output :: proc(user_data: rawptr, call, parent_call: journal.Call_
 		remaining := copy(entry.stream[:], entry.stream[cut:])
 		_ = resize(&entry.stream, remaining)
 	}
-	// The stream is charged before the text is rebuilt, so a text that cannot be set
-	// still leaves the budget true and gets trimmed.
-	snap_entry_recharge_locked(app, entry)
-	defer snap_trim_locked(app)
 	base := string(entry.text[:entry.stream_prefix])
 	separator := "" if len(base) == 0 || strings.has_suffix(base, "\n") else "\n"
 	tail := text_last_lines(string(entry.stream[:]), STREAM_TAIL_LINES)
@@ -1278,14 +1119,6 @@ observer_tool_output :: proc(user_data: rawptr, call, parent_call: journal.Call_
 	snap_publish_locked(app)
 }
 
-// snap_entry_recharge_locked charges the transcript's budget for the change in what an
-// entry holds since it was last accounted.
-snap_entry_recharge_locked :: proc(app: ^App, entry: ^Entry) {
-	before := entry.bytes
-	snap_entry_account(entry)
-	app.run.snap.entries_bytes += entry.bytes - before
-}
-
 // snap_stream_release_locked frees the streamed tail of a box that ends and charges the
 // transcript's budget for the smaller entry.
 snap_stream_release_locked :: proc(app: ^App, entry: ^Entry) {
@@ -1294,12 +1127,11 @@ snap_stream_release_locked :: proc(app: ^App, entry: ^Entry) {
 	entry.stream = nil
 	entry.stream.allocator = app.run.alloc
 	entry.stream_prefix = 0
-	snap_entry_recharge_locked(app, entry)
 }
 
 // snap_push_tool_locked appends a tool box under a held runtime mutex. kind is the box
 // the entry draws as: a Code Mode inner call draws as .Codemode even though its text
-// reads like a normal tool box. Live, follower, and replay build their boxes through it.
+// reads like a normal tool box. Live and follower boxes are built through it.
 snap_push_tool_locked :: proc(
 	app: ^App,
 	kind: Entry_Kind,
@@ -1342,13 +1174,10 @@ snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_
 	snap_stream_release_locked(app, entry)
 	snap_entry_image_set_locked(app, entry, image)
 	snap_publish_locked(app)
-	snap_trim_locked(app)
 }
 
-// snap_entry_rewrite_locked replaces the text of an entry already in the transcript and
-// charges the transcript's budget for the difference. It neither trims nor publishes, so a
-// caller walking the entries is not disturbed by a trim removing one. When the new text
-// cannot be allocated the entry keeps its old text and the result is false.
+// snap_entry_rewrite_locked replaces the text of a live entry. When the new text cannot be
+// allocated the entry keeps its old text and the result is false.
 snap_entry_rewrite_locked :: proc(app: ^App, entry: ^Entry, text: string) -> bool {
 	replacement, allocation_error := make([dynamic]u8, len(text), len(text), app.run.alloc)
 	if allocation_error != nil {
@@ -1359,9 +1188,6 @@ snap_entry_rewrite_locked :: proc(app: ^App, entry: ^Entry, text: string) -> boo
 	delete(entry.text)
 	entry.text = replacement
 	entry.revision += 1
-	before := entry.bytes
-	snap_entry_account(entry)
-	app.run.snap.entries_bytes += entry.bytes - before
 	return true
 }
 
@@ -1437,7 +1263,6 @@ codemode_inner_update_locked :: proc(app: ^App, parent_call: journal.Call_Id, in
 	}
 	if !snap_entry_rewrite_locked(app, outer, codemode_entry_text(display, "", "", .Success, pending.inner[:])) { return }
 	snap_publish_locked(app)
-	snap_trim_locked(app)
 }
 
 // observer_turn_finished settles every box still running: no call of the turn can report
@@ -1473,7 +1298,6 @@ observer_turn_finished :: proc(user_data: rawptr) {
 		_ = snap_entry_rewrite_locked(app, &entry, codemode_entry_text(display, "", fallback, .Unknown, pending.inner[:]))
 	}
 	snap_publish_locked(app)
-	snap_trim_locked(app)
 	codemode_pending_clear_locked(app)
 }
 

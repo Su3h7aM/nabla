@@ -207,17 +207,6 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	return 0
 }
 
-// snap_entry_by_id finds the resident entry carrying id, or nil when the transcript no
-// longer holds it. The scan runs from the newest entry. The caller holds the runtime mutex.
-@(require_results)
-snap_entry_by_id :: proc(app: ^App, id: u64) -> ^Entry {
-	for index := len(app.run.snap.entries) - 1; index >= 0; index -= 1 {
-		entry := &app.run.snap.entries[index]
-		if entry.id == id { return entry }
-	}
-	return nil
-}
-
 // tool_box_scroll moves a tool box's window one wheel tick and reports whether
 // the box could take it. The box owns the wheel only while it has rows left in
 // the direction asked for: at its boundary the report is left to the transcript,
@@ -246,7 +235,7 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	if entry_id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1); entry_id != 0 {
 		sync.mutex_lock(&app.run.mu)
 		consumed := false
-		if entry := snap_entry_by_id(app, entry_id); entry != nil {
+		if entry := entry_find(app, entry_id); entry != nil {
 			consumed = tool_box_scroll(entry, mouse.button)
 		}
 		sync.mutex_unlock(&app.run.mu)

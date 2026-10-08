@@ -24,7 +24,8 @@ import "nabla:tui/widgets"
 WORK_CAPACITY :: 16
 
 // Entry is one rendered conversation line group: a role or diagnostic plus
-// its text, owned by the snapshot.
+// its text, owned by the layer that holds it: the snapshot for a live entry, the
+// transcript window for an entry made from a journal node.
 Entry_Kind :: enum u8 {
 	User,
 	Assistant,
@@ -41,13 +42,16 @@ Entry :: struct {
 	// id names this entry for as long as it is on screen. The frame carries it on
 	// a tool box, and the mouse report is answered by id rather than by position,
 	// which is what keeps a box under the pointer its own after the transcript
-	// dropped older lines. Zero is not an entry.
+	// slid to other nodes. Zero is not an entry.
 	id:              u64,
+	// node is the journal node a window entry was made from; zero for a live entry.
+	node:            journal.Node_Id,
+	// after is the node whose entries a live entry is drawn after; zero for a window entry.
+	after:           journal.Node_Id,
+	// rows is the height the last frame gave the entry.
+	rows:            int,
 	// revision counts changes to text, so a presentation derived from the text can tell it is stale.
 	revision:        u64,
-	// bytes is what this entry costs the transcript's budget: its own slot and the
-	// text it keeps, so one budget covers everything the transcript holds.
-	bytes:           int,
 	complete:        bool,
 	tool_outcome:    journal.Tool_Outcome,
 	// call is the journal id of the tool call a tool box shows, zero for any other
@@ -110,22 +114,9 @@ Status :: struct {
 	retrying:             bool,
 }
 
-// TRANSCRIPT_MAX_BYTES bounds the rendered transcript: the entries the screen keeps for
-// scrolling and the text they hold. Past the budget the oldest entries are dropped and
-// their text released, while the store keeps the whole conversation, so the bound is a
-// display cost and never a limit on the run.
-TRANSCRIPT_MAX_BYTES :: 1 * mem.Megabyte
-
-// TRANSCRIPT_IMAGE_MAX_BYTES bounds the pixels the transcript holds for tool-box pictures,
-// apart from TRANSCRIPT_MAX_BYTES, because one shrunk photo is larger than the whole text
-// budget. Past it the oldest pictures are released and their boxes show the text preview;
-// no entry is dropped for picture bytes. The store keeps the files, so this is a display cost.
+// TRANSCRIPT_IMAGE_MAX_BYTES bounds the picture pixels live entries hold. Past it the
+// oldest pictures are released and their boxes keep the text preview. Window pictures are bounded by the window.
 TRANSCRIPT_IMAGE_MAX_BYTES :: 64 * mem.Megabyte
-
-// TRANSCRIPT_TRIMMED_NOTICE is said once, when the transcript first drops an old
-// line. A screen that quietly loses its oldest rows looks like a screen that lost
-// them for another reason.
-TRANSCRIPT_TRIMMED_NOTICE :: "older transcript lines are not shown; the session store keeps them and /resume replays them"
 
 // snapshot_transcript_own points the transcript at the run's allocator, so every
 // entry is allocated with the allocator the run releases it with rather than with
@@ -163,26 +154,22 @@ snapshot_status_start :: proc(app: ^App) -> bool {
 // after any change; the main thread redraws when it moves.
 Snapshot :: struct {
 	entries:            [dynamic]Entry, // owned,
-	// entries_bytes is what the resident entries hold: each entry's own slot and
-	// the text it keeps, the number the transcript's budget is spent from.
-	entries_bytes:      int,
-	// image_bytes is the pixels the entries' pictures hold, whether still in the entry or
-	// moved to a pending upload, the number TRANSCRIPT_IMAGE_MAX_BYTES is spent from.
+	// image_bytes is the pixels live entries' pictures hold, in the entry or in a pending upload.
 	image_bytes:        int,
 	// display_incomplete records that a line or status field could not be kept.
 	display_incomplete: bool,
-	// transcript_trimmed records that the transcript dropped old lines, so the
-	// notice is said once rather than at every drop.
-	transcript_trimmed: bool,
-	// next_entry_id numbers the entries the transcript keeps. An entry's id
-	// travels on its tool box node to the mouse, so a report still finds its box
-	// after older entries were dropped.
+	// head_session and head are the session shown and its committed head, which the
+	// transcript window reads up to. after is the in-memory head, which new live entries follow.
+	head_session:       journal.Session_Id,
+	head:               journal.Node_Id,
+	after:              journal.Node_Id,
+	// next_entry_id numbers the live entries.
 	next_entry_id:      u64,
 	// images_enabled says the terminal draws images, so a tool result's picture is
 	// kept for the box. It is set once before the first entry is shown.
 	images_enabled:     bool,
-	// next_image_id numbers the pictures the transcript keeps; a number is never
-	// reused, so a terminal image is never mistaken for a later one.
+	// next_image_id numbers the pictures the live entries and the window keep; a number
+	// is never reused, so a terminal image is never mistaken for a later one.
 	next_image_id:      u32,
 	status:             Status,
 	// sessions is what the /resume menu offers. Only the worker reads the store,
@@ -475,8 +462,10 @@ tui_run :: proc(
 	// Only a terminal that draws images keeps the pictures of tool results.
 	app.run.snap.images_enabled = term.graphics_detect(term.profile_default().color_depth)
 	// The resumed conversation is shown before the first prompt, so the screen
-	// matches the history the next request will be built from.
-	session_replay(app, &app.setup.session)
+	// matches the history the next request will be built from: the transcript window
+	// reads it from the journal up to the head published here.
+	head_publish(app)
+	session_opened_show(app)
 	app.home = os.get_env("HOME", app.run.alloc)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
@@ -762,6 +751,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	agent.steer_queue_destroy(&app.run.steer)
 	pending_selection_clear(&app.run.pending, app.run.alloc)
 	pending_target_clear(&app.run.pending_target, app.run.alloc)
+	transcript_destroy(app)
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)

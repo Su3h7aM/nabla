@@ -12,6 +12,7 @@ import "core:image"
 import _ "core:image/jpeg"
 import _ "core:image/png"
 import "core:math"
+import "core:sync"
 
 import "nabla:ai"
 import "nabla:term"
@@ -225,8 +226,25 @@ image_cells :: proc(image: Entry_Image, available_columns, conversation_rows: in
 	return
 }
 
-// snap_image_entry_locked finds the entry that holds image id, or nil.
+// image_attach numbers a prepared picture and moves it into a window entry, leaving image
+// empty. A picture it cannot number stays with the caller, who frees it. The window's
+// pictures are not charged to the live budget.
+image_attach :: proc(app: ^App, entry: ^Entry, image: ^Entry_Image) {
+	if len(image.pixels) == 0 { return }
+	sync.mutex_guard(&app.run.mu)
+	if app.run.snap.next_image_id + 1 >= u32(term.IMAGE_ID_LIMIT) { return }
+	app.run.snap.next_image_id += 1
+	image.id = term.Image_Id(app.run.snap.next_image_id)
+	image.bytes = cap(image.pixels)
+	entry.image = image^
+	image^ = {}
+}
+
+// snap_image_entry_locked finds the window or live entry that holds image id, or nil.
 snap_image_entry_locked :: proc(app: ^App, id: term.Image_Id) -> ^Entry {
+	for &entry in app.transcript.entries {
+		if entry.image.id == id { return &entry }
+	}
 	for &entry in app.run.snap.entries {
 		if entry.image.id == id { return &entry }
 	}

@@ -269,8 +269,8 @@ test_unreadable_jpeg_leaves_the_text_preview :: proc(t: ^testing.T) {
 	testing.expect_value(t, image_test_count_placeholders(storage), 0)
 }
 
-// A photo the read tool attached is larger than the whole text budget, yet charges only
-// its own budget: the entries before it, its box, and the answer after it all stay.
+// A photo the read tool attached charges only the picture budget: the entries before it,
+// its box, and the answer after it all stay.
 @(test)
 test_large_picture_keeps_the_transcript :: proc(t: ^testing.T) {
 	app := new(App)
@@ -287,10 +287,7 @@ test_large_picture_keeps_the_transcript :: proc(t: ^testing.T) {
 
 	if !testing.expect_value(t, len(app.run.snap.entries), 4) { return }
 	testing.expect(t, app.run.snap.entries[2].image.id != 0, "the box keeps its picture")
-	testing.expect(t, cap(app.run.snap.entries[2].image.pixels) > TRANSCRIPT_MAX_BYTES, "the picture is larger than the text budget")
-	testing.expect(t, app.run.snap.entries_bytes < TRANSCRIPT_MAX_BYTES, "pixels do not count toward the text budget")
 	testing.expect_value(t, app.run.snap.image_bytes, app.run.snap.entries[2].image.bytes)
-	testing.expect(t, !app.run.snap.transcript_trimmed, "no entry is dropped for a picture")
 }
 
 // A picture that does not fit the picture budget releases the oldest pictures, oldest
