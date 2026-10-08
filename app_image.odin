@@ -6,8 +6,11 @@ package main
 // main thread owns what the terminal holds: the frame draws placeholder cells,
 // and present_frame sends, resizes, and frees terminal images to match them.
 
+import "base:runtime"
 import "core:fmt"
-import "core:image/jpeg"
+import "core:image"
+import _ "core:image/jpeg"
+import _ "core:image/png"
 import "core:math"
 
 import "nabla:ai"
@@ -35,15 +38,15 @@ IMAGE_MAX_COLUMNS :: 80
 IMAGE_CELL_WIDTH :: 8
 IMAGE_CELL_HEIGHT :: 16
 
-// PNG_SIGNATURE starts every PNG file; its first chunk is the 13-byte IHDR, whose
-// width and height follow the chunk's length and type.
-PNG_SIGNATURE :: "\x89PNG\r\n\x1a\n"
-PNG_HEADER_END :: 24
+// IMAGE_MAX_EDGE is the longest side, in pixels, a prepared picture keeps. A
+// picture of IMAGE_MAX_COLUMNS cells at a large HiDPI cell width is about this
+// wide, so a larger picture only costs transfer time and memory.
+IMAGE_MAX_EDGE :: 1024
 
 // Entry_Image is the picture of one tool box. The terminal names it by id, which
-// is zero when the entry has none. pixels is what the terminal is sent, the PNG
-// file itself or the RGB or RGBA pixels a JPEG decoded to, owned by the run's
-// allocator.
+// is zero when the entry has none. pixels is what the terminal is sent, the RGB or RGBA
+// pixels the picture decoded to, at most IMAGE_MAX_EDGE on a side, owned by the
+// run's allocator.
 Entry_Image :: struct {
 	id:     term.Image_Id,
 	pixels: [dynamic]u8, // owned,
@@ -80,26 +83,18 @@ entry_destroy :: proc(entry: ^Entry) {
 }
 
 // image_prepare makes the picture of the first PNG or JPEG among attachments,
-// copied, because the result is destroyed after the callback: a PNG is kept as
-// the file with its size read from the header, and a JPEG is decoded to pixels.
-// GIF, WebP, and PDF keep the text preview only, and so does a file that cannot
-// be read. It runs on the calling thread before the runtime mutex is taken. The
-// result owns its pixels with the run's allocator and has no id yet; its pixels
-// are empty when there is no picture. images_enabled is set before any thread
-// that calls this starts, so it is read without the lock.
+// decoded to 8-bit RGB or RGBA pixels and shrunk to IMAGE_MAX_EDGE. GIF, WebP,
+// and PDF keep the text preview only, and so does a file that cannot be read.
+// It runs on the calling thread before the runtime mutex is taken. The result
+// owns its pixels with the run's allocator and has no id yet; its pixels are
+// empty when there is no picture. images_enabled is set before any thread that
+// calls this starts, so it is read without the lock.
 image_prepare :: proc(app: ^App, attachments: []ai.Provider_Attachment) -> (image: Entry_Image) {
 	if !app.run.snap.images_enabled { return }
 	for attachment in attachments {
 		switch attachment.Media {
-		case .PNG:
-			width, height, ok := png_size(attachment.Data)
-			if !ok { return }
-			pixels, allocation_error := make([dynamic]u8, len(attachment.Data), len(attachment.Data), app.run.alloc)
-			if allocation_error != nil { return }
-			copy(pixels[:], attachment.Data)
-			return {pixels = pixels, format = .PNG, width = width, height = height}
-		case .JPEG:
-			image_decode_jpeg(app, attachment.Data, &image)
+		case .PNG, .JPEG:
+			image_decode(app, attachment.Data, &image)
 			return
 		case .GIF, .WebP, .PDF:
 		}
@@ -122,36 +117,66 @@ snap_entry_image_set_locked :: proc(app: ^App, entry: ^Entry, image: ^Entry_Imag
 	return true
 }
 
-// image_decode_jpeg decodes a JPEG file into image, whose pixels the decoder
-// allocates with the run's allocator. image stays empty when it cannot.
-image_decode_jpeg :: proc(app: ^App, data: []byte, image: ^Entry_Image) {
-	// jpeg.destroy frees the metadata with the context's allocator.
+// image_decode decodes a PNG or JPEG file into prepared, whose pixels the decoder
+// allocates with the run's allocator, and shrinks it to IMAGE_MAX_EDGE. prepared
+// stays empty when it cannot.
+image_decode :: proc(app: ^App, data: []byte, prepared: ^Entry_Image) {
+	// image.destroy frees the metadata with the context's allocator.
 	context.allocator = app.run.alloc
-	decoded, decode_error := jpeg.load_from_bytes(data, {}, app.run.alloc)
-	defer jpeg.destroy(decoded)
+	decoded, decode_error := image.load_from_bytes(data, {}, app.run.alloc)
+	defer image.destroy(decoded)
 	if decode_error != nil || decoded.depth != 8 || decoded.width <= 0 || decoded.height <= 0 { return }
 	switch decoded.channels {
 	case 3:
-		image.format = .RGB
+		prepared.format = .RGB
 	case 4:
-		image.format = .RGBA
+		prepared.format = .RGBA
 	case:
 		return
 	}
-	image.pixels = decoded.pixels.buf
+	prepared.pixels = decoded.pixels.buf
 	decoded.pixels.buf = nil
-	image.width, image.height = decoded.width, decoded.height
+	prepared.width, prepared.height = decoded.width, decoded.height
+	longer := max(prepared.width, prepared.height)
+	if longer <= IMAGE_MAX_EDGE { return }
+	new_width := max(1, prepared.width * IMAGE_MAX_EDGE / longer)
+	new_height := max(1, prepared.height * IMAGE_MAX_EDGE / longer)
+	if !image_shrink(prepared, new_width, new_height, app.run.alloc) {
+		delete(prepared.pixels)
+		prepared^ = {}
+	}
 }
 
-// png_size reads the pixel size from the IHDR chunk, which the format puts first.
-// False means data does not start like a PNG file.
-png_size :: proc(data: []byte) -> (width, height: int, ok: bool) {
-	if len(data) < PNG_HEADER_END || string(data[:len(PNG_SIGNATURE)]) != PNG_SIGNATURE || string(data[12:16]) != "IHDR" {
-		return 0, 0, false
+// image_shrink scales image down to new_width by new_height, which are no larger
+// than its size, and replaces its pixels with a buffer allocated with allocator.
+// Each new pixel is the mean of the old pixels it covers. False means the
+// allocation failed and image is unchanged.
+image_shrink :: proc(image: ^Entry_Image, new_width, new_height: int, allocator: runtime.Allocator) -> bool {
+	channels := 3 if image.format == .RGB else 4
+	pixels, allocation_error := make([dynamic]u8, new_width * new_height * channels, allocator)
+	if allocation_error != nil { return false }
+	for y in 0 ..< new_height {
+		top := y * image.height / new_height
+		bottom := max((y + 1) * image.height / new_height, top + 1)
+		for x in 0 ..< new_width {
+			left := x * image.width / new_width
+			right := max((x + 1) * image.width / new_width, left + 1)
+			covered := (right - left) * (bottom - top)
+			for channel in 0 ..< channels {
+				sum := 0
+				for source_y in top ..< bottom {
+					for source_x in left ..< right {
+						sum += int(image.pixels[(source_y * image.width + source_x) * channels + channel])
+					}
+				}
+				pixels[(y * new_width + x) * channels + channel] = u8((sum + covered / 2) / covered)
+			}
+		}
 	}
-	width = int(u32(data[16]) << 24 | u32(data[17]) << 16 | u32(data[18]) << 8 | u32(data[19]))
-	height = int(u32(data[20]) << 24 | u32(data[21]) << 16 | u32(data[22]) << 8 | u32(data[23]))
-	return width, height, width > 0 && height > 0
+	delete(image.pixels)
+	image.pixels = pixels
+	image.width, image.height = new_width, new_height
+	return true
 }
 
 // image_cells sizes a picture in cells: its natural size at the given pixels per
