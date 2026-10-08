@@ -177,6 +177,7 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 	completed: journal.Tool_Completed
 	if journal.payload_decode(record.data, &completed, context.temp_allocator) != nil { return nil }
 	name := "tool"
+	arguments: string
 	proposals, _ := journal.read_records(
 		store,
 		{session = record.session, kinds = {.Tool_Proposed}, call = record.call},
@@ -186,7 +187,10 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 	) or_return
 	if len(proposals) > 0 {
 		proposed: journal.Tool_Proposed
-		if journal.payload_decode(proposals[0].data, &proposed, context.temp_allocator) == nil { name = proposed.name }
+		if journal.payload_decode(proposals[0].data, &proposed, context.temp_allocator) == nil {
+			name = proposed.name
+			arguments = string(proposals[0].body)
+		}
 	}
 	outcome, _ := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completed.outcome)
 	result := Tool_Result {
@@ -195,7 +199,7 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 		content   = string(record.body),
 		allocator = context.temp_allocator,
 	}
-	_observer_tool_result(observer, name, &result)
+	_observer_tool_result(observer, name, arguments, &result)
 	return nil
 }
 

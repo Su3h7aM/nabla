@@ -31,7 +31,7 @@ follow_log_call :: proc(user_data: rawptr, event: Chat_Tool_Event) {
 	follow_log_add(user_data, fmt.tprintf("call:%s", event.name))
 }
 
-follow_log_result :: proc(user_data: rawptr, name: string, result: ^Tool_Result) {
+follow_log_result :: proc(user_data: rawptr, name, arguments: string, result: ^Tool_Result) {
 	follow_log_add(user_data, fmt.tprintf("result:%s:%s", name, result.content))
 }
 

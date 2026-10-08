@@ -30,7 +30,8 @@ Chat_Observer :: struct {
 	// exactly once as pending and exactly once as settled. Calls a Code Mode script makes
 	// are not reported: the script's own result is what the turn shows.
 	tool_call:        proc(user_data: rawptr, event: Chat_Tool_Event),
-	tool_result:      proc(user_data: rawptr, name: string, result: ^Tool_Result),
+	// tool_result borrows name and the proposed arguments for the duration of the callback.
+	tool_result:      proc(user_data: rawptr, name, arguments: string, result: ^Tool_Result),
 	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
 	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
 	// request_prepared is called once for each provider request the turn is about to
@@ -100,8 +101,8 @@ _observer_tool_call :: proc(observer: Chat_Observer, event: Chat_Tool_Event) {
 }
 
 @(private)
-_observer_tool_result :: proc(observer: Chat_Observer, name: string, result: ^Tool_Result) {
-	if observer.tool_result != nil { observer.tool_result(observer.user_data, name, result) }
+_observer_tool_result :: proc(observer: Chat_Observer, name, arguments: string, result: ^Tool_Result) {
+	if observer.tool_result != nil { observer.tool_result(observer.user_data, name, arguments, result) }
 }
 
 @(private)

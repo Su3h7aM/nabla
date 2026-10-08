@@ -943,6 +943,144 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 	testing.expect(t, replayed, "resuming should replay the tool call")
 }
 
+// A replayed agent start is the box the live turn showed: the start prompt, not the
+// subagent's answer. The live observer and the replay read the same proposed arguments,
+// so the two boxes read the same.
+@(test)
+test_resume_replays_an_agent_start_as_its_prompt :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	id := app.setup.session.session
+	accepted := agent.chat_session_accept_user(&app.setup.session, "delegate work")
+	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
+
+	arguments := `{"action":"start","prompt":"inspect the parser","wait":true}`
+	answer := "ok\n\nthe parser is fine"
+	live := agent.Tool_Result {
+		content = answer,
+		reason  = "<agent> started",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, "agent", arguments, &live)
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	live_box := strings.clone(string(app.run.snap.entries[0].text[:]), context.allocator)
+	defer delete(live_box, context.allocator)
+	testing.expect_value(t, live_box, "agent\ninspect the parser")
+	snapshot_clear(&app)
+
+	store := app.setup.store
+	chat := &app.setup.session
+	assistant := journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	call := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, request = 1, call = call},
+		journal.Tool_Proposed{provider_id = "call_1", name = "agent"},
+		transmute([]u8)arguments,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)answer,
+	)
+	_ = journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
+		journal.Results{calls = []journal.Call_Id{call}},
+	)
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the tool call could not be recorded") }
+
+	testing.expect(t, session_switch(&app, Start_Fresh{}))
+	snapshot_clear(&app)
+	session_resume(&app, app_session_id_text(id)[:8])
+	testing.expect_value(t, app.setup.session.session, id)
+
+	replayed := false
+	for &entry in app.run.snap.entries {
+		if entry.kind != .Tool { continue }
+		replayed = true
+		testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Success)
+		testing.expect_value(t, string(entry.text[:]), live_box)
+	}
+	testing.expect(t, replayed, "resuming should replay the agent start")
+}
+
+// A failed agent start replays the box the live turn showed: the start prompt and then
+// the failure reason, never the prompt alone. The live observer and the replay share
+// the procedure that builds the text, so the two boxes read the same.
+@(test)
+test_resume_replays_a_failed_agent_start_with_its_reason :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	id := app.setup.session.session
+	accepted := agent.chat_session_accept_user(&app.setup.session, "delegate work")
+	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
+
+	arguments := `{"action":"start","prompt":"inspect the parser","wait":true}`
+	failure := "unknown_model: no such model 'fast'"
+	live := agent.Tool_Result {
+		content = failure,
+		reason  = "unknown model 'fast'",
+		outcome = .Unknown,
+	}
+	observer_tool_result(&app, "agent", arguments, &live)
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	live_box := strings.clone(string(app.run.snap.entries[0].text[:]), context.allocator)
+	defer delete(live_box, context.allocator)
+	testing.expect_value(t, live_box, "agent\ninspect the parser\nno such model 'fast'")
+	snapshot_clear(&app)
+
+	store := app.setup.store
+	chat := &app.setup.session
+	assistant := journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	call := journal.next_call(store)
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, request = 1, call = call},
+		journal.Tool_Proposed{provider_id = "call_1", name = "agent"},
+		transmute([]u8)arguments,
+	)
+	journal.append_record(
+		store,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Unknown]},
+		transmute([]u8)failure,
+	)
+	_ = journal.append_node(
+		store,
+		{session = id, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
+		journal.Results{calls = []journal.Call_Id{call}},
+	)
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the tool call could not be recorded") }
+
+	testing.expect(t, session_switch(&app, Start_Fresh{}))
+	snapshot_clear(&app)
+	session_resume(&app, app_session_id_text(id)[:8])
+	testing.expect_value(t, app.setup.session.session, id)
+
+	replayed := false
+	for &entry in app.run.snap.entries {
+		if entry.kind != .Tool { continue }
+		replayed = true
+		testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Unknown)
+		testing.expect_value(t, string(entry.text[:]), live_box)
+	}
+	testing.expect(t, replayed, "resuming should replay the failed agent start")
+}
+
 @(test)
 test_resume_refuses_an_unknown_reference :: proc(t: ^testing.T) {
 	app: App

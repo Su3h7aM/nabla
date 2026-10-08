@@ -855,7 +855,7 @@ tool_jobs_abandon :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_
 	// The unknown outcome is recorded before the abandonment, so recovery never sees an
 	// abandoned call that still has no answer.
 	tool_job_abandon(jobs, job)
-	if recorded { _observer_tool_result(observer, job.name, &result) }
+	if recorded { _observer_tool_result(observer, job.name, job.call.arguments, &result) }
 	tool_result_destroy(&result)
 	if !recorded {
 		// The answer could not be recorded, so the session's storage failed. Recovery still
@@ -962,7 +962,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	if job.parent != nil {
 		codemode_job_child_committed(jobs, job, &result)
 	}
-	_observer_tool_result(observer, job.name, &result)
+	_observer_tool_result(observer, job.name, job.call.arguments, &result)
 	tool_result_destroy(&result)
 	job.phase = .Retiring
 }

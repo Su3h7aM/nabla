@@ -652,9 +652,8 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		return
 	}
 
-	// The name of each call, by the id its result names.
-	call_names := make(map[journal.Call_Id]string, len(replayed.items), app.run.alloc)
-	defer delete(call_names)
+	calls := make(map[journal.Call_Id]Tool_Display_Call, len(replayed.items), app.run.alloc)
+	defer delete(calls)
 
 	if replayed.summary != "" {
 		snap_append(app, .Notice, "(earlier turns are summarized)")
@@ -671,11 +670,18 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		case agent.Projected_Assistant:
 			snap_append(app, .Assistant, payload.text)
 		case agent.Projected_Call:
-			// A result names its call, not the tool, so the call's name is kept
-			// for the result that follows it.
-			call_names[payload.call] = payload.name
+			call := tool_display_call(payload.name, payload.proposed)
+			// The prompt points into temporary memory, but the call waits in the map
+			// for its result, so the prompt moves into the replay arena, which lives
+			// as long as the map does. The name already points into that arena.
+			if prompt, present := call.prompt.?; present {
+				if owned, clone_error := strings.clone(prompt, virtual.arena_allocator(&arena)); clone_error == nil {
+					call.prompt = owned
+				}
+			}
+			calls[payload.call] = call
 		case agent.Projected_Result:
-			snap_append_tool(app, call_names[payload.call], payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
+			snap_append_tool(app, calls[payload.call], payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
 		}
 	}
 	if following { session_replay_queued(app) }
@@ -1050,17 +1056,15 @@ observer_user_text :: proc(user_data: rawptr, text: string) {
 	snap_append(cast(^App)user_data, .User, text)
 }
 
-observer_tool_result :: proc(user_data: rawptr, name: string, result: ^agent.Tool_Result) {
+observer_tool_result :: proc(user_data: rawptr, name, arguments: string, result: ^agent.Tool_Result) {
 	app := cast(^App)user_data
-	snap_append_tool(app, name, result.content, tool_display_summary(result), result.outcome)
+	snap_append_tool(app, tool_display_call(name, arguments), result.content, tool_display_summary(result), result.outcome)
 }
 
-// snap_append_tool records one tool box: the call's name, the preview of its
-// result, and the outcome its border is colored by. The live turn and the
-// replayed session both arrive here, so the box is the same either way.
-snap_append_tool :: proc(app: ^App, name, content, fallback: string, outcome: journal.Tool_Outcome) {
+// snap_append_tool records the same tool box for a live turn and a replayed session.
+snap_append_tool :: proc(app: ^App, call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome) {
 	sync.mutex_guard(&app.run.mu)
-	entry := snap_entry_make(app, .Tool, tool_entry_text(name, content, fallback))
+	entry := snap_entry_make(app, .Tool, tool_entry_text(call, content, fallback, outcome))
 	entry.tool_outcome = outcome
 	snap_push_locked(app, entry)
 }

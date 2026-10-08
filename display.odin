@@ -1,5 +1,6 @@
 package main
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:time"
@@ -213,13 +214,42 @@ display_duration :: proc(delay: time.Duration) -> string {
 	return fmt.tprintf("%.0fs", seconds)
 }
 
-// tool_entry_text renders one tool box: the call's name, then the preview of its result. A
-// live turn and a replayed session build the box here, so a resumed conversation shows what
-// the call produced rather than the outcome line the model reads first.
-tool_entry_text :: proc(name, content, fallback: string) -> string {
+// Tool_Display_Call is the part of a tool call the transcript box shows. The name is
+// borrowed from the caller and the prompt is decoded into the temporary allocator, so a
+// caller that keeps the call past its own temporary scope must clone the prompt into
+// memory that lives as long as the call does.
+Tool_Display_Call :: struct {
+	name:   string,
+	prompt: Maybe(string),
+}
+
+// tool_display_call borrows name and decodes a start prompt into the temporary allocator. A
+// start without a prompt text has none to show, so its box falls back to the result.
+tool_display_call :: proc(name, arguments: string) -> Tool_Display_Call {
+	call := Tool_Display_Call {
+		name = name,
+	}
+	if name != agent.TOOL_AGENT_NAME { return call }
+	args: struct {
+		action: string,
+		prompt: Maybe(string),
+	}
+	if json.unmarshal_string(arguments, &args, allocator = context.temp_allocator) != nil { return call }
+	if prompt, present := args.prompt.?; present && args.action == "start" && strings.trim_space(prompt) != "" { call.prompt = prompt }
+	return call
+}
+
+// tool_entry_text renders a start call's prompt, or the result preview of another call.
+// A failed start shows the prompt and then the same preview a non-start box would show,
+// so the failure reason is not lost behind the prompt.
+tool_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome) -> string {
 	preview := tool_display_preview(content)
 	if preview == "" { preview = fallback }
-	return fmt.tprintf("%s\n%s", name, preview)
+	if prompt, present := call.prompt.?; present {
+		if outcome == .Success { return fmt.tprintf("%s\n%s", call.name, prompt) }
+		return fmt.tprintf("%s\n%s\n%s", call.name, prompt, preview)
+	}
+	return fmt.tprintf("%s\n%s", call.name, preview)
 }
 
 tool_display_preview :: proc(content: string) -> string {

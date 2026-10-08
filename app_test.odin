@@ -274,7 +274,43 @@ test_stopping_refuses_queued_work :: proc(t: ^testing.T) {
 test_tool_display_preview_shows_the_result_body :: proc(t: ^testing.T) {
 	content := "ok\nexit_code: 3\n\nstdout:\nfirst\nsecond\n"
 	testing.expect_value(t, tool_display_preview(content), "stdout:\nfirst\nsecond\n")
-	testing.expect_value(t, tool_entry_text("shell", content, "success"), "shell\nstdout:\nfirst\nsecond\n")
+	testing.expect_value(t, tool_entry_text({name = "shell"}, content, "success", .Success), "shell\nstdout:\nfirst\nsecond\n")
+}
+
+@(test)
+test_agent_start_box_shows_only_the_prompt :: proc(t: ^testing.T) {
+	app: App
+	app.run.alloc = context.allocator
+	defer snapshot_destroy(&app)
+	calls := []string {
+		`{"action":"start","prompt":"inspect the parser\nand report errors","instruction":"be precise","wait":false}`,
+		`{"action":"start","prompt":"inspect the parser\nand report errors","wait":true}`,
+	}
+	contents := []string{"ok\n\n", "ok\n\nsubagent answer"}
+	for arguments in calls {
+		for content in contents {
+			result := agent.Tool_Result {
+				content = content,
+				reason  = "agent-1 started",
+				outcome = .Success,
+			}
+			observer_tool_result(&app, "agent", arguments, &result)
+		}
+	}
+	for entry in app.run.snap.entries {
+		testing.expect_value(t, string(entry.text[:]), "agent\ninspect the parser\nand report errors")
+	}
+	observer_tool_result(&app, "agent", `{"action":"stop","agent":"agent-1"}`, &agent.Tool_Result{content = "ok\n\nstopped"})
+	testing.expect_value(t, string(app.run.snap.entries[len(app.run.snap.entries) - 1].text[:]), "agent\nstopped")
+	// A start that fails keeps its prompt and appends the failure reason, so the live
+	// box reads the same as the replayed one.
+	failed := agent.Tool_Result {
+		content = "unknown",
+		reason  = "unknown model",
+		outcome = .Unknown,
+	}
+	observer_tool_result(&app, "agent", calls[0], &failed)
+	testing.expect_value(t, string(app.run.snap.entries[len(app.run.snap.entries) - 1].text[:]), "agent\ninspect the parser\nand report errors\nunknown model")
 }
 
 // A scheduled retry is what the working indicator shows, and the send that follows is what
