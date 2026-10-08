@@ -248,12 +248,9 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	}
 	#partial switch mouse.button {
 	case .Wheel_Up:
-		app.scroll += MOUSE_WHEEL_LINES
+		scroll_to(app, scroll_view_top(app) - MOUSE_WHEEL_LINES)
 	case .Wheel_Down:
-		app.scroll -= MOUSE_WHEEL_LINES
-		if app.scroll < 0 {
-			app.scroll = 0
-		}
+		scroll_to(app, scroll_view_top(app) + MOUSE_WHEEL_LINES)
 	case:
 	}
 }
@@ -515,7 +512,7 @@ interrupt :: proc(app: ^App) {
 // scroll_page scrolls the transcript by a screen.
 scroll_page :: proc(app: ^App, up: bool) {
 	page := max(app.rows - 3, 1)
-	app.scroll = app.scroll + page if up else max(app.scroll - page, 0)
+	scroll_to(app, scroll_view_top(app) + (-page if up else page))
 }
 
 // handle_key sends a key to the prompt, or to the transcript while it has the keyboard.
@@ -636,6 +633,7 @@ submit :: proc(app: ^App) {
 		if runtime_busy(app) && !runtime_following(app) {
 			// A steering line is not a command: commands keep their own path, which
 			// decides what can happen while a turn is running.
+			transcript_jump_bottom(app)
 			if !agent.steer_push(&app.run.steer, text) {
 				// The line could not be queued, and the prompt still holds it: the text stays
 				// where the user put it rather than being cleared into a warning.
@@ -646,6 +644,7 @@ submit :: proc(app: ^App) {
 			// The notice that the line is queued comes from the worker once the journal
 			// holds it, so the transcript never claims a line the session does not have.
 		} else {
+			transcript_jump_bottom(app)
 			enqueue(app, .Prompt, text)
 		}
 		// The line left the prompt, so it enters the history the arrow keys walk.

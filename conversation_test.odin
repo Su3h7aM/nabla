@@ -181,17 +181,53 @@ test_conversation_scroll_reveals_older_rows_and_clamps :: proc(t: ^testing.T) {
 
 	// Scrolled back by the full range: the viewport sits on the oldest rows,
 	// and the newest entries are below the fold.
-	app.scroll = 50
+	scroll_back(app, 50)
 	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the scrolled frame must solve")
 	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "0                   ")
 	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "4                   ")
 	testing.expect_value(t, conversation_glyph_row(storage, 9, scratch[:]), "                    ")
 
-	// A scroll past the range clamps instead of over-scrolling.
-	app.scroll = 1000
+	// A scroll past the bottom of the content follows the bottom instead of over-scrolling.
+	app.scroll_top = app.conv_scroll_range + 1000
 	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the clamped frame must solve")
-	testing.expect_value(t, app.scroll, 50)
-	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "0                   ")
+	testing.expect_value(t, scrolled_back(app), 0)
+	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "29                  ")
+}
+
+scroll_back :: proc(app: ^App, rows: int) {
+	app.scroll_top = app.conv_scroll_range - rows if rows > 0 else nil
+}
+
+scrolled_back :: proc(app: ^App) -> int {
+	return app.conv_scroll_range - scroll_view_top(app)
+}
+
+// A scrolled-up view keeps the rows on screen while entries arrive below it.
+@(test)
+test_conversation_holds_a_scrolled_up_view_while_entries_arrive :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	for value in 0 ..< 30 {
+		snap_append(app, .Notice, fmt.tprintf("%d", value))
+	}
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	scratch: [256]byte
+
+	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the first frame must solve")
+	scroll_back(app, 12)
+	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the scrolled frame must solve")
+	top := strings.clone(conversation_glyph_row(storage, 0, scratch[:]), context.temp_allocator)
+
+	for value in 30 ..< 40 {
+		snap_append(app, .Notice, fmt.tprintf("%d", value))
+	}
+	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the grown frame must solve")
+	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), top)
 }
 
 @(test)
@@ -672,6 +708,8 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	defer frame_storage_destroy(app.storage)
 	_, frame_error := render_frame(app, app.storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	// Wheel scrolls only content that exceeds the viewport, which these small frames may not.
+	app.conv_scroll_range = 100
 
 	box_row := conversation_row_with(app.storage, "shell")
 	notice_row := conversation_row_with(app.storage, "notice")
@@ -682,14 +720,14 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
 	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Down, x = box_column + 2, y = box_row + 2})
 	testing.expect_value(t, app.run.snap.entries[1].tool_scroll, MOUSE_WHEEL_LINES)
-	testing.expect_value(t, app.scroll, 0)
+	testing.expect_value(t, scrolled_back(app), 0)
 
 	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = box_column + 2, y = box_row + 2})
 	testing.expect_value(t, app.run.snap.entries[1].tool_scroll, 0)
 
 	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = box_column + 2, y = notice_row + 1})
 	testing.expect_value(t, app.run.snap.entries[1].tool_scroll, 0)
-	testing.expect_value(t, app.scroll, MOUSE_WHEEL_LINES)
+	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
 }
 
 // A rendered frame can outlive the entry ordinal it was solved from. A worker
@@ -713,6 +751,8 @@ test_wheel_ignores_a_stale_tool_box_ordinal :: proc(t: ^testing.T) {
 	defer frame_storage_destroy(app.storage)
 	_, frame_error := render_frame(app, app.storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	// Wheel scrolls only content that exceeds the viewport, which these small frames may not.
+	app.conv_scroll_range = 100
 	box_row := conversation_row_with(app.storage, "shell")
 	if !testing.expect(t, box_row >= 0, "the tool box must be drawn") { return }
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
@@ -723,9 +763,9 @@ test_wheel_ignores_a_stale_tool_box_ordinal :: proc(t: ^testing.T) {
 	}
 
 	snapshot_clear(app)
-	app.scroll = 0
+	scroll_back(app, 0)
 	wheel_scroll(app, report)
-	testing.expect_value(t, app.scroll, MOUSE_WHEEL_LINES)
+	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
 }
 
 // A tool box owns the wheel only while it can move the way the wheel asks. At its
@@ -751,6 +791,8 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	defer frame_storage_destroy(app.storage)
 	_, frame_error := render_frame(app, app.storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	// Wheel scrolls only content that exceeds the viewport, which these small frames may not.
+	app.conv_scroll_range = 100
 
 	// The frame resolved what the window can hold, which is what the wheel asks
 	// before it decides who owns the report.
@@ -766,25 +808,25 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 
 	// At the first row there is nothing above to show, so the transcript scrolls.
 	entry.tool_scroll = 0
-	app.scroll = 0
+	scroll_back(app, 0)
 	wheel_scroll(app, report)
 	testing.expect_value(t, entry.tool_scroll, 0)
-	testing.expect_value(t, app.scroll, MOUSE_WHEEL_LINES)
+	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
 
 	// At the last row there is nothing below, so the transcript scrolls back.
 	entry.tool_scroll = entry.tool_scroll_max
-	app.scroll = 10
+	scroll_back(app, 10)
 	report.button = .Wheel_Down
 	wheel_scroll(app, report)
 	testing.expect_value(t, entry.tool_scroll, entry.tool_scroll_max)
-	testing.expect_value(t, app.scroll, 10 - MOUSE_WHEEL_LINES)
+	testing.expect_value(t, scrolled_back(app), 10 - MOUSE_WHEEL_LINES)
 
 	// In the middle the box still has rows either way, so it keeps the report.
 	entry.tool_scroll = 5
-	app.scroll = 10
+	scroll_back(app, 10)
 	wheel_scroll(app, report)
 	testing.expect_value(t, entry.tool_scroll, 5 + MOUSE_WHEEL_LINES)
-	testing.expect_value(t, app.scroll, 10)
+	testing.expect_value(t, scrolled_back(app), 10)
 }
 
 // A collapsed box never captures the wheel: over it the wheel scrolls the session.
@@ -806,13 +848,15 @@ test_a_collapsed_tool_box_never_captures_the_wheel :: proc(t: ^testing.T) {
 	defer frame_storage_destroy(app.storage)
 	_, frame_error := render_frame(app, app.storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	// Wheel scrolls only content that exceeds the viewport, which these small frames may not.
+	app.conv_scroll_range = 100
 	box_row := conversation_row_with(app.storage, "shell")
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
 	for button in ([]input.Mouse_Button{.Wheel_Up, .Wheel_Down}) {
-		app.scroll = 10
+		scroll_back(app, 10)
 		wheel_scroll(app, input.Mouse_Event{button = button, x = box_column + 2, y = box_row + 2})
 		testing.expect_value(t, app.run.snap.entries[0].tool_scroll, 0)
-		testing.expect_value(t, app.scroll, 10 + MOUSE_WHEEL_LINES if button == .Wheel_Up else 10 - MOUSE_WHEEL_LINES)
+		testing.expect_value(t, scrolled_back(app), 10 + MOUSE_WHEEL_LINES if button == .Wheel_Up else 10 - MOUSE_WHEEL_LINES)
 	}
 }
 

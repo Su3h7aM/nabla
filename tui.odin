@@ -391,19 +391,17 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 }
 
 // draw_conversation solves the transcript as a layout column and draws the visible text
-// lines into rect. The conversation root is a scroll container: app.scroll counts rows
-// back from the bottom (0 follows it), and the clip offset is range - scroll. The offset
-// needs the solved range, so the first pass uses the previous frame's; when that moved
-// the frame re-solves once with the corrected offset.
+// lines into rect. The conversation root is a scroll container: the clip offset is
+// app.scroll_top, or the range when it is absent and the view follows the bottom. A
+// following offset needs the solved range, so the first pass uses the previous frame's;
+// when that moved the frame re-solves once with the corrected offset.
 @(require_results)
 draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> bool {
 	if rect.height <= 0 || rect.width <= 0 {
 		return true
 	}
-	if app.scroll > app.conv_scroll_range {
-		app.scroll = app.conv_scroll_range
-	}
-	offset := app.conv_scroll_range - app.scroll
+	scroll_clamp(app)
+	offset := scroll_view_top(app)
 	viewport := layout.Vec2{layout.Scalar(rect.width), layout.Scalar(rect.height)}
 	storage.conversation_rows = rect.height
 	order := transcript_order(app)
@@ -418,10 +416,8 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			return false
 		}
 		app.conv_scroll_range = int(node.scroll_range.y)
-		if app.scroll > app.conv_scroll_range {
-			app.scroll = app.conv_scroll_range
-		}
-		corrected := app.conv_scroll_range - app.scroll
+		scroll_clamp(app)
+		corrected := scroll_view_top(app)
 		if corrected == offset || pass == 1 {
 			// The last solve declared every entry this frame draws, so the
 			// Markdown it did not ask for belongs to entries that are gone.

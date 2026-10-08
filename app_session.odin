@@ -125,11 +125,12 @@ App :: struct {
 	transcript:                 Transcript,
 	home:                       string, // owned; shortens the footer path,
 	input:                      widgets.Input,
-	scroll:                     int, // rows scrolled back; 0 follows the bottom,
+	// scroll_top is the first visible row of the scrolled-up transcript, counted from
+	// its top, so content added below never moves it. Absent follows the bottom.
+	scroll_top:                 Maybe(int),
 	// conv_scroll_range is the conversation's scrollable height in rows, as
-	// the last completed layout frame reported it. The offset handed to layout
-	// is range - scroll, so a scroll of 0 pins the newest content to the
-	// bottom and the range shrinks and grows with the transcript.
+	// the last completed layout frame reported it. It is the offset that shows
+	// the newest content at the bottom and grows with the transcript.
 	conv_scroll_range:          int,
 	generation_seen:            u64,
 	// steer_active is whether the runtime was running when this thread last looked. The

@@ -293,6 +293,30 @@ test_up_arrow_walks_prompt_history :: proc(t: ^testing.T) {
 	}
 }
 
+// Submitting a prompt follows the bottom from wherever the transcript was scrolled; a slash command leaves the scroll alone.
+@(test)
+test_submitting_a_prompt_jumps_to_the_bottom :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+	app.conv_scroll_range = 100
+
+	app.scroll_top = 10
+	if !testing.expect(t, widgets.input_insert(&app.input, "/help")) { return }
+	submit(&app)
+	testing.expect_value(t, app.scroll_top, Maybe(int)(10))
+
+	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works")) { return }
+	submit(&app)
+	testing.expect(t, app.scroll_top == nil, "a submitted prompt follows the bottom")
+
+	for {
+		work, received := chan.try_recv(app.run.work)
+		if !received { break }
+		work_destroy(&app, work)
+	}
+}
+
 // The line being typed is not a submitted prompt, so an up arrow that walks
 // into history must not destroy it: leaving the fresh line keeps what it
 // holds, and stepping forward past the newest entry puts it back exactly as it

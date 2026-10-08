@@ -41,7 +41,7 @@ Transcript :: struct {
 	failed:        bool, // a page read failed; cleared by a new head or session
 	measured:      bool, // the transcript was laid out since the last slide
 	viewport_rows: int,
-	anchor:        Maybe(int), // rows above the view when a page was loaded below it
+	anchor:        Maybe(int), // rows below the view when a page was loaded above it
 	expanded:      map[journal.Call_Id]string, // owned; the whole text of each expanded box
 	focused:       bool, // the keyboard drives the transcript instead of the prompt
 	selected:      journal.Call_Id, // the box the keyboard selected
@@ -79,7 +79,7 @@ transcript_sync :: proc(app: ^App) {
 		transcript.focused = false
 		transcript.selected = 0
 		boxes_collapse_all(app)
-		app.scroll = 0
+		app.scroll_top = nil
 	}
 	if head != transcript.head { transcript_follow(app, head) }
 	transcript_reduce(app)
@@ -149,6 +149,32 @@ transcript_page_tail :: proc(app: ^App) {
 	entries_destroy(&transcript.entries)
 	transcript.entries = entries
 	transcript.first, transcript.end = first, end
+}
+
+// scroll_view_top returns the first visible row of the scroll content.
+scroll_view_top :: proc(app: ^App) -> int {
+	return app.scroll_top.? or_else app.conv_scroll_range
+}
+
+// scroll_to shows the content from row top, or follows the bottom when top reaches it.
+scroll_to :: proc(app: ^App, row: int) {
+	top := max(row, 0)
+	app.scroll_top = top if top < app.conv_scroll_range else nil
+}
+
+// scroll_clamp follows the bottom when the content shrank to the scrolled-up view.
+scroll_clamp :: proc(app: ^App) {
+	if top, scrolled := app.scroll_top.?; scrolled && top >= app.conv_scroll_range {
+		app.scroll_top = nil
+	}
+}
+
+// transcript_jump_bottom follows the newest content, reattaching a window that was paged away from the tail.
+transcript_jump_bottom :: proc(app: ^App) {
+	transcript := &app.transcript
+	app.scroll_top = nil
+	transcript.anchor = nil
+	if transcript.end < len(transcript.path) && !transcript.failed { transcript_page_tail(app) }
 }
 
 transcript_page_older :: proc(app: ^App) {
@@ -418,7 +444,7 @@ transcript_measure :: proc(app: ^App, order: []^Entry, frame_result: layout.Fram
 	}
 }
 
-// transcript_slide reads or releases pages after a layout and reports whether the frame must be laid out again. It adjusts scroll so the view does not move.
+// transcript_slide reads or releases pages after a layout and reports whether the frame must be laid out again. It adjusts the scroll so the view does not move.
 transcript_slide :: proc(app: ^App) -> bool {
 	moved := transcript_slide_step(app)
 	if moved { transcript_reduce(app) }
@@ -431,30 +457,29 @@ transcript_slide_step :: proc(app: ^App) -> bool {
 	transcript.measured = false
 	if anchor, pending := transcript.anchor.?; pending {
 		transcript.anchor = nil
-		app.scroll = max(app.conv_scroll_range - anchor, 0)
+		if app.scroll_top != nil { scroll_to(app, app.conv_scroll_range - anchor) }
 		return true
 	}
 	height := transcript.viewport_rows
-	above := app.conv_scroll_range - app.scroll
-	below := app.scroll
+	above := scroll_view_top(app)
+	below := app.conv_scroll_range - above
 	near := TRANSCRIPT_LOAD_SCREENS * height
 	far := (TRANSCRIPT_WINDOW_SCREENS - 1) / 2 * height
 	if above < near && transcript.first > 0 {
 		transcript_page_older(app)
-		return !transcript.failed
+		if transcript.failed { return false }
+		if app.scroll_top != nil { transcript.anchor = below }
+		return true
 	}
 	if below < near && transcript.end < len(transcript.path) {
 		transcript_page_newer(app)
-		if transcript.failed { return false }
-		transcript.anchor = above
-		return true
+		return !transcript.failed
 	}
 	if transcript.end - transcript.first <= 1 { return false }
 	last := transcript.path[transcript.end - 1]
 	if rows := transcript_node_rows(transcript, last); below - rows >= far {
 		transcript_pop_node(app, last)
 		transcript.end -= 1
-		app.scroll = max(app.scroll - rows, 0)
 		return true
 	}
 	first := transcript.path[transcript.first]
@@ -464,6 +489,7 @@ transcript_slide_step :: proc(app: ^App) -> bool {
 		for &entry in transcript.entries[:count] { entry_destroy(&entry) }
 		remove_range(&transcript.entries, 0, count)
 		transcript.first += 1
+		if top, scrolled := app.scroll_top.?; scrolled { app.scroll_top = max(top - rows, 0) }
 		return true
 	}
 	return false
@@ -646,7 +672,7 @@ transcript_focus :: proc(app: ^App) {
 	transcript := &app.transcript
 	transcript.focused = true
 	boxes := transcript_boxes(app)
-	view_top := app.conv_scroll_range - app.scroll
+	view_top := scroll_view_top(app)
 	view_bottom := view_top + transcript.viewport_rows
 	best, best_distance := -1, max(int)
 	for box, index in boxes {
@@ -674,11 +700,11 @@ transcript_select_move :: proc(app: ^App, delta: int) {
 	box := boxes[next]
 	transcript.selected = box.call
 	height := transcript.viewport_rows
-	view_top := app.conv_scroll_range - app.scroll
+	view_top := scroll_view_top(app)
 	switch {
 	case box.top < view_top:
-		app.scroll = app.conv_scroll_range - box.top
+		scroll_to(app, box.top)
 	case box.top + box.rows > view_top + height:
-		app.scroll = max(app.conv_scroll_range - (box.top + box.rows - height), 0)
+		scroll_to(app, box.top + box.rows - height)
 	}
 }
