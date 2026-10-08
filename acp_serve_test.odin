@@ -1599,3 +1599,33 @@ test_acp_owner_activity_prevents_eviction_until_idle :: proc(t: ^testing.T) {
 	sync.mutex_unlock(&server.table_mu)
 	testing.expect(t, !acp_owner_service_begin(closing), "background servicing began after closing")
 }
+
+@(test)
+test_acp_idle_v2_store_session_stays_evictable_after_an_owner_wake :: proc(t: ^testing.T) {
+	server: ACP_Server
+	if !acp_test_server_init(t, &server) { return }
+	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
+	server.profile = .V2
+	for i in 0 ..< ACP_MAX_SESSIONS {
+		session, made := acp_session_make(&server, fmt.tprintf("session-%d", i))
+		if !testing.expect(t, made, "the fixture session could not be allocated") { return }
+		worker := thread.create(acp_worker, name = "nabla-acp-worker")
+		if !testing.expect(t, worker != nil, "the fixture worker could not be created") {
+			acp_session_free(session)
+			return
+		}
+		session.app.setup.store = new(journal.Journal, server.alloc)
+		worker.data = session
+		session.worker = worker
+		server.sessions[i] = session
+		acp_session_touch(session)
+		thread.start(worker)
+	}
+	// The wake is process-wide: every worker looks for work and finds none.
+	agent.owner_wake_signal()
+	opened, reason := acp_session_create(&server, "session-ninth")
+	if !testing.expectf(t, opened != nil, "an idle session with a store blocked eviction: %s", reason) { return }
+	testing.expect(t, acp_session_find(&server, "session-0") == nil, "the least recently used session was not evicted")
+	testing.expect(t, acp_session_find(&server, "session-1") != nil, "a newer session was evicted instead")
+	testing.expect(t, acp_session_find(&server, "session-ninth") != nil, "the new session was not published")
+}

@@ -450,6 +450,24 @@ acp_work_id :: proc(id: acp.JSONRPC_Id, allocator: mem.Allocator) -> (acp.JSONRP
 
 // --- the worker --------------------------------------------------------------
 
+// acp_owner_service_pending reports whether the session has a model request, a model
+// selection, or a compaction for the owner to service.
+@(require_results)
+acp_owner_service_pending :: proc(session: ^ACP_Session) -> bool {
+	if acp_model_owner_work_pending(session) || session.model_selection.active { return true }
+	return session.app.setup.session.store != nil && session.app.setup.session.compact.state != agent.Compact_State.Idle
+}
+
+// acp_owner_service_wanted reports whether an idle worker has background work to do.
+// A worker with none must not claim the session: the claim makes eviction skip it, and
+// every process-wide owner wake, from any session, would reopen that window. The inbox
+// probe reads the journal and claims nothing.
+@(require_results)
+acp_owner_service_wanted :: proc(session: ^ACP_Session) -> bool {
+	if acp_owner_service_pending(session) { return true }
+	return acp_is_v2(session.conn) && session.app.setup.store != nil && agent.chat_inbox_reports_pending(&session.app.setup.session)
+}
+
 // acp_worker runs the requests the reader hands over and owns the session while it does.
 // While a V2 client has nothing queued, a background subagent's report starts a turn of its
 // own; a V1 client cannot receive a turn it did not ask for, so its reports wait in the
@@ -466,7 +484,12 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 		if !ok {
 			// A closed queue is shutdown, which starts no report turn.
 			if chan.is_closed(session.work) { break }
-			if !acp_owner_service_begin(session) {
+			if acp_is_v2(session.conn) && session.app.setup.store != nil {
+				// Reaping commits the reports of finished subagents, which the wanted probe
+				// then sees. Both run unclaimed, so an idle session stays evictable.
+				_ = agent.chat_agents_pending(&session.app.setup.session)
+			}
+			if !acp_owner_service_wanted(session) || !acp_owner_service_begin(session) {
 				agent.owner_wake_wait(seen, nil)
 				continue
 			}
@@ -476,19 +499,14 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 					free_all(context.temp_allocator)
 					continue
 				}
-				// Reports arrive through the owner wake, which new requests signal too.
-				if agent.chat_agents_pending(&session.app.setup.session) {
-					acp_owner_service_end(session)
-					agent.owner_wake_wait(seen, nil)
-					continue
-				}
 			}
+			service_pending := acp_owner_service_pending(session)
 			model_pending := acp_model_owner_work_pending(session) || session.model_selection.active
 			if model_pending {
 				_ = acp_model_selection_service(session)
 			}
 			compact_pending := session.app.setup.session.store != nil && session.app.setup.session.compact.state != agent.Compact_State.Idle
-			if model_pending || compact_pending {
+			if service_pending {
 				if compact_pending {
 					observer := acp_observer(session)
 					_ = agent.chat_compact_idle_service(&session.app.setup.session, observer, session.app.run.connection)

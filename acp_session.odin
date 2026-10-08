@@ -377,7 +377,7 @@ acp_owner_service_begin :: proc(session: ^ACP_Session) -> bool {
 
 // acp_owner_service_end keeps unfinished owner-only service protected across waits.
 acp_owner_service_end :: proc(session: ^ACP_Session) {
-	active := session.model_selection.active || (session.app.setup.session.store != nil && session.app.setup.session.compact.state != agent.Compact_State.Idle)
+	active := acp_owner_service_pending(session)
 	sync.mutex_guard(&session.conn.table_mu)
 	session.owner_active = active
 }
