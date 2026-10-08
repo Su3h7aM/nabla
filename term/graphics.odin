@@ -3,6 +3,7 @@ package term
 import "base:runtime"
 import "core:encoding/base64"
 import "core:fmt"
+import "core:io"
 import "core:os"
 import "core:strings"
 import "core:terminal/ansi"
@@ -397,11 +398,13 @@ _graphics_supported :: proc(depth: Color_Depth, environment: _Graphics_Environme
 
 // _env_value returns the value of an environment variable in buf and whether
 // it is set. A value too long for buf is set but unreadable, which only
-// matters to comparisons, and it matches none.
+// matters to comparisons, and it matches none. An empty value counts as unset:
+// none of the variables read here is ever set empty, and core:os's libc lookup
+// reports a missing variable with no error, so the error alone cannot say.
 _env_value :: proc(buf: []byte, key: string) -> (value: string, set: bool) {
 	err: os.Error
 	value, err = os.lookup_env(buf, key)
-	return value, err != os.General_Error.Env_Var_Not_Found
+	return value, value != "" || err == io.Error.Buffer_Full
 }
 
 // graphics_transmit sends image to the terminal under id and creates its
