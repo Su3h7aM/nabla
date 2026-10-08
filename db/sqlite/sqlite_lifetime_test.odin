@@ -588,7 +588,8 @@ test_a_column_that_cannot_be_read_reports_out_of_memory :: proc(t: ^testing.T) {
 		return
 	}
 
-	binary := os.args[0]
+	binary, binary_err := os.get_executable_path(context.temp_allocator)
+	if binary_err != nil { testing.fail_now(t, "could not find the test binary") }
 	current_env, env_err := os.environ(context.temp_allocator)
 	if env_err != nil { testing.fail_now(t, "could not read the environment") }
 	child_env := make([dynamic]string, 0, len(current_env) + 1, context.temp_allocator)
