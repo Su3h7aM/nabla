@@ -22,17 +22,17 @@ end_read_snapshot :: proc(journal: ^Journal) -> Error {
 	return db.rollback(&journal.connection)
 }
 
-// Filter selects records. A zero field matches anything; empty kinds or nodes
-// match every kind or node.
+// Filter selects records. A zero field or empty slice matches anything.
 Filter :: struct {
-	session:  Session_Id,
-	kinds:    bit_set[Record_Kind;u128],
-	turn:     Turn_Id,
-	request:  Request_Id,
-	call:     Call_Id,
+	session:       Session_Id,
+	kinds:         bit_set[Record_Kind;u128],
+	turn:          Turn_Id,
+	request:       Request_Id,
+	call:          Call_Id,
 	// subagent selects the records of one delegation, named by the child's session.
-	subagent: Session_Id,
-	nodes:    []Node_Id,
+	subagent:      Session_Id,
+	nodes:         []Node_Id,
+	only_children: bool, // selects records with a parent_call
 }
 
 // Session_Filter selects sessions. The zero value lists all of them, newest
@@ -696,6 +696,7 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 		}
 		query_add(query, ")") or_return
 	}
+	if filter.only_children { query_add(query, " AND parent_call != 0") or_return }
 	return nil
 }
 

@@ -6,6 +6,23 @@ import "core:math"
 import "core:testing"
 
 @(test)
+test_child_record_filter_does_not_bind_parent_ids :: proc(test: ^testing.T) {
+	filter := Filter {
+		session       = session_id_create(),
+		kinds         = {.Tool_Proposed, .Tool_Completed},
+		only_children = true,
+	}
+	query: Query
+	if error := query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE seq > ?", i64(0)); error != nil {
+		testing.fail_now(test, "query allocation failed")
+	}
+	if error := query_filter(&query, &filter); error != nil { testing.fail_now(test, "filter allocation failed") }
+	// The cursor, session, and two record kinds are the only parameters, regardless
+	// of how many parent calls the session has. SQLite bounds the parameter count.
+	testing.expect_value(test, len(query.arguments), 4)
+}
+
+@(test)
 test_response_committed_reasoning_tokens_are_presence_aware :: proc(test: ^testing.T) {
 	payload: Response_Committed
 	err := payload_decode(`{"version":1,"model_resolved":"model","finish":"stop","output_tokens":1}`, &payload, context.temp_allocator)

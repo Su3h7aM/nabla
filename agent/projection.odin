@@ -15,6 +15,7 @@ Projection :: struct {
 	covers:     journal.Node_Id,
 	head:       journal.Node_Id,
 	items:      []Projection_Item,
+	nested:     []Projected_Nested_Call, // display only, in completion order
 }
 
 // Projection_Item is one step of the conversation. request names the response
@@ -57,9 +58,11 @@ Projected_Response :: struct {
 }
 
 // Projected_Call is a proposed call. admitted is the arguments it ran with,
-// "" when it was never admitted.
+// "" when it was never admitted. parent_call is the Code Mode call that ran it,
+// or zero for a call the model made directly.
 Projected_Call :: struct {
 	call:        journal.Call_Id,
+	parent_call: journal.Call_Id,
 	provider_id: string,
 	item_id:     string,
 	name:        string,
@@ -69,10 +72,24 @@ Projected_Call :: struct {
 
 // Projected_Result answers a call. content is the rendered result, or the
 // harness's account when the call produced none, as after recovery.
+// parent_call is the Code Mode call that ran it, or zero for a call the model
+// made directly, so a replay tells an inner call like the live view does.
 Projected_Result :: struct {
-	call:    journal.Call_Id,
-	outcome: journal.Tool_Outcome,
-	content: string,
+	call:        journal.Call_Id,
+	parent_call: journal.Call_Id,
+	outcome:     journal.Tool_Outcome,
+	content:     string,
+}
+
+// Projected_Nested_Call is a settled child of a call in items. It is display-only
+// and never contributes to the provider conversation. Its strings borrow the arena.
+Projected_Nested_Call :: struct {
+	call:        journal.Call_Id,
+	parent_call: journal.Call_Id,
+	name:        string,
+	proposed:    string,
+	content:     string,
+	outcome:     journal.Tool_Outcome,
 }
 
 // PROJECTION_RECORD_KINDS are the records an Assistant node's response and
@@ -156,8 +173,9 @@ projection_load :: proc(
 				completion: journal.Tool_Completed
 				journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
 				result := Projected_Result {
-					call    = call,
-					content = string(record.body),
+					call        = call,
+					parent_call = record.parent_call,
+					content     = string(record.body),
 				}
 				// A result whose outcome is not a name this build writes is a record it cannot
 				// read: left at the zero member it would report an unreadable record as a call
@@ -171,6 +189,44 @@ projection_load :: proc(
 		}
 	}
 	projection.items = items[:]
+	parents := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
+	for item in items {
+		if call, ok := item.payload.(Projected_Call); ok && call.name == TOOL_CODEMODE_NAME { parents[call.call] = true }
+	}
+	if len(parents) > 0 {
+		children, _ := journal.read_records(store, {session = session, kinds = {.Tool_Proposed, .Tool_Completed}, only_children = true}, 0, 0, arena) or_return
+		proposals := make(map[journal.Call_Id]^journal.Record, allocator = context.temp_allocator)
+		nested := make([dynamic]Projected_Nested_Call, arena) or_return
+		for &record in children {
+			if !parents[record.parent_call] { continue }
+			if record.kind == .Tool_Proposed {
+				proposals[record.call] = &record
+				continue
+			}
+			proposal_record, found := proposals[record.call]
+			if !found { return {}, journal.Journal_Error.Corrupt }
+			proposal: journal.Tool_Proposed
+			journal.payload_decode(proposal_record.data, &proposal, arena, corruption_journal = store, session = session, seq = proposal_record.seq) or_return
+			completion: journal.Tool_Completed
+			journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = session, seq = record.seq) or_return
+			outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+			if !known { return {}, journal.Journal_Error.Corrupt }
+			content := string(record.body)
+			if content == "" { content = completion.detail }
+			append(
+				&nested,
+				Projected_Nested_Call {
+					call = record.call,
+					parent_call = record.parent_call,
+					name = proposal.name,
+					proposed = string(proposal_record.body),
+					content = content,
+					outcome = outcome,
+				},
+			) or_return
+		}
+		projection.nested = nested[:]
+	}
 	return projection, nil
 }
 
@@ -216,6 +272,7 @@ projection_add_assistant :: proc(
 		journal.payload_decode(record.data, &proposal, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
 		item.payload = Projected_Call {
 			call        = record.call,
+			parent_call = record.parent_call,
 			provider_id = proposal.provider_id,
 			item_id     = proposal.item_id,
 			name        = proposal.name,
