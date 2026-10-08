@@ -1082,10 +1082,85 @@ test_resume_replays_a_failed_agent_start_with_its_reason :: proc(t: ^testing.T) 
 	testing.expect(t, replayed, "resuming should replay the failed agent start")
 }
 
+// app_observe_call reports a call the harness admitted, as the owner's observer does.
+app_observe_call :: proc(app: ^App, call, parent_call: journal.Call_Id, name, arguments: string) {
+	observer_tool_call(app, agent.Chat_Tool_Event{call = call, parent_call = parent_call, name = name, arguments = arguments})
+}
+
+// A call shows a running box when it is admitted and the same box, finished, when it
+// settles: one entry, updated in place with the final text.
+@(test)
+test_a_tool_box_is_running_until_its_result_settles_it :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app_observe_call(&app, 3, 0, "shell", `{"command":"ls"}`)
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	testing.expect(t, app.run.snap.entries[0].running, "an admitted call is running")
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "shell\n")
+
+	result := agent.Tool_Result {
+		content = "ok\nexit_code: 0\n\nstdout:\nfirst\n",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 3, 0, "shell", `{"command":"ls"}`, &result)
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	entry := &app.run.snap.entries[0]
+	testing.expect(t, !entry.running, "a settled call is finished")
+	testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(t, string(entry.text[:]), "shell\nstdout:\nfirst\n")
+}
+
+// The outer box of a script lists each inner call as it starts and settles, and each
+// inner call has its own box, after the outer one, in the order it was admitted.
+@(test)
+test_a_codemode_box_follows_its_inner_calls_as_they_run :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	outer_arguments := `{"code":"return tools.read({path = \"a.odin\"})"}`
+	inner_arguments := `{"path":"a.odin"}`
+	app_observe_call(&app, 7, 0, "codemode", outer_arguments)
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "codemode\nreturn tools.read({path = \"a.odin\"})\n\n")
+
+	app_observe_call(&app, 8, 7, "read", inner_arguments)
+	if !testing.expect_value(t, len(app.run.snap.entries), 2) { return }
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "codemode\nreturn tools.read({path = \"a.odin\"})\n\n… read {\"path\":\"a.odin\"}\n\n")
+	testing.expect_value(t, string(app.run.snap.entries[1].text[:]), "codemode · read\n")
+	testing.expect(t, app.run.snap.entries[0].running && app.run.snap.entries[1].running, "both boxes run")
+
+	inner_result := agent.Tool_Result {
+		content = "ok\n\nhello",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 8, 7, "read", inner_arguments, &inner_result)
+	if !testing.expect_value(t, len(app.run.snap.entries), 2) { return }
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "codemode\nreturn tools.read({path = \"a.odin\"})\n\n✓ read {\"path\":\"a.odin\"}\n\n")
+	testing.expect_value(t, string(app.run.snap.entries[1].text[:]), "codemode · read\nhello")
+	testing.expect(t, app.run.snap.entries[0].running && !app.run.snap.entries[1].running, "only the script still runs")
+
+	outer_result := agent.Tool_Result {
+		content = "ok\nvalue: 1\n\nfinished",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 7, 0, "codemode", outer_arguments, &outer_result)
+	if !testing.expect_value(t, len(app.run.snap.entries), 2) { return }
+	testing.expect_value(
+		t,
+		string(app.run.snap.entries[0].text[:]),
+		"codemode\nreturn tools.read({path = \"a.odin\"})\n\n✓ read {\"path\":\"a.odin\"}\n\nfinished",
+	)
+	testing.expect(t, !app.run.snap.entries[0].running, "the finished script is not running")
+	testing.expect_value(t, len(app.run.codemode_pending), 0)
+}
+
 // A Code Mode run shows the script and one line per inner call, and each inner call
 // keeps its own box titled for the script that ran it. A direct call keeps its own
-// title. The live observer and the replay share the text, so resuming shows the same
-// boxes the turn showed.
+// title. The live observer and the replay share the text and the order, so resuming
+// shows the same boxes the turn showed.
 @(test)
 test_resume_replays_codemode_boxes_like_the_live_turn :: proc(t: ^testing.T) {
 	app: App
@@ -1117,27 +1192,33 @@ test_resume_replays_codemode_boxes_like_the_live_turn :: proc(t: ^testing.T) {
 		content = outer_content,
 		outcome = .Success,
 	}
-	observer_tool_result(&app, 8, 7, "read", read_arguments, &read_result)
-	observer_tool_result(&app, 9, 7, "shell", shell_arguments, &shell_result)
-	observer_tool_result(&app, 7, 0, "codemode", outer_arguments, &outer_result)
 	direct_result := agent.Tool_Result {
 		content = read_content,
 		outcome = .Success,
 	}
+	// The response's calls are admitted together; the script's calls follow once it runs.
+	app_observe_call(&app, 7, 0, "codemode", outer_arguments)
+	app_observe_call(&app, 10, 0, "read", direct_arguments)
+	app_observe_call(&app, 8, 7, "read", read_arguments)
+	app_observe_call(&app, 9, 7, "shell", shell_arguments)
+	observer_tool_result(&app, 8, 7, "read", read_arguments, &read_result)
+	observer_tool_result(&app, 9, 7, "shell", shell_arguments, &shell_result)
+	observer_tool_result(&app, 7, 0, "codemode", outer_arguments, &outer_result)
 	observer_tool_result(&app, 10, 0, "read", direct_arguments, &direct_result)
 	if !testing.expect_value(t, len(app.run.snap.entries), 4) { return }
 
-	expected_kinds := [4]Entry_Kind{.Codemode, .Codemode, .Codemode, .Tool}
-	expected_outcomes := [4]journal.Tool_Outcome{.Success, .Tool_Failed, .Success, .Success}
+	expected_kinds := [4]Entry_Kind{.Codemode, .Tool, .Codemode, .Codemode}
+	expected_outcomes := [4]journal.Tool_Outcome{.Success, .Success, .Success, .Tool_Failed}
 	expected_texts := [4]string {
-		"codemode · read\ncontent:\nhello\n",
-		"codemode · shell\nexit 1 failed",
 		"codemode\nreturn tools.read({path = \"a.odin\"})\n\n✓ read {\"path\":\"a.odin\"}\n✗ shell {\"command\":\"exit 1\"}\n\n1\n",
 		"read\ncontent:\nhello\n",
+		"codemode · read\ncontent:\nhello\n",
+		"codemode · shell\nexit 1 failed",
 	}
 	for index in 0 ..< 4 {
 		entry := &app.run.snap.entries[index]
 		testing.expect_value(t, entry.kind, expected_kinds[index])
+		testing.expect(t, !entry.running, "every call settled")
 		testing.expect_value(t, entry.tool_outcome, expected_outcomes[index])
 		testing.expect_value(t, string(entry.text[:]), expected_texts[index])
 	}
@@ -2007,6 +2088,241 @@ test_follower_attachment_replays_captured_pending_input_once :: proc(t: ^testing
 	testing.expect_value(t, len(app.setup.follow_pending), 0)
 }
 
+// A turn that ends with calls still running settles their boxes as unknown, and the script's
+// running inner lines with them.
+@(test)
+test_a_finished_turn_settles_the_boxes_still_running :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app_observe_call(&app, 7, 0, "codemode", `{"code":"return tools.read({path = \"a.odin\"})"}`)
+	app_observe_call(&app, 8, 7, "read", `{"path":"a.odin"}`)
+	observer_turn_finished(&app)
+	if !testing.expect_value(t, len(app.run.snap.entries), 2) { return }
+	for &entry in app.run.snap.entries {
+		testing.expect(t, !entry.running, "no box runs after the turn")
+		testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Unknown)
+	}
+	testing.expect(t, strings.contains(string(app.run.snap.entries[0].text[:]), "✗ read"), "the running line settled as unknown")
+	testing.expect_value(t, len(app.run.codemode_pending), 0)
+}
+
+// An inner result that arrives after its script settled leaves the script's box as it was
+// and creates no pending record.
+@(test)
+test_an_inner_result_after_the_script_settled_changes_nothing :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	outer_arguments := `{"code":"return 1"}`
+	app_observe_call(&app, 7, 0, "codemode", outer_arguments)
+	outer_result := agent.Tool_Result {
+		content = "ok\nvalue: 1\n\n1",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 7, 0, "codemode", outer_arguments, &outer_result)
+	settled := strings.clone(string(app.run.snap.entries[0].text[:]), context.allocator)
+	defer delete(settled, context.allocator)
+
+	inner_result := agent.Tool_Result {
+		content = "ok\n\nhello",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 8, 7, "read", `{"path":"a.odin"}`, &inner_result)
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), settled)
+	testing.expect_value(t, len(app.run.codemode_pending), 0)
+}
+
+// A child proposal the replay showed and the poll reads again does not add a second box.
+@(test)
+test_a_follower_does_not_repeat_a_child_proposal_the_replay_showed :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	chat, tool_error := agent.chat_session_init(&runner, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "runner initialization failed") }
+	defer agent.chat_session_destroy(&chat)
+	chat.skill_instructions = agent.test_skill_instructions(&chat)
+	if agent.chat_session_accept_user(&chat, "run a script") != .Accepted { testing.fail_now(t, "runner prompt failed") }
+	assistant := journal.append_node(
+		&runner,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	outer := journal.next_call(&runner)
+	inner := journal.next_call(&runner)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = outer},
+		journal.Tool_Proposed{provider_id = "outer", name = "codemode"},
+		transmute([]u8)string(`{"code":"return tools.read({path = \"a.odin\"})"}`),
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, turn = chat.turn, call = inner, parent_call = outer},
+		journal.Tool_Proposed{provider_id = "inner", name = "read"},
+		transmute([]u8)string(`{"path":"a.odin"}`),
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "commit failed") }
+	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
+	session_replay(&app, &app.setup.session)
+
+	proposals, _, read_error := journal.read_records(app.setup.store, {session = id, kinds = {.Tool_Proposed}}, 0, 0, context.temp_allocator)
+	if !testing.expect(t, read_error == nil && len(proposals) == 2) { return }
+	app.setup.follow.last = proposals[0].seq
+	_ = app_follow_poll(&app, run_observer(&app))
+	boxes := 0
+	for &entry in app.run.snap.entries {
+		if entry.kind == .Codemode && entry.call == inner { boxes += 1 }
+	}
+	testing.expect_value(t, boxes, 1)
+	testing.expect_value(t, len(app.run.codemode_pending[outer].inner), 1)
+}
+
+// A completion the replay already showed, read again by the poll, does not add a second box.
+@(test)
+test_a_follower_does_not_repeat_a_result_the_replay_showed :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	chat, tool_error := agent.chat_session_init(&runner, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "runner initialization failed") }
+	defer agent.chat_session_destroy(&chat)
+	chat.skill_instructions = agent.test_skill_instructions(&chat)
+	if agent.chat_session_accept_user(&chat, "list files") != .Accepted { testing.fail_now(t, "runner prompt failed") }
+	assistant := journal.append_node(
+		&runner,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	call := journal.next_call(&runner)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
+		journal.Tool_Proposed{provider_id = "first", name = "shell"},
+		transmute([]u8)string(`{"command":"ls"}`),
+	)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)string("ok\nexit_code: 0\n\nstdout:\nfile\n"),
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "commit failed") }
+	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
+	session_replay(&app, &app.setup.session)
+
+	// The poll position sits before the completion, as when the journal moved after the
+	// follow started but before the replay read it.
+	completed, _, read_error := journal.read_records(app.setup.store, {session = id, kinds = {.Tool_Completed}}, 0, 0, context.temp_allocator)
+	if !testing.expect(t, read_error == nil && len(completed) == 1) { return }
+	app.setup.follow.last = completed[0].seq - 1
+	_ = app_follow_poll(&app, run_observer(&app))
+	boxes := 0
+	for &entry in app.run.snap.entries {
+		if entry.kind != .Tool { continue }
+		boxes += 1
+		testing.expect(t, !entry.running, "the replayed result is finished")
+	}
+	testing.expect_value(t, boxes, 1)
+}
+
+// A call proposed before the follower attached replays as a running box; one proposed
+// after arrives through the poll. Each completion settles its own box in place.
+@(test)
+test_a_follower_runs_calls_it_attached_to_and_settles_them_in_place :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
+	   error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	chat, tool_error := agent.chat_session_init(&runner, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "runner initialization failed") }
+	defer agent.chat_session_destroy(&chat)
+	chat.skill_instructions = agent.test_skill_instructions(&chat)
+	if agent.chat_session_accept_user(&chat, "list files") != .Accepted { testing.fail_now(t, "runner prompt failed") }
+	assistant := journal.append_node(
+		&runner,
+		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
+		journal.Assistant{request = 1},
+	)
+	arguments := `{"command":"ls"}`
+	first := journal.next_call(&runner)
+	second := journal.next_call(&runner)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = first},
+		journal.Tool_Proposed{provider_id = "first", name = "shell"},
+		transmute([]u8)arguments,
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "first proposal commit failed") }
+	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
+	if !testing.expect(t, app_following(&app)) { return }
+
+	session_replay(&app, &app.setup.session)
+	observer := run_observer(&app)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = second},
+		journal.Tool_Proposed{provider_id = "second", name = "shell"},
+		transmute([]u8)arguments,
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "second proposal commit failed") }
+	_ = app_follow_poll(&app, observer)
+	boxes := make([dynamic]^Entry, 0, 2, context.allocator)
+	defer delete(boxes)
+	for &entry in app.run.snap.entries {
+		if entry.kind == .Tool { append(&boxes, &entry) }
+	}
+	if !testing.expect_value(t, len(boxes), 2) { return }
+	for box in boxes {
+		testing.expect(t, box.running, "a proposed call is running")
+		testing.expect_value(t, string(box.text[:]), "shell\n")
+	}
+
+	for call in ([2]journal.Call_Id{second, first}) {
+		journal.append_record(
+			&runner,
+			{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
+			journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+			transmute([]u8)string("ok\nexit_code: 0\n\nstdout:\nfile\n"),
+		)
+	}
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "completion commit failed") }
+	_ = app_follow_poll(&app, observer)
+	clear(&boxes)
+	for &entry in app.run.snap.entries {
+		if entry.kind == .Tool { append(&boxes, &entry) }
+	}
+	if !testing.expect_value(t, len(boxes), 2) { return }
+	for box in boxes {
+		testing.expect(t, !box.running, "a completed call is finished")
+		testing.expect_value(t, box.tool_outcome, journal.Tool_Outcome.Success)
+		testing.expect_value(t, string(box.text[:]), "shell\nstdout:\nfile\n")
+	}
+}
+
 @(test)
 test_follower_attachment_keeps_inner_results_until_the_script_finishes :: proc(t: ^testing.T) {
 	app: App
@@ -2056,7 +2372,7 @@ test_follower_attachment_keeps_inner_results_until_the_script_finishes :: proc(t
 	if !testing.expect(t, app_following(&app)) { return }
 	session_replay(&app, &app.setup.session)
 	testing.expect_value(t, app_entries_count(&app, "codemode · read\nhello"), 1)
-	testing.expect_value(t, len(app.run.codemode_pending[outer]), 1)
+	testing.expect_value(t, len(app.run.codemode_pending[outer].inner), 1)
 	observer := run_observer(&app)
 	_ = app_follow_poll(&app, observer)
 	testing.expect_value(t, app_entries_count(&app, "codemode · read\nhello"), 1)

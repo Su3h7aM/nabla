@@ -376,7 +376,11 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// The call is announced before anything decides whether it runs, so a front-end sees
 	// the proposal itself. The result that follows names the same call id whatever the
 	// harness decided here.
-	_observer_tool_call(observer, Chat_Tool_Event{call_id = job.call_id, name = job.name, arguments = job.call.arguments})
+	_, parent_call := tool_job_record_placement(chat, job)
+	_observer_tool_call(
+		observer,
+		Chat_Tool_Event{call = job.call.call, parent_call = parent_call, call_id = job.call_id, name = job.name, arguments = job.call.arguments},
+	)
 
 	// A cancelled turn still answers every committed call, so a call that never ran
 	// becomes a not-executed result rather than a silent gap in the record.
@@ -676,11 +680,11 @@ tool_job_record_placement :: proc(chat: ^Chat_Session, job: ^Tool_Job) -> (node:
 // that, the write comes first: a dispatch entry without a result is recovered as an
 // unknown outcome, while a result without a dispatch entry would claim knowledge the
 // harness does not have.
-tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
+tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer) {
 	job := tool_jobs_runnable(jobs, time.tick_now())
 	if job == nil { return }
 	if job.placement == .Lua && job.lua_dispatched {
-		tool_job_lua_resume(jobs, chat, job)
+		tool_job_lua_resume(jobs, chat, observer, job)
 		return
 	}
 	job.phase = .Dispatching
@@ -755,7 +759,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	}
 	if job.placement == .Lua {
 		job.lua_dispatched = true
-		tool_job_lua_start(jobs, chat, job)
+		tool_job_lua_start(jobs, chat, observer, job)
 		return
 	}
 	if launch_error := tool_job_launch(job); launch_error != nil {

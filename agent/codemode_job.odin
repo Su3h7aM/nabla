@@ -17,7 +17,7 @@ Codemode_Child :: struct {
 }
 
 @(private)
-tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
+tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, job: ^Tool_Job) {
 	args := job.arguments.(Codemode_Args)
 	children, children_error := make([dynamic]Codemode_Child, job.allocator)
 	if children_error != nil {
@@ -50,12 +50,12 @@ tool_job_lua_start :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job
 			return
 		}
 	}
-	tool_job_lua_resume(jobs, chat, job)
+	tool_job_lua_resume(jobs, chat, observer, job)
 }
 
 // tool_job_lua_resume runs the script's next step and acts on what it reported.
 @(private)
-tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
+tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, job: ^Tool_Job) {
 	event := Lua_Event.Failed
 	if !codemode_lua_expired(job.lua) { event = codemode_lua_resume(job.lua) }
 	if codemode_lua_expired(job.lua) {
@@ -65,7 +65,7 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 	case .Slice:
 		job.phase = .Queued
 	case .Host_Request:
-		codemode_job_request(jobs, chat, job)
+		codemode_job_request(jobs, chat, observer, job)
 	case .Returned, .Stopped, .Failed:
 		codemode_job_stop_children(job)
 		if codemode_job_settled(job) {
@@ -79,12 +79,12 @@ tool_job_lua_resume :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Jo
 // codemode_job_request answers what the script asked for. An answer leaves the job queued
 // to resume; a wait for a child still running parks it until the child commits.
 @(private)
-codemode_job_request :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, job: ^Tool_Job) {
+codemode_job_request :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, job: ^Tool_Job) {
 	run := job.lua
 	handle := run.request.handle
 	if run.request.kind != .Wait {
 		refusal: string
-		handle, refusal = codemode_job_start_child(jobs, chat, job)
+		handle, refusal = codemode_job_start_child(jobs, chat, observer, job)
 		if job.result != nil { return }
 		if refusal != "" {
 			answered := codemode_lua_answer_error(run, refusal)
@@ -132,7 +132,7 @@ codemode_job_deliver :: proc(job: ^Tool_Job, handle: int) {
 // A call the script can fix is refused with a message owned by the run's allocator, which
 // the script receives as an error. A failure of the batch answers the parent itself.
 @(private, require_results)
-codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: ^Tool_Job) -> (handle: int, refusal: string) {
+codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, parent: ^Tool_Job) -> (handle: int, refusal: string) {
 	run := parent.lua
 	name := run.request.name
 	if name == TOOL_CODEMODE_NAME {
@@ -187,18 +187,31 @@ codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, parent: 
 		codemode_job_answer(parent, .Tool_Failed, .Out_Of_Memory, "the nested tool call could not be allocated: out of memory", "out of memory")
 		return
 	}
-	tool_job_admit(jobs, chat, {}, child)
+	tool_job_admit(jobs, chat, observer, child)
 	if _, append_failure := append(&parent.lua_children, Codemode_Child{job = child}); append_failure != nil {
 		tool_job_release(child)
+		codemode_job_child_unadmitted(observer, parent, call, call_id, name, arguments, "the nested tool job could not be tracked")
 		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be tracked", "allocation failed")
 		return
 	}
 	if !tool_jobs_publish(jobs, child) {
 		_ = pop(&parent.lua_children)
+		codemode_job_child_unadmitted(observer, parent, call, call_id, name, arguments, "the nested tool job could not be admitted")
 		codemode_job_answer(parent, .Tool_Failed, .Unavailable, "the nested tool job could not be admitted", "allocation failed")
 		return
 	}
 	return len(parent.lua_children), ""
+}
+
+// codemode_job_child_unadmitted settles, for the observer, a child that was announced and
+// then could not be tracked or published, so every announced call settles exactly once.
+// The child's own storage is already released, so the result is built on the parent's.
+codemode_job_child_unadmitted :: proc(observer: Chat_Observer, parent: ^Tool_Job, call: journal.Call_Id, call_id, name, arguments, message: string) {
+	context_of_child := parent.exec
+	context_of_child.call_id = call_id
+	result := tool_result_failure(&context_of_child, .Unavailable, message, "allocation failed")
+	_observer_tool_result(observer, call, parent.call.call, name, arguments, &result)
+	tool_result_destroy(&result)
 }
 
 // codemode_job_child_committed hands a recorded child result to its parent: it is kept for

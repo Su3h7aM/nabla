@@ -5,6 +5,7 @@ package main
 import "core:fmt"
 import "core:mem"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 
 import "nabla:input"
@@ -47,6 +48,12 @@ conversation_render :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage, c
 		return false
 	}
 	return draw_conversation(app, storage, tui.Cell_Rect{x = 0, y = 0, width = cols, height = rows})
+}
+
+// conversation_test_report_dropped reports one display failure the way the worker does, under the lock.
+conversation_test_report_dropped :: proc(app: ^App) {
+	sync.mutex_guard(&app.run.mu)
+	snap_report_dropped_locked(app)
 }
 
 @(test)
@@ -443,9 +450,9 @@ test_display_allocation_failure_is_reported_in_the_footer_once :: proc(t: ^testi
 	widgets.input_init(&app.input, context.allocator)
 	defer widgets.input_destroy(&app.input)
 
-	snap_report_dropped(app)
+	conversation_test_report_dropped(app)
 	generation := app.run.snap.generation
-	snap_report_dropped(app)
+	conversation_test_report_dropped(app)
 	if !testing.expect_value(t, app.run.snap.generation, generation) { return }
 
 	storage := frame_storage_new(context.allocator)

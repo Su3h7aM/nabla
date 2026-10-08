@@ -16,6 +16,8 @@ import "nabla:ai"
 Tool_Test :: struct {
 	fixture:   Chat_Test,
 	workspace: string,
+	// observer is what the stepped batch reports to; the zero observer reports nothing.
+	observer:  Chat_Observer,
 }
 
 // Tool_Test_Result is what the harness recorded for one call: the outcome and the text

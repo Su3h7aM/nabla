@@ -15,7 +15,11 @@ Projection :: struct {
 	covers:     journal.Node_Id,
 	head:       journal.Node_Id,
 	items:      []Projection_Item,
-	nested:     []Projected_Nested_Call, // display only, in completion order
+	// unanswered answers the calls of items that have a committed Tool_Completed but no
+	// Results node yet, in item order. It is display only: the provider conversation
+	// never reads it.
+	unanswered: []Projected_Result,
+	nested:     []Projected_Nested_Call, // display only, in proposal order
 }
 
 // Projection_Item is one step of the conversation. request names the response
@@ -81,8 +85,9 @@ Projected_Result :: struct {
 	content:     string,
 }
 
-// Projected_Nested_Call is a settled child of a call in items. It is display-only
-// and never contributes to the provider conversation. Its strings borrow the arena.
+// Projected_Nested_Call is a child of a call in items, running or settled. It is
+// display-only and never contributes to the provider conversation. content and outcome
+// are set only once settled. Its strings borrow the arena.
 Projected_Nested_Call :: struct {
 	call:        journal.Call_Id,
 	parent_call: journal.Call_Id,
@@ -90,6 +95,7 @@ Projected_Nested_Call :: struct {
 	proposed:    string,
 	content:     string,
 	outcome:     journal.Tool_Outcome,
+	settled:     bool,
 }
 
 // PROJECTION_RECORD_KINDS are the records an Assistant node's response and
@@ -131,6 +137,7 @@ projection_load :: proc(
 	responses := make(map[journal.Node_Id][dynamic]^journal.Record, allocator = context.temp_allocator)
 	admitted := make(map[journal.Call_Id]string, allocator = context.temp_allocator)
 	completed := make(map[journal.Call_Id]^journal.Record, allocator = context.temp_allocator)
+	answered := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
 	for &record in records {
 		// The filter reads PROJECTION_RECORD_KINDS only.
 		#partial switch record.kind {
@@ -170,64 +177,75 @@ projection_load :: proc(
 			for call in results.calls {
 				record, found := completed[call]
 				if !found { return {}, journal.Journal_Error.Corrupt }
-				completion: journal.Tool_Completed
-				journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
-				result := Projected_Result {
-					call        = call,
-					parent_call = record.parent_call,
-					content     = string(record.body),
-				}
-				// A result whose outcome is not a name this build writes is a record it cannot
-				// read: left at the zero member it would report an unreadable record as a call
-				// whose outcome nobody knows.
-				outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
-				if !known { return {}, journal.Journal_Error.Corrupt }
-				result.outcome = outcome
-				if result.content == "" { result.content = completion.detail }
+				result := projection_result(store, record, arena) or_return
+				answered[call] = true
 				append(&items, Projection_Item{node = node.id, turn = node.turn, payload = result}) or_return
 			}
 		}
 	}
 	projection.items = items[:]
+	unanswered := make([dynamic]Projected_Result, arena) or_return
 	parents := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
 	for item in items {
-		if call, ok := item.payload.(Projected_Call); ok && call.name == TOOL_CODEMODE_NAME { parents[call.call] = true }
+		call, is_call := item.payload.(Projected_Call)
+		if !is_call { continue }
+		if call.name == TOOL_CODEMODE_NAME { parents[call.call] = true }
+		if record, found := completed[call.call]; found && !answered[call.call] {
+			// The entry is display only, so a completion that cannot be read is left out
+			// instead of failing the projection the provider conversation comes from.
+			result, result_error := projection_result(store, record, arena)
+			if result_error != nil { continue }
+			append(&unanswered, result) or_return
+		}
 	}
+	projection.unanswered = unanswered[:]
 	if len(parents) > 0 {
 		children, _ := journal.read_records(store, {session = session, kinds = {.Tool_Proposed, .Tool_Completed}, only_children = true}, 0, 0, arena) or_return
-		proposals := make(map[journal.Call_Id]^journal.Record, allocator = context.temp_allocator)
+		positions := make(map[journal.Call_Id]int, allocator = context.temp_allocator)
 		nested := make([dynamic]Projected_Nested_Call, arena) or_return
 		for &record in children {
 			if !parents[record.parent_call] { continue }
 			if record.kind == .Tool_Proposed {
-				proposals[record.call] = &record
+				proposal: journal.Tool_Proposed
+				journal.payload_decode(record.data, &proposal, arena, corruption_journal = store, session = session, seq = record.seq) or_return
+				positions[record.call] = len(nested)
+				append(
+					&nested,
+					Projected_Nested_Call{call = record.call, parent_call = record.parent_call, name = proposal.name, proposed = string(record.body)},
+				) or_return
 				continue
 			}
-			proposal_record, found := proposals[record.call]
+			position, found := positions[record.call]
 			if !found { return {}, journal.Journal_Error.Corrupt }
-			proposal: journal.Tool_Proposed
-			journal.payload_decode(proposal_record.data, &proposal, arena, corruption_journal = store, session = session, seq = proposal_record.seq) or_return
-			completion: journal.Tool_Completed
-			journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = session, seq = record.seq) or_return
-			outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
-			if !known { return {}, journal.Journal_Error.Corrupt }
-			content := string(record.body)
-			if content == "" { content = completion.detail }
-			append(
-				&nested,
-				Projected_Nested_Call {
-					call = record.call,
-					parent_call = record.parent_call,
-					name = proposal.name,
-					proposed = string(proposal_record.body),
-					content = content,
-					outcome = outcome,
-				},
-			) or_return
+			result := projection_result(store, &record, arena) or_return
+			nested[position].content = result.content
+			nested[position].outcome = result.outcome
+			nested[position].settled = true
 		}
 		projection.nested = nested[:]
 	}
 	return projection, nil
+}
+
+// projection_result reads the answer a Tool_Completed record carries. The record's
+// strings are decoded into arena.
+@(private, require_results)
+projection_result :: proc(store: ^journal.Journal, record: ^journal.Record, arena: mem.Allocator) -> (result: Projected_Result, error: journal.Error) {
+	completion: journal.Tool_Completed
+	journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
+	result = Projected_Result {
+		call        = record.call,
+		parent_call = record.parent_call,
+		content     = string(record.body),
+	}
+	// A result whose outcome is not a name this build writes is a record it cannot
+	// read: left at the zero member it would report an unreadable record as a call
+	// whose outcome nobody knows.
+	outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+	if !known { return {}, journal.Journal_Error.Corrupt }
+	result.outcome = outcome
+	if result.content == "" { result.content = completion.detail }
+	return result, nil
 }
 
 // projection_add_assistant appends one response in the order it is replayed:

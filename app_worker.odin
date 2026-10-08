@@ -652,18 +652,23 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		return
 	}
 
-	calls := make(map[journal.Call_Id]agent.Projected_Call, len(replayed.items), app.run.alloc)
-	defer delete(calls)
-	// inners holds one inner-call list per Code Mode call, by the outer call's id,
-	// so an outer box lists its inner calls like the live view lists them. The
-	// replay arena owns the lists and every string they borrow, and releases them
-	// as a whole when the replay ends.
-	inners := make(map[journal.Call_Id][dynamic]Codemode_Inner, virtual.arena_allocator(&arena))
+	// answers holds what each call reported. A call without an answer is unfinished, and
+	// only a followed session can still finish it, so the answers the Results node has
+	// not caught up with are read only then.
+	answers := make(map[journal.Call_Id]agent.Projected_Result, len(replayed.items), app.run.alloc)
+	defer delete(answers)
+	for item in replayed.items {
+		if result, is_result := item.payload.(agent.Projected_Result); is_result { answers[result.call] = result }
+	}
+	if following {
+		for result in replayed.unanswered { answers[result.call] = result }
+	}
 
 	if replayed.summary != "" {
 		snap_append(app, .Notice, "(earlier turns are summarized)")
 	}
-	for &item in replayed.items {
+	group_start := 0
+	for &item, index in replayed.items {
 		// A native response replays only to the model; its text and calls are items of their own.
 		#partial switch payload in item.payload {
 		case agent.Projected_User:
@@ -675,79 +680,99 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		case agent.Projected_Assistant:
 			snap_append(app, .Assistant, payload.text)
 		case agent.Projected_Call:
-			calls[payload.call] = payload
-		case agent.Projected_Result:
-			for nested in replayed.nested {
-				if nested.parent_call == payload.call { session_replay_nested(app, &inners, nested, virtual.arena_allocator(&arena)) }
+			if index == 0 || !projected_is_call(replayed.items[index - 1]) { group_start = index }
+			answer: Maybe(agent.Projected_Result)
+			if result, answered := answers[payload.call]; answered { answer = result }
+			if answer != nil || following { session_replay_call(app, payload, answer, replayed.nested) }
+			// A script's calls are admitted after every call of its response, so the live
+			// turn showed them after the response's last call.
+			if index + 1 == len(replayed.items) || !projected_is_call(replayed.items[index + 1]) {
+				session_replay_children(app, replayed.nested, replayed.items[group_start:index + 1], answers, following)
 			}
-			session_replay_tool(app, &inners, calls[payload.call], payload, virtual.arena_allocator(&arena))
-			delete_key(&calls, payload.call)
 		}
 	}
-	for nested in replayed.nested {
-		if _, pending := calls[nested.parent_call]; pending { session_replay_nested(app, &inners, nested, virtual.arena_allocator(&arena)) }
-	}
-	if following {
-		sync.mutex_lock(&app.run.mu)
-		for parent_call, list in inners {
-			for inner in list { codemode_pending_append_locked(app, parent_call, inner.name, inner.arguments, inner.outcome) }
-		}
-		sync.mutex_unlock(&app.run.mu)
-		session_replay_queued(app)
-	}
+	if following { session_replay_queued(app) }
 }
 
-session_replay_nested :: proc(app: ^App, inners: ^map[journal.Call_Id][dynamic]Codemode_Inner, nested: agent.Projected_Nested_Call, arena: mem.Allocator) {
-	session_replay_tool(
-		app,
-		inners,
-		agent.Projected_Call{call = nested.call, parent_call = nested.parent_call, name = nested.name, proposed = nested.proposed},
-		agent.Projected_Result{call = nested.call, parent_call = nested.parent_call, content = nested.content, outcome = nested.outcome},
-		arena,
-	)
+projected_is_call :: proc(item: agent.Projection_Item) -> bool {
+	_, is_call := item.payload.(agent.Projected_Call)
+	return is_call
 }
 
-// session_replay_tool shows one replayed call: an inner call joins its script's list
-// and gets its own box at once, an outer Code Mode call gets its box with the list,
-// and any other call gets the box the live turn showed.
-session_replay_tool :: proc(
-	app: ^App,
-	inners: ^map[journal.Call_Id][dynamic]Codemode_Inner,
-	stored: agent.Projected_Call,
-	payload: agent.Projected_Result,
-	arena: mem.Allocator,
-) {
+// session_replay_call shows one replayed call as the live turn showed it: a call with an
+// answer as its finished box and any other as a running box. A running Code Mode call also
+// restores its pending record, so the events a follower reads next update the box.
+session_replay_call :: proc(app: ^App, stored: agent.Projected_Call, answer: Maybe(agent.Projected_Result), nested: []agent.Projected_Nested_Call) {
 	display := tool_display_call(stored.name, stored.proposed)
-	if payload.parent_call != 0 {
-		list := inners[payload.parent_call]
-		allocation_error: mem.Allocator_Error
-		if list == nil { list, allocation_error = make([dynamic]Codemode_Inner, 0, 4, arena) }
-		if allocation_error == nil {
-			_, allocation_error = append(&list, Codemode_Inner{name = stored.name, arguments = stored.proposed, outcome = payload.outcome})
-		}
-		if allocation_error == nil {
-			inners[payload.parent_call] = list
-		} else {
-			snap_report_dropped(app)
-		}
-		snap_append_titled_tool(
-			app,
-			.Codemode,
-			display,
-			codemode_inner_title(stored.name),
-			payload.content,
-			journal.TOOL_OUTCOME_NAMES[payload.outcome],
-			payload.outcome,
-		)
+	result, settled := answer.?
+	content, fallback, outcome := "", "", journal.Tool_Outcome.Success
+	if settled { content, fallback, outcome = result.content, journal.TOOL_OUTCOME_NAMES[result.outcome], result.outcome }
+	sync.mutex_guard(&app.run.mu)
+	if stored.name != agent.TOOL_CODEMODE_NAME {
+		snap_push_tool_locked(app, .Tool, stored.call, tool_entry_text(display, content, fallback, outcome), result.outcome, !settled)
 		return
 	}
-	if stored.name == agent.TOOL_CODEMODE_NAME {
-		inner := inners[payload.call]
-		delete_key(inners, payload.call)
-		snap_append_codemode(app, display, payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome, inner[:])
-		return
+	inner := codemode_inner_list(app, nested, stored.call, settled)
+	snap_push_tool_locked(app, .Codemode, stored.call, codemode_entry_text(display, content, fallback, outcome, inner), result.outcome, !settled)
+	if settled { return }
+	codemode_pending_start_locked(app, stored.call, display.code)
+	for item in inner { codemode_pending_upsert_locked(app, stored.call, item) }
+}
+
+// session_replay_children shows the calls the Code Mode calls of one response made, in
+// admission order. A session that is not followed shows only the children of a script that
+// has an answer; a followed one shows them all. A child still unsettled under a script that
+// has an answer will never settle, so it shows as settled unknown, as turn_finished does.
+session_replay_children :: proc(
+	app: ^App,
+	nested: []agent.Projected_Nested_Call,
+	response: []agent.Projection_Item,
+	answers: map[journal.Call_Id]agent.Projected_Result,
+	following: bool,
+) {
+	for child in nested {
+		_, parent_settled := answers[child.parent_call]
+		if !parent_settled && !following { continue }
+		for item in response {
+			if stored, is_call := item.payload.(agent.Projected_Call); is_call && stored.call == child.parent_call {
+				session_replay_child(app, child, parent_settled)
+				break
+			}
+		}
 	}
-	snap_append_tool(app, .Tool, display, payload.content, journal.TOOL_OUTCOME_NAMES[payload.outcome], payload.outcome)
+}
+
+session_replay_child :: proc(app: ^App, child: agent.Projected_Nested_Call, parent_settled: bool) {
+	display := tool_display_call(child.name, child.proposed)
+	settled := child.settled || parent_settled
+	content, fallback, outcome := "", "", journal.Tool_Outcome.Success
+	if settled { content, fallback, outcome = child.content, journal.TOOL_OUTCOME_NAMES[child.outcome], child.outcome }
+	text := tool_entry_text_titled(display, codemode_inner_title(child.name), content, fallback, outcome)
+	sync.mutex_guard(&app.run.mu)
+	snap_push_tool_locked(app, .Codemode, child.call, text, child.outcome, !settled)
+}
+
+// codemode_inner_list lists the calls the Code Mode call parent_call made, in admission
+// order, for its box. When the script is settled, a call that never settled lists as
+// unknown. The list and the strings it borrows live as long as nested and the temporary
+// allocator do. The caller holds the runtime mutex.
+codemode_inner_list :: proc(app: ^App, nested: []agent.Projected_Nested_Call, parent_call: journal.Call_Id, parent_settled: bool) -> []Codemode_Inner {
+	list := make([dynamic]Codemode_Inner, context.temp_allocator)
+	for child in nested {
+		if child.parent_call != parent_call { continue }
+		inner := Codemode_Inner {
+			call      = child.call,
+			name      = child.name,
+			arguments = child.proposed,
+			outcome   = child.outcome,
+			running   = !child.settled && !parent_settled,
+		}
+		if _, append_error := append(&list, inner); append_error != nil {
+			snap_report_dropped_locked(app)
+			break
+		}
+	}
+	return list[:]
 }
 
 // session_replay_queued shows the lines the session accepted and the runner has not
@@ -980,12 +1005,6 @@ snap_entry_append_text :: proc(app: ^App, entry: ^Entry, text: string) {
 	snap_entry_account(entry)
 }
 
-// snap_report_dropped records one display failure while holding the snapshot lock.
-snap_report_dropped :: proc(app: ^App) {
-	sync.mutex_guard(&app.run.mu)
-	snap_report_dropped_locked(app)
-}
-
 // snap_report_dropped_locked marks the display incomplete once, without allocating or
 // writing to the terminal's stderr stream. The footer reads the flag under the same lock.
 snap_report_dropped_locked :: proc(app: ^App) {
@@ -1040,6 +1059,7 @@ run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 		assistant_text = observer_assistant_text,
 		assistant_end = observer_assistant_end,
 		user_text = observer_user_text,
+		tool_call = observer_tool_call,
 		tool_result = observer_tool_result,
 		turn_finished = observer_turn_finished,
 		message = observer_message,
@@ -1132,131 +1152,247 @@ observer_user_text :: proc(user_data: rawptr, text: string, origin: journal.User
 	snap_append(cast(^App)user_data, user_entry_kind(origin), text)
 }
 
+observer_tool_call :: proc(user_data: rawptr, event: agent.Chat_Tool_Event) {
+	app := cast(^App)user_data
+	display := tool_display_call(event.name, event.arguments)
+	sync.mutex_guard(&app.run.mu)
+	// A box already shown for the call came from a replay of a record the poll reads again.
+	if snap_tool_entry_locked(app, event.call) != nil { return }
+	switch {
+	case event.parent_call != 0:
+		inner := Codemode_Inner {
+			call      = event.call,
+			name      = event.name,
+			arguments = event.arguments,
+			running   = true,
+		}
+		codemode_inner_update_locked(app, event.parent_call, inner)
+		text := tool_entry_text_titled(display, codemode_inner_title(event.name), "", "", .Success)
+		snap_push_tool_locked(app, .Codemode, event.call, text, .Unknown, true)
+	case event.name == agent.TOOL_CODEMODE_NAME:
+		if event.call != 0 { codemode_pending_start_locked(app, event.call, display.code) }
+		snap_push_tool_locked(app, .Codemode, event.call, codemode_entry_text(display, "", "", .Success, nil), .Unknown, true)
+	case:
+		snap_push_tool_locked(app, .Tool, event.call, tool_entry_text(display, "", "", .Success), .Unknown, true)
+	}
+}
+
+// observer_tool_result settles the running box of the call and, for a call whose pending
+// event was never observed, shows the finished box. A call with a finished box already
+// is ignored: a replay showed it, or its turn finished and settled the box as unknown, so
+// a completion that arrives after turn_finished does not change what the box says. Call 0
+// is no identity and always gets a box of its own.
 observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
 	app := cast(^App)user_data
-	if parent_call != 0 {
-		snap_append_codemode_inner(app, call, parent_call, name, arguments, result)
-		return
-	}
-	if name == agent.TOOL_CODEMODE_NAME {
-		snap_append_codemode_outer(app, call, tool_display_call(name, arguments), result)
-		return
-	}
-	_ = call
-	snap_append_tool(app, .Tool, tool_display_call(name, arguments), result.content, tool_display_summary(result), result.outcome)
-}
-
-// snap_append_tool records the same tool box for a live turn and a replayed session.
-// kind is the box the entry draws as: a Code Mode inner call draws as .Codemode
-// even though its text reads like a normal tool box.
-snap_append_tool :: proc(app: ^App, kind: Entry_Kind, call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome) {
-	sync.mutex_guard(&app.run.mu)
-	snap_append_titled_tool_locked(app, kind, call, call.name, content, fallback, outcome)
-}
-
-// snap_append_titled_tool records a tool box under another title. A Code Mode inner
-// call keeps its own result preview, so its box reads like a normal tool box that is
-// titled for the script that ran it.
-snap_append_titled_tool :: proc(app: ^App, kind: Entry_Kind, call: Tool_Display_Call, title, content, fallback: string, outcome: journal.Tool_Outcome) {
-	sync.mutex_guard(&app.run.mu)
-	snap_append_titled_tool_locked(app, kind, call, title, content, fallback, outcome)
-}
-
-// snap_append_titled_tool_locked appends under a held runtime mutex.
-snap_append_titled_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: Tool_Display_Call, title, content, fallback: string, outcome: journal.Tool_Outcome) {
-	entry := snap_entry_make(app, kind, tool_entry_text_titled(call, title, content, fallback, outcome))
-	entry.tool_outcome = outcome
-	snap_push_locked(app, entry)
-}
-
-// snap_append_codemode records a Code Mode call's own box: the program, one line per
-// inner call, and the result preview. Live and replay share the text, so the two
-// boxes read the same.
-snap_append_codemode :: proc(app: ^App, call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome, inner: []Codemode_Inner) {
-	sync.mutex_guard(&app.run.mu)
-	entry := snap_entry_make(app, .Codemode, codemode_entry_text(call, content, fallback, outcome, inner))
-	entry.tool_outcome = outcome
-	snap_push_locked(app, entry)
-}
-
-// snap_append_codemode_inner records one call a Code Mode script made. Its summary
-// joins the script's pending list, and its own box is shown at once, in commit order,
-// so the transcript reads the script's work as it happens.
-snap_append_codemode_inner :: proc(app: ^App, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
-	_ = call
-	sync.mutex_guard(&app.run.mu)
 	display := tool_display_call(name, arguments)
-	snap_append_titled_tool_locked(app, .Codemode, display, codemode_inner_title(name), result.content, tool_display_summary(result), result.outcome)
-	codemode_pending_append_locked(app, parent_call, name, arguments, result.outcome)
-}
-
-// codemode_pending_append_locked clones an inner summary into the worker-owned
-// list. Both replay and live results cross this ownership boundary once.
-codemode_pending_append_locked :: proc(app: ^App, parent_call: journal.Call_Id, name, arguments: string, outcome: journal.Tool_Outcome) {
-	owned_name, owned_name_error := strings.clone(name, app.run.alloc)
-	owned_arguments, owned_arguments_error := strings.clone(arguments, app.run.alloc)
-	if owned_name_error != nil || owned_arguments_error != nil {
-		delete(owned_name, app.run.alloc)
-		delete(owned_arguments, app.run.alloc)
-		snap_report_dropped_locked(app)
-		return
-	}
-	if app.run.codemode_pending == nil {
-		app.run.codemode_pending = make(map[journal.Call_Id][dynamic]Codemode_Inner, app.run.alloc)
-	}
-	list := app.run.codemode_pending[parent_call]
-	if list == nil {
-		created, created_error := make([dynamic]Codemode_Inner, 0, 4, app.run.alloc)
-		if created_error != nil {
-			delete(owned_name, app.run.alloc)
-			delete(owned_arguments, app.run.alloc)
-			snap_report_dropped_locked(app)
-			return
-		}
-		list = created
-		app.run.codemode_pending[parent_call] = list
-	}
-	if _, append_error := append(&list, Codemode_Inner{name = owned_name, arguments = owned_arguments, outcome = outcome}); append_error != nil {
-		delete(owned_name, app.run.alloc)
-		delete(owned_arguments, app.run.alloc)
-		snap_report_dropped_locked(app)
-		return
-	}
-	app.run.codemode_pending[parent_call] = list
-}
-
-// snap_append_codemode_outer shows the script's own box with the inner calls its
-// results committed before it. The pending list is taken and freed with the box.
-snap_append_codemode_outer :: proc(app: ^App, call: journal.Call_Id, display: Tool_Display_Call, result: ^agent.Tool_Result) {
+	summary := tool_display_summary(result)
 	sync.mutex_guard(&app.run.mu)
-	inner := app.run.codemode_pending[call]
-	delete_key(&app.run.codemode_pending, call)
-	entry := snap_entry_make(app, .Codemode, codemode_entry_text(display, result.content, tool_display_summary(result), result.outcome, inner[:]))
-	entry.tool_outcome = result.outcome
-	snap_push_locked(app, entry)
-	for recorded in inner {
-		delete(recorded.name, app.run.alloc)
-		delete(recorded.arguments, app.run.alloc)
+	if shown := snap_tool_entry_locked(app, call); shown != nil && !shown.running { return }
+	switch {
+	case parent_call != 0:
+		inner := Codemode_Inner {
+			call      = call,
+			name      = name,
+			arguments = arguments,
+			outcome   = result.outcome,
+		}
+		codemode_inner_update_locked(app, parent_call, inner)
+		text := tool_entry_text_titled(display, codemode_inner_title(name), result.content, summary, result.outcome)
+		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome)
+	case name == agent.TOOL_CODEMODE_NAME:
+		pending: Codemode_Pending
+		if call != 0 {
+			pending = app.run.codemode_pending[call]
+			delete_key(&app.run.codemode_pending, call)
+		}
+		text := codemode_entry_text(display, result.content, summary, result.outcome, pending.inner[:])
+		snap_settle_tool_locked(app, .Codemode, call, text, result.outcome)
+		codemode_pending_destroy_locked(app, &pending)
+	case:
+		snap_settle_tool_locked(app, .Tool, call, tool_entry_text(display, result.content, summary, result.outcome), result.outcome)
 	}
-	delete(inner)
 }
 
+// snap_push_tool_locked appends a tool box under a held runtime mutex. kind is the box
+// the entry draws as: a Code Mode inner call draws as .Codemode even though its text
+// reads like a normal tool box. Live, follower, and replay build their boxes through it.
+snap_push_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_Id, text: string, outcome: journal.Tool_Outcome, running: bool) {
+	entry := snap_entry_make(app, kind, text)
+	entry.call = call
+	entry.tool_outcome = outcome
+	entry.running = running
+	snap_push_locked(app, entry)
+}
+
+// snap_tool_entry_locked finds the newest box of call, running or finished, or nil. Call 0
+// is no identity and finds nothing. The pointer is valid until the entries change.
+snap_tool_entry_locked :: proc(app: ^App, call: journal.Call_Id) -> ^Entry {
+	if call == 0 { return nil }
+	#reverse for &entry in app.run.snap.entries {
+		if entry.call == call { return &entry }
+	}
+	return nil
+}
+
+// snap_settle_tool_locked replaces the text and outcome of the running box of call and
+// ends its running state. A call without a box gets a finished one. When the new text
+// cannot be set the box stays as it was, running.
+snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_Id, text: string, outcome: journal.Tool_Outcome) {
+	entry := snap_tool_entry_locked(app, call)
+	if entry == nil {
+		snap_push_tool_locked(app, kind, call, text, outcome, false)
+		return
+	}
+	if !snap_entry_rewrite_locked(app, entry, text) { return }
+	entry.tool_outcome = outcome
+	entry.running = false
+	snap_publish_locked(app)
+	snap_trim_locked(app)
+}
+
+// snap_entry_rewrite_locked replaces the text of an entry already in the transcript and
+// charges the transcript's budget for the difference. It neither trims nor publishes, so a
+// caller walking the entries is not disturbed by a trim removing one. When the new text
+// cannot be allocated the entry keeps its old text and the result is false.
+snap_entry_rewrite_locked :: proc(app: ^App, entry: ^Entry, text: string) -> bool {
+	replacement, allocation_error := make([dynamic]u8, len(text), len(text), app.run.alloc)
+	if allocation_error != nil {
+		snap_report_dropped_locked(app)
+		return false
+	}
+	copy(replacement[:], text)
+	delete(entry.text)
+	entry.text = replacement
+	entry.revision += 1
+	before := entry.bytes
+	snap_entry_account(entry)
+	app.run.snap.entries_bytes += entry.bytes - before
+	return true
+}
+
+// codemode_pending_entry_locked returns the pending record of a Code Mode call, creating
+// an empty one when the call has none. It is nil after reporting a failed allocation.
+codemode_pending_entry_locked :: proc(app: ^App, call: journal.Call_Id) -> ^Codemode_Pending {
+	if app.run.codemode_pending == nil {
+		app.run.codemode_pending = make(map[journal.Call_Id]Codemode_Pending, app.run.alloc)
+	}
+	_, pending, inserted, map_error := map_entry(&app.run.codemode_pending, call)
+	if map_error != nil {
+		snap_report_dropped_locked(app)
+		return nil
+	}
+	if inserted { pending.inner.allocator = app.run.alloc }
+	return pending
+}
+
+// codemode_pending_start_locked records the script of a Code Mode call that started.
+codemode_pending_start_locked :: proc(app: ^App, call: journal.Call_Id, code: Maybe(string)) {
+	script, present := code.?
+	if !present { return }
+	pending := codemode_pending_entry_locked(app, call)
+	if pending == nil { return }
+	owned, clone_error := strings.clone(script, app.run.alloc)
+	if clone_error != nil {
+		snap_report_dropped_locked(app)
+		return
+	}
+	if previous, had_previous := pending.code.?; had_previous { delete(previous, app.run.alloc) }
+	pending.code = owned
+}
+
+// codemode_pending_upsert_locked updates the item of an inner call in its script's list, or
+// adds it, cloning its strings into the worker-owned list.
+codemode_pending_upsert_locked :: proc(app: ^App, parent_call: journal.Call_Id, inner: Codemode_Inner) {
+	pending := codemode_pending_entry_locked(app, parent_call)
+	if pending == nil { return }
+	for &existing in pending.inner {
+		if existing.call != inner.call { continue }
+		existing.outcome = inner.outcome
+		existing.running = inner.running
+		return
+	}
+	owned := inner
+	name_error, arguments_error: mem.Allocator_Error
+	owned.name, name_error = strings.clone(inner.name, app.run.alloc)
+	owned.arguments, arguments_error = strings.clone(inner.arguments, app.run.alloc)
+	if name_error != nil || arguments_error != nil {
+		delete(owned.name, app.run.alloc)
+		delete(owned.arguments, app.run.alloc)
+		snap_report_dropped_locked(app)
+		return
+	}
+	if _, append_error := append(&pending.inner, owned); append_error != nil {
+		delete(owned.name, app.run.alloc)
+		delete(owned.arguments, app.run.alloc)
+		snap_report_dropped_locked(app)
+	}
+}
+
+// codemode_inner_update_locked records the state of an inner call in its script's pending
+// record and rebuilds the script's running box. A script whose box is not running (it
+// settled, or was never observed) keeps its box and gets no record.
+codemode_inner_update_locked :: proc(app: ^App, parent_call: journal.Call_Id, inner: Codemode_Inner) {
+	outer := snap_tool_entry_locked(app, parent_call)
+	if outer == nil || !outer.running { return }
+	codemode_pending_upsert_locked(app, parent_call, inner)
+	pending := app.run.codemode_pending[parent_call]
+	display := Tool_Display_Call {
+		name = agent.TOOL_CODEMODE_NAME,
+		code = pending.code,
+	}
+	if !snap_entry_rewrite_locked(app, outer, codemode_entry_text(display, "", "", .Success, pending.inner[:])) { return }
+	snap_publish_locked(app)
+	snap_trim_locked(app)
+}
+
+// observer_turn_finished settles every box still running: no call of the turn can report
+// anymore, so each ends with an unknown outcome. A script's box also settles its running
+// inner lines as unknown.
 observer_turn_finished :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
+	for &entry in app.run.snap.entries {
+		if !entry.running { continue }
+		entry.running = false
+		entry.tool_outcome = .Unknown
+		pending, found := app.run.codemode_pending[entry.call]
+		if entry.kind != .Codemode || !found { continue }
+		for &inner in pending.inner {
+			if inner.running {
+				inner.running = false
+				inner.outcome = .Unknown
+			}
+		}
+		display := Tool_Display_Call {
+			name = agent.TOOL_CODEMODE_NAME,
+			code = pending.code,
+		}
+		fallback := journal.TOOL_OUTCOME_NAMES[.Unknown]
+		// A text that cannot be set leaves the old one; the box still ends, since no
+		// later event can settle it.
+		_ = snap_entry_rewrite_locked(app, &entry, codemode_entry_text(display, "", fallback, .Unknown, pending.inner[:]))
+	}
+	snap_publish_locked(app)
+	snap_trim_locked(app)
 	codemode_pending_clear_locked(app)
 }
 
-// codemode_pending_clear_locked releases the lists whose scripts can no longer
+// codemode_pending_destroy_locked releases the strings and the list of one pending record.
+codemode_pending_destroy_locked :: proc(app: ^App, pending: ^Codemode_Pending) {
+	if code, present := pending.code.?; present { delete(code, app.run.alloc) }
+	for inner in pending.inner {
+		delete(inner.name, app.run.alloc)
+		delete(inner.arguments, app.run.alloc)
+	}
+	delete(pending.inner)
+}
+
+// codemode_pending_clear_locked releases the records whose scripts can no longer
 // report, when their turn ends or their transcript is discarded. The caller holds
 // the runtime mutex.
 codemode_pending_clear_locked :: proc(app: ^App) {
-	for _, list in app.run.codemode_pending {
-		for recorded in list {
-			delete(recorded.name, app.run.alloc)
-			delete(recorded.arguments, app.run.alloc)
-		}
-		delete(list)
+	for _, &pending in app.run.codemode_pending {
+		codemode_pending_destroy_locked(app, &pending)
 	}
 	delete(app.run.codemode_pending)
 	app.run.codemode_pending = nil

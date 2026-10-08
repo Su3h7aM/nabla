@@ -43,8 +43,8 @@ follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (f
 
 // follow_poll renders the records of session committed after follow.last through the
 // observer, in seq order, and advances follow. Each record is reported as the live view
-// reports the same fact: a Code Mode child's result carries its script's call as
-// parent_call, as the live view reports it. Records whose payload cannot be decoded
+// reports the same fact: a Code Mode child's proposal and result carry its script's call
+// as parent_call, as the live view reports them. Records whose payload cannot be decoded
 // are skipped. A journal error stops the poll with follow.last at the last record
 // rendered. Nothing here writes the journal.
 @(require_results)
@@ -67,10 +67,12 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .Node_Committed:
 		return follow_node(store, follow, record, observer)
 	case .Tool_Proposed:
-		if record.parent_call != 0 { return nil }
 		proposed: journal.Tool_Proposed
 		if journal.payload_decode(record.data, &proposed, context.temp_allocator) != nil { return nil }
-		_observer_tool_call(observer, Chat_Tool_Event{call_id = proposed.provider_id, name = proposed.name, arguments = body})
+		_observer_tool_call(
+			observer,
+			Chat_Tool_Event{call = record.call, parent_call = record.parent_call, call_id = proposed.provider_id, name = proposed.name, arguments = body},
+		)
 	case .Tool_Completed:
 		return follow_tool_result(store, record, observer)
 	case .Turn_Started:

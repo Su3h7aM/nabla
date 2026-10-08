@@ -155,7 +155,7 @@ test_a_follower_shows_a_delivered_agent_input_once :: proc(test: ^testing.T) {
 
 // A follower shows what the runner commits through the same callbacks a runner's own
 // front-end has, in order: a line it sent shows once, though the User node that delivers it
-// is committed later, and a Lua child is reported only once it settles.
+// is committed later, and a Lua child is reported as pending and as settled like any call.
 @(test)
 test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -261,6 +261,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 		"user:question:prompt",
 		"assistant:looking",
 		"call:codemode",
+		"call:read",
 		"result:read:child result",
 		"result:codemode:ok\nvalue: 1",
 		"user:from the follower:prompt",

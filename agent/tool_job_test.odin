@@ -124,15 +124,15 @@ tool_job_test_step_at :: proc(tool_test: ^Tool_Test, jobs: ^Tool_Jobs, now: time
 	effect := tool_jobs_next(jobs, now)
 	switch effect {
 	case .Commit:
-		tool_jobs_commit(jobs, chat, {})
+		tool_jobs_commit(jobs, chat, tool_test.observer)
 	case .Refuse:
 		tool_jobs_refuse(jobs)
 	case .Abandon:
-		tool_jobs_abandon(jobs, chat, {}, now)
+		tool_jobs_abandon(jobs, chat, tool_test.observer, now)
 	case .Retire:
 		tool_jobs_retire(jobs, chat, now)
 	case .Dispatch:
-		tool_jobs_dispatch(jobs, chat)
+		tool_jobs_dispatch(jobs, chat, tool_test.observer)
 	case .Wait:
 		// A stepped test advances its own clock, so the wait is bounded by the real one: what
 		// it is waiting for is a worker's publication, not a deadline its own simulation has
@@ -302,7 +302,7 @@ test_an_unpublished_nested_tool_job_frees_with_worker_allocator :: proc(test: ^t
 	defer delete(parent.call_id, parent.allocator)
 	defer if parent.result != nil { tool_result_destroy(&parent.result.?) }
 
-	codemode_job_request(&jobs, chat, &parent)
+	codemode_job_request(&jobs, chat, {}, &parent)
 
 	testing.expect_value(test, parent.phase, Tool_Job_Phase.Result_Ready)
 	testing.expect_value(test, len(jobs.jobs), 0)
@@ -363,7 +363,7 @@ test_an_untracked_nested_tool_job_is_never_published :: proc(test: ^testing.T) {
 	defer delete(parent.lua_children)
 	defer if parent.result != nil { tool_result_destroy(&parent.result.?) }
 
-	codemode_job_request(&jobs, chat, &parent)
+	codemode_job_request(&jobs, chat, {}, &parent)
 
 	testing.expect_value(test, parent.phase, Tool_Job_Phase.Result_Ready)
 	testing.expect_value(test, parent.result.?.outcome, journal.Tool_Outcome.Tool_Failed)
@@ -442,6 +442,48 @@ return first.outcome .. " " .. second.outcome .. " " .. tostring(again)`
 	for job in jobs.jobs { testing.expect_value(test, job.phase, Tool_Job_Phase.Retired) }
 	testing.expect_value(test, tool_jobs_committed(&jobs), 1)
 	testing.expect_value(test, jobs.committed, 4)
+}
+
+tool_job_test_record_call :: proc(user_data: rawptr, event: Chat_Tool_Event) {
+	admitted := cast(^[dynamic]Chat_Tool_Event)user_data
+	// The event's strings are borrowed for the callback, so only the ids are kept.
+	_, _ = append(admitted, Chat_Tool_Event{call = event.call, parent_call = event.parent_call})
+}
+
+// A call a script starts is announced when it is admitted, like a call the model made, and
+// names the script's call as its parent.
+@(test)
+test_codemode_children_are_announced_when_admitted :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+	chat := &tool_test.fixture.chat
+	hold: Tool_Job_Hold_State
+	lane := tool_job_hold_lane(&hold)
+	tool_job_test_register(test, &tool_test, tool_job_hold_definition(&lane, "test_child", tool_job_immediate_execute))
+	admitted: [dynamic]Chat_Tool_Event
+	defer delete(admitted)
+	tool_test.observer = Chat_Observer {
+		user_data = &admitted,
+		tool_call = tool_job_test_record_call,
+	}
+	object := make(json.Object, 1, context.temp_allocator)
+	object["code"] = json.String(`return job.wait(job.start("test_child", {})).outcome`)
+	arguments, marshal_error := json.marshal(object, allocator = context.temp_allocator)
+	if marshal_error != nil { testing.fail_now(test, "the arguments could not be built") }
+	_test_stage_call(test, chat, "call_code", string(arguments), TOOL_CODEMODE_NAME)
+
+	jobs: Tool_Jobs
+	tool_jobs_init(&jobs, chat, len(chat.pending_calls), os.heap_allocator())
+	defer tool_jobs_destroy(&jobs)
+	tool_jobs_submit(&jobs, chat, tool_test.observer)
+	tool_job_test_drain(test, &tool_test, &jobs)
+
+	if !testing.expect_value(test, len(admitted), 2) { return }
+	testing.expect_value(test, admitted[0].parent_call, journal.Call_Id(0))
+	testing.expect(test, admitted[0].call != 0, "the script is announced under its own call")
+	testing.expect_value(test, admitted[1].parent_call, admitted[0].call)
+	testing.expect(test, admitted[1].call != 0 && admitted[1].call != admitted[0].call, "the child is announced under its own call")
 }
 
 // Admission must preserve every call the provider committed, including a batch larger

@@ -50,6 +50,11 @@ Entry :: struct {
 	bytes:           int,
 	complete:        bool,
 	tool_outcome:    journal.Tool_Outcome,
+	// call is the journal id of the tool call a tool box shows, zero for any other
+	// entry. running says the call has not reported its result: the box draws with the
+	// spinner and the working border until the result replaces its text and outcome.
+	call:            journal.Call_Id,
+	running:         bool,
 	// tool_scroll is the first preview row a tool box shows, so a long result can
 	// be read inside its own box. The box clamps it to the rows it has, which is
 	// why the value is only a request until the next frame resolves it.
@@ -326,12 +331,20 @@ Runtime :: struct {
 	// catalog_applied_revision is the newest published catalog whose metadata the
 	// worker applied to the active selection. Only the worker reads and writes it.
 	catalog_applied_revision: u64,
-	// codemode_pending holds one inner-call list per running Code Mode call, by the
-	// outer call's journal id. An inner result appends to its script's list before
-	// its box is shown, and the outer result takes and frees the list when its box
-	// is shown. Owned by alloc; only the worker thread reads and writes it, under
-	// mu like the snapshot.
-	codemode_pending:         map[journal.Call_Id][dynamic]Codemode_Inner,
+	// codemode_pending holds the state of each running Code Mode call, by the outer
+	// call's journal id. An inner call's admission and result update its script's list
+	// and rebuild the outer box, and the outer result takes and frees the record when
+	// its box settles. Owned by alloc; only the worker thread reads and writes it,
+	// under mu like the snapshot.
+	codemode_pending:         map[journal.Call_Id]Codemode_Pending,
+}
+
+// Codemode_Pending is what a running Code Mode box needs to be rebuilt as its inner
+// calls start and settle: the script, and one item per inner call in admission order.
+// The code and every inner name and arguments are owned by the runtime allocator.
+Codemode_Pending :: struct {
+	code:  Maybe(string),
+	inner: [dynamic]Codemode_Inner,
 }
 
 // stop_runtime refuses further work. The front-end is the only enqueuer, so once

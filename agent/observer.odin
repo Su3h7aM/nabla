@@ -30,14 +30,18 @@ Chat_Observer :: struct {
 	// the front-end can show what another agent sent apart from the user's own
 	// lines.
 	user_text:        proc(user_data: rawptr, text: string, origin: journal.User_Origin),
-	// tool_call reports a direct model call before it runs, including calls that
-	// are refused or cancelled. Code Mode children report only their settled
-	// tool_result, never a pending tool_call.
+	// tool_call is called once when the harness admits a call, before the call runs and
+	// before its result exists. It reports a call the model made and a call a Code Mode
+	// script made alike. A call that is refused or cancelled announces itself here too and
+	// still reports a result, so a front-end sees every committed call exactly once as
+	// pending and exactly once as settled. The event borrows its strings for the duration
+	// of the callback. The session's own calls have nonzero ids; zero means unknown and
+	// identifies nothing.
 	tool_call:        proc(user_data: rawptr, event: Chat_Tool_Event),
 	// tool_result reports one committed result. call is the call's own journal id and
 	// parent_call the Code Mode call that ran it, or zero for a call the model made
 	// directly. name and the proposed arguments are borrowed for the duration of the
-	// callback. Code Mode children report only here, once they settle.
+	// callback.
 	tool_result:      proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^Tool_Result),
 	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
 	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
@@ -52,12 +56,16 @@ Chat_Observer :: struct {
 	retry_scheduled:  proc(user_data: rawptr, event: Chat_Retry_Event),
 }
 
-// Chat_Tool_Event is one tool call the harness admitted. The strings are borrowed and
-// live until that call's result has been reported.
+// Chat_Tool_Event is one tool call the harness admitted. call is the call's own journal
+// id and parent_call the Code Mode call that ran it, or zero for a call the model made
+// directly; the later tool_result names the same call. The strings are borrowed for the
+// duration of the callback.
 Chat_Tool_Event :: struct {
-	call_id:   string,
-	name:      string,
-	arguments: string, // the argument text the model sent, before any repair
+	call:        journal.Call_Id,
+	parent_call: journal.Call_Id,
+	call_id:     string,
+	name:        string,
+	arguments:   string, // the argument text the model sent, before any repair
 }
 
 // Chat_Retry_Event is one retry the harness scheduled.

@@ -451,7 +451,7 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 				}
 			} else {
 				for &entry in app.run.snap.entries {
-					declare_entry(&storage.layout_ctx, storage, &entry, width)
+					declare_entry(&storage.layout_ctx, storage, &entry, width, app.spin_frame)
 				}
 			}
 		}
@@ -614,9 +614,9 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // cleaned body in an element whose bottom padding is the blank row that
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
-declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int) {
+declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
 	if entry.kind == .Tool || entry.kind == .Codemode {
-		declare_tool_entry(ctx, entry, width)
+		declare_tool_entry(ctx, entry, width, spin_frame)
 		return
 	}
 	if entry.kind == .Assistant {
@@ -728,7 +728,9 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // `entry.tool_scroll`), and the bottom border says how many rows are held back. Only the
 // border carries the outcome color; the content is ordinary text. Code Mode calls draw
 // here too: a successful one in blue, any other outcome in the same red a tool box uses.
-declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
+// A running call draws the spinner frame before its name and the working border color,
+// whatever its kind.
+declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int, spin_frame: int) {
 	outline := widgets.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
@@ -746,6 +748,7 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 		name = value[:split]
 		preview = value[split + 1:]
 	}
+	if entry.running { name = fmt.tprintf("%s %s", spinner_glyph(spin_frame), name) }
 	// The corner, the leading rule, and the space after the name leave the name
 	// this much room; the rest of the top border is rule.
 	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
@@ -767,7 +770,10 @@ declare_tool_entry :: proc(ctx: ^layout.Context, entry: ^Entry, width: int) {
 	entry.tool_scroll = clamp(entry.tool_scroll, 0, entry.tool_scroll_max)
 	bottom := tool_border_bottom(outline, border_inner_width, tool_window_label(entry.tool_scroll, entry.tool_scroll_max - entry.tool_scroll))
 	border_style := TOOL_FAILURE
-	if entry.tool_outcome == .Success {
+	switch {
+	case entry.running:
+		border_style = WORKING_BORDER_TEXT
+	case entry.tool_outcome == .Success:
 		border_style = CODEMODE_SUCCESS if entry.kind == .Codemode else TOOL_SUCCESS
 	}
 	if layout.element(

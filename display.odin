@@ -273,11 +273,14 @@ tool_entry_text_titled :: proc(call: Tool_Display_Call, title, content, fallback
 }
 
 // Codemode_Inner is one call a Code Mode script made, as the script's box lists it:
-// the tool, the arguments it ran with, and how it ended. The strings are borrowed.
+// the call's journal id, the tool, the arguments it ran with, and how it ended. While
+// running is set the call has no outcome yet. The strings are borrowed.
 Codemode_Inner :: struct {
+	call:      journal.Call_Id,
 	name:      string,
 	arguments: string,
 	outcome:   journal.Tool_Outcome,
+	running:   bool,
 }
 
 // codemode_inner_title is the title of one inner call's box: the script and the tool
@@ -324,10 +327,11 @@ codemode_arguments_preview :: proc(arguments: string) -> string {
 }
 
 // codemode_entry_text renders a Code Mode call's box: the title, the program, one
-// line per inner call in commit order, and the result preview. A script with no
-// inner calls omits the call lines and their blank line, and a call without a
-// program text falls back to the preview-only box other calls show. Live and replay
-// share it so the two boxes read the same.
+// line per inner call in admission order, and the result preview. A running inner
+// call reads `… <tool> <arguments>`. A script with no inner calls omits the call
+// lines and their blank line, and a call without a program text falls back to the
+// preview-only box other calls show. Live, follower, and replay share it so the boxes
+// read the same.
 codemode_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, outcome: journal.Tool_Outcome, inner: []Codemode_Inner) -> string {
 	preview := tool_display_preview(content)
 	if preview == "" { preview = fallback }
@@ -343,12 +347,16 @@ codemode_entry_text :: proc(call: Tool_Display_Call, content, fallback: string, 
 		strings.write_byte(&builder, '\n')
 		for entry in inner {
 			glyph := "✗"
-			switch entry.outcome {
-			case .Success:
-				glyph = "✓"
-			case .Cancelled:
-				glyph = "⊘"
-			case .Tool_Failed, .Invalid_Arguments, .Denied, .Unavailable, .Not_Executed, .Transport_Failed, .Timed_Out, .Unknown:
+			if entry.running {
+				glyph = "…"
+			} else {
+				switch entry.outcome {
+				case .Success:
+					glyph = "✓"
+				case .Cancelled:
+					glyph = "⊘"
+				case .Tool_Failed, .Invalid_Arguments, .Denied, .Unavailable, .Not_Executed, .Transport_Failed, .Timed_Out, .Unknown:
+				}
 			}
 			strings.write_string(&builder, glyph)
 			strings.write_byte(&builder, ' ')

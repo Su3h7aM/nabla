@@ -34,7 +34,7 @@ chat_tool_jobs_step :: proc(chat: ^Chat_Session, observer: Chat_Observer, effect
 	case .Retire:
 		tool_jobs_retire(&chat.tool_jobs, chat, time.tick_now())
 	case .Dispatch:
-		tool_jobs_dispatch(&chat.tool_jobs, chat)
+		tool_jobs_dispatch(&chat.tool_jobs, chat, observer)
 	case .Wait, .Done:
 	}
 }
