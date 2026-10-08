@@ -181,24 +181,34 @@ chat_inbox_read :: proc(chat: ^Chat_Session) -> (records: []journal.Record, ok: 
 	return records, true
 }
 
-// chat_inbox_stage buffers one User node per record, in seq order, and returns the text
-// of each in temp memory. It commits nothing.
-chat_inbox_stage :: proc(chat: ^Chat_Session, records: []journal.Record) -> []string {
-	texts, texts_error := make([]string, len(records), context.temp_allocator)
-	if texts_error != nil { return nil }
+// Staged_Text is one delivered input: the text its User node carries and the origin
+// the node names.
+Staged_Text :: struct {
+	text:   string,
+	origin: journal.User_Origin,
+}
+
+// chat_inbox_stage buffers one User node per record, in seq order, and returns each
+// text with its origin in temp memory. It commits nothing.
+chat_inbox_stage :: proc(chat: ^Chat_Session, records: []journal.Record) -> []Staged_Text {
+	staged, staged_error := make([]Staged_Text, len(records), context.temp_allocator)
+	if staged_error != nil { return nil }
 	for record, index in records {
 		text, origin := inbox_text(record)
 		node := chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin], message = record.seq}, transmute([]u8)text)
-		if node == 0 { return texts[:index] }
+		if node == 0 { return staged[:index] }
 		chat.delivered = record.seq
-		texts[index] = text
+		staged[index] = {
+			text   = text,
+			origin = origin,
+		}
 	}
-	return texts
+	return staged
 }
 
 // chat_inbox_report tells the front-end what a commit delivered.
-chat_inbox_report :: proc(observer: Chat_Observer, texts: []string) {
-	for text in texts { _observer_user_text(observer, text) }
+chat_inbox_report :: proc(observer: Chat_Observer, staged: []Staged_Text) {
+	for item in staged { _observer_user_text(observer, item.text, item.origin) }
 }
 
 // chat_inbox_deliver records what the session accepted and other agents sent it, as User
@@ -206,10 +216,10 @@ chat_inbox_report :: proc(observer: Chat_Observer, texts: []string) {
 chat_inbox_deliver :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int {
 	records, read_ok := chat_inbox_read(chat)
 	if !read_ok || len(records) == 0 { return 0 }
-	texts := chat_inbox_stage(chat, records)
+	staged := chat_inbox_stage(chat, records)
 	if !chat_commit(chat, "the queued input could not be recorded") { return 0 }
-	chat_inbox_report(observer, texts)
-	return len(texts)
+	chat_inbox_report(observer, staged)
+	return len(staged)
 }
 
 // chat_inbox_reports_pending reports whether something is waiting that was committed after
@@ -231,10 +241,11 @@ chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
 }
 
 // inbox_text is the text a User node carries for one inbox record, and the origin the
-// node names. The text matches what the model knows: a child is named as the start call
-// named it, and a record that has no name, such as one recovery wrote, names the child's
-// session. A completion report names the child's session and, for a child that did not
-// complete, the cause and the last text the child committed. Text is in temp memory.
+// node names. A report from or to another agent starts with a one-line heading naming
+// the sender and the kind: "<name> answered", "<name> failed", "<name> stopped",
+// "<name> asks", or "orchestrator says". Everything after the first newline is the
+// body the front-end shows below the heading. The name is the one the start call gave
+// the child, or the child's session when the record names none. Text is in temp memory.
 @(private)
 inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.User_Origin) {
 	hex: [journal.SESSION_ID_HEX_LENGTH]u8
@@ -251,30 +262,42 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		// A payload that cannot be read still reports that the child ended.
 		_ = journal.payload_decode(record.data, &completed, context.temp_allocator)
 		name := completed.name if completed.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
-		session := journal.session_id_to_hex(record.subagent, hex[:])
 		switch completed.outcome {
 		case journal.TOOL_OUTCOME_NAMES[.Success]:
-			return fmt.tprintf("Subagent %s completed (session %s). Its answer:\n\n%s", name, session, body), .Agent
+			return inbox_report(fmt.tprintf("%s answered", name), body), .Agent
 		case journal.TOOL_OUTCOME_NAMES[.Cancelled]:
-			return fmt.tprintf("Subagent %s was stopped before it finished (session %s).%s", name, session, inbox_last_text(body)), .Agent
+			return inbox_report(fmt.tprintf("%s stopped", name), inbox_last_text(body)), .Agent
 		}
-		return fmt.tprintf("Subagent %s failed (session %s): %s%s", name, session, completed.detail, inbox_last_text(body)), .Agent
+		cause := completed.detail
+		if last := inbox_last_text(body); last != "" {
+			cause = last if cause == "" else fmt.tprintf("%s\n\n%s", cause, last)
+		}
+		return inbox_report(fmt.tprintf("%s failed", name), cause), .Agent
 	case .Subagent_Message:
-		if record.session != record.subagent { return fmt.tprintf("Message from the orchestrator:\n%s", body), .Agent }
+		if record.session != record.subagent { return inbox_report("orchestrator says", body), .Agent }
 		message: journal.Subagent_Message
 		_ = journal.payload_decode(record.data, &message, context.temp_allocator)
 		name := message.name if message.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
-		return fmt.tprintf("Message from subagent %s, which is still working (reply with agent action message if it asks something):\n%s", name, body), .Agent
+		return inbox_report(fmt.tprintf("%s asks", name), body), .Agent
 	}
 	return body, .Agent
 }
 
-// inbox_last_text is the paragraph a report of a child that did not complete adds for the
-// last text the child committed, "" when it committed none. Text is in temp memory.
+// inbox_report is heading, then body on the lines below it, or the heading alone when the
+// body is empty. Text is in temp memory.
+@(private)
+inbox_report :: proc(heading, body: string) -> string {
+	if body == "" { return heading }
+	return fmt.tprintf("%s\n%s", heading, body)
+}
+
+// inbox_last_text is the paragraph a report of a child that did not complete adds after
+// the cause for the last text the child committed, "" when it committed none. Text is
+// in temp memory.
 @(private)
 inbox_last_text :: proc(body: string) -> string {
 	if body == "" { return "" }
-	return fmt.tprintf("\n\nThe last text it committed, which may be cut off:\n\n%s", body)
+	return fmt.tprintf("The last text it committed, which may be cut off:\n\n%s", body)
 }
 
 // chat_steering_observe is the driver's collection step for input that reached the

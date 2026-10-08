@@ -62,7 +62,12 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	body := string(record.body)
 	#partial switch record.kind {
 	case .User_Input:
-		_observer_user_text(observer, body)
+		input: journal.User_Input
+		origin := journal.User_Origin.Steering
+		if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
+			if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { origin = named }
+		}
+		_observer_user_text(observer, body, origin)
 	case .Node_Committed:
 		return follow_node(store, follow, record, observer)
 	case .Tool_Proposed:
@@ -152,8 +157,10 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 		origin, _ := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
 		// A node delivering a user.input line repeats a line already shown.
 		if user.message != 0 && origin != .Agent { return nil }
-		if origin == .Prompt {
-			_observer_user_text(observer, body)
+		// A delivered agent report shows as user text with its origin, so the
+		// front-end renders it as a subagent entry rather than a notice.
+		if origin == .Prompt || origin == .Agent {
+			_observer_user_text(observer, body, origin)
 		} else {
 			_observer_message(observer, .Notice, body)
 		}

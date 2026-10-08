@@ -111,6 +111,46 @@ test_user_message_empty_line_keeps_the_background :: proc(t: ^testing.T) {
 	testing.expect_value(t, storage.buffer.cells[5 * 20].style, term.Style{})
 }
 
+// A subagent message is a band like a user message: its heading is the first line
+// alone, a long body wraps inside the band, and every band row keeps the background to
+// the last column. A message that is only a heading still fills its band.
+@(test)
+test_subagent_message_keeps_the_band_around_heading_and_body :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	snap_append(app, .Subagent, "agent-1 answered\nforty-two is the answer to everything")
+	snap_append(app, .Subagent, "agent-2 failed")
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	testing.expect(t, conversation_render(t, app, storage, 20, 12), "the conversation frame must solve")
+
+	scratch: [256]byte
+	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "agent-1 answered    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "forty-two is the    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "answer to everything")
+	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 6, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 7, scratch[:]), "agent-2 failed      ")
+	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "                    ")
+
+	for row in 0 ..< 5 {
+		testing.expect_value(t, storage.buffer.cells[row * 20].style.background, SUBAGENT_TEXT.background)
+		testing.expect_value(t, storage.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
+	}
+	testing.expect_value(t, storage.buffer.cells[5 * 20].style, term.Style{})
+	for row in 6 ..< 9 {
+		testing.expect_value(t, storage.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
+	}
+}
+
 @(test)
 test_conversation_scroll_reveals_older_rows_and_clamps :: proc(t: ^testing.T) {
 	app := new(App)

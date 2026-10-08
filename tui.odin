@@ -51,10 +51,23 @@ LABEL_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
 // A user message is a band across the terminal. Its background is the terminal's
-// own black, the darkest color a theme offers, so light message text keeps its
+// black with light text, the darkest color a theme offers, so the text keeps its
 // contrast however the theme is set.
 USER_TEXT :: term.Style {
 	background = term.Indexed_Color(0),
+}
+// A subagent message is a band like a user message. Its background is the
+// terminal's gray with dark text, so the two read apart.
+SUBAGENT_TEXT :: term.Style {
+	background = term.Indexed_Color(7),
+	foreground = term.Indexed_Color(0),
+}
+// The heading of a subagent message names who sent it and why. Bold sets it
+// apart from the body; the gray background and dark text match the band behind it.
+SUBAGENT_LABEL :: term.Style {
+	background = term.Indexed_Color(7),
+	foreground = term.Indexed_Color(0),
+	modifiers  = {.Bold},
 }
 AGENT_TEXT :: term.Style{}
 NOTICE_TEXT :: term.Style {
@@ -607,23 +620,17 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 			return
 		}
 	}
+	if entry.kind == .Subagent {
+		declare_subagent_entry(ctx, entry)
+		return
+	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
 	body_style := layout_text_style(entry_style(entry.kind))
 	// A user message is a band, and the band's padding rows are painted too, so
 	// they keep the band's style rather than the body's wrapping one.
 	band_style := body_style
 	body_style.wrap = .Words
-	if layout.element(
-		ctx,
-		layout.Element_Desc {
-			layout = layout.Layout_Style {
-				flow = .Column,
-				sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
-				align = .Stretch,
-				padding = layout.Edges{bottom = 1},
-			},
-		},
-	) {
+	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
 		if entry.kind == .User { declare_band_pad(ctx, band_style) }
 		if len(cleaned) > 0 {
 			layout.text(ctx, layout.Text_Desc{text = cleaned, style = body_style})
@@ -632,11 +639,46 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 	}
 }
 
-// declare_band_pad reserves one row of a user message's background. The row is a
-// single cell wide: the renderer paints a user row across the whole terminal, so
-// the row only has to exist, and `Wrap.None` is what keeps one cell one line.
+// text_entry_layout is the column a text entry sits in. Its bottom padding is the blank
+// row that separates entries, and stretching gives a band the full width.
+text_entry_layout :: proc() -> layout.Layout_Style {
+	return {flow = .Column, sizing = layout.Sizing{width = layout.fit(), height = layout.fit()}, align = .Stretch, padding = layout.Edges{bottom = 1}}
+}
+
+// declare_band_pad reserves one row of a band's background. The row is a single cell
+// wide: the renderer paints a band row across the whole terminal, so the row only has
+// to exist, and `Wrap.None` is what keeps one cell one line.
 declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
 	layout.text(ctx, layout.Text_Desc{text = " ", style = band})
+}
+
+// declare_subagent_entry adds one message from another agent on the subagent band: the
+// first line as a bold heading naming the sender and the kind, the rest as the body
+// below it. The heading is the first line by the sender's contract, so the split
+// reads no wording.
+declare_subagent_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
+	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
+	heading := cleaned
+	rest := ""
+	if split := strings.index_byte(cleaned, '\n'); split >= 0 {
+		heading = cleaned[:split]
+		rest = cleaned[split + 1:]
+	}
+	heading_style := layout_text_style(SUBAGENT_LABEL)
+	heading_style.wrap = .Words
+	band_style := layout_text_style(SUBAGENT_TEXT)
+	body_style := band_style
+	body_style.wrap = .Words
+	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
+		declare_band_pad(ctx, band_style)
+		if len(heading) > 0 {
+			layout.text(ctx, layout.Text_Desc{text = heading, style = heading_style})
+		}
+		if len(rest) > 0 {
+			layout.text(ctx, layout.Text_Desc{text = rest, style = body_style})
+		}
+		declare_band_pad(ctx, band_style)
+	}
 }
 
 // declare_markdown_entry adds an assistant message rendered from Markdown. The
@@ -964,6 +1006,8 @@ entry_style :: proc(kind: Entry_Kind) -> term.Style {
 		return USER_TEXT
 	case .Assistant:
 		return AGENT_TEXT
+	case .Subagent:
+		return SUBAGENT_TEXT
 	case .Tool:
 		return TOOL_BODY
 	case .Notice:

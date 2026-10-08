@@ -662,8 +662,8 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 		// A native response replays only to the model; its text and calls are items of their own.
 		#partial switch payload in item.payload {
 		case agent.Projected_User:
-			if payload.origin == .Prompt {
-				snap_append(app, .User, payload.text)
+			if payload.origin == .Prompt || payload.origin == .Agent {
+				snap_append(app, user_entry_kind(payload.origin), payload.text)
 			} else {
 				snap_append(app, .Notice, payload.text)
 			}
@@ -692,7 +692,14 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 // delivers one later is skipped as a repeat of the line (see follow_poll).
 session_replay_queued :: proc(app: ^App) {
 	for record in app.setup.follow_pending {
-		if record.kind == .User_Input { snap_append(app, .User, string(record.body)) }
+		if record.kind == .User_Input {
+			input: journal.User_Input
+			origin := journal.User_Origin.Steering
+			if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
+				if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { origin = named }
+			}
+			snap_append(app, user_entry_kind(origin), string(record.body))
+		}
 	}
 }
 
@@ -1052,8 +1059,17 @@ observer_assistant_end :: proc(user_data: rawptr) {
 	snap_publish_locked(app)
 }
 
-observer_user_text :: proc(user_data: rawptr, text: string) {
-	snap_append(cast(^App)user_data, .User, text)
+// user_entry_kind maps a user-role text's origin to its transcript kind: what another
+// agent sent shows as its own kind of entry, anything else as the user's own.
+user_entry_kind :: proc(origin: journal.User_Origin) -> Entry_Kind {
+	if origin == .Agent {
+		return .Subagent
+	}
+	return .User
+}
+
+observer_user_text :: proc(user_data: rawptr, text: string, origin: journal.User_Origin) {
+	snap_append(cast(^App)user_data, user_entry_kind(origin), text)
 }
 
 observer_tool_result :: proc(user_data: rawptr, name, arguments: string, result: ^agent.Tool_Result) {

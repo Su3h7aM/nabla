@@ -23,7 +23,10 @@ Chat_Observer :: struct {
 	assistant_text:   proc(user_data: rawptr, text: string),
 	assistant_flush:  proc(user_data: rawptr),
 	assistant_end:    proc(user_data: rawptr),
-	user_text:        proc(user_data: rawptr, text: string),
+	// user_text reports one user-role text with the origin that produced it, so
+	// the front-end can show what another agent sent apart from the user's own
+	// lines.
+	user_text:        proc(user_data: rawptr, text: string, origin: journal.User_Origin),
 	// tool_call is called once for each call the harness admits, before the call runs
 	// and before its result exists. A call that is refused or cancelled announces itself
 	// here too and still reports a result, so a front-end sees every committed call
@@ -91,8 +94,8 @@ _observer_assistant_end :: proc(observer: Chat_Observer) {
 }
 
 @(private)
-_observer_user_text :: proc(observer: Chat_Observer, text: string) {
-	if observer.user_text != nil { observer.user_text(observer.user_data, text) }
+_observer_user_text :: proc(observer: Chat_Observer, text: string, origin: journal.User_Origin) {
+	if observer.user_text != nil { observer.user_text(observer.user_data, text, origin) }
 }
 
 @(private)

@@ -19,8 +19,8 @@ follow_log_add :: proc(user_data: rawptr, event: string) {
 	append(&log.events, strings.clone(event))
 }
 
-follow_log_user :: proc(user_data: rawptr, text: string) {
-	follow_log_add(user_data, fmt.tprintf("user:%s", text))
+follow_log_user :: proc(user_data: rawptr, text: string, origin: journal.User_Origin) {
+	follow_log_add(user_data, fmt.tprintf("user:%s:%s", text, journal.USER_ORIGIN_NAMES[origin]))
 }
 
 follow_log_assistant :: proc(user_data: rawptr, text: string) {
@@ -83,6 +83,38 @@ follow_commit :: proc(test: ^testing.T, store: ^journal.Journal) {
 
 follow_send :: proc(test: ^testing.T, follower: ^journal.Journal, text: string) {
 	if input_error := journal.append_input(follower, text, .Prompt); input_error != nil { testing.fail_now(test, "the line was not accepted") }
+}
+
+// A follower shows a delivered agent report as user text with its origin, so the
+// front-end renders it as a subagent entry rather than a notice.
+@(test)
+test_a_follower_shows_a_delivered_agent_report_as_user_text :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	store := &fixture.store
+	session := fixture.chat.session
+
+	follower: journal.Journal
+	follow_open(test, &fixture, &follower)
+	defer _ = journal.close(&follower)
+	follow, start_error := follow_start(&follower, session)
+	if !testing.expect(test, start_error == nil, "the follow could not start") { return }
+
+	log: Follow_Log
+	defer follow_log_destroy(&log)
+	observer := follow_log_observer(&log)
+
+	_ = journal.append_node(
+		store,
+		{session = session, branch = journal.INITIAL_BRANCH, kind = .User, turn = 1},
+		journal.User{origin = journal.USER_ORIGIN_NAMES[.Agent]},
+		follow_body("agent-1 answered\nforty-two"),
+	)
+	follow_commit(test, store)
+	if !testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the poll failed") { return }
+	if !testing.expect_value(test, len(log.events), 1) { return }
+	testing.expect_value(test, log.events[0], "user:agent-1 answered\nforty-two:agent")
 }
 
 // A follower shows what the runner commits through the same callbacks a runner's own
@@ -181,7 +213,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 
 	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the second poll failed")
 	testing.expect(test, !follow.working, "the turn completed")
-	expected := [?]string{"user:question", "assistant:looking", "call:shell", "result:shell:ok\nexit_code: 0", "user:from the follower"}
+	expected := [?]string{"user:question:prompt", "assistant:looking", "call:shell", "result:shell:ok\nexit_code: 0", "user:from the follower:prompt"}
 	if !testing.expect_value(test, len(log.events), len(expected)) { return }
 	for event, index in expected { testing.expect_value(test, log.events[index], event) }
 
@@ -230,7 +262,7 @@ test_the_runner_starts_a_turn_for_lines_other_processes_sent_while_idle :: proc(
 	testing.expect(test, had_message, "a turn was started for the lines")
 	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, nil), "the turn completed")
 
-	expected := [?]string{"user:line one", "user:line two", "user:line three"}
+	expected := [?]string{"user:line one:prompt", "user:line two:prompt", "user:line three:prompt"}
 	if !testing.expect_value(test, follow_log_count(&log, "user:"), len(expected)) { return }
 	for event, index in expected { testing.expect_value(test, log.events[index], event) }
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 1) { return }
@@ -395,7 +427,16 @@ test_follow_attachment_snapshot_keeps_delivery_between_reads_once :: proc(test: 
 	log: Follow_Log
 	defer follow_log_destroy(&log)
 	observer := follow_log_observer(&log)
-	for record in captured_pending { if record.kind == .User_Input { observer.user_text(observer.user_data, string(record.body)) } }
+	for record in captured_pending {
+		if record.kind == .User_Input {
+			input: journal.User_Input
+			origin := journal.User_Origin.Steering
+			if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
+				if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { origin = named }
+			}
+			observer.user_text(observer.user_data, string(record.body), origin)
+		}
+	}
 	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)
 	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)
 	testing.expect_value(test, follow_log_count(&log, "user:queued at attachment"), 1)

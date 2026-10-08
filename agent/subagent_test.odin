@@ -208,7 +208,7 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	testing.expect_value(test, inbox_error, nil)
 	if !testing.expect_value(test, len(inbox), 1) { return }
 	text, origin := inbox_text(inbox[0])
-	testing.expect(test, strings.contains(text, "Message from the orchestrator") && strings.contains(text, "Inspect the parser instead."), text)
+	testing.expect(test, strings.contains(text, "orchestrator says") && strings.contains(text, "Inspect the parser instead."), text)
 	testing.expect_value(test, origin, journal.User_Origin.Agent)
 
 	// A subagent can message only its orchestrator.
@@ -450,7 +450,7 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 
 	testing.expect(test, strings.contains(agent_provider_request(&delegate, 0), `"reasoning_effort":"medium"`), "the subagent runs one level below")
 	report := agent_provider_request(&orchestrator, 2)
-	testing.expect(test, strings.contains(report, "Subagent agent-1 completed"), "the report names the subagent")
+	testing.expect(test, strings.contains(report, "agent-1 answered"), "the report names the subagent")
 	testing.expect(test, strings.contains(report, "forty-two"), "the report carries the answer")
 }
 
@@ -630,16 +630,16 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 	records, read_ok := chat_inbox_read(chat)
 	if !testing.expect(test, read_ok && len(records) == 1) { return }
 	message, _ := inbox_text(records[0])
-	testing.expect(test, strings.contains(message, "agent-1 was stopped"), message)
+	testing.expect(test, strings.contains(message, "agent-1 stopped"), message)
 	chat.delivered = records[0].seq
 	testing.expect(test, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
 }
 
 // A background child whose provider cuts the stream after part of an answer fails, and its
-// report to the orchestrator names the child's session, the cause, and the text it had
+// report to the orchestrator names the child, the cause, and the text it had
 // committed, so the orchestrator knows what was lost and where to look.
 @(test)
-test_a_failed_background_subagent_reports_its_session_cause_and_partial_text :: proc(test: ^testing.T) {
+test_a_failed_background_subagent_reports_cause_and_partial_text :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
@@ -673,9 +673,7 @@ test_a_failed_background_subagent_reports_its_session_cause_and_partial_text :: 
 	records, read_ok := chat_inbox_read(chat)
 	if !testing.expect(test, read_ok && len(records) == 1) { return }
 	report, _ := inbox_text(records[0])
-	session_hex: [journal.SESSION_ID_HEX_LENGTH]u8
-	testing.expect(test, strings.contains(report, "Subagent agent-1 failed"), report)
-	testing.expect(test, strings.contains(report, journal.session_id_to_hex(records[0].subagent, session_hex[:])), report)
+	testing.expect(test, strings.contains(report, "agent-1 failed"), report)
 	testing.expect(test, strings.contains(report, "The parser lives in"), report)
 	completion: journal.Subagent_Completed
 	if journal.payload_decode(records[0].data, &completion, context.temp_allocator) != nil { testing.fail_now(test, "the completion could not be read") }
@@ -786,7 +784,7 @@ test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	records, read_ok := chat_inbox_read(chat)
 	if !testing.expect(test, read_ok && len(records) == 1) { return }
 	message, _ := inbox_text(records[0])
-	testing.expect(test, strings.contains(message, "agent-1 was stopped"), message)
+	testing.expect(test, strings.contains(message, "agent-1 stopped"), message)
 	testing.expect_value(test, agent_provider_request_count(&provider), 0)
 	testing.expect_value(test, chat.team.running, SUBAGENT_TEST_MAX_RUNNING)
 }
@@ -1256,7 +1254,7 @@ test_agent_configure_compacts_a_finished_subagent_and_continues_with_an_effort :
 	}
 
 	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","compact":true}`), success)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "agent-1 completed"), "the compaction ended with a completion")
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "agent-1 answered"), "the compaction ended with a completion")
 	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 5)
 
 	for kind in ([]journal.Record_Kind{.Compaction_Completed, .Checkpoint_Installed}) {

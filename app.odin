@@ -28,6 +28,7 @@ WORK_CAPACITY :: 16
 Entry_Kind :: enum u8 {
 	User,
 	Assistant,
+	Subagent,
 	Tool,
 	Notice,
 	Warning,
