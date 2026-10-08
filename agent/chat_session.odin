@@ -592,8 +592,7 @@ chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch
 // chat_session_accept_user admits a prompt: it opens a turn and commits the input the
 // session accepted but never delivered, then the prompt, as that turn's User nodes before
 // any request is made. observer hears each delivered text once the commit lands.
-// attachments are the files the prompt carries; only the prompt's own node holds them,
-// and the caller keeps their memory.
+// attachments are the files the prompt carries; only the prompt's own node holds them, and the caller keeps their memory.
 chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, observer := Chat_Observer{}, attachments: []ai.Provider_Attachment = nil) -> Chat_Accept {
 	return chat_session_accept_message(chat, text, .Prompt, observer, attachments = attachments)
 }

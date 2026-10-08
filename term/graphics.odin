@@ -8,30 +8,25 @@ import "core:os"
 import "core:strings"
 import "core:terminal/ansi"
 
-// Inline images use the Kitty graphics protocol with Unicode placeholders. A
-// program transmits an image once under an Image_Id and creates a virtual
-// placement of a given size in cells; the image then appears wherever cells
-// hold the placeholder character with the id as their foreground color. The
-// image is therefore part of the cell grid: it scrolls, clips, and is
-// overwritten like text, and present needs no knowledge of it.
+// Inline images use the Kitty graphics protocol with Unicode placeholders: an image is
+// transmitted once under an Image_Id, placed in a run of cells, and appears wherever
+// cells hold the placeholder with the id as their foreground color, as ordinary cell
+// content that scrolls, clips, and is overwritten like text.
 
-// Image_Id names a transmitted image. It is the 24-bit foreground color of the
-// placeholder cells that show it, so valid ids are 1 ..< IMAGE_ID_LIMIT. Zero
-// is no image.
+// Image_Id names a transmitted image as the 24-bit foreground color of its placeholder
+// cells, so valid ids are 1 ..< IMAGE_ID_LIMIT; zero is no image.
 Image_Id :: distinct u32
 
-// IMAGE_ID_LIMIT is the exclusive upper bound of an Image_Id.
 IMAGE_ID_LIMIT :: 1 << 24
 
-// Image_Format selects how Image.data is encoded.
 Image_Format :: enum u8 {
 	PNG, // a complete PNG file
 	RGB, // width * height * 3 bytes, row-major
 	RGBA, // width * height * 4 bytes, row-major
 }
 
-// Image is a borrowed image to transmit. width and height are in pixels and
-// are used for the raw formats only; a PNG carries its own size.
+// Image is a borrowed image to transmit; width and height are pixels and serve the raw
+// formats only, since a PNG carries its own size.
 Image :: struct {
 	data:   []byte,
 	format: Image_Format,
@@ -39,15 +34,12 @@ Image :: struct {
 	height: int,
 }
 
-// GRAPHICS_PLACEHOLDER is the code point (U+10EEEE) that marks a cell as part
-// of an image. Followed by no combining marks it inherits the row, and the
-// column after the cell to its left, from that neighbor (the protocol's
-// inheritance rule), so only the first cell of a row needs marks.
+// GRAPHICS_PLACEHOLDER (U+10EEEE) marks a cell as part of an image. With no combining
+// marks it inherits the row and the column after its left neighbor, so only the first
+// cell of a row needs marks.
 GRAPHICS_PLACEHOLDER :: "\U0010EEEE"
 
-// GRAPHICS_MAX_COLUMNS and GRAPHICS_MAX_ROWS are the largest image placement
-// in cells: the protocol numbers rows and columns with a fixed list of
-// combining marks, 297 long.
+// GRAPHICS_MAX_COLUMNS and GRAPHICS_MAX_ROWS bound a placement in cells: the protocol numbers rows and columns with a 297-long list of combining marks.
 GRAPHICS_MAX_ROWS :: len(graphics_placeholder_rows)
 GRAPHICS_MAX_COLUMNS :: GRAPHICS_MAX_ROWS
 
@@ -57,10 +49,9 @@ GRAPHICS_CHUNK_SIZE :: 4096
 @(private = "file")
 _COLUMN_ZERO_DIACRITIC :: "\u0305"
 
-// graphics_placeholder_rows holds, per image row, the text of that row's first
-// cell: the placeholder, the row's combining mark, and the column-0 mark. The
-// cells after it in the row are bare GRAPHICS_PLACEHOLDER. The strings are
-// static and valid for the life of the program.
+// graphics_placeholder_rows holds, per image row, the text of that row's first cell:
+// the placeholder, the row's combining mark, and the column-0 mark; later cells are
+// bare GRAPHICS_PLACEHOLDER. The strings are static.
 @(rodata)
 graphics_placeholder_rows := [?]string {
 	GRAPHICS_PLACEHOLDER + "\u0305" + _COLUMN_ZERO_DIACRITIC,
@@ -362,13 +353,10 @@ graphics_placeholder_rows := [?]string {
 	GRAPHICS_PLACEHOLDER + "\U0001D244" + _COLUMN_ZERO_DIACRITIC,
 }
 
-// graphics_detect reports whether the terminal is known to draw Kitty
-// placeholder images, judged from the environment alone because the package
-// has no terminal query path. It is true for kitty and Ghostty when the
-// given color depth is TrueColor (the image id travels as a 24-bit
-// foreground color) and the process is not under tmux or screen, which would
-// swallow the graphics sequences. A terminal that supports the protocol but is
-// not recognized reports false.
+// graphics_detect reports whether the terminal is known to draw Kitty placeholder
+// images, judged from the environment alone (the package has no query path): kitty and
+// Ghostty at TrueColor depth (the id is a 24-bit color) outside tmux and screen, which
+// swallow the graphics sequences. An unrecognized terminal reports false.
 @(require_results)
 graphics_detect :: proc(depth: Color_Depth) -> bool {
 	term_buffer, program_buffer, scratch: [128]byte
@@ -396,27 +384,22 @@ _graphics_supported :: proc(depth: Color_Depth, environment: _Graphics_Environme
 	return environment.kitty_window || environment.term == "xterm-kitty" || environment.term == "xterm-ghostty" || environment.term_program == "ghostty"
 }
 
-// _env_value returns the value of an environment variable in buf and whether
-// it is set. A value too long for buf is set but unreadable, which only
-// matters to comparisons, and it matches none. An empty value counts as unset:
-// none of the variables read here is ever set empty, and core:os's libc lookup
-// reports a missing variable with no error, so the error alone cannot say.
+// _env_value returns the value of an environment variable in buf and whether it is set;
+// a value too long for buf is set but matches no comparison. An empty value counts as
+// unset: core:os's libc lookup reports a missing variable with no error, so the error
+// alone cannot say.
 _env_value :: proc(buf: []byte, key: string) -> (value: string, set: bool) {
 	err: os.Error
 	value, err = os.lookup_env(buf, key)
 	return value, value != "" || err == io.Error.Buffer_Full
 }
 
-// graphics_transmit sends image to the terminal under id and creates its
-// virtual placement, columns by rows cells large. The pixels are scaled to the
-// placement. Transmitting an id that exists replaces that image. It returns
-// the bytes written; the terminal answers nothing, so a terminal that rejects
-// the image shows blank placeholder cells and the write still succeeds.
-//
-// Invalid ids, placements larger than GRAPHICS_MAX_COLUMNS by GRAPHICS_MAX_ROWS,
-// empty data, and raw data whose length does not match width, height, and
-// format return .Unsupported without writing. The sequence is one allocation
-// with allocator, released before returning.
+// graphics_transmit sends image under id and creates its placement, columns by rows
+// cells, scaling the pixels to fit; an existing id is replaced. It returns the bytes
+// written, and the terminal answers nothing, so a rejected image shows blank cells and
+// the write still succeeds. Invalid ids or placements and malformed data return
+// .Unsupported without writing; the sequence is one allocation with allocator, released
+// before returning.
 @(require_results)
 graphics_transmit :: proc(session: ^Session, id: Image_Id, image: Image, columns, rows: int, allocator := context.allocator) -> (committed: int, err: Error) {
 	if session == nil || !session.opened {
@@ -427,9 +410,8 @@ graphics_transmit :: proc(session: ^Session, id: Image_Id, image: Image, columns
 	return _session_present(session, transmute([]byte)sequence)
 }
 
-// graphics_place resizes the placement of a transmitted image to columns by
-// rows cells: the old placement is deleted and a new one created from the
-// image data the terminal kept. Placing an id the terminal does not hold shows
+// graphics_place resizes the placement of a transmitted image to columns by rows cells,
+// recreating it from the data the terminal kept; an id the terminal does not hold shows
 // nothing. Errors and allocation are those of graphics_transmit.
 @(require_results)
 graphics_place :: proc(session: ^Session, id: Image_Id, columns, rows: int, allocator := context.allocator) -> (committed: int, err: Error) {
@@ -441,9 +423,9 @@ graphics_place :: proc(session: ^Session, id: Image_Id, columns, rows: int, allo
 	return _session_present(session, transmute([]byte)sequence)
 }
 
-// graphics_delete deletes an image's placements and frees its data in the
-// terminal. Its placeholder cells, if still drawn, show nothing. Errors and
-// allocation are those of graphics_transmit.
+// graphics_delete deletes an image's placements and frees its data in the terminal;
+// placeholder cells still drawn show nothing. Errors and allocation are those of
+// graphics_transmit.
 @(require_results)
 graphics_delete :: proc(session: ^Session, id: Image_Id, allocator := context.allocator) -> (committed: int, err: Error) {
 	if session == nil || !session.opened {
@@ -476,8 +458,7 @@ _graphics_transmit_sequence :: proc(id: Image_Id, image: Image, columns, rows: i
 	encoded := base64.encode(image.data, allocator = allocator) or_return
 	defer delete(encoded, allocator)
 
-	// Every chunk adds at most a few bytes of framing around its payload, and
-	// the first adds the keys, so one allocation holds the whole sequence.
+	// One allocation holds the whole sequence: each chunk adds only a few bytes of framing.
 	chunks := (len(encoded) + GRAPHICS_CHUNK_SIZE - 1) / GRAPHICS_CHUNK_SIZE
 	builder := strings.builder_make_len_cap(0, len(encoded) + 256 + 16 * chunks, allocator) or_return
 	for start := 0; start < len(encoded); start += GRAPHICS_CHUNK_SIZE {
@@ -503,8 +484,7 @@ _graphics_place_sequence :: proc(id: Image_Id, columns, rows: int, allocator: ru
 	if !_graphics_valid(id, columns, rows) {
 		return "", General_Error.Unsupported
 	}
-	// Placing without a placement id adds a placement instead of replacing
-	// one, so the old one goes first. The lowercase delete keeps the data.
+	// A placement without a placement id adds one instead of replacing, so the old placement goes first; the lowercase delete keeps the data.
 	sequence = fmt.aprintf(
 		_GRAPHICS_START + "a=d,d=i,i=%d,q=2" + ansi.ST + _GRAPHICS_START + "a=p,U=1,q=2,i=%d,c=%d,r=%d" + ansi.ST,
 		u32(id),

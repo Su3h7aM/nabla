@@ -38,8 +38,7 @@ Read_Output :: struct {
 }
 
 
-// Read_Media_Output is a read of an image or PDF file. The file itself travels as the
-// result's attachment, so the output only describes it.
+// Read_Media_Output is a read of an image or PDF file; the file travels as the result's attachment, so the output only describes it.
 Read_Media_Output :: struct {
 	path:       string,
 	media_type: string,

@@ -60,12 +60,10 @@
 // custom widgets address a smaller absolute rectangle while retaining the
 // active layout clip.
 //
-// draw_image fills a cell rect with the placeholder cells of a term.Image_Id,
-// which the terminal shows as the image transmitted under that id and placed at
-// the rect's size (term.graphics_transmit, term.graphics_place). The image is
-// then ordinary cells: it clips, scrolls, and is overwritten like text. The
-// first cell of each row names column 0, so a rect clipped at its left edge
-// draws nothing.
+// draw_image fills a cell rect with the placeholder cells of a term.Image_Id, which the
+// terminal shows as the image placed at the rect's size (term.graphics_transmit,
+// term.graphics_place). The image is then ordinary cells that clip and scroll like text;
+// a rect clipped at its left edge draws nothing, since each row names column 0.
 //
 // The widgets subpackage owns reusable UI behavior and caller-owned widget
 // state. Events remain in nabla:input. Terminal sessions, styles, colors,

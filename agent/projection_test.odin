@@ -132,9 +132,7 @@ test_projection_lists_unanswered_calls_and_unsettled_children :: proc(test: ^tes
 	testing.expect(test, projection.nested[1].settled, "a child with a completion is settled")
 }
 
-// A window that starts at a Results node whose Assistant node is outside it, and ends at
-// an Assistant node whose Results node is outside it, loads: the first Results node's
-// calls are skipped and the last Assistant node's calls keep their completions.
+// A window cut through tool exchanges loads: the first Results node's calls are skipped and the last Assistant node's calls keep their completions.
 @(test)
 test_projection_load_nodes_accepts_a_window_cut_through_tool_exchanges :: proc(test: ^testing.T) {
 	fixture: Chat_Test

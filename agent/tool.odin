@@ -428,7 +428,7 @@ Tool_Result :: struct {
 	message:           string, // why the outcome is what it is; "" for a plain success
 	output:            Tool_Output,
 	content:           string,
-	attachments:       []ai.Provider_Attachment, // files the model reads beside content
+	attachments:       []ai.Provider_Attachment,
 	error:             Tool_Argument_Error, // set only when the outcome is .Invalid_Arguments
 	allocation_failed: bool,
 	allocator:         mem.Allocator,

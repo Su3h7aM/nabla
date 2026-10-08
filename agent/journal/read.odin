@@ -248,12 +248,10 @@ read_ancestry :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, all
 	return list[:], nil
 }
 
-// read_path returns the id of every node on the parent chain from head back to the
-// root, oldest first, and no bodies. Unlike read_ancestry it does not stop at a
-// Checkpoint, and it crosses the base of a forked branch into the branch it forked
-// from, so it is the full history the user can scroll through. A zero head returns an
-// empty path. A head or parent the session does not hold is Corrupt. The result is
-// owned by allocator; release it with delete.
+// read_path returns the ids on the parent chain from head back to the root, oldest
+// first, crossing fork bases and never stopping at a Checkpoint, unlike read_ancestry.
+// A zero head returns an empty path, a head or parent the session does not hold is
+// Corrupt, and the result is owned by allocator; release it with delete.
 @(require_results)
 read_path :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocator: mem.Allocator) -> (path: []Node_Id, error: Error) {
 	assert(journal.open)
@@ -278,8 +276,7 @@ read_path :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocat
 		if len(list) == 0 { oldest_parent = parent }
 		append(&list, id) or_return
 	}
-	// The newest row is head, and the oldest must be the root; anything else is a
-	// parent the tree promised and the session does not hold.
+	// Anything else is a parent the tree promised and the session does not hold.
 	if len(list) == 0 || list[len(list) - 1] != head || oldest_parent != 0 {
 		return nil, corrupt(journal, Journal_Error.Corrupt, session, 0)
 	}
@@ -287,9 +284,9 @@ read_path :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocat
 }
 
 // read_nodes returns the nodes of session named by ids, with data and body, in the
-// order of ids, in one query. ids must be distinct, and a node the session does not
-// hold is Corrupt. The ids are bound parameters, so their count is bounded by SQLite's
-// variable limit. The result is owned by allocator; release it with nodes_destroy.
+// order of ids. ids must be distinct, a node the session does not hold is Corrupt, and
+// their bound count is capped by SQLite's variable limit. The result is owned by
+// allocator; release it with nodes_destroy.
 @(require_results)
 read_nodes :: proc(journal: ^Journal, session: Session_Id, ids: []Node_Id, allocator: mem.Allocator) -> (nodes: []Node, error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
@@ -564,9 +561,8 @@ NODE_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND node
 @(private)
 NODE_LAST_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND kind = ? ORDER BY node DESC LIMIT 1"
 
-// The parent chain of node ?2 in session ?1. UNION drops a node it already holds, so a
-// damaged parent that points back cannot loop. Ids grow in commit order, so the chain
-// ordered by id is oldest first.
+// The parent chain of node ?2 in session ?1: UNION drops a repeated node so a damaged parent that points back cannot loop, and ids grow in commit order so
+// ordering by id is oldest first.
 @(private)
 PATH_QUERY :: `WITH RECURSIVE chain(node, parent) AS (
 	SELECT node, parent FROM nodes WHERE session = ?1 AND node = ?2

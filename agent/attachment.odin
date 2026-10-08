@@ -6,12 +6,9 @@ import "core:strings"
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// attachments_record buffers the bytes of attachments as journal artifacts and returns
-// the references a User node or a tool.completed record carries, in the same order.
-// The references borrow each name and own their digest text and the slice, all
-// allocated with allocator; scratch memory suits, since the journal copies the
-// references when the record is appended. On an allocation error the references made
-// so far are left to allocator.
+// attachments_record buffers attachment bytes as journal artifacts and returns the references a User node or a tool.completed record carries, in order. The
+// references borrow each name and own their digest text and the slice from allocator (scratch memory suits, since the journal copies them on append); on an
+// allocation error those made so far are left to allocator.
 @(require_results)
 attachments_record :: proc(
 	store: ^journal.Journal,

@@ -112,9 +112,8 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	return tool_result_success(ctx, result, reason)
 }
 
-// tool_read_media answers a read of an image or PDF: the file's bytes become the
-// result's attachment, named by the file's base name. It takes ownership of data,
-// allocated with ctx.allocator.
+// tool_read_media answers a read of an image or PDF: the file's bytes become the result's attachment, named by the file's base name. It takes ownership of
+// data, allocated with ctx.allocator.
 @(private, require_results)
 tool_read_media :: proc(ctx: ^Tool_Context, display_path, path: string, media: ai.Provider_Media, data: []u8) -> Tool_Result {
 	media_type := ai.PROVIDER_MEDIA_TYPES[media]

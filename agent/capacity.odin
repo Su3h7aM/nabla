@@ -13,7 +13,6 @@ Model_Capacity :: struct {
 	model_max_output: int,
 	margin:           int,
 	trigger:          int,
-	// media is the file formats the model takes as input.
 	media:            bit_set[ai.Provider_Media],
 }
 
@@ -73,8 +72,7 @@ MEDIA_MODALITIES := [ai.Provider_Media]string {
 	.PDF  = "pdf",
 }
 
-// model_media returns the file formats whose modality the model lists. A model that lists
-// none, or states nothing, takes no file.
+// model_media returns the file formats whose modality the model lists; a model that lists none, or states nothing, takes no file.
 model_media :: proc(model: Catalog_Model) -> (media: bit_set[ai.Provider_Media]) {
 	for modality in model.input_modalities.? or_else nil {
 		for name, format in MEDIA_MODALITIES {

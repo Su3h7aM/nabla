@@ -292,8 +292,7 @@ acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 			protocol_version = negotiated,
 			info = {name = NABLA_ACP_NAME, title = "Nabla", version = NABLA_ACP_VERSION},
 			capabilities = {
-				// The v2 session surface is implemented below. Nabla takes image
-				// prompts but not audio, and it exposes stdio MCP only.
+				// The v2 session surface is implemented below: image prompts but not audio, stdio MCP only.
 				session = {prompt = {image = acp.V2_Support{}, embedded_context = {}}, mcp = {stdio = {}}},
 			},
 			auth_methods = auth_methods,
@@ -940,7 +939,7 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
-	// The work item takes text and attachments on success; every refusal below releases them.
+	// Every refusal below releases the text and attachments the work item would have taken.
 	queued := false
 	defer if !queued {
 		delete(text, server.alloc)
@@ -1048,16 +1047,11 @@ acp_enqueue :: proc(session: ^ACP_Session, work: ACP_Work) -> bool {
 
 // --- prompts -----------------------------------------------------------------
 
-// acp_prompt_text renders a prompt's content blocks as the one message the harness records,
-// with the files it carries. Text blocks are the message itself; a resource link becomes
-// the path it names, and an embedded text resource brings its text along. An image block
-// and a binary resource whose bytes are a recognized image or PDF become attachments.
-// Other binary resources are named in a note so the model knows bytes were attached but
-// not included. Other unsupported content, an image block that is not a recognized
-// format, and base64 that does not decode are refused rather than dropped, and reason
-// names the block when ok is false.
-// text and attachments, with their names and bytes, are owned by allocator; release the
-// attachments with acp_attachments_destroy.
+// acp_prompt_text renders a prompt's content blocks as the one message the harness records, with the files it carries. Text blocks are the message itself; a
+// resource link becomes the path it names; an embedded text resource brings its text along; an image block or a binary resource whose bytes are a recognized
+// image or PDF becomes an attachment; and other binary resources are named in a note so the model knows bytes were attached but not included. Unsupported
+// content, an unrecognized image, and base64 that does not decode are refused rather than dropped, and reason names the block when ok is false. text and
+// attachments, with their names and bytes, are owned by allocator; release the attachments with acp_attachments_destroy.
 @(require_results)
 acp_prompt_text :: proc(
 	blocks: []acp.Content_Block,
@@ -1153,9 +1147,8 @@ ACP_Prompt_Attach :: enum {
 	Allocation,
 }
 
-// acp_prompt_attach decodes encoded and, when the bytes are a recognized image or PDF,
-// appends them to attachments, named by the base name of uri or else by their position
-// and format. Nothing is appended for any other result.
+// acp_prompt_attach decodes encoded and, when the bytes are a recognized image or PDF, appends them to attachments, named by the base name of uri or else by
+// their position and format. Nothing is appended for any other result.
 @(private, require_results)
 acp_prompt_attach :: proc(attachments: ^[dynamic]ai.Provider_Attachment, encoded: string, uri: string, allocator: mem.Allocator) -> ACP_Prompt_Attach {
 	data, decode_error := base64.decode(encoded, allocator = allocator)

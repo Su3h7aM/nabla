@@ -1244,8 +1244,7 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	if acp_test_client_expect(t, &client, `"id":5,"result"`, "v2 plain resume did not answer") == "" { return }
 }
 
-// A prompt with an image block reaches the session as a user message that carries the file:
-// the journal's User node for the turn names one PNG attachment, whatever mimeType said.
+// A prompt with an image block reaches the session as a user message carrying one PNG attachment, whatever mimeType said.
 @(test)
 test_acp_prompt_records_an_image_block_as_an_attachment :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }

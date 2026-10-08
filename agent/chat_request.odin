@@ -303,10 +303,9 @@ chat_build_request_selection_into :: proc(
 	return nil
 }
 
-// Chat_Replay_Target is the model a request is built for: the endpoint identity and the input
-// it takes. An endpoint's native output items are replayed only to the API, provider, and
-// model that produced them; any other target gets the neutral text and calls. An attachment
-// in a format the model does not take is left out and the message says so.
+// Chat_Replay_Target is the model a request is built for: the endpoint identity and the input it takes. An endpoint's native output items are replayed only to
+// the API, provider, and model that produced them; any other target gets the neutral text and calls, and an attachment the model does not take is left out and
+// the message says so.
 Chat_Replay_Target :: struct {
 	api:      ai.API_Kind,
 	provider: string,
@@ -462,9 +461,8 @@ chat_append_projection :: proc(
 	return
 }
 
-// chat_accept_attachments returns the files the model takes and content with a note on its
-// own line for each file it does not, so the model knows what it was not shown. When the
-// model takes every file, both results borrow the arguments.
+// chat_accept_attachments returns the files the model takes and content with a note for each file it does not, so the model knows what it was not shown. When
+// the model takes every file, both results borrow the arguments.
 @(private, require_results)
 chat_accept_attachments :: proc(
 	content: string,
@@ -612,10 +610,8 @@ chat_attachment_tokens :: proc(attachment: ai.Provider_Attachment) -> int {
 	return 0
 }
 
-// chat_pdf_page_count counts the page objects of a PDF, at least one. A page object is
-// marked /Type/Page or /Type /Page; /Type/Pages, the page tree, is not one. A file that
-// keeps its page objects in compressed object streams has no readable marker and counts as
-// one page.
+// chat_pdf_page_count counts the page objects of a PDF, at least one: a page object is marked /Type/Page or /Type /Page (/Type/Pages, the page tree, is not
+// one), and a file that keeps its page objects in compressed object streams has no readable marker and counts as one page.
 @(private)
 chat_pdf_page_count :: proc(data: []u8) -> int {
 	pages := 0

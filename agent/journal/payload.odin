@@ -126,9 +126,8 @@ RESPONSE_FINISH_NAMES := [Response_Finish]string {
 	.Tool_Call      = "tool_call",
 }
 
-// Completion ends a unit of work: outcome is a TOOL_OUTCOME_NAMES name for a
-// call, Lua run, Task, or subagent. attachments are the files a tool result
-// carries beside its rendered text, in the order the model reads them.
+// Completion ends a unit of work: outcome is a TOOL_OUTCOME_NAMES name for a call, Lua run, Task, or subagent. attachments are the files a tool result carries
+// beside its rendered text, in the order the model reads them.
 Completion :: struct {
 	version:     int,
 	outcome:     string,
@@ -139,17 +138,14 @@ Completion :: struct {
 Tool_Completed :: Completion
 Call_Completed :: Completion // lua.completed, task.completed
 
-// Attachment names one file a User node or a tool result carries. Its bytes are
-// the artifact stored under digest, as lowercase hexadecimal; media_type is the
-// media type the format is named by on the wire, and name the file name the
-// model is told.
+// Attachment names one file a User node or a tool result carries; its bytes are the artifact stored under digest, as lowercase hexadecimal, media_type is the
+// wire name of the format, and name is the file name the model is told.
 Attachment :: struct {
 	media_type: string,
 	name:       string,
 	digest:     string,
 }
 
-// ATTACHMENT_ARTIFACT is the artifact kind an attachment's bytes are stored as.
 ATTACHMENT_ARTIFACT :: "attachment"
 
 // User_Input is one line a user sent a session, committed before anything acknowledges

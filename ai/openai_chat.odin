@@ -49,9 +49,7 @@ openai_chat_encode_request :: proc(
 		encode_write_literal_string(&cursor, body, "system")
 		encode_write_raw(&cursor, body, "}")
 	}
-	// A run of adjacent tool messages is written as it comes, and its files follow it as
-	// one user message when the next message is not a tool result. Reasoning items are
-	// dropped below, so they never end a run.
+	// The files of a run of adjacent tool messages follow it as one user message once the run ends.
 	run_start, run_end := 0, 0
 	for message, message_index in request.Messages {
 		// Chat Completions has no reasoning input; reasoning continuity is
@@ -67,8 +65,7 @@ openai_chat_encode_request :: proc(
 		encode_write_item(&cursor, body, &item_first)
 		field_first := true
 		encode_write_raw(&cursor, body, "{")
-		// Only a user message carries its attachments in its own content: a tool message
-		// accepts text only, so a tool result's files follow its run of tool messages.
+		// A tool message accepts text only, so a tool result's files follow its run.
 		attachments := message.Role == .User ? message.Attachments : nil
 		switch {
 		case message.Role == .Assistant && message.Content == "" && len(message.Tool_Calls) > 0:
@@ -171,9 +168,8 @@ openai_chat_encode_request :: proc(
 	return encode_finish_take(&cursor)
 }
 
-// openai_chat_write_attachments writes each attachment as the image or file content part
-// Chat Completions takes. Every part type accepts a cache breakpoint, so a marked list
-// carries it on its last part.
+// openai_chat_write_attachments writes each attachment as the image or file content part Chat Completions takes; a marked list carries its cache breakpoint on
+// the last part.
 @(private)
 openai_chat_write_attachments :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, part_first: ^bool, attachments: []Provider_Attachment, marked: bool) {
 	for attachment, index in attachments {
@@ -209,9 +205,8 @@ openai_chat_write_attachments :: proc(cursor: ^Encode_Cursor, body: ^strings.Bui
 	}
 }
 
-// openai_chat_write_tool_attachments writes the files of a run of adjacent tool results as
-// one user message, after the run. Tool messages accept text only, and every tool message
-// answering an assistant message has to stay adjacent, so the files cannot sit between them.
+// openai_chat_write_tool_attachments writes the files of a run of adjacent tool results as one user message, after the run: tool messages accept text only and
+// must stay adjacent to their assistant message, so the files cannot sit between them.
 @(private)
 openai_chat_write_tool_attachments :: proc(
 	cursor: ^Encode_Cursor,

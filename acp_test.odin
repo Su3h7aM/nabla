@@ -38,8 +38,7 @@ test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^test
 	testing.expect(t, !bad_ok)
 	testing.expect(t, bad_reason != "")
 
-	// The signature decides: a PDF sent as a blob resource is a document attachment, and
-	// an image block without a uri is named by its position and format.
+	// The signature decides: a PDF sent as a blob resource is a document attachment, and an image block without a uri is named by its position and format.
 	files := []acp.Content_Block {
 		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/paper.pdf", mime_type = "text/plain", blob = "JVBERi0xLjQK", blob_present = true}},
 		{type = acp.CONTENT_IMAGE, data = "iVBORw0KGgo="},

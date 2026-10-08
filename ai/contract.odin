@@ -70,9 +70,8 @@ Provider_Tool_Def :: struct {
 	Parameters_JSON: string, // borrowed until operation retirement,
 }
 
-// Provider_Media is a file format a message can carry beside its text. The images are
-// the formats the Messages API accepts, which the OpenAI APIs accept too, and PDF is the
-// one document format all three API families read.
+// Provider_Media is a file format a message can carry beside its text: the images the Messages API accepts, and PDF, the one document all three API families
+// read.
 Provider_Media :: enum {
 	PNG,
 	JPEG,
@@ -81,7 +80,6 @@ Provider_Media :: enum {
 	PDF,
 }
 
-// PROVIDER_MEDIA_TYPES is the media type each format is named by on the wire.
 PROVIDER_MEDIA_TYPES := [Provider_Media]string {
 	.PNG  = "image/png",
 	.JPEG = "image/jpeg",
@@ -90,17 +88,16 @@ PROVIDER_MEDIA_TYPES := [Provider_Media]string {
 	.PDF  = "application/pdf",
 }
 
-// Provider_Attachment is one file a user message or a tool result carries beside its
-// text. The encoder writes Data as base64, so a caller holds the file's own bytes.
+// Provider_Attachment is one file a user message or a tool result carries beside its text. The encoder writes Data as base64, so a caller holds the file's own
+// bytes.
 Provider_Attachment :: struct {
 	Media: Provider_Media,
-	Name:  string, // borrowed until operation retirement; the file name the model is told,
-	Data:  []u8, // borrowed until operation retirement; the file's bytes,
+	Name:  string, // borrowed until operation retirement; the name the model is told,
+	Data:  []u8, // borrowed until operation retirement,
 }
 
-// Provider_Media_Detect names the format of data from the signature it starts with, and
-// reports false for data that starts with none of them. The signature decides, never a
-// file name or a stated media type, so what is sent is what the endpoint is told it is.
+// Provider_Media_Detect names the format of data from the signature it starts with, false when it starts with none of them. The signature decides, never a file
+// name or a stated media type.
 @(require_results)
 Provider_Media_Detect :: proc(data: []u8) -> (media: Provider_Media, ok: bool) {
 	text := string(data)
@@ -122,8 +119,7 @@ Provider_Media_Detect :: proc(data: []u8) -> (media: Provider_Media, ok: bool) {
 Provider_Message :: struct {
 	Role:                Provider_Role,
 	Content:             string, // borrowed until operation retirement,
-	// Attachments are the files a .User message or a .Tool result carries after its
-	// text. A user message with attachments may have empty Content.
+	// Attachments are the files a .User message or a .Tool result carries after its text; a user message may have empty Content.
 	Attachments:         []Provider_Attachment, // borrowed until operation retirement,
 	Tool_Call_ID:        string, // borrowed; set on .Tool results, matches a call ID,
 	// Tool_Is_Error marks a tool result the model should read as a failure. The

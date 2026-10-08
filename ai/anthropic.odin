@@ -373,8 +373,7 @@ anthropic_write_text_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builde
 	encode_write_raw(cursor, body, "}")
 }
 
-// anthropic_write_attachment_block writes an attachment as the image or document block
-// the Messages API takes.
+// anthropic_write_attachment_block writes an attachment as the image or document block the Messages API takes.
 @(private)
 anthropic_write_attachment_block :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, attachment: Provider_Attachment, marked: bool) {
 	field_first := true

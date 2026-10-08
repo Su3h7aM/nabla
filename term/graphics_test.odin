@@ -8,8 +8,7 @@ import "core:testing"
 
 @(test)
 test_graphics_transmit_chunks_the_payload :: proc(t: ^testing.T) {
-	// 3073 zero bytes encode to 4096 'A's and one more group, so the payload
-	// splits into a full chunk and a one-group chunk.
+	// 3073 zero bytes encode to 4096 'A's plus one group, splitting the payload at the chunk size.
 	data := make([]byte, 3073)
 	defer delete(data)
 	sequence, err := _graphics_transmit_sequence(7, {data = data, format = .PNG}, 3, 2, context.allocator)
@@ -88,8 +87,7 @@ test_graphics_detect_decision :: proc(t: ^testing.T) {
 	}
 }
 
-// A placeholder cell is ordinary text to present: the frame must validate and
-// the combining marks must reach the output.
+// A placeholder cell is ordinary text to present: the frame must validate and the combining marks must reach the output.
 @(test)
 test_graphics_placeholders_are_a_valid_frame :: proc(t: ^testing.T) {
 	style := Style {

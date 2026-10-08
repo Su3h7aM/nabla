@@ -332,9 +332,8 @@ encode_write_text :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, text: 
 	encode_write_raw(cursor, body, strings.to_string(slot.bytes))
 }
 
-// encode_write_base64 writes the base64 characters of data. The caller writes the quotes
-// and any prefix around them. The characters are not cached: comparing a file against a
-// cached copy costs about what encoding it does.
+// encode_write_base64 writes the base64 characters of data; the caller writes the quotes and any prefix around them. The characters are not cached: comparing a
+// file against a cached copy costs about what encoding it does.
 @(private = "package")
 encode_write_base64 :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, data: []u8) {
 	if base64.encode_into(strings.to_writer(body), data) != .None { encode_fail(cursor, .Allocation) }
@@ -431,7 +430,6 @@ encode_write_cache_fields :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder
 	}
 }
 
-// encode_write_breakpoint writes the explicit cache breakpoint field of a content part.
 @(private = "package")
 encode_write_breakpoint :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, field_first: ^bool) {
 	encode_write_field(cursor, body, field_first, "prompt_cache_breakpoint")

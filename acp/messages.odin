@@ -293,8 +293,8 @@ Session_Close_Params :: struct {
 }
 
 // Embedded_Resource is a resource the client inlined into the prompt. Text travels with
-// the message; a binary resource keeps its base64 text in blob, borrowed from the decoded
-// JSON value, and blob_present reports whether the field was there at all.
+// the message; a binary resource keeps its base64 text in blob, borrowed from the decoded JSON value, and blob_present reports whether the field was there at
+// all.
 Embedded_Resource :: struct {
 	uri:          string `json:"uri"`,
 	text:         string `json:"text"`,
@@ -305,8 +305,8 @@ Embedded_Resource :: struct {
 
 // Content_Block is one element of a prompt. The union is by `type`, and every kind's
 // fields live side by side rather than in a tagged union, because the JSON decoder fills
-// the shape the document has and a block carries whichever fields its type names. An
-// image block keeps its base64 text in data, borrowed from the decoded JSON value.
+// the shape the document has and a block carries whichever fields its type names. An image block keeps its base64 text in data, borrowed from the decoded JSON
+// value.
 Content_Block :: struct {
 	type:      string `json:"type"`,
 	text:      string `json:"text"`,

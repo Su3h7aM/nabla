@@ -234,9 +234,8 @@ openai_responses_encode_request_body :: proc(
 	return encode_finish_take(&cursor)
 }
 
-// openai_responses_write_attachments writes each attachment as the input_image or
-// input_file part the Responses API takes. Every part type accepts a cache breakpoint, so
-// a marked list carries it on its last part.
+// openai_responses_write_attachments writes each attachment as the input_image or input_file part the Responses API takes; a marked list carries its cache
+// breakpoint on the last part.
 @(private)
 openai_responses_write_attachments :: proc(
 	cursor: ^Encode_Cursor,

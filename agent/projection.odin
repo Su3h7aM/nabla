@@ -125,17 +125,12 @@ projection_load :: proc(
 	return projection, nil
 }
 
-// projection_load_nodes builds the projection of nodes, oldest first, which may be
-// any slice of a branch's history, for example a window the user scrolled to. The
-// caller owns nodes and arena and releases arena whether or not the load succeeds.
-// head is the last node's id.
-//
-// A Results node whose Assistant node is outside nodes has its calls skipped, since
-// nothing in the window proposed them. An Assistant node whose Results node is outside
-// nodes keeps its calls, and a completion is read by the Assistant node (the
-// Tool_Completed record carries it), so the call's result is in unanswered. A call
-// proposed inside nodes that its Results node names without a completion is still
-// Corrupt.
+// projection_load_nodes builds the projection of nodes, oldest first, which may be any
+// slice of a branch's history; head is the last node's id, and the caller owns nodes and
+// arena and releases arena whether or not the load succeeds. A Results node whose
+// Assistant node is outside nodes has its calls skipped, an Assistant node whose Results
+// node is outside keeps its calls with their completions, and a call proposed in nodes
+// without a completion is still Corrupt.
 @(require_results)
 projection_load_nodes :: proc(
 	store: ^journal.Journal,
@@ -149,7 +144,6 @@ projection_load_nodes :: proc(
 	return projection_build(store, session, nodes, false, arena)
 }
 
-// projection_build is the shared body of projection_load and projection_load_nodes.
 // With strict set, a Results node naming a call that has no completion is Corrupt
 // whether or not the call was proposed in nodes; without it, such a call is skipped
 // unless nodes proposed it.
@@ -308,9 +302,8 @@ projection_result :: proc(store: ^journal.Journal, record: ^journal.Record, aren
 	return result, nil
 }
 
-// projection_attachments reads the files a record names, with their bytes, into arena. An
-// unknown media type, a malformed digest, or an artifact the journal no longer has is a
-// record it cannot read.
+// projection_attachments reads the files a record names, with their bytes, into arena; an unknown media type, a malformed digest, or an artifact the journal no
+// longer has is a record it cannot read.
 @(private, require_results)
 projection_attachments :: proc(
 	store: ^journal.Journal,

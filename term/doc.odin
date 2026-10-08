@@ -107,22 +107,17 @@
 //
 // Inline images:
 // - graphics.odin draws images with the Kitty graphics protocol and Unicode
-//   placeholders. graphics_transmit sends PNG or raw RGB/RGBA pixels under an
-//   Image_Id and creates a virtual placement of columns by rows cells;
-//   graphics_place resizes the placement, and graphics_delete frees the image.
-//   Like clipboard_set, each is one sequence written through the shared write
-//   path, reports the bytes written rather than whether the terminal kept
-//   them, and sends no query (q=2 silences the replies).
+//   placeholders. graphics_transmit sends pixels under an Image_Id and places
+//   them in a run of cells; graphics_place resizes the placement and
+//   graphics_delete frees the image. Like clipboard_set, each writes one
+//   sequence through the shared write path, reports bytes written rather than
+//   whether the terminal kept them, and sends no query.
 // - The image appears wherever cells hold GRAPHICS_PLACEHOLDER with the id as
-//   their 24-bit foreground color. graphics_placeholder_rows[row] is the text
-//   of a row's first cell (placeholder, row mark, column-0 mark); the cells
-//   after it are bare placeholders and inherit the next column. The table's
-//   length, GRAPHICS_MAX_ROWS, is the protocol's limit on rows and columns.
-//   Placeholder cells are ordinary width-1 cells, so present needs no support.
-// - graphics_detect decides from TERM, TERM_PROGRAM, KITTY_WINDOW_ID, TMUX,
-//   and STY, because the package has no query path: kitty and Ghostty at
-//   TrueColor depth outside tmux and screen. An unrecognized terminal that
-//   supports the protocol reports false.
+//   their 24-bit foreground color; graphics_placeholder_rows[row] is the text
+//   of a row's first cell. Placeholder cells are ordinary width-1 cells, so
+//   present needs no support.
+// - graphics_detect decides from the environment alone (the package has no
+//   query path): kitty and Ghostty at TrueColor depth outside tmux and screen.
 //
 // Frame validation and encoding:
 // - present/encode validate the whole frame before a single byte is written:
