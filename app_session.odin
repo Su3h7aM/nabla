@@ -125,13 +125,9 @@ App :: struct {
 	transcript:                 Transcript,
 	home:                       string, // owned; shortens the footer path,
 	input:                      widgets.Input,
-	// scroll_top is the first visible row of the scrolled-up transcript, counted from
-	// its top, so content added below never moves it. Absent follows the bottom.
-	scroll_top:                 Maybe(int),
-	// conv_scroll_range is the conversation's scrollable height in rows, as
-	// the last completed layout frame reported it. It is the offset that shows
-	// the newest content at the bottom and grows with the transcript.
-	conv_scroll_range:          int,
+	// conversation_scroll is the transcript's position. It pins a row while scrolled up, so
+	// content added below never moves it, and carries the range the last frame solved.
+	conversation_scroll:        widgets.Scroll,
 	generation_seen:            u64,
 	// steer_active is whether the runtime was running when this thread last looked. The
 	// transition back to idle is what returns input the turn never applied to the

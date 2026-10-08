@@ -211,6 +211,14 @@ Frame_Storage :: struct {
 	stale:             [dynamic]term.Image_Id,
 	// graphics_failed latches the one warning a failing image write produces.
 	graphics_failed:   bool,
+	// tool_blocks is the border of each tool box the frame declared, drawn once the frame is solved.
+	tool_blocks:       [dynamic]Tool_Block,
+}
+
+// Tool_Block is one tool box's border: the entry id its layout element carries and the block to draw around that element's rect.
+Tool_Block :: struct {
+	id:    u64,
+	block: widgets.Block,
 }
 
 @(require_results)
@@ -219,6 +227,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
 	storage.links = make([dynamic]string, alloc)
+	storage.tool_blocks = make([dynamic]Tool_Block, alloc)
 	storage.shown = make([dynamic]Image_Placement, alloc)
 	storage.placed = make([dynamic]Image_Placement, alloc)
 	storage.uploads = make([dynamic]Image_Upload, alloc)
@@ -248,6 +257,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 
 frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 	delete(storage.links)
+	delete(storage.tool_blocks)
 	delete(storage.shown)
 	delete(storage.placed)
 	for &upload in storage.uploads { delete(upload.pixels) }
@@ -391,17 +401,15 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 }
 
 // draw_conversation solves the transcript as a layout column and draws the visible text
-// lines into rect. The conversation root is a scroll container: the clip offset is
-// app.scroll_top, or the range when it is absent and the view follows the bottom. A
-// following offset needs the solved range, so the first pass uses the previous frame's;
-// when that moved the frame re-solves once with the corrected offset.
+// lines into rect. The conversation root is a scroll container whose clip offset is
+// the scroll's offset. The offset needs the solved range, so the first pass uses the
+// previous frame's; when the solved range moved it, the frame re-solves once.
 @(require_results)
 draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> bool {
 	if rect.height <= 0 || rect.width <= 0 {
 		return true
 	}
-	scroll_clamp(app)
-	offset := scroll_view_top(app)
+	offset := widgets.scroll_offset(app.conversation_scroll)
 	viewport := layout.Vec2{layout.Scalar(rect.width), layout.Scalar(rect.height)}
 	storage.conversation_rows = rect.height
 	order := transcript_order(app)
@@ -415,15 +423,15 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		if !found {
 			return false
 		}
-		app.conv_scroll_range = int(node.scroll_range.y)
-		scroll_clamp(app)
-		corrected := scroll_view_top(app)
+		widgets.scroll_set_range(&app.conversation_scroll, int(node.scroll_range.y))
+		corrected := widgets.scroll_offset(app.conversation_scroll)
 		if corrected == offset || pass == 1 {
 			// The last solve declared every entry this frame draws, so the
 			// Markdown it did not ask for belongs to entries that are gone.
 			markdown_cache_sweep(&storage.markdown)
 			transcript_measure(app, order, frame_result, rect.height)
 			if !draw_conversation_commands(storage, frame_result, rect) { return false }
+			if !draw_tool_blocks(storage, frame_result, rect) { return false }
 			selection_paint(app, storage, rect)
 			box_drag_paint(app, storage, frame_result, rect)
 			return true
@@ -472,6 +480,7 @@ conversation_solve :: proc(
 // the frame's own `if` block, because that block is what layout closes the frame on.
 declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int, order: []^Entry) {
 	clear(&storage.links)
+	clear(&storage.tool_blocks)
 	// Services bind for one frame only, so every solve re-binds them.
 	layout.set_services(
 		&storage.layout_ctx,
@@ -595,6 +604,25 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 	return true
 }
 
+// draw_tool_blocks draws each declared tool box's border around the rect its layout element solved to, clipped to the transcript's last row.
+@(require_results)
+draw_tool_blocks :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
+	clipped := storage.buffer
+	clipped.rows = viewport.y + viewport.height
+	for tool in storage.tool_blocks {
+		for node in frame_result.nodes {
+			if u64(node.user) != tool.id || node.flags.is_text { continue }
+			rect, project_err := tui.project_rect_integral(node.outer)
+			if project_err != nil { return false }
+			rect.x += viewport.x
+			rect.y += viewport.y
+			widgets.draw_block(&clipped, rect, tool.block)
+			break
+		}
+	}
+	return true
+}
+
 // draw_conversation_image draws a picture's placeholder cells into a view of the grid that ends at the transcript's last row,
 // so the part below it is clipped, and records it as shown.
 @(require_results)
@@ -634,7 +662,7 @@ box_drag_paint :: proc(app: ^App, storage: ^Frame_Storage, frame_result: layout.
 	for node in frame_result.nodes {
 		if u64(node.user) != drag.id { continue }
 		for shown in 0 ..< entry.tool_rows {
-			row := entry.tool_scroll + shown
+			row := widgets.scroll_offset(entry.tool_scroll) + shown
 			if row < min(drag.anchor, drag.cursor) || row > max(drag.anchor, drag.cursor) { continue }
 			y := int(node.outer.position.y) + 1 + shown
 			if y < 0 || y >= viewport.height { continue }
@@ -816,6 +844,8 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // border, then a window of its result. A collapsed box shows the first rows its entry kept and
 // the bottom border counts the lines hidden. An expanded box (entry.full) scrolls its whole
 // text in the window (see `entry.tool_scroll`) and draws its border in the bright color.
+// The box is one layout element whose padding reserves the border; the border itself is a
+// widgets.Block recorded in storage.tool_blocks and drawn by draw_tool_blocks once solved.
 // Only the border carries the outcome color. Code Mode calls draw here too, in blue on success.
 // A running call draws the spinner frame before its name and the working border color.
 declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
@@ -839,30 +869,34 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	// this much room; the rest of the top border is rule.
 	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
 	preview = display_clean(preview, context.temp_allocator)
-	// These presentation scratch strings are best effort. A failed repeat leaves a
-	// shorter border or spacer, never a tool result or a model-visible field; the
-	// next frame retries with a fresh temporary arena.
-	rule_fill :=
-		strings.repeat(outline.horizontal, max(border_inner_width - text.text_columns_at(name, TOOL_LABEL_START) - 3, 0), context.temp_allocator) or_else ""
-	top := fmt.tprintf("%s%s %s %s%s", outline.top_left, outline.horizontal, name, rule_fill, outline.top_right)
-	// The window is the part of the result the box shows. Its offset is clamped
+	title := fmt.tprintf("%s %s ", outline.horizontal, name)
+	// The window is the part of the result the box shows. Its range is set
 	// here because this is where the row count and the box's width are both known:
 	// a resize or a shorter result can leave a remembered offset past the end.
 	content_rows := tool_preview_rows(preview, content_width, TOOL_CONTENT_START)
 	visible_rows := min(content_rows, TOOL_WINDOW_ROWS)
-	// The bound is kept on the entry because the wheel asks whether the window has
-	// room left before it decides who owns the report.
 	scrolls := expanded || entry.running
-	entry.tool_scroll_max = max(content_rows - visible_rows, 0) if scrolls else 0
-	entry.tool_scroll = clamp(entry.tool_scroll, 0, entry.tool_scroll_max)
+	// The range stays on the entry because the wheel asks whether the window has
+	// room left before it decides who owns the report. A collapsed box has no range
+	// and keeps its position, so it opens where it was left.
+	first_row := 0
+	if scrolls {
+		widgets.scroll_set_range(&entry.tool_scroll, content_rows - visible_rows)
+		first_row = widgets.scroll_offset(entry.tool_scroll)
+	} else {
+		entry.tool_scroll.range = 0
+	}
 	entry.tool_rows = visible_rows
 	label: string
 	if scrolls {
-		label = tool_window_label(entry.tool_scroll, entry.tool_scroll_max - entry.tool_scroll)
+		label = tool_window_label(first_row, entry.tool_scroll.range - first_row)
 	} else if hidden := entry.hidden_lines + content_rows - visible_rows; hidden > 0 {
 		label = fmt.tprintf("%d more line%s", hidden, "" if hidden == 1 else "s")
 	}
-	bottom := tool_border_bottom(outline, border_inner_width, label)
+	footer: string
+	if visible := text.truncate_text_at(label, max(border_inner_width - 3, 0), TOOL_LABEL_START); visible != "" {
+		footer = fmt.tprintf("%s %s ", outline.horizontal, visible)
+	}
 	border_style := TOOL_FAILURE
 	switch {
 	case entry.running:
@@ -872,36 +906,41 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	}
 	if expanded { border_style = tool_border_bright(border_style) }
 	if entry.selected { border_style.modifiers += {.Bold} }
-	if layout.element(
-		ctx,
-		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = layout.User_Tag(entry.id)},
-	) {
-		border := tui.text_style(border_style)
-		body := tui.text_style(TOOL_BODY)
-		layout.text(ctx, layout.Text_Desc{text = top, style = border})
-		remaining := preview
-		row_index := 0
-		drawn := 0
-		for len(remaining) > 0 {
-			piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
-			if row_index >= entry.tool_scroll && drawn < visible_rows {
-				fill := strings.repeat(" ", max(content_width - text.text_columns_at(piece, TOOL_CONTENT_START), 0), context.temp_allocator) or_else ""
-				declare_tool_row(ctx, fmt.tprintf(" %s%s ", piece, fill), border, body, outline.vertical)
-				drawn += 1
+	// A failed append leaves this box without a border for the frame; the next frame retries.
+	_, _ = append(
+		&storage.tool_blocks,
+		Tool_Block{id = entry.id, block = widgets.Block{border = outline, style = border_style, title = title, footer = footer}},
+	)
+	// The outer element holds the blank row that separates boxes, so the box's own rect is exactly its border.
+	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}}) {
+		box := layout.Layout_Style {
+			flow = .Column,
+			sizing = layout.Sizing{width = layout.fixed(layout.Scalar(box_width)), height = layout.fit()},
+			padding = layout.pad_all(1),
+		}
+		if layout.element(ctx, layout.Element_Desc{layout = box, user = layout.User_Tag(entry.id)}) {
+			body := tui.text_style(TOOL_BODY)
+			remaining := preview
+			row_index := 0
+			drawn := 0
+			for len(remaining) > 0 {
+				piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
+				if row_index >= first_row && drawn < visible_rows {
+					layout.text(ctx, layout.Text_Desc{text = fmt.tprintf(" %s", piece), style = body})
+					drawn += 1
+				}
+				row_index += 1
+				remaining = rest
+				if drawn >= visible_rows { break }
 			}
-			row_index += 1
-			remaining = rest
-			if drawn >= visible_rows { break }
+			if content_rows == 0 {
+				layout.text(ctx, layout.Text_Desc{text = " ", style = body})
+			}
+			if entry.image.id != 0 {
+				columns, rows := image_cells(entry.image, content_width, storage.conversation_rows, storage.cell_pixels)
+				declare_tool_image(ctx, entry.image.id, columns, rows)
+			}
 		}
-		if content_rows == 0 {
-			fill := strings.repeat(" ", content_width, context.temp_allocator) or_else ""
-			declare_tool_row(ctx, fmt.tprintf(" %s ", fill), border, body, outline.vertical)
-		}
-		if entry.image.id != 0 {
-			columns, rows := image_cells(entry.image, content_width, storage.conversation_rows, storage.cell_pixels)
-			declare_tool_image(ctx, entry.image.id, columns, rows, content_width, border, outline.vertical)
-		}
-		layout.text(ctx, layout.Text_Desc{text = bottom, style = border})
 	}
 }
 
@@ -913,37 +952,25 @@ tool_border_bright :: proc(style: term.Style) -> term.Style {
 }
 
 // declare_tool_image reserves a box's picture rows below its text, inside the border.
-declare_tool_image :: proc(ctx: ^layout.Context, id: term.Image_Id, columns, rows, content_width: int, border: layout.Text_Style, vertical: string) {
-	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
-		declare_tool_bars(ctx, rows, border, vertical)
-		picture_box := layout.Layout_Style {
-			sizing = layout.Sizing{width = layout.fixed(layout.Scalar(content_width + 2)), height = layout.fixed(layout.Scalar(rows))},
-			padding = layout.Edges{left = 1},
+declare_tool_image :: proc(ctx: ^layout.Context, id: term.Image_Id, columns, rows: int) {
+	picture_box := layout.Layout_Style {
+		sizing = layout.Sizing{width = layout.fixed(layout.Scalar(columns + 1)), height = layout.fixed(layout.Scalar(rows))},
+		padding = layout.Edges{left = 1},
+	}
+	if layout.element(ctx, layout.Element_Desc{layout = picture_box}) {
+		picture := layout.Layout_Style {
+			sizing = layout.Sizing{width = layout.fixed(layout.Scalar(columns)), height = layout.fixed(layout.Scalar(rows))},
 		}
-		if layout.element(ctx, layout.Element_Desc{layout = picture_box}) {
-			picture := layout.Layout_Style {
-				sizing = layout.Sizing{width = layout.fixed(layout.Scalar(columns)), height = layout.fixed(layout.Scalar(rows))},
-			}
-			layout.content(
-				ctx,
-				layout.Element_Desc {
-					layout = picture,
-					content = layout.Image_Content{handle = layout.Image_Handle(id), intrinsic_size = {layout.Scalar(columns), layout.Scalar(rows)}},
-				},
-			)
-		}
-		declare_tool_bars(ctx, rows, border, vertical)
+		layout.content(
+			ctx,
+			layout.Element_Desc {
+				layout = picture,
+				content = layout.Image_Content{handle = layout.Image_Handle(id), intrinsic_size = {layout.Scalar(columns), layout.Scalar(rows)}},
+			},
+		)
 	}
 }
 
-// declare_tool_bars declares a column of rows vertical bars.
-declare_tool_bars :: proc(ctx: ^layout.Context, rows: int, border: layout.Text_Style, vertical: string) {
-	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column}}) {
-		for _ in 0 ..< rows {
-			layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
-		}
-	}
-}
 // tool_row_next splits the first row a tool box draws from `value` and returns it with the
 // remainder. A row ends at a newline or at the content width; a grapheme wider than the
 // width still takes a row, so the split always advances. start_column is where the row
@@ -992,109 +1019,38 @@ tool_window_label :: proc(hidden_above, hidden_below: int) -> string {
 	return fmt.tprintf("↑ %d · ↓ %d lines", hidden_above, hidden_below)
 }
 
-// tool_border_bottom draws the box's bottom edge, carrying the window's label
-// when it has one. The label is truncated to the room the border has, and an
-// empty result is a plain rule.
-tool_border_bottom :: proc(outline: widgets.Border, inner_width: int, label: string) -> string {
-	visible := text.truncate_text_at(label, max(inner_width - 3, 0), 3)
-	if visible == "" {
-		fill := strings.repeat(outline.horizontal, inner_width, context.temp_allocator) or_else ""
-		return fmt.tprintf("%s%s%s", outline.bottom_left, fill, outline.bottom_right)
-	}
-	fill := strings.repeat(outline.horizontal, max(inner_width - text.text_columns_at(visible, 3) - 3, 0), context.temp_allocator) or_else ""
-	return fmt.tprintf("%s%s %s %s%s", outline.bottom_left, outline.horizontal, visible, fill, outline.bottom_right)
-}
-
-// declare_tool_row adds one framed content row. The vertical bars carry the
-// outline style and the text between them the body style, so the box reads as
-// one outline without tinting the result inside it.
-declare_tool_row :: proc(ctx: ^layout.Context, content: string, border, body: layout.Text_Style, vertical: string) {
-	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
-		layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
-		layout.text(ctx, layout.Text_Desc{text = content, style = body})
-		layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
-	}
-}
-
 // draw_menu renders the open choice list: the title, the last selection error
-// when there is one, and one line per choice with its detail column. The cursor
-// stays visible in a scrolling window.
+// when there is one, and the choices below them in a list that scrolls to keep
+// the selection visible. The rows the list got are remembered for paging.
 draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	lines, lines_error := make([dynamic]Line, 0, 64, context.temp_allocator)
-	if lines_error != nil {
+	list_rect := rect
+	_, _ = tui.draw_text(&storage.buffer, {rect.x, list_rect.y, rect.width, 1}, app.menu.title, TITLE_STYLE)
+	list_rect.y += 1
+	list_rect.height -= 1
+	if setup_error := setup_error_text(app); setup_error != "" && list_rect.height > 0 {
+		_, _ = tui.draw_text(&storage.buffer, {rect.x, list_rect.y, rect.width, 1}, setup_error, ERROR_TEXT)
+		list_rect.y += 1
+		list_rect.height -= 1
+	}
+	app.menu.rows = max(list_rect.height, 0)
+
+	items, items_error := make([]string, len(app.menu.choices), context.temp_allocator)
+	if items_error != nil {
 		snap_report_dropped_locked(app)
 		return
-	}
-	if _, append_error := append(&lines, Line{text = app.menu.title, style = TITLE_STYLE}); append_error != nil {
-		snap_report_dropped_locked(app)
-		return
-	}
-	if setup_error := setup_error_text(app); setup_error != "" {
-		cloned, clone_error := strings.clone(setup_error, context.temp_allocator)
-		if clone_error != nil {
-			snap_report_dropped_locked(app)
-			return
-		}
-		if _, append_error := append(&lines, Line{text = cloned, style = ERROR_TEXT}); append_error != nil {
-			snap_report_dropped_locked(app)
-			return
-		}
-	}
-	cursor := app.menu.cursor
-	if cursor >= len(app.menu.choices) {
-		cursor = max(len(app.menu.choices) - 1, 0)
 	}
 	for choice, index in app.menu.choices {
-		marker := "> " if index == cursor else "  "
-		style := PICKED_STYLE if index == cursor else HINT_STYLE
-		text: string
+		marker := "> " if index == app.menu.list.selected else "  "
 		if choice.detail != "" {
-			text = fmt.tprintf("%s%-24s %s", marker, choice.label, choice.detail)
+			items[index] = fmt.tprintf("%s%-24s %s", marker, choice.label, choice.detail)
 		} else {
-			text = fmt.tprintf("%s%s", marker, choice.label)
-		}
-		if _, append_error := append(&lines, Line{text = text, style = style}); append_error != nil {
-			snap_report_dropped_locked(app)
-			return
+			items[index] = fmt.tprintf("%s%s", marker, choice.label)
 		}
 	}
-	total := len(lines)
-	if total == 0 {
-		return
-	}
-	// The cursor's line must stay inside the window.
-	cursor_line := min(cursor + 1, total - 1)
-	visible := rect.height
-	if cursor_line < app.menu.top {
-		app.menu.top = cursor_line
-	}
-	if cursor_line >= app.menu.top + visible {
-		app.menu.top = cursor_line - visible + 1
-	}
-	start := app.menu.top
-	if start > max(total - visible, 0) {
-		start = max(total - visible, 0)
-	}
-	for i in 0 ..< visible {
-		line_index := start + i
-		if line_index >= total {
-			break
-		}
-		line := &lines[line_index]
-		row := tui.Cell_Rect {
-			x      = rect.x + line.indent,
-			y      = rect.y + i,
-			width  = rect.width - line.indent,
-			height = 1,
-		}
-		if row.width <= 0 {
-			continue
-		}
-		_, _ = tui.draw_text(&storage.buffer, row, line.text, line.style)
-	}
+	_ = widgets.draw_list(&storage.buffer, list_rect, {items = items, style = HINT_STYLE, selected_style = PICKED_STYLE}, &app.menu.list)
 }
 
 // draw_input_hint replaces the prompt with the menu's keys while one is open.

@@ -35,50 +35,47 @@ Entry_Kind :: enum u8 {
 	Error,
 }
 Entry :: struct {
-	kind:            Entry_Kind,
-	text:            [dynamic]u8, // owned,
+	kind:          Entry_Kind,
+	text:          [dynamic]u8, // owned,
 	// id names an entry while it is on screen and travels on a tool box to the mouse. Zero is not an entry.
-	id:              u64,
+	id:            u64,
 	// node is the journal node a window entry was made from; zero for a live entry.
-	node:            journal.Node_Id,
+	node:          journal.Node_Id,
 	// after is the node whose entries a live entry is drawn after; zero for a window entry.
-	after:           journal.Node_Id,
+	after:         journal.Node_Id,
 	// rows is the height the last frame gave the entry.
-	rows:            int,
+	rows:          int,
 	// revision counts changes to text, so a presentation derived from the text can tell it is stale.
-	revision:        u64,
-	complete:        bool,
-	tool_outcome:    journal.Tool_Outcome,
+	revision:      u64,
+	complete:      bool,
+	tool_outcome:  journal.Tool_Outcome,
 	// call is the journal id of the tool call a tool box shows, zero for any other
 	// entry. running says the call has not reported its result: the box draws with the
 	// spinner and the working border until the result replaces its text and outcome.
-	call:            journal.Call_Id,
-	running:         bool,
+	call:          journal.Call_Id,
+	running:       bool,
 	// stream is the bounded tail of the output a running call has streamed, owned and
 	// freed when the box settles. It is display only. stream_prefix is the length of
 	// the box text before the tail was added to it.
-	stream:          [dynamic]u8, // owned,
-	stream_prefix:   int,
-	// tool_scroll is the first preview row a tool box shows, so a long result can
-	// be read inside its own box. The box clamps it to the rows it has, which is
-	// why the value is only a request until the next frame resolves it.
-	tool_scroll:     int,
-	// tool_scroll_max is the largest tool_scroll that window has, as the last
-	// frame resolved it. Zero means the result fits and the box has nothing to
-	// scroll, which is what tells the wheel the transcript behind it owns the
-	// report.
-	tool_scroll_max: int,
+	stream:        [dynamic]u8, // owned,
+	stream_prefix: int,
+	// tool_scroll is the window a tool box shows over its result rows, so a long
+	// result can be read inside its own box. Its range is what the last frame
+	// resolved; zero means the result fits and the transcript behind the box owns
+	// the wheel. A box starts at its top (top = 0) and follows its output after
+	// scroll_follow, as a streaming call does.
+	tool_scroll:   widgets.Scroll,
 	// A settled box keeps only the first TOOL_WINDOW_ROWS lines of its result. preview_at is the
 	// offset in text where the result starts, hidden_lines the lines cut, and tool_rows the result rows drawn.
-	preview_at:      int,
-	hidden_lines:    int,
-	tool_rows:       int,
+	preview_at:    int,
+	hidden_lines:  int,
+	tool_rows:     int,
 	// full is the whole text of an expanded box, borrowed from the transcript for one frame.
 	// selected marks the box the keyboard selected.
-	full:            string,
-	selected:        bool,
+	full:          string,
+	selected:      bool,
 	// image is the picture of the call's result; its id is zero when there is none.
-	image:           Entry_Image,
+	image:         Entry_Image,
 }
 
 // Status carries the runtime facts the footer shows. provider_id and cwd are borrowed
@@ -264,8 +261,8 @@ Menu :: struct {
 	kind:     Menu_Kind,
 	title:    string, // owned
 	choices:  [dynamic]Choice, // owned
-	cursor:   int,
-	top:      int, // first choice line on screen, so the cursor stays visible
+	list:     widgets.List_State, // selection and scroll offset of the choices
+	rows:     int, // choice rows drawn last frame, which is how far a page moves
 	// required marks the startup chooser: no model is selected yet, so escape
 	// quits rather than returning to the prompt.
 	required: bool,

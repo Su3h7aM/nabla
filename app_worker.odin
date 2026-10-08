@@ -890,8 +890,9 @@ snap_append :: proc(app: ^App, kind: Entry_Kind, text: string) {
 // snap_entry_make builds a live entry with a fresh id that follows the current head.
 snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
 	entry := Entry {
-		kind  = kind,
+		kind = kind,
 		after = app.run.snap.after,
+		tool_scroll = {top = 0},
 	}
 	entry.text.allocator = app.run.alloc
 	entry.stream.allocator = app.run.alloc
@@ -1174,7 +1175,7 @@ observer_tool_output :: proc(user_data: rawptr, call, parent_call: journal.Call_
 		return
 	}
 	if !snap_entry_rewrite_locked(app, entry, text) { return }
-	entry.tool_scroll = max(int)
+	entry.tool_scroll.top = nil
 	snap_publish_locked(app)
 }
 

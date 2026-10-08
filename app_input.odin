@@ -219,13 +219,9 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 tool_box_scroll :: proc(entry: ^Entry, button: input.Mouse_Button) -> bool {
 	#partial switch button {
 	case .Wheel_Up:
-		if entry.tool_scroll <= 0 { return false }
-		entry.tool_scroll = max(entry.tool_scroll - MOUSE_WHEEL_LINES, 0)
-		return true
+		return widgets.scroll_by(&entry.tool_scroll, -MOUSE_WHEEL_LINES)
 	case .Wheel_Down:
-		if entry.tool_scroll >= entry.tool_scroll_max { return false }
-		entry.tool_scroll = min(entry.tool_scroll + MOUSE_WHEEL_LINES, entry.tool_scroll_max)
-		return true
+		return widgets.scroll_by(&entry.tool_scroll, MOUSE_WHEEL_LINES)
 	}
 	return false
 }
@@ -250,9 +246,9 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	}
 	#partial switch mouse.button {
 	case .Wheel_Up:
-		scroll_to(app, scroll_view_top(app) - MOUSE_WHEEL_LINES)
+		_ = widgets.scroll_by(&app.conversation_scroll, -MOUSE_WHEEL_LINES)
 	case .Wheel_Down:
-		scroll_to(app, scroll_view_top(app) + MOUSE_WHEEL_LINES)
+		_ = widgets.scroll_by(&app.conversation_scroll, MOUSE_WHEEL_LINES)
 	case:
 	}
 }
@@ -392,8 +388,8 @@ box_drag_begin :: proc(app: ^App, mouse: input.Mouse_Event) -> bool {
 	app.box_drag = {
 		active = true,
 		id     = id,
-		anchor = entry.tool_scroll + row,
-		cursor = entry.tool_scroll + row,
+		anchor = widgets.scroll_offset(entry.tool_scroll) + row,
+		cursor = widgets.scroll_offset(entry.tool_scroll) + row,
 	}
 	return true
 }
@@ -408,13 +404,13 @@ box_drag_move :: proc(app: ^App, mouse: input.Mouse_Event) {
 	drag.moved = true
 	switch {
 	case row < 0:
-		entry.tool_scroll = max(entry.tool_scroll - MOUSE_WHEEL_LINES, 0)
-		drag.cursor = entry.tool_scroll
+		_ = widgets.scroll_by(&entry.tool_scroll, -MOUSE_WHEEL_LINES)
+		drag.cursor = widgets.scroll_offset(entry.tool_scroll)
 	case row >= entry.tool_rows:
-		entry.tool_scroll = min(entry.tool_scroll + MOUSE_WHEEL_LINES, entry.tool_scroll_max)
-		drag.cursor = entry.tool_scroll + entry.tool_rows - 1
+		_ = widgets.scroll_by(&entry.tool_scroll, MOUSE_WHEEL_LINES)
+		drag.cursor = widgets.scroll_offset(entry.tool_scroll) + entry.tool_rows - 1
 	case:
-		drag.cursor = entry.tool_scroll + row
+		drag.cursor = widgets.scroll_offset(entry.tool_scroll) + row
 	}
 }
 
@@ -511,10 +507,10 @@ interrupt :: proc(app: ^App) {
 	cancel_or_quit(app)
 }
 
-// scroll_page scrolls the transcript by a screen.
+// scroll_page scrolls the transcript by the height of its viewport.
 scroll_page :: proc(app: ^App, up: bool) {
-	page := max(app.rows - 3, 1)
-	scroll_to(app, scroll_view_top(app) + (-page if up else page))
+	page := app.conversation_rect.height
+	_ = widgets.scroll_by(&app.conversation_scroll, -page if up else page)
 }
 
 // handle_key sends a key to the prompt, or to the transcript while it has the keyboard.

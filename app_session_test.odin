@@ -831,7 +831,11 @@ app_frame_storage :: proc(rows: int) -> ^Frame_Storage {
 app_settle :: proc(app: ^App, storage: ^Frame_Storage, rows: int) {
 	head_publish(app)
 	transcript_sync(app)
-	for draw_conversation(app, storage, tui.Cell_Rect{width = 80, height = rows}) && transcript_slide(app) {  }
+	app.conversation_rect = {
+		width  = 80,
+		height = rows,
+	}
+	for draw_conversation(app, storage, app.conversation_rect) && transcript_slide(app) {  }
 }
 
 app_window_rows :: proc(app: ^App) -> (rows: int) {
@@ -874,7 +878,6 @@ app_has_text :: proc(entries: []Entry, text: string) -> bool {
 }
 
 SCROLL_ROWS :: 40
-SCROLL_PAGE :: SCROLL_ROWS - 3
 
 // Paging up reaches the first prompt of a session far longer than the window, within its budget, and paging down returns to the newest answer.
 @(test)
@@ -889,11 +892,11 @@ test_scrolling_reaches_the_first_prompt_with_a_bounded_window :: proc(t: ^testin
 	app_settle(&app, storage, SCROLL_ROWS)
 
 	budget := (TRANSCRIPT_WINDOW_SCREENS + 2) * SCROLL_ROWS
-	testing.expect(t, app.conv_scroll_range > 0, "the newest page fills the screen")
+	testing.expect(t, app.conversation_scroll.range > 0, "the newest page fills the screen")
 	testing.expect(t, app_has_text(app.transcript.entries[:], fmt.tprintf("answer %d", TURNS)), "the window starts at the newest answer")
 	reached := false
 	for _ in 0 ..< 400 {
-		scroll_to(&app, scroll_view_top(&app) - SCROLL_PAGE)
+		scroll_page(&app, up = true)
 		app_settle(&app, storage, SCROLL_ROWS)
 		testing.expect(t, app_window_rows(&app) <= budget, "the window stays within its budget")
 		if app_has_text(app.transcript.entries[:], "question 1") {
@@ -905,12 +908,12 @@ test_scrolling_reaches_the_first_prompt_with_a_bounded_window :: proc(t: ^testin
 	testing.expect(t, len(app.transcript.entries) < 2 * TURNS, "the window does not hold the whole session")
 
 	for _ in 0 ..< 400 {
-		if app.scroll_top == nil { break }
-		scroll_to(&app, scroll_view_top(&app) + SCROLL_PAGE)
+		if app.conversation_scroll.top == nil { break }
+		scroll_page(&app, up = false)
 		app_settle(&app, storage, SCROLL_ROWS)
 		testing.expect(t, app_window_rows(&app) <= budget, "the window stays within its budget")
 	}
-	testing.expect(t, app.scroll_top == nil, "paging down follows the bottom")
+	testing.expect(t, app.conversation_scroll.top == nil, "paging down follows the bottom")
 	testing.expect(t, app_has_text(app.transcript.entries[:], fmt.tprintf("answer %d", TURNS)), "paging down returns to the newest answer")
 }
 
@@ -935,7 +938,7 @@ test_scrolling_reaches_the_prompts_before_a_checkpoint :: proc(t: ^testing.T) {
 
 	reached, noticed := false, false
 	for _ in 0 ..< 400 {
-		scroll_to(&app, scroll_view_top(&app) - SCROLL_PAGE)
+		scroll_page(&app, up = true)
 		app_settle(&app, storage, SCROLL_ROWS)
 		noticed ||= app_has_text(app.transcript.entries[:], CHECKPOINT_NOTICE)
 		if app_has_text(app.transcript.entries[:], "question 1") {

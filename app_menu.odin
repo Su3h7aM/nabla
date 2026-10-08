@@ -10,6 +10,7 @@ import "core:sync"
 import "nabla:agent"
 import "nabla:agent/journal"
 import input "nabla:input"
+import "nabla:tui/widgets"
 
 // menu_begin publishes a freshly built list. The caller owns choices until this
 // takes them; false means the title could not be copied, and the list stays with
@@ -46,12 +47,12 @@ menu_close :: proc(app: ^App) {
 	menu_destroy(&app.menu, app.run.alloc)
 }
 
-// menu_pick places the cursor on the first choice whose label names the current
-// value, so a menu opens where the user already is.
-menu_pick :: proc(app: ^App, label: string) {
+// menu_select selects the first choice whose action is action and leaves the
+// selection alone when none is, so a menu opens where the user already is.
+menu_select :: proc(app: ^App, action: Choice_Action) {
 	for choice, index in app.menu.choices {
-		if choice.label == label {
-			app.menu.cursor = index
+		if choice.action == action {
+			widgets.list_select_index(&app.menu.list, len(app.menu.choices), index)
 			return
 		}
 	}
@@ -150,13 +151,7 @@ menu_rebuild_model :: proc(app: ^App) {
 	}
 	if !menu_begin(app, .Model, menu_title, choices, false) { return }
 	taken = true
-	for choice, index in app.menu.choices {
-		action := choice.action.(Model_Choice)
-		if action.provider_id == current_provider && action.model_id == current_model {
-			app.menu.cursor = index
-			break
-		}
-	}
+	menu_select(app, Model_Choice{provider_id = current_provider, model_id = current_model})
 }
 
 // model_choice_make builds one model menu line, every string owned by the run's
@@ -264,7 +259,7 @@ menu_open_effort :: proc(app: ^App) {
 	}
 	if !menu_begin(app, .Effort, "reasoning effort", choices, false) { return }
 	taken = true
-	menu_pick(app, "provider default" if current == "" else current)
+	menu_select(app, Effort_Choice{level = current})
 }
 
 // menu_open_session lists the workspace's sessions, newest activity first, from
@@ -317,39 +312,20 @@ menu_open_session :: proc(app: ^App) {
 
 	if !menu_begin(app, .Session, "sessions in this workspace", choices, false) { return }
 	taken = true
-	menu_pick_session(app, active)
+	menu_select(app, Session_Choice{id = active})
 }
 
 // SESSION_ID_SHORT_LENGTH is how many hex digits of an id a listing shows.
 SESSION_ID_SHORT_LENGTH :: 8
-
-// menu_pick_session opens the list on the running session, so the menu shows
-// where the user already is.
-@(private)
-menu_pick_session :: proc(app: ^App, active: journal.Session_Id) {
-	if active == {} { return }
-	for choice, index in app.menu.choices {
-		action := choice.action.(Session_Choice)
-		if action.id == active {
-			app.menu.cursor = index
-			return
-		}
-	}
-}
-
-// menu_page is how far one Page_Up/Page_Down moves in a menu.
-menu_page :: proc(app: ^App) -> int {
-	return max(app.rows - TUI_FOOTER_ROWS - 1, 1)
-}
 
 // menu_submit sends the choice under the cursor as work. The startup chooser
 // stays open until its selection applies, because no model is selected yet; a
 // menu opened from the prompt closes at once, and a selection that fails is
 // reported as a transcript warning.
 menu_submit :: proc(app: ^App) {
-	if len(app.menu.choices) == 0 { return }
-	cursor := min(app.menu.cursor, len(app.menu.choices) - 1)
-	switch action in app.menu.choices[cursor].action {
+	selected := app.menu.list.selected
+	if selected < 0 || selected >= len(app.menu.choices) { return }
+	switch action in app.menu.choices[selected].action {
 	case Model_Choice:
 		selection_request(app, action.provider_id, action.model_id)
 	case Effort_Choice:
@@ -364,20 +340,21 @@ menu_submit :: proc(app: ^App) {
 // handle_menu_key drives every menu: arrows move, enter chooses, escape cancels,
 // and the startup chooser quits instead because it cannot be dismissed.
 handle_menu_key :: proc(app: ^App, key: input.Key_Event) {
-	last := len(app.menu.choices) - 1
+	count := len(app.menu.choices)
+	page := max(app.menu.rows, 1)
 	#partial switch key.code {
 	case .Up:
-		app.menu.cursor = max(app.menu.cursor - 1, 0)
+		widgets.list_select_previous(&app.menu.list, count)
 	case .Down:
-		app.menu.cursor = min(app.menu.cursor + 1, max(last, 0))
+		widgets.list_select_next(&app.menu.list, count)
 	case .Home:
-		app.menu.cursor = 0
+		widgets.list_select_first(&app.menu.list, count)
 	case .End:
-		app.menu.cursor = max(last, 0)
+		widgets.list_select_last(&app.menu.list, count)
 	case .Page_Up:
-		app.menu.cursor = max(app.menu.cursor - menu_page(app), 0)
+		widgets.list_select_page(&app.menu.list, count, -page)
 	case .Page_Down:
-		app.menu.cursor = min(app.menu.cursor + menu_page(app), max(last, 0))
+		widgets.list_select_page(&app.menu.list, count, page)
 	case .Enter:
 		menu_submit(app)
 	case .Escape:

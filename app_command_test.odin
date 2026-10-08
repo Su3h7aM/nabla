@@ -183,10 +183,10 @@ test_effort_menu_offers_the_default_and_every_level :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.menu.choices[0].label, "provider default")
 	testing.expect_value(t, app.menu.choices[2].label, "high")
 	// The menu opens where the user already is.
-	testing.expect_value(t, app.menu.cursor, 2)
+	testing.expect_value(t, app.menu.list.selected, 2)
 
 	// The default choice means no level, which is how the agent reads it.
-	app.menu.cursor = 0
+	app.menu.list.selected = 0
 	menu_submit(&app)
 	work, received := chan.try_recv(app.run.work)
 	if !testing.expect(t, received, "the choice should become work") { return }
@@ -215,7 +215,7 @@ test_session_menu_choices_become_resume_work :: proc(t: ^testing.T) {
 	// The id is shown only to tell two untitled sessions apart; it is not typed.
 	testing.expect_value(t, app.menu.choices[1].detail, "fedcba98")
 
-	app.menu.cursor = 1
+	app.menu.list.selected = 1
 	menu_submit(&app)
 	testing.expect(t, !app.menu_open, "a menu opened from the prompt closes on submit")
 	work, received := chan.try_recv(app.run.work)
@@ -299,16 +299,16 @@ test_submitting_a_prompt_jumps_to_the_bottom :: proc(t: ^testing.T) {
 	app: App
 	command_app(t, &app)
 	defer command_app_end(&app)
-	app.conv_scroll_range = 100
+	widgets.scroll_set_range(&app.conversation_scroll, 100)
 
-	app.scroll_top = 10
+	widgets.scroll_to(&app.conversation_scroll, 10)
 	if !testing.expect(t, widgets.input_insert(&app.input, "/help")) { return }
 	submit(&app)
-	testing.expect_value(t, app.scroll_top, Maybe(int)(10))
+	testing.expect_value(t, app.conversation_scroll.top, Maybe(int)(10))
 
 	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works")) { return }
 	submit(&app)
-	testing.expect(t, app.scroll_top == nil, "a submitted prompt follows the bottom")
+	testing.expect(t, app.conversation_scroll.top == nil, "a submitted prompt follows the bottom")
 
 	for {
 		work, received := chan.try_recv(app.run.work)

@@ -12,6 +12,7 @@ import "nabla:agent"
 import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:layout"
+import "nabla:tui/widgets"
 
 // TRANSCRIPT_WINDOW_SCREENS is the screens of history kept in memory: the visible one, two above, two below.
 // Memory then follows what can be seen next, however far the user scrolls back.
@@ -79,7 +80,7 @@ transcript_sync :: proc(app: ^App) {
 		transcript.focused = false
 		transcript.selected = 0
 		boxes_collapse_all(app)
-		app.scroll_top = nil
+		widgets.scroll_follow(&app.conversation_scroll)
 	}
 	if head != transcript.head { transcript_follow(app, head) }
 	transcript_reduce(app)
@@ -151,28 +152,10 @@ transcript_page_tail :: proc(app: ^App) {
 	transcript.first, transcript.end = first, end
 }
 
-// scroll_view_top returns the first visible row of the scroll content.
-scroll_view_top :: proc(app: ^App) -> int {
-	return app.scroll_top.? or_else app.conv_scroll_range
-}
-
-// scroll_to shows the content from row top, or follows the bottom when top reaches it.
-scroll_to :: proc(app: ^App, row: int) {
-	top := max(row, 0)
-	app.scroll_top = top if top < app.conv_scroll_range else nil
-}
-
-// scroll_clamp follows the bottom when the content shrank to the scrolled-up view.
-scroll_clamp :: proc(app: ^App) {
-	if top, scrolled := app.scroll_top.?; scrolled && top >= app.conv_scroll_range {
-		app.scroll_top = nil
-	}
-}
-
 // transcript_jump_bottom follows the newest content, reattaching a window that was paged away from the tail.
 transcript_jump_bottom :: proc(app: ^App) {
 	transcript := &app.transcript
-	app.scroll_top = nil
+	widgets.scroll_follow(&app.conversation_scroll)
 	transcript.anchor = nil
 	if transcript.end < len(transcript.path) && !transcript.failed { transcript_page_tail(app) }
 }
@@ -295,8 +278,9 @@ window_push :: proc(
 	for index := len(entries) - 1; index >= 0 && entries[index].node == node; index -= 1 { ordinal += 1 }
 	made := Entry {
 		kind = kind,
-		id   = WINDOW_ENTRY_FLAG | u64(node) << WINDOW_ORDINAL_BITS | u64(ordinal),
+		id = WINDOW_ENTRY_FLAG | u64(node) << WINDOW_ORDINAL_BITS | u64(ordinal),
 		node = node,
+		tool_scroll = {top = 0},
 	}
 	made.text.allocator = app.run.alloc
 	made.stream.allocator = app.run.alloc
@@ -453,22 +437,23 @@ transcript_slide :: proc(app: ^App) -> bool {
 
 transcript_slide_step :: proc(app: ^App) -> bool {
 	transcript := &app.transcript
+	scroll := &app.conversation_scroll
 	if !transcript.measured || transcript.failed { return false }
 	transcript.measured = false
 	if anchor, pending := transcript.anchor.?; pending {
 		transcript.anchor = nil
-		if app.scroll_top != nil { scroll_to(app, app.conv_scroll_range - anchor) }
+		if scroll.top != nil { widgets.scroll_to(scroll, scroll.range - anchor) }
 		return true
 	}
 	height := transcript.viewport_rows
-	above := scroll_view_top(app)
-	below := app.conv_scroll_range - above
+	above := widgets.scroll_offset(scroll^)
+	below := scroll.range - above
 	near := TRANSCRIPT_LOAD_SCREENS * height
 	far := (TRANSCRIPT_WINDOW_SCREENS - 1) / 2 * height
 	if above < near && transcript.first > 0 {
 		transcript_page_older(app)
 		if transcript.failed { return false }
-		if app.scroll_top != nil { transcript.anchor = below }
+		if scroll.top != nil { transcript.anchor = below }
 		return true
 	}
 	if below < near && transcript.end < len(transcript.path) {
@@ -489,7 +474,7 @@ transcript_slide_step :: proc(app: ^App) -> bool {
 		for &entry in transcript.entries[:count] { entry_destroy(&entry) }
 		remove_range(&transcript.entries, 0, count)
 		transcript.first += 1
-		if top, scrolled := app.scroll_top.?; scrolled { app.scroll_top = max(top - rows, 0) }
+		if scroll.top != nil { widgets.scroll_to(scroll, above - rows) }
 		return true
 	}
 	return false
@@ -672,7 +657,7 @@ transcript_focus :: proc(app: ^App) {
 	transcript := &app.transcript
 	transcript.focused = true
 	boxes := transcript_boxes(app)
-	view_top := scroll_view_top(app)
+	view_top := widgets.scroll_offset(app.conversation_scroll)
 	view_bottom := view_top + transcript.viewport_rows
 	best, best_distance := -1, max(int)
 	for box, index in boxes {
@@ -699,12 +684,6 @@ transcript_select_move :: proc(app: ^App, delta: int) {
 	}
 	box := boxes[next]
 	transcript.selected = box.call
-	height := transcript.viewport_rows
-	view_top := scroll_view_top(app)
-	switch {
-	case box.top < view_top:
-		scroll_to(app, box.top)
-	case box.top + box.rows > view_top + height:
-		scroll_to(app, box.top + box.rows - height)
-	}
+	view_top := widgets.scroll_offset(app.conversation_scroll)
+	widgets.scroll_to(&app.conversation_scroll, widgets.scroll_reveal(view_top, transcript.viewport_rows, box.top, box.rows))
 }

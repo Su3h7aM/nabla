@@ -26,12 +26,15 @@ BORDER_ROUNDED :: Border {
 	vertical     = "│",
 }
 
-// Block draws a border and title. Layout padding, not the widget, reserves the
-// content inset.
+// Block draws a border, a title on the top edge, and a footer on the bottom
+// edge. Both labels start one cell inside the corner and are truncated to the
+// room the edge has; the caller supplies any spacing around them. Layout
+// padding, not the widget, reserves the content inset.
 Block :: struct {
 	border: Border,
 	style:  term.Style,
 	title:  string,
+	footer: string,
 }
 
 draw_block_rect :: proc(buffer: ^term.Frame_Buffer, rect: tui.Cell_Rect, block: Block) {
@@ -50,6 +53,9 @@ draw_block_rect :: proc(buffer: ^term.Frame_Buffer, rect: tui.Cell_Rect, block: 
 	_ = tui.put(buffer, right, bottom, block.border.bottom_right, block.style)
 	if block.title != "" {
 		_, _ = tui.draw_text(buffer, {x = rect.x + 1, y = rect.y, width = rect.width - 2, height = 1}, block.title, block.style)
+	}
+	if block.footer != "" {
+		_, _ = tui.draw_text(buffer, {x = rect.x + 1, y = bottom, width = rect.width - 2, height = 1}, block.footer, block.style)
 	}
 }
 
@@ -72,6 +78,9 @@ draw_block_context :: proc(ctx: ^tui.Context, block: Block) {
 	_ = tui.put_at(ctx, right, bottom, block.border.bottom_right, block.style)
 	if block.title != "" {
 		_, _ = tui.draw_text_at(ctx, {x = rect.x + 1, y = rect.y, width = rect.width - 2, height = 1}, block.title, block.style)
+	}
+	if block.footer != "" {
+		_, _ = tui.draw_text_at(ctx, {x = rect.x + 1, y = bottom, width = rect.width - 2, height = 1}, block.footer, block.style)
 	}
 }
 

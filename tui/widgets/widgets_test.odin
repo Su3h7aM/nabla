@@ -308,3 +308,15 @@ test_list_select_first_last_page :: proc(t: ^testing.T) {
 	list_select_last(&state, 0)
 	testing.expect_value(t, state.selected, -1)
 }
+
+@(test)
+test_block_draws_footer_on_bottom_edge_and_truncates_it :: proc(t: ^testing.T) {
+	cells: [48]term.Cell
+	frame := _frame(cells[:], 12, 4)
+	draw_block(&frame, {x = 0, y = 0, width = 12, height = 4}, Block{border = BORDER_ROUNDED, title = "top", footer = "─ 3 more lines ─────"})
+	testing.expect_value(t, frame.cells[1].grapheme, "t")
+	testing.expect_value(t, frame.cells[3 * 12].grapheme, "╰")
+	testing.expect_value(t, frame.cells[3 * 12 + 1].grapheme, "─")
+	testing.expect_value(t, frame.cells[3 * 12 + 5].grapheme, "m")
+	testing.expect_value(t, frame.cells[3 * 12 + 11].grapheme, "╯")
+}

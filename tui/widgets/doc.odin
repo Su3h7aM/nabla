@@ -2,7 +2,8 @@
 //
 // Block and Input have scoped forms that draw in the active tui element. Their
 // geometry comes from layout: Block uses the resolved outer box and expects
-// layout padding to reserve its border, while Input uses the selected box and
+// layout padding to reserve its border and labels its top and bottom edges with
+// Block.title and Block.footer, while Input uses the selected box and
 // only computes which rows the box shows and where the caret sits in them. The
 // caret's rows come from input_lines, so the box a caller draws and the rows the
 // caret moves through are the same wrap.
