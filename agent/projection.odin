@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:mem"
 
 import "nabla:agent/journal"
+import "nabla:ai"
 
 // Projection is the conversation a request is built from: the covering
 // checkpoint's summary, then every step after it up to head. Everything it
@@ -43,8 +44,9 @@ Projection_Payload :: union {
 // Projected_User is user-role text: the user's input, a harness notice, or
 // harness-inserted context.
 Projected_User :: struct {
-	text:   string,
-	origin: journal.User_Origin,
+	text:        string,
+	origin:      journal.User_Origin,
+	attachments: []ai.Provider_Attachment,
 }
 
 Projected_Assistant :: struct {
@@ -83,6 +85,7 @@ Projected_Result :: struct {
 	parent_call: journal.Call_Id,
 	outcome:     journal.Tool_Outcome,
 	content:     string,
+	attachments: []ai.Provider_Attachment,
 }
 
 // Projected_Nested_Call is a child of a call in items, running or settled. It is
@@ -163,10 +166,14 @@ projection_load :: proc(
 			projection.covers = node.covers
 		case .User:
 			user: journal.User
-			journal.payload_decode(node.data, &user, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
+			journal.payload_decode(node.data, &user, arena, corruption_journal = store, session = node.session, seq = node.seq) or_return
 			origin, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
 			if !known { return {}, journal.Journal_Error.Corrupt }
-			append(&items, Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = origin}}) or_return
+			attachments := projection_attachments(store, user.attachments, arena) or_return
+			append(
+				&items,
+				Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = origin, attachments = attachments}},
+			) or_return
 		case .Context, .Notice:
 			append(&items, Projection_Item{node = node.id, turn = node.turn, payload = Projected_User{text = body, origin = .Harness}}) or_return
 		case .Assistant:
@@ -245,7 +252,38 @@ projection_result :: proc(store: ^journal.Journal, record: ^journal.Record, aren
 	if !known { return {}, journal.Journal_Error.Corrupt }
 	result.outcome = outcome
 	if result.content == "" { result.content = completion.detail }
+	result.attachments = projection_attachments(store, completion.attachments, arena) or_return
 	return result, nil
+}
+
+// projection_attachments reads the files a record names, with their bytes, into arena. An
+// unknown media type, a malformed digest, or an artifact the journal no longer has is a
+// record it cannot read.
+@(private, require_results)
+projection_attachments :: proc(
+	store: ^journal.Journal,
+	stored: []journal.Attachment,
+	arena: mem.Allocator,
+) -> (
+	attachments: []ai.Provider_Attachment,
+	error: journal.Error,
+) {
+	if len(stored) == 0 { return nil, nil }
+	attachments = make([]ai.Provider_Attachment, len(stored), arena) or_return
+	for file, i in stored {
+		media, known := journal.enum_from_name(ai.PROVIDER_MEDIA_TYPES, file.media_type)
+		if !known { return nil, journal.Journal_Error.Corrupt }
+		digest, valid := journal.digest_from_hex(file.digest)
+		if !valid { return nil, journal.Journal_Error.Corrupt }
+		data, found := journal.read_artifact(store, digest, arena) or_return
+		if !found { return nil, journal.Journal_Error.Corrupt }
+		attachments[i] = {
+			Media = media,
+			Name  = file.name,
+			Data  = data,
+		}
+	}
+	return attachments, nil
 }
 
 // projection_add_assistant appends one response in the order it is replayed:

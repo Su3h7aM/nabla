@@ -420,7 +420,7 @@ tool_definition_destroy :: proc(definition: ^Tool_Definition, allocator: mem.All
 
 // Tool_Result is one finished call. output is what the tool produced, typed, and
 // content is its rendering, exactly as the session stores it. Every string and
-// slice is owned by allocator.
+// slice is owned by allocator, including each attachment's name and bytes.
 Tool_Result :: struct {
 	call_id:           string,
 	outcome:           journal.Tool_Outcome,
@@ -428,6 +428,7 @@ Tool_Result :: struct {
 	message:           string, // why the outcome is what it is; "" for a plain success
 	output:            Tool_Output,
 	content:           string,
+	attachments:       []ai.Provider_Attachment, // files the model reads beside content
 	error:             Tool_Argument_Error, // set only when the outcome is .Invalid_Arguments
 	allocation_failed: bool,
 	allocator:         mem.Allocator,
@@ -440,6 +441,11 @@ tool_result_destroy :: proc(result: ^Tool_Result) {
 	delete(result.message, allocator)
 	tool_output_destroy(&result.output, allocator)
 	delete(result.content, allocator)
+	for attachment in result.attachments {
+		delete(attachment.Name, allocator)
+		delete(attachment.Data, allocator)
+	}
+	delete(result.attachments, allocator)
 	tool_argument_error_destroy(&result.error, allocator)
 	result^ = {}
 }

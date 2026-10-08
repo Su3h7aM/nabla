@@ -149,7 +149,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 
 - `core:encoding/json` at external boundaries only. Native tool arguments and outputs are typed structs. A Lua child's arguments are the one JSON path inside the process: they are written as JSON text because they are journaled as the proposed arguments and admitted through the same decoder as a provider call (section 17.1). Typed outputs are pushed to Lua directly.
 - Canonical JSON (sorted keys, no insignificant whitespace) for everything that enters a provider request prefix: tool schemas and harness-generated JSON. Encoded once, stored as bytes, reused verbatim.
-- Journal payloads are one level of JSON (a JSON object column, never JSON inside a JSON string). Exact external bytes (tool arguments as sent, provider replay items, rendered tool results, text) go in a `body` BLOB column.
+- Journal payloads are one level of JSON (a JSON object column, never JSON inside a JSON string). Exact external bytes (tool arguments as sent, provider replay items, rendered tool results, text) go in a `body` BLOB column. A file the model reads as an attachment (section 14.5) is an `attachment` artifact, and the payload names it by media type, file name, and hex digest.
 - `core:crypto/hash` (SHA-256) for digests.
 
 ### 3.7 Source
@@ -518,7 +518,7 @@ artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) ST
 - Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is the highest `node` on that branch.
 - Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node) WHERE node IS NOT NULL`, `records(session, request) WHERE request IS NOT NULL`, `nodes(session, branch, node)`.
 - `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
-- `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
+- `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and the attachments of a `User` node or a `tool.completed` record are artifacts named in its `data`, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
 - WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes share the file, and SQLite serializes their write transactions, so no other journal mode is needed. Each session has one claim, held by the process that runs its turns (section 8.6).
 - Migrations are explicit steps stamped in the same transaction. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 
@@ -602,7 +602,7 @@ Every `Unknown` settled here, whatever rule settles it, also names with their si
 
 | Node kind | Body | Settled fork point |
 | --- | --- | --- |
-| `User` | input text; origin `Prompt`, `Steering`, or `Command{name, digest}` | yes |
+| `User` | input text and attached files; origin `Prompt`, `Steering`, or `Command{name, digest}` | yes |
 | `Assistant` | text, reasoning replay items, native replay bytes, calls | only without calls |
 | `Results` | ordered call ids answering the preceding `Assistant` node | yes |
 | `Context` | harness-inserted model input: rule activation, hook continuation | yes |
@@ -691,7 +691,7 @@ Model_Facts :: struct {
 }
 ```
 
-- `Catalog_Snapshot` is immutable, built in its own arena, and published like config (section 13). Frontends, request construction, tool exposure, transport selection, subagent model choice, and capacity all read the same snapshot. No code derives capabilities from model names.
+- `Catalog_Snapshot` is immutable, built in its own arena, and published like config (section 13). Frontends, request construction, tool exposure, transport selection, subagent model choice, and capacity all read the same snapshot. No code derives capabilities from model names. `input_modalities` decides which attachments a request carries: `image` admits the image formats and `pdf` admits PDF, and an absent list admits none (section 14.5).
 - Refresh runs on the catalog thread: on demand (model menu, ACP config request) at most once per `CATALOG_REFRESH_COOLDOWN`, and at startup when a cache is older than `CATALOG_CACHE_TTL`. models.dev is parsed into a temporary arena, extracted into compact tables, and the arena is destroyed. A provider that fails keeps its previous listing.
 
 ## 13. Live configuration
@@ -793,10 +793,20 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 
 ### 14.4 Native tools
 
-- Read: open once, `fstat` that descriptor; text only (no NUL, valid UTF-8); the model chooses the line window, and the result is projected through the context budget like any other.
+- Read: open once, `fstat` that descriptor. A file whose signature names an attachment format (section 14.5) is returned whole as an attachment with its path, media type, and size; any other file must be text (no NUL, valid UTF-8), the model chooses the line window, and the result is projected through the context budget like any other.
 - Write: validate, temp file in the same directory, write, fsync, rename; refuse symlinks and non-regular targets; keep the mode.
 - Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole: each stream is written as it arrives to `<call>.stdout.txt` or `<call>.stderr.txt` beside the other kept outputs, and held in memory up to `TOOL_STREAM_MEMORY_BYTES`. A stream that stayed within memory is whole in the result and its file is removed when the call ends; a larger stream keeps its file, named in the result, with only its beginning in the result. A call whose process ends mid-run therefore leaves the output it produced so far in those files, which recovery names (section 9). A file that cannot be created leaves its stream in memory. The timeout is the model's value when given, else the default; there is no maximum.
 - MCP: one shared executor; one request at a time per client lane. Delivery state maps to `Transport_Failed` (not delivered) or `Unknown` (delivered, no reply). Non-text blocks are described, not dumped.
+
+### 14.5 Attachments
+
+An attachment is a file a model reads beside the text of a user message or a tool result: an image (PNG, JPEG, GIF, WebP) or a PDF, the formats every API family accepts (`ai.Provider_Media`). The file's signature names its format, never its name or a media type a client stated.
+
+- Sources: the `read` tool, and ACP prompt `image` blocks and embedded resources with a blob. Steering lines, follower input, Lua children, and MCP results carry text only.
+- Storage: the bytes are an `attachment` artifact stored by digest in the same transaction as the record that names them, so a file read twice is stored once. A missing artifact is corruption.
+- Projection: the projection reads the bytes into the chain arena. Request building keeps an attachment only when the selected model's `input_modalities` admits its format; one it leaves out becomes a line in the message text naming the file and the input the model does not list, so the model knows it was not shown. The decision is made per request, so a model switch changes it without rewriting history.
+- Encoding: `ai` writes the bytes as base64 in the API family's own part. Chat Completions takes text only in a tool message, so the files of a run of tool results follow it in one user message that names each call.
+- Estimate: an image counts `CHAT_IMAGE_TOKENS` and a PDF `CHAT_PDF_PAGE_TOKENS` per page; the provider's count calibrates both like any estimate (section 23.1).
 
 ## 15. Deterministic repair
 
@@ -1027,7 +1037,7 @@ A failed child's partial text is committed and reported with the failure, but pr
 - TUI live output: a running shell box shows a bounded live tail of the call's output (`STREAM_TAIL_BYTES`, `STREAM_TAIL_LINES`), delivered through the observer's `tool_output` from the tool's worker thread and replaced by the settling result. It is display only and not journaled, so followers and replay show running boxes without it, and a subagent session streams only to its own observer.
 - Headless (`nabla --prompt`): the observer writes the final answer to stdout and everything else to stderr on the owner thread. Those streams are the run's only consumer, so a reader that stops reading should hold the run back; the answer is never dropped to keep the owner moving.
 - ACP server (`nabla acp`): the reader thread routes commands by session id to an independent owner and worker for each open session, up to `ACP_MAX_SESSIONS` per connection. Opening another session does not replace an existing one or invalidate it when the open fails. A full connection closes its least recently used idle session to make room; if every session has a turn or request in progress, the new open is refused. An evicted session can be loaded again from the journal. Prompts within one session run one at a time: a prompt that arrives during a turn is queued for a later turn (V2) or refused as busy (V1), while other sessions keep running. Sharing a session across connections remains a target under section 8.6; until then, the ACP server refuses a session another connection or process claims. The target also includes `session/fork` mapped to `Fork`, permission requests mapped to `session/request_permission`, and `_nabla/rate` and `_nabla/branches` as extension methods. `acp` implements the client role used by subagents.
-- ACP protocol rules the server keeps: `initialize` advertises exactly the methods and content it implements (`loadSession`, the session list capability for `session/list`, embedded context, stdio MCP), since a client treats an omitted capability as unsupported; every `session/update` of a prompt is queued before that prompt's response; a cancelled turn ends with `stopReason: cancelled` (V1) or an idle state carrying the cancelled reason (V2), after its pending updates; `session/load` replays the conversation as updates before its response.
+- ACP protocol rules the server keeps: `initialize` advertises exactly the methods and content it implements (`loadSession`, the session list capability for `session/list`, embedded context, image prompts, stdio MCP), since a client treats an omitted capability as unsupported; every `session/update` of a prompt is queued before that prompt's response; a cancelled turn ends with `stopReason: cancelled` (V1) or an idle state carrying the cancelled reason (V2), after its pending updates; `session/load` replays the conversation as updates before its response.
 - ACP output: the owner hands ACP frames to a writer queue. The owner's observer encodes a whole frame and appends it under a lock that guards only the append, never the write; one writer thread writes the queue in order. The owner therefore never blocks on the client. The queue has no bound, since a harness limit would drop protocol frames. An update that reports a durable outcome (a message, a finished tool call) is queued only after the journal commit that records it, so the stream is a view of the journal: a client that stops reading loses nothing that `session/load` cannot replay. Shutdown drains the queue within `SHUTDOWN_JOIN_PATIENCE`; a writer still blocked in a write is abandoned and keeps what it can reach.
 
 ## 23. Context, capacity, compaction

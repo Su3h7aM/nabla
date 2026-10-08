@@ -127,15 +127,30 @@ RESPONSE_FINISH_NAMES := [Response_Finish]string {
 }
 
 // Completion ends a unit of work: outcome is a TOOL_OUTCOME_NAMES name for a
-// call, Lua run, Task, or subagent.
+// call, Lua run, Task, or subagent. attachments are the files a tool result
+// carries beside its rendered text, in the order the model reads them.
 Completion :: struct {
-	version: int,
-	outcome: string,
-	detail:  string,
+	version:     int,
+	outcome:     string,
+	detail:      string,
+	attachments: []Attachment `json:"attachments,omitempty"`,
 }
 
 Tool_Completed :: Completion
 Call_Completed :: Completion // lua.completed, task.completed
+
+// Attachment names one file a User node or a tool result carries. Its bytes are
+// the artifact stored under digest, as lowercase hexadecimal; media_type is the
+// media type the format is named by on the wire, and name the file name the
+// model is told.
+Attachment :: struct {
+	media_type: string,
+	name:       string,
+	digest:     string,
+}
+
+// ATTACHMENT_ARTIFACT is the artifact kind an attachment's bytes are stored as.
+ATTACHMENT_ARTIFACT :: "attachment"
 
 // User_Input is one line a user sent a session, committed before anything acknowledges
 // it. The line is in the body. origin is a USER_ORIGIN_NAMES name, the origin of the
@@ -527,14 +542,15 @@ Job_Reclaimed :: struct {
 	job:     string, // JOB_KIND_NAMES
 }
 
-// User carries the text in the node body.
+// User carries the text in the node body and the files the user attached to it.
 User :: struct {
-	version: int,
-	origin:  string, // USER_ORIGIN_NAMES
+	version:     int,
+	origin:      string, // USER_ORIGIN_NAMES
 	// message is the seq of the user.input, subagent.completed, or subagent.message
 	// record this node delivers, 0 for none. The highest one is where the session's
 	// reading of its inbox resumes.
-	message: Journal_Seq,
+	message:     Journal_Seq,
+	attachments: []Attachment `json:"attachments,omitempty"`,
 }
 
 // Assistant carries the visible text in the node body. partial marks text kept

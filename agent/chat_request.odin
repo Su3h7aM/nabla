@@ -222,6 +222,7 @@ chat_build_request_selection_into :: proc(
 		api      = connection.API,
 		provider = provider_id,
 		model    = model_id,
+		media    = capacity.media,
 	}
 	prep.replay_refused = chat_append_projection(&prep.wire, &prep.calls, &prep.feedback, replay, items, arena) or_return
 	if directive != "" {
@@ -302,13 +303,15 @@ chat_build_request_selection_into :: proc(
 	return nil
 }
 
-// Chat_Replay_Target is who a request goes to. An endpoint's native output items are
-// replayed only to the API, provider, and model that produced them; any other target
-// gets the neutral text and calls.
+// Chat_Replay_Target is the model a request is built for: the endpoint identity and the input
+// it takes. An endpoint's native output items are replayed only to the API, provider, and
+// model that produced them; any other target gets the neutral text and calls. An attachment
+// in a format the model does not take is left out and the message says so.
 Chat_Replay_Target :: struct {
 	api:      ai.API_Kind,
 	provider: string,
 	model:    string,
+	media:    bit_set[ai.Provider_Media],
 }
 
 // chat_append_projection turns projected items into provider messages. Consecutive
@@ -410,7 +413,8 @@ chat_append_projection :: proc(
 		switch payload in item.payload {
 		case Projected_User:
 			chat_flush_calls(messages, call_lists, &group, &group_open) or_return
-			append(messages, ai.Provider_Message{Role = .User, Content = payload.text}) or_return
+			text, attachments := chat_accept_attachments(payload.text, payload.attachments, target.media, arena) or_return
+			append(messages, ai.Provider_Message{Role = .User, Content = text, Attachments = attachments}) or_return
 		case Projected_Assistant:
 			if !covered || target.api == .Anthropic_Messages {
 				chat_flush_calls(messages, call_lists, &group, &group_open) or_return
@@ -441,9 +445,11 @@ chat_append_projection :: proc(
 				append(feedback, text) or_return
 				append(&pending, text) or_return
 			} else {
+				text, attachments := chat_accept_attachments(payload.content, payload.attachments, target.media, arena) or_return
 				message := ai.Provider_Message {
 					Role          = .Tool,
-					Content       = payload.content,
+					Content       = text,
+					Attachments   = attachments,
 					Tool_Call_ID  = provider_ids[payload.call],
 					Tool_Is_Error = payload.outcome != .Success,
 				}
@@ -454,6 +460,45 @@ chat_append_projection :: proc(
 	chat_flush_calls(messages, call_lists, &group, &group_open) or_return
 	chat_flush_feedback(messages, &pending) or_return
 	return
+}
+
+// chat_accept_attachments returns the files the model takes and content with a note on its
+// own line for each file it does not, so the model knows what it was not shown. When the
+// model takes every file, both results borrow the arguments.
+@(private, require_results)
+chat_accept_attachments :: proc(
+	content: string,
+	attachments: []ai.Provider_Attachment,
+	media: bit_set[ai.Provider_Media],
+	arena: mem.Allocator,
+) -> (
+	text: string,
+	accepted: []ai.Provider_Attachment,
+	allocation_error: mem.Allocator_Error,
+) {
+	all_taken := true
+	for attachment in attachments {
+		if attachment.Media not_in media { all_taken = false }
+	}
+	if all_taken { return content, attachments, nil }
+
+	text = content
+	kept := make([dynamic]ai.Provider_Attachment, 0, len(attachments), arena) or_return
+	for attachment in attachments {
+		if attachment.Media in media {
+			append(&kept, attachment) or_return
+			continue
+		}
+		note := fmt.aprintf(
+			"[%s (%s) is not attached: the selected model does not list %s input]",
+			attachment.Name,
+			ai.PROVIDER_MEDIA_TYPES[attachment.Media],
+			MEDIA_MODALITIES[attachment.Media],
+			allocator = arena,
+		)
+		text = note if text == "" else fmt.aprintf("%s\n%s", text, note, allocator = arena)
+	}
+	return text, kept[:], nil
 }
 
 // CHAT_REFUSED_CALL_SUFFIX joins a call's name to the harness's account of why it
@@ -533,16 +578,57 @@ chat_flush_calls :: proc(
 @(private)
 chat_estimate_input_tokens :: proc(instructions: string, messages: []ai.Provider_Message, tools: []ai.Provider_Tool_Def) -> int {
 	chars := len(instructions)
+	attachment_tokens := 0
 	for message in messages {
 		chars += len(message.Content) + len(message.Tool_Call_ID) + len(message.Reasoning_ID) + len(message.Reasoning_Encrypted) + len(message.Verbatim_Items)
 		for call in message.Tool_Calls {
 			chars += len(call.ID) + len(call.Item_ID) + len(call.Name) + len(call.Arguments)
 		}
+		for attachment in message.Attachments {
+			attachment_tokens += chat_attachment_tokens(attachment)
+		}
 	}
 	for tool in tools {
 		chars += len(tool.Name) + len(tool.Description) + len(tool.Parameters_JSON)
 	}
-	return chars / CHAT_CHARS_PER_TOKEN + len(messages) * CHAT_MESSAGE_OVERHEAD_TOKENS
+	return chars / CHAT_CHARS_PER_TOKEN + len(messages) * CHAT_MESSAGE_OVERHEAD_TOKENS + attachment_tokens
+}
+
+// CHAT_IMAGE_TOKENS is Anthropic's upper bound for an image: width * height / 750 tokens, and images above about 1.15 megapixels are scaled down.
+CHAT_IMAGE_TOKENS :: 1600
+
+// CHAT_PDF_PAGE_TOKENS is the upper per-page figure Anthropic gives for a PDF page's text.
+CHAT_PDF_PAGE_TOKENS :: 3000
+
+// chat_attachment_tokens estimates a file's cost in tokens, never from its bytes as characters.
+@(private)
+chat_attachment_tokens :: proc(attachment: ai.Provider_Attachment) -> int {
+	switch attachment.Media {
+	case .PNG, .JPEG, .GIF, .WebP:
+		return CHAT_IMAGE_TOKENS
+	case .PDF:
+		return chat_pdf_page_count(attachment.Data) * CHAT_PDF_PAGE_TOKENS
+	}
+	return 0
+}
+
+// chat_pdf_page_count counts the page objects of a PDF, at least one. A page object is
+// marked /Type/Page or /Type /Page; /Type/Pages, the page tree, is not one. A file that
+// keeps its page objects in compressed object streams has no readable marker and counts as
+// one page.
+@(private)
+chat_pdf_page_count :: proc(data: []u8) -> int {
+	pages := 0
+	for marker in ([]string{"/Type/Page", "/Type /Page"}) {
+		rest := string(data)
+		for {
+			at := strings.index(rest, marker)
+			if at < 0 { break }
+			rest = rest[at + len(marker):]
+			if !strings.has_prefix(rest, "s") { pages += 1 }
+		}
+	}
+	return max(pages, 1)
 }
 
 // Admission is approximate and says so: character counts divided by four plus

@@ -108,9 +108,15 @@ chat_record_tool_result :: proc(
 		call        = call,
 		parent_call = parent_call,
 	}
+	attachments, attachments_error := attachments_record(chat.store, result.attachments, context.temp_allocator)
+	if attachments_error != nil {
+		chat_session_fail(chat, "the tool result could not be recorded: out of memory", latch = false)
+		return false
+	}
 	completed := journal.Tool_Completed {
-		outcome = journal.TOOL_OUTCOME_NAMES[result.outcome],
-		detail  = error_text,
+		outcome     = journal.TOOL_OUTCOME_NAMES[result.outcome],
+		detail      = error_text,
+		attachments = attachments,
 	}
 	chat_record(chat, header, completed, transmute([]u8)result.content)
 	return chat_commit(chat, "the tool result could not be recorded")

@@ -1,5 +1,6 @@
 package agent
 
+import "base:runtime"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -591,8 +592,10 @@ chat_session_fail :: proc(chat: ^Chat_Session, what: string, detail := "", latch
 // chat_session_accept_user admits a prompt: it opens a turn and commits the input the
 // session accepted but never delivered, then the prompt, as that turn's User nodes before
 // any request is made. observer hears each delivered text once the commit lands.
-chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, observer := Chat_Observer{}) -> Chat_Accept {
-	return chat_session_accept_message(chat, text, .Prompt, observer)
+// attachments are the files the prompt carries; only the prompt's own node holds them,
+// and the caller keeps their memory.
+chat_session_accept_user :: proc(chat: ^Chat_Session, text: string, observer := Chat_Observer{}, attachments: []ai.Provider_Attachment = nil) -> Chat_Accept {
+	return chat_session_accept_message(chat, text, .Prompt, observer, attachments = attachments)
 }
 
 // chat_session_accept_message is chat_session_accept_user for text that did not come from
@@ -607,6 +610,7 @@ chat_session_accept_message :: proc(
 	origin: journal.User_Origin,
 	observer := Chat_Observer{},
 	inbox_first := true,
+	attachments: []ai.Provider_Attachment = nil,
 ) -> Chat_Accept {
 	if chat.storage_failed { return .Storage_Failed }
 	if chat.state != .Idle { return .Busy }
@@ -649,6 +653,14 @@ chat_session_accept_message :: proc(
 	// The first turn names the session, so a listing says what each session was about
 	// without asking the user to name it.
 	first := chat.store.counters.turn == 0 && text != ""
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	recorded, attachments_error := attachments_record(chat.store, attachments, context.temp_allocator)
+	if attachments_error != nil {
+		chat_session_fail(chat, "the prompt could not be recorded: out of memory", latch = false)
+		chat.state = .Idle
+		chat.active_failed = false
+		return .Storage_Failed
+	}
 	chat.turn = journal.next_turn(chat.store)
 	chat.request = 0
 	if first {
@@ -674,7 +686,9 @@ chat_session_accept_message :: proc(
 	}
 	chat_record(chat, {kind = .Turn_Started, provider = chat.provider_id, model = chat.model_id}, started)
 	delivered := chat_inbox_stage(chat, pending)
-	if text != "" { chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin]}, transmute([]u8)text) }
+	if text != "" || len(recorded) > 0 {
+		chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin], attachments = recorded}, transmute([]u8)text)
+	}
 	if !chat_commit(chat, "the prompt could not be recorded") {
 		busy_failure := !chat.storage_failed
 		pending_message := "the prompt was not answered because the session store was busy; its records will be saved with the next successful write"

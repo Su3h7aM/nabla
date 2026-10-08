@@ -8,12 +8,13 @@ import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
 
+import "nabla:ai"
 
 // --- read --------------------------------------------------------------------
 
 TOOL_READ_NAME :: "read"
 
-TOOL_READ_DESCRIPTION :: `Read a text file and return a window of its lines. Use it to see a file before editing it and to continue a result that was cut off; to find text across many files, run a search command with shell instead of reading them all. Relative paths start at the session workspace, and absolute paths are used as given. Directories, binary files, and files that are not valid UTF-8 fail.
+TOOL_READ_DESCRIPTION :: `Read a text file and return a window of its lines. Use it to see a file before editing it and to continue a result that was cut off; to find text across many files, run a search command with shell instead of reading them all. Relative paths start at the session workspace, and absolute paths are used as given. PNG, JPEG, GIF, WebP images and PDF files are attached to the result so you can view them, when the selected model accepts that input; offset and limit do not apply to them. Directories, other binary files, and files that are not valid UTF-8 fail.
 
 offset is the first line, counting from 1 (default 1), and limit is the number of lines (default 2000). The result starts with path, first_line, line_count (lines returned), total_lines, and truncated, which is true when lines remain after the window; the text of the lines follows after a blank line. At most %d KiB of one result is shown to you. When the window is longer, the text is cut at a line break and a notice gives the number of complete lines shown and the offset to continue from; call read again with that offset and a smaller limit. The notice also names a file that holds the whole result.`
 
@@ -77,11 +78,16 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	if read_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not read %s: %s", args.path, os.error_string(read_error)), "unreadable")
 	}
-	defer delete(data, ctx.allocator)
+	transferred := false
+	defer if !transferred { delete(data, ctx.allocator) }
 	if tool_control_cancelled(ctx.control) {
 		return tool_result_failure(ctx, .Cancelled, "the read was cancelled", "cancelled")
 	}
 
+	if media, is_media := ai.Provider_Media_Detect(data); is_media {
+		transferred = true
+		return tool_read_media(ctx, args.path, path, media, data)
+	}
 	text := string(data)
 	// Only text is handed to the model: a provider request carries UTF-8, and a reader
 	// that silently received a prefix would not know it had. A NUL marks a binary file.
@@ -104,6 +110,37 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 	}
 	reason := fmt.tprintf("lines %d-%d of %d", args.offset, args.offset + lines - 1, total_lines) if lines > 0 else "no lines"
 	return tool_result_success(ctx, result, reason)
+}
+
+// tool_read_media answers a read of an image or PDF: the file's bytes become the
+// result's attachment, named by the file's base name. It takes ownership of data,
+// allocated with ctx.allocator.
+@(private, require_results)
+tool_read_media :: proc(ctx: ^Tool_Context, display_path, path: string, media: ai.Provider_Media, data: []u8) -> Tool_Result {
+	media_type := ai.PROVIDER_MEDIA_TYPES[media]
+	output := Read_Media_Output {
+		path       = display_path,
+		media_type = media_type,
+		bytes      = len(data),
+	}
+	result := tool_result_success(ctx, output, fmt.tprintf("%s, %d bytes", media_type, len(data)))
+	_, base := os.split_path(path)
+	name, name_error := strings.clone(base, ctx.allocator)
+	attachments, attachments_error := make([]ai.Provider_Attachment, 1, ctx.allocator)
+	if name_error != nil || attachments_error != nil {
+		delete(name, ctx.allocator)
+		delete(attachments, ctx.allocator)
+		delete(data, ctx.allocator)
+		result.allocation_failed = true
+		return result
+	}
+	attachments[0] = {
+		Media = media,
+		Name  = name,
+		Data  = data,
+	}
+	result.attachments = attachments
+	return result
 }
 
 // tool_line_count is the number of newline-separated lines. A trailing newline

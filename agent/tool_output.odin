@@ -14,6 +14,7 @@ import "nabla:agent/journal"
 // as a table keyed by these names, and the model reads them as `key: value` lines.
 Tool_Output :: union {
 	Read_Output,
+	Read_Media_Output,
 	Write_Output,
 	Edit_Output,
 	Shell_Output,
@@ -34,6 +35,15 @@ Read_Output :: struct {
 	total_lines: int,
 	truncated:   bool,
 	content:     string,
+}
+
+
+// Read_Media_Output is a read of an image or PDF file. The file itself travels as the
+// result's attachment, so the output only describes it.
+Read_Media_Output :: struct {
+	path:       string,
+	media_type: string,
+	bytes:      int,
 }
 
 Write_Output :: struct {
@@ -181,6 +191,10 @@ tool_result_render :: proc(
 		render_field(&head, "total_lines", value.total_lines) or_return
 		render_field(&head, "truncated", value.truncated) or_return
 		render_text(&body, value.content) or_return
+	case Read_Media_Output:
+		render_field(&head, "path", value.path) or_return
+		render_field(&head, "media_type", value.media_type) or_return
+		render_field(&head, "bytes", value.bytes) or_return
 	case Write_Output:
 		render_field(&head, "path", value.path) or_return
 		render_field(&head, "bytes", value.bytes) or_return
@@ -416,6 +430,12 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.content = ""
 		value.path = strings.clone(borrowed.path, allocator) or_return
 		value.content = strings.clone(borrowed.content, allocator) or_return
+	case Read_Media_Output:
+		borrowed := value
+		value.path = ""
+		value.media_type = ""
+		value.path = strings.clone(borrowed.path, allocator) or_return
+		value.media_type = strings.clone(borrowed.media_type, allocator) or_return
 	case Write_Output:
 		borrowed := value
 		value.path = ""
@@ -520,6 +540,9 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 	case Read_Output:
 		delete(value.path, allocator)
 		delete(value.content, allocator)
+	case Read_Media_Output:
+		delete(value.path, allocator)
+		delete(value.media_type, allocator)
 	case Write_Output:
 		delete(value.path, allocator)
 	case Edit_Output:

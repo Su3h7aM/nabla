@@ -1,9 +1,11 @@
 package agent
 
-// How much context a model has and where its limits are.
+import "nabla:ai"
+
+// What a model holds and what input it takes.
 //
 // Model_Capacity is computed once, by model_capacity, while the catalog is resolved, so no
-// two features disagree about what a model can hold. window is the limit; the trigger only
+// two features disagree about what a model can hold or accept. window is the limit; the trigger only
 // decides when background compaction starts, and a request asks for whatever room the window
 // has left rather than reserving a share of it for output in advance.
 Model_Capacity :: struct {
@@ -11,6 +13,8 @@ Model_Capacity :: struct {
 	model_max_output: int,
 	margin:           int,
 	trigger:          int,
+	// media is the file formats the model takes as input.
+	media:            bit_set[ai.Provider_Media],
 }
 
 // CHAT_DEFAULT_CONTEXT_WINDOW is the window assumed for a model that no
@@ -53,10 +57,31 @@ model_capacity :: proc(model: Catalog_Model) -> Model_Capacity {
 		window           = window,
 		model_max_output = stated,
 		margin           = max(window * CHAT_MARGIN_PERCENT / 100, CHAT_MARGIN_MIN_TOKENS),
+		media            = model_media(model),
 	}
 	reserve := window * CHAT_COMPACT_RESERVE_PERCENT / 100
 	capacity.trigger = max(chat_capacity_input_ceiling(capacity) - reserve, 0)
 	return capacity
+}
+
+// MEDIA_MODALITIES names each file format by the models.dev input modality that admits it.
+MEDIA_MODALITIES := [ai.Provider_Media]string {
+	.PNG  = "image",
+	.JPEG = "image",
+	.GIF  = "image",
+	.WebP = "image",
+	.PDF  = "pdf",
+}
+
+// model_media returns the file formats whose modality the model lists. A model that lists
+// none, or states nothing, takes no file.
+model_media :: proc(model: Catalog_Model) -> (media: bit_set[ai.Provider_Media]) {
+	for modality in model.input_modalities.? or_else nil {
+		for name, format in MEDIA_MODALITIES {
+			if name == modality { media += {format} }
+		}
+	}
+	return media
 }
 
 // Chat_Calibration is the provider's count against the harness's raw estimate for one

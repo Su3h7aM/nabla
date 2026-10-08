@@ -54,6 +54,49 @@ request_test_call :: proc(
 }
 
 @(test)
+test_build_request_attaches_files_only_for_models_that_take_them :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	bytes := []u8{0x89, 'P', 'N', 'G', 1, 2, 3}
+	digest := journal.put_artifact(chat.store, journal.ATTACHMENT_ARTIFACT, bytes)
+	hex_buffer: [journal.DIGEST_HEX_LENGTH]u8
+	attachment := journal.Attachment {
+		media_type = ai.PROVIDER_MEDIA_TYPES[.PNG],
+		name       = "shot.png",
+		digest     = journal.digest_to_hex(digest, hex_buffer[:]),
+	}
+	user := journal.User {
+		origin      = journal.USER_ORIGIN_NAMES[.Prompt],
+		attachments = []journal.Attachment{attachment},
+	}
+	chat_node(chat, .User, user, transmute([]u8)string("look"))
+	_test_commit(test, chat)
+
+	chat.capacity.media = {.PNG, .JPEG, .GIF, .WebP}
+	arena: virtual.Arena
+	accepted := request_test_prepare(test, chat, tool_loop_connection, &arena)
+	defer virtual.arena_destroy(&arena)
+	message := accepted.wire[len(accepted.wire) - 1]
+	testing.expect_value(test, message.Content, "look")
+	if testing.expect_value(test, len(message.Attachments), 1) {
+		testing.expect_value(test, message.Attachments[0].Name, "shot.png")
+		testing.expect_value(test, string(message.Attachments[0].Data), string(bytes))
+	}
+	testing.expect(test, accepted.raw_estimate >= CHAT_IMAGE_TOKENS)
+
+	chat.capacity.media = {}
+	refused_arena: virtual.Arena
+	refused := request_test_prepare(test, chat, tool_loop_connection, &refused_arena)
+	defer virtual.arena_destroy(&refused_arena)
+	message = refused.wire[len(refused.wire) - 1]
+	testing.expect_value(test, len(message.Attachments), 0)
+	testing.expect_value(test, message.Content, "look\n[shot.png (image/png) is not attached: the selected model does not list image input]")
+	testing.expect(test, refused.raw_estimate < CHAT_IMAGE_TOKENS)
+}
+
+@(test)
 test_build_request_uses_canonical_tool_names_directly :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
