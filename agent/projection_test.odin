@@ -132,6 +132,59 @@ test_projection_lists_unanswered_calls_and_unsettled_children :: proc(test: ^tes
 	testing.expect(test, projection.nested[1].settled, "a child with a completion is settled")
 }
 
+@(test)
+test_projection_load_nodes_loads_only_the_children_of_its_window :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	store := &fixture.store
+	session := fixture.chat.session
+	branch := fixture.chat.branch
+	scripts: [2]journal.Call_Id
+	children: [2]journal.Call_Id
+	assistants: [2]journal.Node_Id
+	for index in 0 ..< 2 {
+		assistants[index] = journal.append_node(
+			store,
+			{session = session, parent = assistants[0] if index == 1 else 0, branch = branch, kind = .Assistant},
+			journal.Assistant{request = journal.Request_Id(index + 1)},
+		)
+		scripts[index] = journal.next_call(store)
+		journal.append_record(
+			store,
+			{kind = .Tool_Proposed, session = session, node = assistants[index], call = scripts[index]},
+			journal.Tool_Proposed{provider_id = fmt.tprintf("call_%d", scripts[index]), name = TOOL_CODEMODE_NAME},
+			transmute([]u8)string(`{}`),
+		)
+		children[index] = journal.next_call(store)
+		journal.append_record(
+			store,
+			{kind = .Tool_Proposed, session = session, call = children[index], parent_call = scripts[index]},
+			journal.Tool_Proposed{provider_id = "child", name = "read"},
+			transmute([]u8)string(`{"path":"a.odin"}`),
+		)
+		journal.append_record(
+			store,
+			{kind = .Tool_Completed, session = session, call = children[index], parent_call = scripts[index]},
+			journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+			transmute([]u8)string("ok"),
+		)
+	}
+	if _, error := journal.commit(store); error != nil { testing.fail_now(test, "history commit failed") }
+
+	window, window_error := journal.read_nodes(store, session, assistants[1:], context.allocator)
+	if window_error != nil { testing.fail_now(test, "window read failed") }
+	defer journal.nodes_destroy(window, context.allocator)
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil { testing.fail_now(test, "projection arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection, error := projection_load_nodes(store, session, window, virtual.arena_allocator(&arena))
+	if !testing.expect(test, error == nil, "a window with a Code Mode call must load") { return }
+	if !testing.expect_value(test, len(projection.nested), 1) { return }
+	testing.expect_value(test, projection.nested[0].call, children[1])
+	testing.expect_value(test, projection.nested[0].parent_call, scripts[1])
+}
+
 // A window cut through tool exchanges loads: the first Results node's calls are skipped and the last Assistant node's calls keep their completions.
 @(test)
 test_projection_load_nodes_accepts_a_window_cut_through_tool_exchanges :: proc(test: ^testing.T) {

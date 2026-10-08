@@ -237,11 +237,11 @@ projection_build :: proc(
 	}
 	projection.items = items[:]
 	unanswered := make([dynamic]Projected_Result, arena) or_return
-	parents := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
+	parents := make([dynamic]journal.Call_Id, context.temp_allocator)
 	for item in items {
 		call, is_call := item.payload.(Projected_Call)
 		if !is_call { continue }
-		if call.name == TOOL_CODEMODE_NAME { parents[call.call] = true }
+		if call.name == TOOL_CODEMODE_NAME { append(&parents, call.call) or_return }
 		if record, found := completed[call.call]; found && !answered[call.call] {
 			// The entry is display only, so a completion that cannot be read is left out
 			// instead of failing the projection the provider conversation comes from.
@@ -251,12 +251,11 @@ projection_build :: proc(
 		}
 	}
 	projection.unanswered = unanswered[:]
-	if len(parents) > 0 {
-		children, _ := journal.read_records(store, {session = session, kinds = {.Tool_Proposed, .Tool_Completed}, only_children = true}, 0, 0, arena) or_return
-		positions := make(map[journal.Call_Id]int, allocator = context.temp_allocator)
-		nested := make([dynamic]Projected_Nested_Call, arena) or_return
+	nested := make([dynamic]Projected_Nested_Call, arena) or_return
+	positions := make(map[journal.Call_Id]int, allocator = context.temp_allocator)
+	for parent in parents {
+		children, _ := journal.read_records(store, {session = session, kinds = {.Tool_Proposed, .Tool_Completed}, parent_call = parent}, 0, 0, arena) or_return
 		for &record in children {
-			if !parents[record.parent_call] { continue }
 			if record.kind == .Tool_Proposed {
 				proposal: journal.Tool_Proposed
 				journal.payload_decode(record.data, &proposal, arena, corruption_journal = store, session = session, seq = record.seq) or_return
@@ -275,8 +274,8 @@ projection_build :: proc(
 			nested[position].attachments = result.attachments
 			nested[position].settled = true
 		}
-		projection.nested = nested[:]
 	}
+	if len(nested) > 0 { projection.nested = nested[:] }
 	return projection, nil
 }
 
