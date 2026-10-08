@@ -13,9 +13,22 @@ import "core:math"
 import "nabla:ai"
 import "nabla:term"
 
-// IMAGE_MAX_ROWS is the tallest a picture is drawn. A screenshot stays readable
-// at this height, and a terminal of forty rows still shows the text around it.
+// IMAGE_MAX_ROWS is the tallest a picture is drawn, and half the conversation's
+// rows is the tallest on a short terminal. A screenshot stays readable at 24 rows,
+// and the text around the picture stays on screen.
 IMAGE_MAX_ROWS :: 24
+#assert(IMAGE_MAX_ROWS <= term.GRAPHICS_MAX_ROWS)
+
+// IMAGE_MIN_ROWS is the height a smaller picture is enlarged to, because an icon
+// at its natural size is a few cells and cannot be read. The maximums win when
+// they are smaller.
+IMAGE_MIN_ROWS :: 8
+#assert(IMAGE_MIN_ROWS <= IMAGE_MAX_ROWS)
+
+// IMAGE_MAX_COLUMNS is the widest a picture is drawn. A wide terminal would
+// otherwise stretch a picture across the whole screen, far past a readable size.
+IMAGE_MAX_COLUMNS :: 80
+#assert(IMAGE_MAX_COLUMNS <= term.GRAPHICS_MAX_COLUMNS)
 
 // IMAGE_CELL_WIDTH and IMAGE_CELL_HEIGHT are the pixels assumed for one cell when
 // the terminal reports no pixel size.
@@ -46,10 +59,16 @@ Image_Placement :: struct {
 	rows:    int,
 }
 
-// Image_Upload is an image the terminal does not have yet. image.data is a copy
-// in temporary memory, because the entry may be dropped once the lock is released.
+// Image_Upload is an image the terminal does not have yet. It owns the pixels
+// that images_collect moved out of the entry under the lock, so the lock never
+// copies them and the entry can be dropped while they are sent. The frame storage
+// frees them when the terminal takes the image, when the entry is gone, or when
+// the storage is destroyed.
 Image_Upload :: struct {
-	image:     term.Image,
+	pixels:    [dynamic]u8, // owned,
+	format:    term.Image_Format,
+	width:     int,
+	height:    int,
 	placement: Image_Placement,
 }
 
@@ -106,6 +125,8 @@ snap_entry_image_set_locked :: proc(app: ^App, entry: ^Entry, image: ^Entry_Imag
 // image_decode_jpeg decodes a JPEG file into image, whose pixels the decoder
 // allocates with the run's allocator. image stays empty when it cannot.
 image_decode_jpeg :: proc(app: ^App, data: []byte, image: ^Entry_Image) {
+	// jpeg.destroy frees the metadata with the context's allocator.
+	context.allocator = app.run.alloc
 	decoded, decode_error := jpeg.load_from_bytes(data, {}, app.run.alloc)
 	defer jpeg.destroy(decoded)
 	if decode_error != nil || decoded.depth != 8 || decoded.width <= 0 || decoded.height <= 0 { return }
@@ -134,17 +155,20 @@ png_size :: proc(data: []byte) -> (width, height: int, ok: bool) {
 }
 
 // image_cells sizes a picture in cells: its natural size at the given pixels per
-// cell (a zero size assumes the default), shrunk to fit available_columns,
-// IMAGE_MAX_ROWS, and the protocol's limits with its aspect ratio kept, and never
-// enlarged. image must be prepared.
-image_cells :: proc(image: Entry_Image, available_columns: int, cell_pixels: [2]int) -> (columns, rows: int) {
+// cell (a zero size assumes the default), enlarged with its aspect ratio kept
+// until it is IMAGE_MIN_ROWS tall when it is smaller, and shrunk to fit
+// available_columns, IMAGE_MAX_COLUMNS, IMAGE_MAX_ROWS, and half of
+// conversation_rows. The maximums win over the minimum. The result is at least
+// one cell. image must be prepared.
+image_cells :: proc(image: Entry_Image, available_columns, conversation_rows: int, cell_pixels: [2]int) -> (columns, rows: int) {
 	cell_width := cell_pixels.x if cell_pixels.x > 0 else IMAGE_CELL_WIDTH
 	cell_height := cell_pixels.y if cell_pixels.y > 0 else IMAGE_CELL_HEIGHT
 	natural_columns := f64(image.width) / f64(cell_width)
 	natural_rows := f64(image.height) / f64(cell_height)
-	limit_columns := clamp(available_columns, 1, term.GRAPHICS_MAX_COLUMNS)
-	limit_rows := min(IMAGE_MAX_ROWS, term.GRAPHICS_MAX_ROWS)
-	scale := min(1, f64(limit_columns) / natural_columns, f64(limit_rows) / natural_rows)
+	limit_columns := clamp(available_columns, 1, IMAGE_MAX_COLUMNS)
+	limit_rows := clamp(conversation_rows / 2, 1, IMAGE_MAX_ROWS)
+	wanted := max(1, IMAGE_MIN_ROWS / natural_rows)
+	scale := min(wanted, f64(limit_columns) / natural_columns, f64(limit_rows) / natural_rows)
 	columns = clamp(int(math.round(natural_columns * scale)), 1, limit_columns)
 	rows = clamp(int(math.round(natural_rows * scale)), 1, limit_rows)
 	return
@@ -159,27 +183,39 @@ snap_image_entry_locked :: proc(app: ^App, id: term.Image_Id) -> ^Entry {
 }
 
 // images_collect works out, from the frame just composed, what the terminal must
-// be told: the shown images it does not hold yet, with a copy of their pixels, and
-// the images it holds whose entries left the transcript. A failed allocation skips
-// the item, and the next frame finds it again. The caller holds the runtime mutex.
+// be told: the shown images it does not hold yet, whose pixels move from their
+// entries to storage.uploads, and the images it holds whose entries left the
+// transcript. Moving is a slice header, so the lock covers no copy of the pixels.
+// A pending upload whose entry left is freed. A failed allocation skips the item,
+// and the next frame finds it again. The caller holds the runtime mutex.
 images_collect :: proc(app: ^App, storage: ^Frame_Storage) {
-	clear(&storage.uploads)
 	clear(&storage.stale)
 	for placed in storage.placed {
 		if snap_image_entry_locked(app, placed.id) == nil { _, _ = append(&storage.stale, placed.id) }
 	}
+	for index := len(storage.uploads) - 1; index >= 0; index -= 1 {
+		if snap_image_entry_locked(app, storage.uploads[index].placement.id) == nil {
+			delete(storage.uploads[index].pixels)
+			unordered_remove(&storage.uploads, index)
+		}
+	}
 	for shown in storage.shown {
 		if image_placement_find(storage.placed[:], shown.id) >= 0 { continue }
+		if index := image_upload_find(storage.uploads[:], shown.id); index >= 0 {
+			storage.uploads[index].placement = shown
+			continue
+		}
 		entry := snap_image_entry_locked(app, shown.id)
-		if entry == nil { continue }
-		copied, copy_error := make([]byte, len(entry.image.pixels), context.temp_allocator)
-		if copy_error != nil { continue }
-		copy(copied, entry.image.pixels[:])
+		if entry == nil || len(entry.image.pixels) == 0 { continue }
 		upload := Image_Upload {
-			image = {data = copied, format = entry.image.format, width = entry.image.width, height = entry.image.height},
+			pixels    = entry.image.pixels,
+			format    = entry.image.format,
+			width     = entry.image.width,
+			height    = entry.image.height,
 			placement = shown,
 		}
-		_, _ = append(&storage.uploads, upload)
+		if _, append_error := append(&storage.uploads, upload); append_error != nil { continue }
+		entry.image.pixels = nil
 	}
 }
 
@@ -191,29 +227,48 @@ image_placement_find :: proc(placements: []Image_Placement, id: term.Image_Id) -
 	return -1
 }
 
+// image_upload_find returns the index of the upload of id in uploads, or -1.
+image_upload_find :: proc(uploads: []Image_Upload, id: term.Image_Id) -> int {
+	for upload, index in uploads {
+		if upload.placement.id == id { return index }
+	}
+	return -1
+}
+
 // images_sync brings the terminal to what images_collect found: it frees stale
 // images, sends new ones, and re-places a shown image whose size changed. It runs
 // on the main thread before the frame is presented and holds no lock. A failed
-// write is reported once and never stops the frame; the image stays recorded so
-// it is not sent again every frame.
+// write is reported once and never stops the frame; the image stays pending or
+// keeps its old size, so the next frame tries it again while its entry exists.
 images_sync :: proc(app: ^App, storage: ^Frame_Storage) {
 	for id in storage.stale {
 		_, delete_error := term.graphics_delete(app.terminal, id, context.temp_allocator)
 		images_report(app, storage, delete_error)
 		if index := image_placement_find(storage.placed[:], id); index >= 0 { unordered_remove(&storage.placed, index) }
 	}
-	for upload in storage.uploads {
-		placement := upload.placement
-		_, transmit_error := term.graphics_transmit(app.terminal, placement.id, upload.image, placement.columns, placement.rows, context.temp_allocator)
+	for shown in storage.shown {
+		index := image_upload_find(storage.uploads[:], shown.id)
+		if index < 0 { continue }
+		upload := storage.uploads[index]
+		image := term.Image {
+			data   = upload.pixels[:],
+			format = upload.format,
+			width  = upload.width,
+			height = upload.height,
+		}
+		_, transmit_error := term.graphics_transmit(app.terminal, shown.id, image, shown.columns, shown.rows, context.temp_allocator)
 		images_report(app, storage, transmit_error)
-		_, _ = append(&storage.placed, placement)
+		if transmit_error != nil { continue }
+		if _, append_error := append(&storage.placed, shown); append_error != nil { continue }
+		delete(upload.pixels)
+		unordered_remove(&storage.uploads, index)
 	}
 	for shown in storage.shown {
 		index := image_placement_find(storage.placed[:], shown.id)
 		if index < 0 || storage.placed[index] == shown { continue }
 		_, place_error := term.graphics_place(app.terminal, shown.id, shown.columns, shown.rows, context.temp_allocator)
 		images_report(app, storage, place_error)
-		storage.placed[index] = shown
+		if place_error == nil { storage.placed[index] = shown }
 	}
 }
 

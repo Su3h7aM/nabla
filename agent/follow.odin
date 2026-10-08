@@ -218,6 +218,8 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 		content   = string(record.body),
 		allocator = context.temp_allocator,
 	}
+	// The pictures are display only, so a file the journal cannot give leaves the text.
+	result.attachments, _ = projection_attachments(store, completed.attachments, context.temp_allocator)
 	_observer_tool_result(observer, record.call, record.parent_call, name, arguments, &result)
 	return nil
 }

@@ -98,6 +98,7 @@ Projected_Nested_Call :: struct {
 	proposed:    string,
 	content:     string,
 	outcome:     journal.Tool_Outcome,
+	attachments: []ai.Provider_Attachment,
 	settled:     bool,
 }
 
@@ -227,6 +228,7 @@ projection_load :: proc(
 			result := projection_result(store, &record, arena) or_return
 			nested[position].content = result.content
 			nested[position].outcome = result.outcome
+			nested[position].attachments = result.attachments
 			nested[position].settled = true
 		}
 		projection.nested = nested[:]

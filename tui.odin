@@ -180,32 +180,36 @@ Render_Status :: enum u8 {
 // Markdown presentation cache, the presentation scratch, and the layout
 // context, whose storage grows to the transcript it is given.
 Frame_Storage :: struct {
-	cells:           []term.Cell,
-	buffer:          term.Frame_Buffer,
-	output:          []byte,
-	alloc:           mem.Allocator,
-	markdown:        Markdown_Cache,
+	cells:             []term.Cell,
+	buffer:            term.Frame_Buffer,
+	output:            []byte,
+	alloc:             mem.Allocator,
+	markdown:          Markdown_Cache,
 	// links is this frame's hyperlink table (term.Frame_Buffer.links); the URIs are
 	// views into markdown's records, which live through the frame's present.
-	links:           [dynamic]string,
-	layout_ctx:      layout.Context,
+	links:             [dynamic]string,
+	layout_ctx:        layout.Context,
 	// capacities is what layout_ctx is currently sized for. The context owns its
 	// storage, so the budget is raised through layout.reserve as the transcript
 	// outgrows it, and this is the base a raise is computed from.
-	capacities:      layout.Capacities,
-	measure:         tui.Measure_Context,
+	capacities:        layout.Capacities,
+	measure:           tui.Measure_Context,
+	// conversation_rows is the height of the transcript's area in the frame being
+	// drawn, which bounds the height of a picture in it.
+	conversation_rows: int,
 	// cell_pixels is the size of one terminal cell in pixels, zero when the terminal
 	// reports none. A picture's size in cells follows from it.
-	cell_pixels:     [2]int,
+	cell_pixels:       [2]int,
 	// shown is the images this frame draws and their sizes in cells. placed is what
-	// the terminal holds, the main thread's record of what it was sent. uploads and
-	// stale are the work images_collect found between the two.
-	shown:           [dynamic]Image_Placement,
-	placed:          [dynamic]Image_Placement,
-	uploads:         [dynamic]Image_Upload,
-	stale:           [dynamic]term.Image_Id,
+	// the terminal holds, the main thread's record of what it was sent. uploads is
+	// the pictures taken from their entries and not yet accepted by the terminal,
+	// and stale is the placed images whose entries left the transcript.
+	shown:             [dynamic]Image_Placement,
+	placed:            [dynamic]Image_Placement,
+	uploads:           [dynamic]Image_Upload,
+	stale:             [dynamic]term.Image_Id,
 	// graphics_failed latches the one warning a failing image write produces.
-	graphics_failed: bool,
+	graphics_failed:   bool,
 }
 
 @(require_results)
@@ -245,6 +249,7 @@ frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 	delete(storage.links)
 	delete(storage.shown)
 	delete(storage.placed)
+	for &upload in storage.uploads { delete(upload.pixels) }
 	delete(storage.uploads)
 	delete(storage.stale)
 }
@@ -285,9 +290,6 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	// and survives this reset. The previous frame was already presented, so its
 	// remaining borrows are dead and the pool can be recycled.
 	free_all(context.temp_allocator)
-	if viewport, viewport_error := term.viewport(app.terminal); viewport_error == nil && viewport.columns > 0 && viewport.rows > 0 {
-		storage.cell_pixels = {viewport.width_pixels / viewport.columns, viewport.height_pixels / viewport.rows}
-	}
 	cursor: term.Cursor
 	err: Render_Status
 	if sync.mutex_guard(&app.run.mu) {
@@ -400,6 +402,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	}
 	offset := app.conv_scroll_range - app.scroll
 	viewport := layout.Vec2{layout.Scalar(rect.width), layout.Scalar(rect.height)}
+	storage.conversation_rows = rect.height
 
 	for pass in 0 ..< 2 {
 		frame_result, solved := conversation_solve(app, storage, viewport, rect.width, offset)
@@ -593,8 +596,9 @@ draw_conversation_image :: proc(storage: ^Frame_Storage, bounds: layout.Rect, id
 	rect.y += viewport.y
 	clipped := storage.buffer
 	clipped.rows = viewport.y + viewport.height
-	_ = tui.draw_image(&clipped, rect, id)
-	_, _ = append(&storage.shown, Image_Placement{id = id, columns = rect.width, rows = rect.height})
+	if tui.draw_image(&clipped, rect, id) > 0 {
+		_, _ = append(&storage.shown, Image_Placement{id = id, columns = rect.width, rows = rect.height})
+	}
 	return true
 }
 
@@ -857,7 +861,7 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 			declare_tool_row(ctx, fmt.tprintf(" %s ", fill), border, body, outline.vertical)
 		}
 		if entry.image.id != 0 {
-			columns, rows := image_cells(entry.image, content_width, storage.cell_pixels)
+			columns, rows := image_cells(entry.image, content_width, storage.conversation_rows, storage.cell_pixels)
 			declare_tool_image(ctx, entry.image.id, columns, rows, content_width, border, outline.vertical)
 		}
 		layout.text(ctx, layout.Text_Desc{text = bottom, style = border})

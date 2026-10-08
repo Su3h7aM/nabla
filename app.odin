@@ -573,7 +573,7 @@ tui_run :: proc(
 	}
 
 	if viewport, viewport_err := term.viewport(app.terminal); viewport_err == nil {
-		app.columns, app.rows = viewport.columns, viewport.rows
+		viewport_adopt(app, viewport)
 		present_frame(app, app.storage)
 	}
 
@@ -610,7 +610,7 @@ tui_run :: proc(
 			recovered = app.viewport_reported
 			app.viewport_reported = false
 			resized = viewport.columns != app.columns || viewport.rows != app.rows
-			app.columns, app.rows = viewport.columns, viewport.rows
+			viewport_adopt(app, viewport)
 		} else {
 			report_viewport_unavailable(app, viewport_err)
 		}
@@ -675,6 +675,15 @@ tui_wait_ms :: proc(app: ^App) -> i64 {
 	if !runtime_busy(app) { return -1 }
 	remaining := SPINNER_INTERVAL - time.tick_diff(app.spin_lap, time.tick_now())
 	return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
+}
+
+// viewport_adopt records the terminal's size in cells and, when it reports pixels, the
+// size of one cell, which a picture's size in cells follows from.
+viewport_adopt :: proc(app: ^App, viewport: term.Viewport) {
+	app.columns, app.rows = viewport.columns, viewport.rows
+	if viewport.columns > 0 && viewport.rows > 0 {
+		app.storage.cell_pixels = {viewport.width_pixels / viewport.columns, viewport.height_pixels / viewport.rows}
+	}
 }
 
 // report_viewport_unavailable says once per episode that the terminal reported no size to

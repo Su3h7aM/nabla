@@ -751,8 +751,10 @@ session_replay_child :: proc(app: ^App, child: agent.Projected_Nested_Call, pare
 	content, fallback, outcome := "", "", journal.Tool_Outcome.Success
 	if settled { content, fallback, outcome = child.content, journal.TOOL_OUTCOME_NAMES[child.outcome], child.outcome }
 	text := tool_entry_text_titled(display, codemode_inner_title(child.name), content, fallback, outcome)
+	image := image_prepare(app, child.attachments)
+	defer delete(image.pixels)
 	sync.mutex_guard(&app.run.mu)
-	snap_push_tool_locked(app, .Codemode, child.call, text, child.outcome, !settled)
+	snap_push_tool_locked(app, .Codemode, child.call, text, child.outcome, !settled, &image)
 }
 
 // codemode_inner_list lists the calls the Code Mode call parent_call made, in admission
@@ -1018,14 +1020,14 @@ snap_report_dropped_locked :: proc(app: ^App) {
 }
 
 snap_push_locked :: proc(app: ^App, entry: Entry) {
+	entry := entry // a parameter is not addressable, and the refused entry is destroyed
 	app.run.snap.entries_bytes += entry.bytes
 	if _, append_error := append(&app.run.snap.entries, entry); append_error != nil {
 		app.run.snap.entries_bytes -= entry.bytes
 		// Nothing holds the buffer now: the array did not take the entry. A
 		// dynamic array releases through its own allocator, which the entry's text
 		// was given when it was made.
-		refused := entry
-		entry_destroy(&refused)
+		entry_destroy(&entry)
 		snap_report_dropped_locked(app)
 		return
 	}
@@ -1192,7 +1194,9 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 	app := cast(^App)user_data
 	display := tool_display_call(name, arguments)
 	summary := tool_display_summary(result)
-	image := image_prepare(app, result.attachments)
+	// Only the boxes of a single call draw a picture; the Code Mode outer box has none.
+	image: Entry_Image
+	if parent_call != 0 || name != agent.TOOL_CODEMODE_NAME { image = image_prepare(app, result.attachments) }
 	defer delete(image.pixels)
 	sync.mutex_guard(&app.run.mu)
 	if shown := snap_tool_entry_locked(app, call); shown != nil && !shown.running { return }
