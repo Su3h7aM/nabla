@@ -1,6 +1,9 @@
 #+build linux
 package main
 
+import "base:runtime"
+
+import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
 import "core:io"
@@ -13,6 +16,7 @@ import "core:sync/chan"
 import "nabla:acp"
 import "nabla:agent"
 import "nabla:agent/journal"
+import "nabla:ai"
 
 // The ACP conversation: reading messages, answering what the reader can answer on its
 // own, and turning the rest into work for the worker. Everything a turn produces is
@@ -288,9 +292,9 @@ acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 			protocol_version = negotiated,
 			info = {name = NABLA_ACP_NAME, title = "Nabla", version = NABLA_ACP_VERSION},
 			capabilities = {
-				// The v2 session surface is implemented below. Nabla does not expose
-				// image or audio prompt variants, and it exposes stdio MCP only.
-				session = {prompt = {embedded_context = {}}, mcp = {stdio = {}}},
+				// The v2 session surface is implemented below. Nabla takes image
+				// prompts but not audio, and it exposes stdio MCP only.
+				session = {prompt = {image = acp.V2_Support{}, embedded_context = {}}, mcp = {stdio = {}}},
 			},
 			auth_methods = auth_methods,
 		}
@@ -305,7 +309,8 @@ acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 			load_session = true,
 			session_capabilities = {list = {}},
 			prompt_capabilities = {
-				// Prompts are text, resource links, and embedded text: no images or audio.
+				// Prompts are text, resource links, embedded resources, and images: no audio.
+				image            = true,
 				embedded_context = true,
 			},
 			// Stdio MCP is supported. HTTP and SSE are deliberately not advertised.
@@ -930,12 +935,18 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "a request is already in flight")
 		return
 	}
-	text, reason, ok := acp_prompt_text(params.prompt, context.temp_allocator)
+	text, attachments, reason, ok := acp_prompt_text(params.prompt, server.alloc)
 	if !ok {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, reason)
 		return
 	}
-	if text == "" {
+	// The work item takes text and attachments on success; every refusal below releases them.
+	queued := false
+	defer if !queued {
+		delete(text, server.alloc)
+		acp_attachments_destroy(attachments, server.alloc)
+	}
+	if text == "" && len(attachments) == 0 {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the prompt is empty")
 		return
 	}
@@ -943,21 +954,16 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "no model is selected; configure a provider in nabla's config.lua")
 		return
 	}
-	prompt_text, prompt_error := strings.clone(text, server.alloc)
-	if prompt_error != nil {
-		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the prompt could not be allocated")
-		return
-	}
 	id, id_ok := acp_work_id(envelope.id, server.alloc)
 	if !id_ok {
-		delete(prompt_text, server.alloc)
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
 	work := ACP_Work {
 		id = id,
-		variant = ACP_Work_Prompt{text = prompt_text},
+		variant = ACP_Work_Prompt{text = text, attachments = attachments},
 	}
+	queued = true
 	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}
@@ -1042,55 +1048,148 @@ acp_enqueue :: proc(session: ^ACP_Session, work: ACP_Work) -> bool {
 
 // --- prompts -----------------------------------------------------------------
 
-// acp_prompt_text renders a prompt's content blocks as the one message the harness records.
-// Text blocks are the message itself; a resource link becomes the path it names, and an
-// embedded text resource brings its text along. Binary resources are named in a note so
-// the model knows bytes were attached but not included. Other unsupported content is
-// refused rather than dropped, and reason names it when ok is false.
+// acp_prompt_text renders a prompt's content blocks as the one message the harness records,
+// with the files it carries. Text blocks are the message itself; a resource link becomes
+// the path it names, and an embedded text resource brings its text along. An image block
+// and a binary resource whose bytes are a recognized image or PDF become attachments.
+// Other binary resources are named in a note so the model knows bytes were attached but
+// not included. Other unsupported content, an image block that is not a recognized
+// format, and base64 that does not decode are refused rather than dropped, and reason
+// names the block when ok is false.
+// text and attachments, with their names and bytes, are owned by allocator; release the
+// attachments with acp_attachments_destroy.
 @(require_results)
-acp_prompt_text :: proc(blocks: []acp.Content_Block, allocator := context.allocator) -> (text: string, reason: string, ok: bool) {
+acp_prompt_text :: proc(
+	blocks: []acp.Content_Block,
+	allocator := context.allocator,
+) -> (
+	text: string,
+	attachments: []ai.Provider_Attachment,
+	reason: string,
+	ok: bool,
+) {
 	builder, builder_error := strings.builder_make(allocator)
-	if builder_error != nil { return "", "the prompt could not be allocated", false }
+	if builder_error != nil { return "", nil, "the prompt could not be allocated", false }
+	collected: [dynamic]ai.Provider_Attachment
+	collected.allocator = allocator
 	complete := false
-	defer if !complete { strings.builder_destroy(&builder) }
-	for block in blocks {
+	defer if !complete {
+		strings.builder_destroy(&builder)
+		acp_attachments_destroy(collected[:], allocator)
+		delete(collected)
+	}
+	for block, index in blocks {
 		switch block.type {
 		case acp.CONTENT_TEXT:
 			if !acp_prompt_append(&builder, block.text) {
-				return "", "the prompt could not be allocated", false
+				return "", nil, "the prompt could not be allocated", false
+			}
+		case acp.CONTENT_IMAGE:
+			switch acp_prompt_attach(&collected, block.data, block.uri, allocator) {
+			case .Attached:
+			case .Unrecognized:
+				return "", nil, fmt.tprintf("prompt block %d: the image is not a PNG, JPEG, GIF, or WebP file", index + 1), false
+			case .Invalid_Base64:
+				return "", nil, fmt.tprintf("prompt block %d: the image data is not valid base64", index + 1), false
+			case .Allocation:
+				return "", nil, "the prompt could not be allocated", false
 			}
 		case acp.CONTENT_RESOURCE_LINK:
 			if block.uri == "" { continue }
 			path, path_ok := acp_resource_path(block.uri, context.temp_allocator)
 			defer delete(path, context.temp_allocator)
 			if !path_ok || !acp_prompt_append(&builder, path) {
-				return "", "the resource path could not be allocated", false
+				return "", nil, "the resource path could not be allocated", false
 			}
 		case acp.CONTENT_RESOURCE:
 			if block.resource.text != "" {
 				if !acp_prompt_append(&builder, block.resource.text) {
-					return "", "the prompt could not be allocated", false
+					return "", nil, "the prompt could not be allocated", false
 				}
 			}
 			if block.resource.blob_present {
-				if !acp_prompt_append_binary_resource(&builder, block.resource) {
-					return "", "the prompt could not be allocated", false
+				switch acp_prompt_attach(&collected, block.resource.blob, block.resource.uri, allocator) {
+				case .Attached:
+				case .Unrecognized:
+					if !acp_prompt_append_binary_resource(&builder, block.resource) {
+						return "", nil, "the prompt could not be allocated", false
+					}
+				case .Invalid_Base64:
+					return "", nil, fmt.tprintf("prompt block %d: the resource blob is not valid base64", index + 1), false
+				case .Allocation:
+					return "", nil, "the prompt could not be allocated", false
 				}
 			} else if block.resource.text == "" && block.resource.uri != "" {
 				path, path_ok := acp_resource_path(block.resource.uri, context.temp_allocator)
 				defer delete(path, context.temp_allocator)
 				if !path_ok || !acp_prompt_append(&builder, path) {
-					return "", "the resource path could not be allocated", false
+					return "", nil, "the resource path could not be allocated", false
 				}
 			}
 		case:
-			strings.builder_destroy(&builder)
-			return "", fmt.tprintf("prompt content of type %q is not supported", block.type), false
+			return "", nil, fmt.tprintf("prompt content of type %q is not supported", block.type), false
 		}
 	}
 	text = strings.to_string(builder)
+	attachments = collected[:]
 	complete = true
-	return text, "", true
+	return text, attachments, "", true
+}
+
+// acp_attachments_destroy releases the names and bytes acp_prompt_text allocated, and the
+// slice itself.
+acp_attachments_destroy :: proc(attachments: []ai.Provider_Attachment, allocator: mem.Allocator) {
+	for attachment in attachments {
+		delete(attachment.Name, allocator)
+		delete(attachment.Data, allocator)
+	}
+	delete(attachments, allocator)
+}
+
+ACP_Prompt_Attach :: enum {
+	Attached,
+	Unrecognized,
+	Invalid_Base64,
+	Allocation,
+}
+
+// acp_prompt_attach decodes encoded and, when the bytes are a recognized image or PDF,
+// appends them to attachments, named by the base name of uri or else by their position
+// and format. Nothing is appended for any other result.
+@(private, require_results)
+acp_prompt_attach :: proc(attachments: ^[dynamic]ai.Provider_Attachment, encoded: string, uri: string, allocator: mem.Allocator) -> ACP_Prompt_Attach {
+	data, decode_error := base64.decode(encoded, allocator = allocator)
+	if decode_error != nil {
+		_, is_allocation := decode_error.(runtime.Allocator_Error)
+		return .Allocation if is_allocation else .Invalid_Base64
+	}
+	media, recognized := ai.Provider_Media_Detect(data)
+	if !recognized {
+		delete(data, allocator)
+		return .Unrecognized
+	}
+	name: string
+	name_error: mem.Allocator_Error
+	if base := uri[strings.last_index_byte(uri, '/') + 1:]; base != "" {
+		name, name_error = strings.clone(base, allocator)
+	} else {
+		// The subtype of the media type is the extension: "image/png" is a .png file.
+		subtype := ai.PROVIDER_MEDIA_TYPES[media]
+		subtype = subtype[strings.last_index_byte(subtype, '/') + 1:]
+		kind := "document" if media == .PDF else "image"
+		name, name_error = fmt.aprintf("%s-%d.%s", kind, len(attachments) + 1, subtype, allocator = allocator), nil
+	}
+	attachment := ai.Provider_Attachment {
+		Media = media,
+		Name  = name,
+		Data  = data,
+	}
+	if name_error != nil || append(attachments, attachment) != 1 {
+		delete(name, allocator)
+		delete(data, allocator)
+		return .Allocation
+	}
+	return .Attached
 }
 
 // acp_prompt_append keeps the blocks of one message apart, so two blocks do not run

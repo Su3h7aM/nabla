@@ -208,6 +208,7 @@ V1_Session_List_Capabilities :: struct {
 }
 
 V2_Prompt_Capabilities :: struct {
+	image:            Maybe(V2_Support) `json:"image,omitempty"`,
 	embedded_context: V2_Support `json:"embeddedContext"`,
 }
 
@@ -292,22 +293,27 @@ Session_Close_Params :: struct {
 }
 
 // Embedded_Resource is a resource the client inlined into the prompt. Text travels with
-// the message, while binary contents are represented without retaining their bytes.
+// the message; a binary resource keeps its base64 text in blob, borrowed from the decoded
+// JSON value, and blob_present reports whether the field was there at all.
 Embedded_Resource :: struct {
 	uri:          string `json:"uri"`,
 	text:         string `json:"text"`,
 	mime_type:    string `json:"mimeType,omitempty"`,
+	blob:         string `json:"-"`,
 	blob_present: bool `json:"-"`,
 }
 
 // Content_Block is one element of a prompt. The union is by `type`, and every kind's
 // fields live side by side rather than in a tagged union, because the JSON decoder fills
-// the shape the document has and a block carries whichever fields its type names.
+// the shape the document has and a block carries whichever fields its type names. An
+// image block keeps its base64 text in data, borrowed from the decoded JSON value.
 Content_Block :: struct {
-	type:     string `json:"type"`,
-	text:     string `json:"text"`,
-	uri:      string `json:"uri"`,
-	resource: Embedded_Resource `json:"resource"`,
+	type:      string `json:"type"`,
+	text:      string `json:"text"`,
+	uri:       string `json:"uri"`,
+	data:      string `json:"data,omitempty"`,
+	mime_type: string `json:"mimeType,omitempty"`,
+	resource:  Embedded_Resource `json:"resource"`,
 }
 
 Session_Prompt_Params :: struct {
@@ -317,7 +323,7 @@ Session_Prompt_Params :: struct {
 
 // session_prompt_params_decode reads the prompt's needed fields from its JSON value.
 // Its strings borrow from value and its block slice is owned by allocator, so value
-// must outlive the returned params. Binary payload bytes are inspected only for presence.
+// must outlive the returned params, including the base64 text of images and blobs.
 // It returns Invalid for a mismatched shape and Allocation when the block slice cannot
 // be allocated.
 @(require_results)
@@ -355,6 +361,16 @@ session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_
 			if !uri_is_string { return .Invalid }
 			block.uri = string(uri)
 		}
+		if data_value, present := block_object["data"]; present {
+			data, data_is_string := data_value.(json.String)
+			if !data_is_string { return .Invalid }
+			block.data = string(data)
+		}
+		if mime_value, present := block_object["mimeType"]; present {
+			mime, mime_is_string := mime_value.(json.String)
+			if !mime_is_string { return .Invalid }
+			block.mime_type = string(mime)
+		}
 		if resource_value, present := block_object["resource"]; present {
 			resource_object, resource_is_object := resource_value.(json.Object)
 			if !resource_is_object { return .Invalid }
@@ -376,7 +392,9 @@ session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_
 				}
 			}
 			if blob_value, has_blob := resource_object["blob"]; has_blob {
-				if _, is_blob_string := blob_value.(json.String); !is_blob_string { return .Invalid }
+				blob, is_blob_string := blob_value.(json.String)
+				if !is_blob_string { return .Invalid }
+				block.resource.blob = string(blob)
 				block.resource.blob_present = true
 			}
 		}

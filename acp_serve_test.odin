@@ -2,6 +2,7 @@
 #+private file
 package main
 
+import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
 import "core:io"
@@ -1042,7 +1043,7 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 	acp_test_client_send(&client, strings.to_string(handshake))
 	hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
 	if hello == "" { return }
-	testing.expect(t, strings.contains(hello, `"capabilities":{"session":{"prompt":{"embeddedContext":{}},"mcp":{"stdio":{}}}}`))
+	testing.expect(t, strings.contains(hello, `"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"mcp":{"stdio":{}}}}`))
 	testing.expect(t, strings.contains(hello, `"info":{"name":"nabla","title":"Nabla","version":"0.1.0"}`))
 
 	opening := strings.builder_make(context.temp_allocator)
@@ -1173,7 +1174,9 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	)
 	strings.write_byte(&handshake, '\n')
 	acp_test_client_send(&client, strings.to_string(handshake))
-	if acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered") == "" { return }
+	v2_hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
+	if v2_hello == "" { return }
+	testing.expectf(t, strings.contains(v2_hello, `"image":{}`), "v2 initialize did not announce image prompts: %s", v2_hello)
 
 	opening := strings.builder_make(context.temp_allocator)
 	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
@@ -1239,6 +1242,138 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	strings.write_byte(&plain_resume, '\n')
 	acp_test_client_send(&client, strings.to_string(plain_resume))
 	if acp_test_client_expect(t, &client, `"id":5,"result"`, "v2 plain resume did not answer") == "" { return }
+}
+
+// A prompt with an image block reaches the session as a user message that carries the file:
+// the journal's User node for the turn names one PNG attachment, whatever mimeType said.
+@(test)
+test_acp_prompt_records_an_image_block_as_an_attachment :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-image-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		_ = os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-image-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		_ = os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	replies := []string {
+		acp_test_stream_reply(
+			acp_test_sse_body({`{"choices":[{"delta":{"content":"seen"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
+		),
+	}
+	defer for reply in replies { delete(reply, context.allocator) }
+	provider: ACP_Test_Provider
+	if !acp_test_provider_start(t, &provider, replies) { return }
+	defer acp_test_provider_stop(t, &provider)
+
+	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	defer delete(sources, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	defer delete(models, context.allocator)
+	models[0] = {
+		id                = "imagemodel",
+		context_window    = 100000,
+		max_output_tokens = 4096,
+		tools             = true,
+	}
+	sources[0] = {
+		id       = "imageprovider",
+		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
+	}
+	defer delete(sources[0].base_url.?, context.allocator)
+
+	client: ACP_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := ACP_Test_Run {
+		client  = &client,
+		sources = sources,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-image-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	acp_test_initialize_message(&handshake, 1)
+	acp_test_client_send(&client, strings.to_string(handshake))
+	hello := acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered")
+	if hello == "" { return }
+	testing.expectf(t, strings.contains(hello, `"image":true`), "initialize did not announce image prompts: %s", hello)
+
+	opening := strings.builder_make(context.temp_allocator)
+	acp_test_new_session_message(&opening, 2, workspace)
+	acp_test_client_send(&client, strings.to_string(opening))
+	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
+	if opened == "" { return }
+	session_id := acp_test_client_session_id_from_frame(t, opened)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+
+	png := transmute([]u8)string("\x89PNG\r\n\x1a\nnot a real image")
+	encoded, encode_error := base64.encode(png, allocator = context.temp_allocator)
+	if !testing.expect_value(t, encode_error, nil) { return }
+	prompting := strings.builder_make(context.temp_allocator)
+	strings.write_string(&prompting, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"`)
+	strings.write_string(&prompting, session_id)
+	strings.write_string(&prompting, `","prompt":[{"type":"text","text":"what is this"},{"type":"image","mimeType":"image/jpeg","data":"`)
+	strings.write_string(&prompting, encoded)
+	strings.write_string(&prompting, `"}]}}`)
+	acp_test_end(&prompting)
+	acp_test_client_send(&client, strings.to_string(prompting))
+	if acp_test_client_expect(t, &client, "seen", "the model's answer did not reach the client") == "" { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the request did not report its usage") == "" { return }
+	if acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the image prompt was not answered") == "" { return }
+
+	directory, directory_error := agent.xdg_directory(.State, context.allocator)
+	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
+	defer delete(directory, context.allocator)
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
+	defer delete(locks, context.allocator)
+	reader: journal.Journal
+	if !testing.expect_value(t, journal.open(&reader, directory, locks, journal.run_id_create(), .Read_Only, context.allocator), nil) { return }
+	defer _ = journal.close(&reader)
+	session, session_ok := journal.session_id_parse(session_id)
+	if !testing.expect(t, session_ok, "the session id is not a journal id") { return }
+	node, found, read_error := journal.read_last_node(&reader, session, .User, context.temp_allocator)
+	if !testing.expect_value(t, read_error, nil) { return }
+	if !testing.expect(t, found, "the turn left no user node") { return }
+	user: journal.User
+	if !testing.expect_value(t, journal.payload_decode(node.data, &user, context.temp_allocator), nil) { return }
+	if !testing.expect_value(t, len(user.attachments), 1) { return }
+	testing.expect_value(t, user.attachments[0].media_type, "image/png")
+	testing.expect_value(t, string(node.body), "what is this")
 }
 
 @(test)

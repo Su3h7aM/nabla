@@ -46,9 +46,11 @@ ACP_Work_Open_Session :: struct {
 	replay:        bool,
 }
 
-// ACP_Work_Prompt runs one turn on the open session.
+// ACP_Work_Prompt runs one turn on the open session. It owns the text and the
+// attachments, names and bytes, and acp_work_destroy releases them.
 ACP_Work_Prompt :: struct {
-	text: string,
+	text:        string,
+	attachments: []ai.Provider_Attachment,
 }
 
 // ACP_Work_Set_Model is Buzz's v1 model-selection RPC. Model selection runs on the
@@ -414,6 +416,7 @@ acp_work_destroy :: proc(work: ^ACP_Work, allocator: mem.Allocator) {
 		delete(item.session_title, allocator)
 	case ACP_Work_Prompt:
 		delete(item.text, allocator)
+		acp_attachments_destroy(item.attachments, allocator)
 	case ACP_Work_Set_Model:
 	case ACP_Work_Set_Config_Option:
 		delete(item.config_id, allocator)
@@ -942,7 +945,7 @@ acp_work_close_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: 
 
 acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Work_Prompt) {
 	chat := &session.app.setup.session
-	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(session))
+	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(session), work.attachments)
 	switch accepted {
 	case .Accepted:
 	case .Storage_Failed:

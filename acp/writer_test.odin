@@ -354,14 +354,14 @@ test_v2_initialize_result_uses_v2_capability_shape :: proc(t: ^testing.T) {
 	result := V2_Initialize_Result {
 		protocol_version = PROTOCOL_VERSION_V2,
 		info = {name = "nabla", title = "Nabla", version = "0.1.0"},
-		capabilities = {session = {prompt = {embedded_context = {}}, mcp = {stdio = {}}}},
+		capabilities = {session = {prompt = {image = V2_Support{}, embedded_context = {}}, mcp = {stdio = {}}}},
 		auth_methods = {},
 	}
 	testing.expect(t, writer_write_response(&writer, i64(2), result))
 	test_writer_finish(t, &writer)
 	frame := bytes.buffer_to_string(&buffer)
 	testing.expect(t, strings.contains(frame, `"protocolVersion":2`))
-	testing.expect(t, strings.contains(frame, `"capabilities":{"session":{"prompt":{"embeddedContext":{}},"mcp":{"stdio":{}}}}`))
+	testing.expect(t, strings.contains(frame, `"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"mcp":{"stdio":{}}}}`))
 	testing.expect(t, strings.contains(frame, `"info":{"name":"nabla","title":"Nabla","version":"0.1.0"}`))
 }
 

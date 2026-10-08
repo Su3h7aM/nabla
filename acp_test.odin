@@ -6,6 +6,7 @@ import "core:testing"
 
 import "nabla:acp"
 import "nabla:agent"
+import "nabla:ai"
 
 // acp_prompt_text renders what a client sent as the one message the harness records. A
 // bug here loses the user's words or refuses content the agent announced support for, so
@@ -18,29 +19,53 @@ test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^test
 		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/inlined.txt", text = "inlined text"}},
 		{type = acp.CONTENT_TEXT, text = "and this"},
 	}
-	text, reason, ok := acp_prompt_text(blocks, context.temp_allocator)
+	text, _, reason, ok := acp_prompt_text(blocks, context.temp_allocator)
 	testing.expectf(t, ok, "the prompt was refused: %s", reason)
 	testing.expect_value(t, text, "explain this\n\n/tmp/example.odin\n\ninlined text\n\nand this")
 
 	// Content the agent does not accept is refused rather than dropped: a client must be
 	// told that part of what it sent never reached the model.
-	unsupported := []acp.Content_Block{{type = acp.CONTENT_IMAGE}}
-	_, image_reason, image_ok := acp_prompt_text(unsupported, context.temp_allocator)
+	unsupported := []acp.Content_Block{{type = acp.CONTENT_AUDIO}}
+	_, _, image_reason, image_ok := acp_prompt_text(unsupported, context.temp_allocator)
 	testing.expect(t, !image_ok)
 	testing.expect(t, image_reason != "")
+	not_an_image := []acp.Content_Block{{type = acp.CONTENT_IMAGE, data = "aGVsbG8=", mime_type = "image/png"}}
+	_, _, not_image_reason, not_image_ok := acp_prompt_text(not_an_image, context.temp_allocator)
+	testing.expect(t, !not_image_ok)
+	testing.expect(t, not_image_reason != "")
+	bad_base64 := []acp.Content_Block{{type = acp.CONTENT_IMAGE, data = "!!!"}}
+	_, _, bad_reason, bad_ok := acp_prompt_text(bad_base64, context.temp_allocator)
+	testing.expect(t, !bad_ok)
+	testing.expect(t, bad_reason != "")
+
+	// The signature decides: a PDF sent as a blob resource is a document attachment, and
+	// an image block without a uri is named by its position and format.
+	files := []acp.Content_Block {
+		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/paper.pdf", mime_type = "text/plain", blob = "JVBERi0xLjQK", blob_present = true}},
+		{type = acp.CONTENT_IMAGE, data = "iVBORw0KGgo="},
+	}
+	file_text, attachments, file_reason, file_ok := acp_prompt_text(files, context.temp_allocator)
+	testing.expectf(t, file_ok, "the files were refused: %s", file_reason)
+	testing.expect_value(t, file_text, "")
+	if testing.expect_value(t, len(attachments), 2) {
+		testing.expect_value(t, attachments[0].Media, ai.Provider_Media.PDF)
+		testing.expect_value(t, attachments[0].Name, "paper.pdf")
+		testing.expect_value(t, attachments[1].Media, ai.Provider_Media.PNG)
+		testing.expect_value(t, attachments[1].Name, "image-2.png")
+	}
 
 	binary := []acp.Content_Block {
 		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/archive.bin", mime_type = "application/octet-stream", blob_present = true}},
 	}
-	binary_text, binary_reason, binary_ok := acp_prompt_text(binary, context.temp_allocator)
+	binary_text, _, binary_reason, binary_ok := acp_prompt_text(binary, context.temp_allocator)
 	testing.expectf(t, binary_ok, "the binary prompt was refused: %s", binary_reason)
 	testing.expect_value(t, binary_text, "[binary resource file:///tmp/archive.bin (application/octet-stream) was attached; its bytes are not included]")
 	unknown_type := []acp.Content_Block{{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/data", blob_present = true}}}
-	unknown_text, _, unknown_ok := acp_prompt_text(unknown_type, context.temp_allocator)
+	unknown_text, _, _, unknown_ok := acp_prompt_text(unknown_type, context.temp_allocator)
 	testing.expect(t, unknown_ok)
 	testing.expect_value(t, unknown_text, "[binary resource file:///tmp/data (unknown type) was attached; its bytes are not included]")
 
-	empty, _, empty_ok := acp_prompt_text(nil, context.temp_allocator)
+	empty, _, _, empty_ok := acp_prompt_text(nil, context.temp_allocator)
 	testing.expect(t, empty_ok)
 	testing.expect_value(t, empty, "")
 }
