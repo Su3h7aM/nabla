@@ -461,12 +461,7 @@ test_follow_attachment_snapshot_keeps_delivery_between_reads_once :: proc(test: 
 	observer := follow_log_observer(&log)
 	for record in captured_pending {
 		if record.kind == .User_Input {
-			input: journal.User_Input
-			origin := journal.User_Origin.Steering
-			if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
-				if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { origin = named }
-			}
-			observer.user_text(observer.user_data, string(record.body), origin)
+			observer.user_text(observer.user_data, string(record.body), user_input_origin(record))
 		}
 	}
 	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)

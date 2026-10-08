@@ -240,6 +240,17 @@ chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
 	return false
 }
 
+// user_input_origin is the origin a User_Input record names. An unreadable payload or
+// an unknown origin name reads as .Steering. It allocates only in the temporary
+// allocator.
+user_input_origin :: proc(record: journal.Record) -> journal.User_Origin {
+	input: journal.User_Input
+	if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
+		if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { return named }
+	}
+	return .Steering
+}
+
 // inbox_text is the text a User node carries for one inbox record, and the origin the
 // node names. A report from or to another agent starts with a one-line heading naming
 // the sender and the kind: "<name> answered", "<name> failed", "<name> stopped",
@@ -252,11 +263,7 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 	body := string(record.body)
 	#partial switch record.kind {
 	case .User_Input:
-		input: journal.User_Input
-		if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
-			if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { return body, named }
-		}
-		return body, .Steering
+		return body, user_input_origin(record)
 	case .Subagent_Completed:
 		completed: journal.Subagent_Completed
 		// A payload that cannot be read still reports that the child ended.

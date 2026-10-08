@@ -693,12 +693,7 @@ session_replay :: proc(app: ^App, chat: ^agent.Chat_Session) {
 session_replay_queued :: proc(app: ^App) {
 	for record in app.setup.follow_pending {
 		if record.kind == .User_Input {
-			input: journal.User_Input
-			origin := journal.User_Origin.Steering
-			if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
-				if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { origin = named }
-			}
-			snap_append(app, user_entry_kind(origin), string(record.body))
+			snap_append(app, user_entry_kind(agent.user_input_origin(record)), string(record.body))
 		}
 	}
 }

@@ -62,12 +62,7 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	body := string(record.body)
 	#partial switch record.kind {
 	case .User_Input:
-		input: journal.User_Input
-		origin := journal.User_Origin.Steering
-		if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
-			if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { origin = named }
-		}
-		_observer_user_text(observer, body, origin)
+		_observer_user_text(observer, body, user_input_origin(record))
 	case .Node_Committed:
 		return follow_node(store, follow, record, observer)
 	case .Tool_Proposed:
