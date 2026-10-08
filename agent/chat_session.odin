@@ -405,19 +405,21 @@ Tool_Registry_Replace_Error :: enum {
 	// A turn is in flight, and it borrows the current registry. Replacing
 	// now would pull the definitions out from under running requests.
 	Busy,
+	// The subagent-only description and schema could not be allocated.
+	Allocation,
 }
 
 // chat_session_replace_tools swaps the session's tool registry for a
 // replacement the caller built. The swap is atomic: on success the old
 // registry is destroyed and the session owns the replacement, whose struct the
-// caller must no longer use; on Busy nothing changes and the caller keeps
+// caller must no longer use; on error nothing changes and the caller keeps
 // owning the replacement.
 //
 // Replacement is refused unless the chat is idle. Idle implies no turn is in
 // flight, so no request preparation or tool execution can still borrow the
 // old registry when it is destroyed. Each registry frees with its own
 // allocator, so the replacement may come from any allocator. A Subagent session's
-// replacement loses agent_spawn, agent_stop, and agent_status first.
+// replacement keeps only the message action of agent and removes agents first.
 //
 // Whether a failed external refresh keeps the previous registry, removes
 // unavailable tools, or blocks the next turn is the root package's policy
@@ -425,22 +427,22 @@ Tool_Registry_Replace_Error :: enum {
 @(require_results)
 chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Registry) -> Tool_Registry_Replace_Error {
 	if chat.state != .Idle { return .Busy }
-	if chat.role == .Subagent { tool_registry_remove_agent_management(replacement) }
+	if chat.role == .Subagent {
+		if tool_registry_remove_agent_management(replacement) != nil { return .Allocation }
+	}
 	tool_registry_destroy(&chat.tools)
 	chat.tools = replacement^
 	replacement^ = {}
 	return .None
 }
 
-// chat_session_apply_harness applies the launch's harness options to a session and its tool
-// registry. The options must outlive the session.
-@(require_results)
-chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) -> Tool_Registry_Error {
+// chat_session_apply_harness applies the launch's harness options to a session.
+// The options must outlive the session.
+chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) {
 	chat.disable_project_instructions = options.disable_project_instructions
 	chat.subagents_max_running = options.subagents_max_running
 	chat.compact_on_switch = options.compact_on_switch
 	chat.acp_agents = options.acp_agents
-	return tool_registry_describe_agents(&chat.tools, options.acp_agents)
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {

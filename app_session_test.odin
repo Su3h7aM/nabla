@@ -912,7 +912,7 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 	journal.append_record(
 		store,
 		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, request = 1, call = call},
-		journal.Tool_Proposed{provider_id = "call_1", name = "builtin_shell"},
+		journal.Tool_Proposed{provider_id = "call_1", name = "shell"},
 		transmute([]u8)arguments,
 	)
 	journal.append_record(
@@ -938,7 +938,7 @@ test_resume_replays_a_tool_call_as_a_box :: proc(t: ^testing.T) {
 		if entry.kind != .Tool { continue }
 		replayed = true
 		testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Success)
-		testing.expect_value(t, string(entry.text[:]), "builtin_shell\nstdout:\nfirst\nsecond\n")
+		testing.expect_value(t, string(entry.text[:]), "shell\nstdout:\nfirst\nsecond\n")
 	}
 	testing.expect(t, replayed, "resuming should replay the tool call")
 }
@@ -1838,9 +1838,15 @@ test_opening_a_child_session_installs_the_subagent_role :: proc(t: ^testing.T) {
 	testing.expect(t, strings.has_suffix(session.role_instructions, "Review the parser."), "the child has the instruction its parent gave it")
 	testing.expect(t, session.team == nil, "a subagent starts no subagents")
 	readable := false
+	can_message := false
 	for definition in session.tools.definitions {
-		testing.expect(t, definition.kind != .Agent_Spawn && definition.kind != .Agent_Stop && definition.kind != .Agent_Status, definition.name)
+		testing.expect(t, definition.kind != .Agents, definition.name)
 		if definition.name == agent.TOOL_READ_NAME { readable = true }
+		if definition.name == agent.TOOL_AGENT_NAME {
+			can_message = true
+			testing.expect(t, strings.contains(definition.input_schema, `"enum":["message"]`), "the child can only message its orchestrator")
+		}
 	}
 	testing.expect(t, readable, "the child keeps the parent's other tools")
+	testing.expect(t, can_message, "the child keeps orchestrator messaging")
 }

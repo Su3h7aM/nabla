@@ -70,7 +70,7 @@ Tool_Context :: struct {
 	// compact is the borrowed session compaction control for tools that ask for a
 	// context change; call names the boundary the call was made at.
 	compact:          ^Compact_Control,
-	status_store:     ^journal.Journal, // borrowed by owner-placed agent_status
+	status_store:     ^journal.Journal, // borrowed by owner-placed agents
 	status_session:   journal.Session_Id,
 	call:             journal.Call_Id,
 	// repairs collects what reading the arguments changed; the owner records it with
@@ -81,7 +81,7 @@ Tool_Context :: struct {
 	agents:           ^Agent_Team,
 	member:           ^Subagent,
 	// subagent is the delegation an agent tool call acts on, named by the child session.
-	// The owner records it at dispatch except for agent_send to a live child, where it
+	// The owner records it at dispatch except for agent message/configure to a live child, where it
 	// is the delegation the message was queued on; the worker sets subagent_started
 	// once the child runs.
 	subagent:         journal.Session_Id,
@@ -520,10 +520,8 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_SKILL_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
 	TOOL_CODEMODE_DEFINITION,
-	TOOL_AGENT_SPAWN_DEFINITION,
-	TOOL_AGENT_SEND_DEFINITION,
-	TOOL_AGENT_STOP_DEFINITION,
-	TOOL_AGENT_STATUS_DEFINITION,
+	TOOL_AGENT_DEFINITION,
+	TOOL_AGENTS_DEFINITION,
 }
 
 // TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,

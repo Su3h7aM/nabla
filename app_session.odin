@@ -622,9 +622,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem:
 	setup.follow_input_busy = false
 	opened^ = {}
 	setup.session = new_session
-	if agent.chat_session_apply_harness(&setup.session, setup.harness_options).kind != .None {
-		agent.chat_runtime_message(&setup.session, .Error, "the subagent tool descriptions could not be applied to the session")
-	}
+	agent.chat_session_apply_harness(&setup.session, setup.harness_options)
 	if watch_error := app_watch_sync(setup); watch_error != nil {
 		agent.chat_runtime_message(&setup.session, .Warning, "the session cannot be watched, so lines other processes send it wait for the next prompt")
 	}

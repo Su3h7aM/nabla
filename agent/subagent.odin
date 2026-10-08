@@ -35,7 +35,7 @@ subagent_status_names := [Subagent_Status]string {
 }
 
 // The shared harness instructions precede this role and the caller-provided instruction.
-SUBAGENT_ROLE :: "You are a subagent. An orchestrator agent started you for one task, stated in the first message, and it reads only your final answer. You do not see the orchestrator's conversation: the task message and what your tools find are all you have.\n\nStay inside the task. Do what it asks and return what it asks for; do not fix, refactor, or investigate beyond it, even when you notice something nearby, and mention such things in one line of your answer instead. Work with your tools until the task is done, then answer concisely with exactly what the task asked you to return: findings, decisions, and exact paths, line numbers, and identifiers. Do not narrate your process or paste file contents the task did not ask for.\n\nThe orchestrator may message you while you work. Its messages start with \"Message from the orchestrator\" and override the original task where they conflict. Use agent_send, leaving agent out, to reach the orchestrator before you finish when information you need is missing or ambiguous, when the task rests on a wrong premise, or when you find something it should act on now. Ask rather than guess on a decision that would change the result. After sending, keep working on what does not depend on the reply; the reply arrives as a message between your steps. If nothing is left that you can do without it, finish with an answer that states what you found and what is missing. You cannot start subagents or reach other subagents; the orchestrator relays between you when needed.\n\nYou share the workspace with the orchestrator and possibly other subagents working at the same time. Edit only the files your task covers. Do not revert, reformat, or overwrite changes you did not make, and do not run commands that discard work you did not do, such as resetting version control, checking out files, or deleting files you did not create. If a change you did not make is in your way, or your task needs a file outside its scope, ask the orchestrator with agent_send instead of acting."
+SUBAGENT_ROLE :: "You are a subagent. An orchestrator agent started you for one task, stated in the first message, and it reads only your final answer. You do not see the orchestrator's conversation: the task message and what your tools find are all you have.\n\nStay inside the task. Do what it asks and return what it asks for; do not fix, refactor, or investigate beyond it, even when you notice something nearby, and mention such things in one line of your answer instead. Work with your tools until the task is done, then answer concisely with exactly what the task asked you to return: findings, decisions, and exact paths, line numbers, and identifiers. Do not narrate your process or paste file contents the task did not ask for.\n\nThe orchestrator may message you while you work. Its messages start with \"Message from the orchestrator\" and override the original task where they conflict. Use agent with action message, leaving agent out, to reach the orchestrator before you finish when information you need is missing or ambiguous, when the task rests on a wrong premise, or when you find something it should act on now. Ask rather than guess on a decision that would change the result. After sending, keep working on what does not depend on the reply; the reply arrives as a message between your steps. If nothing is left that you can do without it, finish with an answer that states what you found and what is missing. You cannot start subagents or reach other subagents; the orchestrator relays between you when needed.\n\nYou share the workspace with the orchestrator and possibly other subagents working at the same time. Edit only the files your task covers. Do not revert, reformat, or overwrite changes you did not make, and do not run commands that discard work you did not do, such as resetting version control, checking out files, or deleting files you did not create. If a change you did not make is in your way, or your task needs a file outside its scope, ask the orchestrator with agent action message instead of acting."
 
 // Subagent is the orchestrator's record of one running or just finished subagent. Everything
 // above admitted is fixed before the subagent starts and owned by allocator. The subagent's
@@ -452,7 +452,7 @@ subagent_destroy :: proc(member: ^Subagent) {
 }
 
 // subagent_name is the id the orchestrator's model knows the child by: it names the
-// spawn call, so the same call has the same name in every process. The result is
+// start call, so the same call has the same name in every process. The result is
 // allocated with allocator.
 @(require_results)
 subagent_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string {
@@ -485,7 +485,7 @@ Subagent_Resume :: struct {
 @(require_results)
 subagent_start :: proc(
 	team: ^Agent_Team,
-	args: Agent_Spawn_Args,
+	args: Agent_Start_Args,
 	call: journal.Call_Id,
 	session: journal.Session_Id,
 	allocator: mem.Allocator,
@@ -584,7 +584,7 @@ subagent_start :: proc(
 @(private, require_results)
 subagent_clone_strings :: proc(
 	created: ^Subagent,
-	args: Agent_Spawn_Args,
+	args: Agent_Start_Args,
 	parent: Agent_Parent,
 	effort, resume_name: string,
 	call: journal.Call_Id,
@@ -1040,36 +1040,36 @@ subagent_find :: proc(team: ^Agent_Team, name: string) -> ^Subagent {
 	return nil
 }
 
-// subagent_control_plan finds the running member named by send.agent and, when the call also
+// subagent_control_plan finds the running member named by update.agent and, when the call also
 // asks for a switch or a compaction, resolves what it asks while the message is still
 // unrecorded: the switch is resolved against the control the member has not yet taken, else its
-// selection, into send.control, so a name that does not exist is refused here and records
+// selection, into update.control, so a name that does not exist is refused here and records
 // nothing. live is false when no member has that name. problem, temp-allocated, says why the
 // request cannot be queued. Owner only.
 @(private, require_results)
-subagent_control_plan :: proc(team: ^Agent_Team, send: ^Agent_Send_Args) -> (session: journal.Session_Id, live: bool, problem: string) {
-	switching := send.model != "" || send.provider != "" || send.effort != ""
+subagent_control_plan :: proc(team: ^Agent_Team, update: ^Agent_Message_Args) -> (session: journal.Session_Id, live: bool, problem: string) {
+	switching := update.model != "" || update.provider != "" || update.effort != ""
 	defaults: Subagent_Defaults
 	allocator: mem.Allocator
 	catalog: Catalog_Ref
 	{
 		sync.mutex_guard(&team.mutex)
-		member := subagent_find(team, send.agent)
+		member := subagent_find(team, update.agent)
 		if member == nil { return {}, false, "" }
 		session, live = member.session, true
-		if !switching && !send.compact { return }
+		if !switching && !update.compact { return }
 		if member.program.name != "" {
-			if send.compact { return session, true, "ACP agents manage their own context" }
-			if send.provider != "" { return session, true, "ACP agents choose their own provider; name only model and effort" }
+			if update.compact { return session, true, "ACP agents manage their own context" }
+			if update.provider != "" { return session, true, "ACP agents choose their own provider; name only model and effort" }
 			wanted_model, wanted_effort := member.program.model, member.effort
 			if member.control.switching { wanted_model, wanted_effort = member.control.acp_model, member.control.effort }
-			if send.model != "" { wanted_model = send.model }
-			if send.effort != "" { wanted_effort = send.effort }
+			if update.model != "" { wanted_model = update.model }
+			if update.effort != "" { wanted_effort = update.effort }
 			model, model_error := strings.clone(wanted_model, member.allocator)
 			effort, effort_error := strings.clone(wanted_effort, member.allocator)
 			if model_error != nil ||
 			   effort_error != nil { delete(model, member.allocator); delete(effort, member.allocator); return session, true, "the switch could not be held" }
-			send.control = {
+			update.control = {
 				acp_model = model,
 				effort    = effort,
 				switching = true,
@@ -1086,22 +1086,22 @@ subagent_control_plan :: proc(team: ^Agent_Team, send: ^Agent_Send_Args) -> (ses
 		}
 		allocator, catalog = member.allocator, team.parent.catalog
 	}
-	send.control.compact = send.compact
+	update.control.compact = update.compact
 	if !switching { return }
 	selection: Model_Selection
 	effort: string
-	selection, effort, problem = subagent_select(send.provider, send.model, send.effort, defaults, catalog, allocator)
+	selection, effort, problem = subagent_select(update.provider, update.model, update.effort, defaults, catalog, allocator)
 	if problem != "" { return }
 	kept, clone_error := strings.clone(effort, allocator)
 	if clone_error != nil {
 		model_selection_destroy(&selection, allocator)
 		return session, true, "the switch could not be held"
 	}
-	send.control = {
+	update.control = {
 		selection = selection,
 		effort    = kept,
 		switching = true,
-		compact   = send.compact,
+		compact   = update.compact,
 		allocator = allocator,
 	}
 	return
@@ -1354,16 +1354,16 @@ subagent_children :: proc(store: ^journal.Journal, session: journal.Session_Id) 
 	return known[:], ""
 }
 
-// subagent_resume_plan finds the child send names among the delegations the orchestrator's
-// journal records, and fills send.resume with what continuing it needs: its instruction from
+// subagent_resume_plan finds the child update names among the delegations the orchestrator's
+// journal records, and fills update.resume with what continuing it needs: its instruction from
 // its newest start and its newest installed or turn selection. It returns the child's session, and
 // has checked that the selection the call names resolves, so a refused call records nothing.
 // problem, temp-allocated, says why the child cannot be continued; for a name the journal
-// does not know it lists the children it does, with how each ended. send.resume stays empty on
+// does not know it lists the children it does, with how each ended. update.resume stays empty on
 // a problem. Owner only.
 @(private)
-subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agent_Send_Args) -> (child: journal.Session_Id, problem: string) {
-	name := send.agent
+subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, update: ^Agent_Message_Args) -> (child: journal.Session_Id, problem: string) {
+	name := update.agent
 	if !chat_journal_writable(chat) { return {}, "subagents are not available in this session" }
 	known, read_problem := subagent_children(chat.store, chat.session)
 	if read_problem != "" { return {}, read_problem }
@@ -1382,21 +1382,21 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	}
 	target := known[found]
 	if target.program != "" {
-		if send.compact { return {}, "ACP agents manage their own context" }
-		if send.provider != "" { return {}, "ACP agents choose their own provider; name only model and effort" }
+		if update.compact { return {}, "ACP agents manage their own context" }
+		if update.provider != "" { return {}, "ACP agents choose their own provider; name only model and effort" }
 	}
 	ended, finished := target.outcome, target.finished
 	if !finished { return {}, fmt.tprintf("%s has not finished", name) }
-	if send.message == "" && !send.compact {
+	if update.message == "" && !update.compact {
 		return {}, fmt.tprintf("%s has finished, so a switch alone does not continue it; send a message to reopen it on the model", name)
 	}
 	if ended == .Not_Executed {
-		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent_spawn", name)
+		return {}, fmt.tprintf("%s never started, so it has no session to continue; start a new one with agent action start", name)
 	}
 
 	if target.program != "" {
-		if target.acp_session == "" { return {}, "the ACP agent has no recorded session id to resume; start a new one with agent_spawn" }
-		send.resume = {
+		if target.acp_session == "" { return {}, "the ACP agent has no recorded session id to resume; start a new one with agent action start" }
+		update.resume = {
 			name        = name,
 			program     = target.program,
 			acp_session = target.acp_session,
@@ -1415,7 +1415,7 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	continued := Subagent_Resume {
 		name        = name,
 		instruction = string(target.start.body),
-		compact     = send.compact,
+		compact     = update.compact,
 	}
 	if latest_found {
 		#partial switch latest.kind {
@@ -1430,15 +1430,15 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, send: ^Agen
 	}
 	// The orchestrator is the only writer of team.parent, so reading it here needs no lock.
 	_, _, problem = subagent_select(
-		send.provider,
-		send.model,
-		send.effort,
+		update.provider,
+		update.model,
+		update.effort,
 		subagent_defaults(&team.parent, continued),
 		team.parent.catalog,
 		context.temp_allocator,
 	)
 	if problem != "" { return {}, problem }
-	send.resume = continued
+	update.resume = continued
 	return target.start.subagent, ""
 }
 
@@ -1537,7 +1537,7 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 	if inbox_error != nil { return "", "the child's unread messages could not be read" }
 	fmt.sbprintf(&block, "unread messages: %d\n", len(unread))
 	if target.finished && target.outcome != .Not_Executed && target.program == "" {
-		fmt.sbprintf(&block, "resume: agent_send(%s\"agent\":%q,\"message\":\"Continue your task.\"%s)\n", "{", name, "}")
+		fmt.sbprintf(&block, "resume: agent(%s\"action\":\"message\",\"agent\":%q,\"message\":\"Continue your task.\"%s)\n", "{", name, "}")
 	}
 	return strings.to_string(block), ""
 }

@@ -23,7 +23,7 @@ Tool_Output :: union {
 	Codemode_Output,
 	MCP_Output,
 	Agent_Output,
-	Agent_Status_Output,
+	Agents_Output,
 	Argument_Failure,
 }
 
@@ -86,7 +86,7 @@ Compact_Output :: struct {
 	state: string,
 }
 
-Agent_Status_Output :: struct {
+Agents_Output :: struct {
 	content: string,
 }
 
@@ -217,7 +217,7 @@ tool_result_render :: proc(
 		render_text(&body, value.instructions) or_return
 	case Compact_Output:
 		render_field(&head, "state", value.state) or_return
-	case Agent_Status_Output:
+	case Agents_Output:
 		render_text(&body, value.content) or_return
 	case Agent_Output:
 		render_field(&head, "agent", value.agent) or_return
@@ -459,7 +459,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.state = ""
 		value.state = strings.clone(borrowed.state, allocator) or_return
-	case Agent_Status_Output:
+	case Agents_Output:
 		borrowed := value.content
 		value.content = ""
 		value.content = strings.clone(borrowed, allocator) or_return
@@ -544,7 +544,7 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.instructions, allocator)
 	case Compact_Output:
 		delete(value.state, allocator)
-	case Agent_Status_Output:
+	case Agents_Output:
 		delete(value.content, allocator)
 	case Agent_Output:
 		delete(value.agent, allocator)

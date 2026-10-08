@@ -60,7 +60,7 @@ subagent_program_destroy :: proc(program: ^Subagent_Program, allocator: mem.Allo
 // subagent_program defines the configured ACP agent a start call names. problem, temp-allocated,
 // says why it cannot run.
 @(private, require_results)
-subagent_program :: proc(args: Agent_Spawn_Args, parent: ^Agent_Parent, allocator: mem.Allocator) -> (program: Subagent_Program, problem: string) {
+subagent_program :: proc(args: Agent_Start_Args, parent: ^Agent_Parent, allocator: mem.Allocator) -> (program: Subagent_Program, problem: string) {
 	config: ACP_Agent_Config
 	for candidate in parent.acp_agents {
 		if candidate.name == args.acp_agent { config = candidate }

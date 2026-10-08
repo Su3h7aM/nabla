@@ -405,17 +405,14 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// changes the context is owner-placed.
 	if definition.placement == .Owner { job.exec.compact = &chat.compact }
 	switch definition.kind {
-	case .Agent_Spawn, .Agent_Send, .Agent_Stop, .Agent_Status:
+	case .Agent, .Agents:
 		job.exec.agents = chat.team if chat.member == nil else nil
 		job.exec.member = chat.member
-		if definition.kind == .Agent_Status {
+		if definition.kind == .Agents {
 			job.exec.status_store = chat.store
 			job.exec.status_session = chat.session
 		}
-		// A blocking subagent holds its worker for its whole run, so each has a lane of its
-		// own and several run side by side.
-		if definition.kind == .Agent_Spawn { job.lane = job }
-	case .Custom, .Read, .Write, .Patch, .Shell, .List_Skills, .Load_Skill, .Compact, .Codemode, .MCP:
+	case .Custom, .Read, .Write, .Edit, .Shell, .Skills, .Skill, .Compact, .Codemode, .MCP:
 	}
 
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
@@ -437,7 +434,15 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.phase = .Result_Ready
 		return
 	}
-	args, args_error := tool_args_decode(&job.exec, definition^, job.admitted.value.(json.Object))
+	object := job.admitted.value.(json.Object)
+	if definition.kind == .Agent && job.exec.member != nil {
+		if action, is_string := object["action"].(json.String); is_string && action != "message" {
+			job.result = tool_result_failure(&job.exec, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable")
+			job.phase = .Result_Ready
+			return
+		}
+	}
+	args, args_error := tool_args_decode(&job.exec, definition^, object)
 	job.arguments = args
 	if args_error != nil {
 		job.admitted.repairs += job.exec.repairs
@@ -445,6 +450,12 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.result = tool_result_refused(&job.exec, &args_error)
 		job.phase = .Result_Ready
 		return
+	}
+	if _, starts := args.(Agent_Start_Args); starts {
+		// A blocking start holds its own worker and lane for the child's whole run.
+		job.placement = .Worker
+		job.lane = job
+		job.exec.compact = nil
 	}
 	if job.exec.repairs != {} {
 		// A field was rewritten while it was read, so the recorded arguments are written
@@ -686,7 +697,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		repair_names[repair_count] = TOOL_REPAIR_NAMES[repair]
 		repair_count += 1
 	}
-	if _, is_send := job.arguments.(Agent_Send_Args); is_send && job.exec.agents != nil && job.exec.member == nil {
+	if _, is_update := job.arguments.(Agent_Message_Args); is_update && job.exec.agents != nil && job.exec.member == nil {
 		// A child that has finished is continued from its journal records, so its outcome is
 		// committed before the message that continues it.
 		_ = agent_team_reap(job.exec.agents, chat)
@@ -698,7 +709,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 		journal.Tool_Admitted{tool = job.name, repairs = repair_names[:repair_count]},
 		transmute([]u8)job.admitted.effective,
 	)
-	if spawn, is_spawn := job.arguments.(Agent_Spawn_Args); is_spawn && job.exec.agents != nil && job.exec.member == nil {
+	if start, is_start := job.arguments.(Agent_Start_Args); is_start && job.exec.agents != nil && job.exec.member == nil {
 		// The delegation is named before its child exists, so the child's session is
 		// traceable to this call whatever happens next.
 		job.exec.subagent = journal.session_id_create()
@@ -707,26 +718,26 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 			{kind = .Subagent_Started, node = node, request = chat.request, call = job.call.call, parent_call = parent_call, subagent = job.exec.subagent},
 			journal.Subagent_Started {
 				name = subagent_name(job.call.call, context.temp_allocator),
-				program = spawn.acp_agent,
-				provider = spawn.provider,
-				model = spawn.model,
-				effort = spawn.effort,
-				background = !spawn.wait,
+				program = start.acp_agent,
+				provider = start.provider,
+				model = start.model,
+				effort = start.effort,
+				background = !start.wait,
 			},
-			transmute([]u8)spawn.instruction,
+			transmute([]u8)start.instruction,
 		)
 	}
-	sends := false
-	if send, is_send := &job.arguments.(Agent_Send_Args); is_send {
-		sends = true
-		tool_job_stage_message(chat, job, send, node, parent_call)
+	updates := false
+	if update, is_update := &job.arguments.(Agent_Message_Args); is_update {
+		updates = true
+		tool_job_stage_message(chat, job, update, node, parent_call)
 	}
 	committed := chat_commit(chat, "the tool dispatch could not be recorded")
 	// The recipient wakes only after the commit that holds its message.
-	if sends && committed && job.exec.subagent != {} { owner_wake_signal() }
+	if updates && committed && job.exec.subagent != {} { owner_wake_signal() }
 	if !committed {
 		// The call never runs, so the switch resolved for the child is not handed over.
-		if send, is_send := &job.arguments.(Agent_Send_Args); is_send { subagent_control_destroy(&send.control) }
+		if update, is_update := &job.arguments.(Agent_Message_Args); is_update { subagent_control_destroy(&update.control) }
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}
@@ -759,19 +770,19 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session) {
 	jobs.active += 1
 }
 
-// tool_job_stage_message buffers the subagent.message record of an agent_send call, so it
+// tool_job_stage_message buffers the subagent.message record of an agent message/configure call, so it
 // commits in the barrier of the call's admission and the recipient is woken only after it.
 // A message to a running child needs nothing more: the child reads it at a settled point, or
 // the reap that finds it unread runs the child again; the switch or compaction the call asks
 // of it is resolved here, so a refused one records nothing, and queued by the executor. A
 // message to a child that has finished
 // continues it: a new subagent.started that opens the delegation is buffered first, and
-// send.resume says how the executor starts the child. A recipient that cannot take the
-// message is left in send.refusal for the executor to report, and nothing is recorded. A
+// update.resume says how the executor starts the child. A recipient that cannot take the
+// message is left in update.refusal for the executor to report, and nothing is recorded. A
 // subagent's message to its orchestrator needs no check, because the orchestrator reads its
 // journal at its own settled points.
 @(private)
-tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent_Send_Args, node: journal.Node_Id, parent_call: journal.Call_Id) {
+tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, update: ^Agent_Message_Args, node: journal.Node_Id, parent_call: journal.Call_Id) {
 	header := journal.Record {
 		kind        = .Subagent_Message,
 		node        = node,
@@ -781,43 +792,43 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, send: ^Agent
 	}
 	if member := job.exec.member; member != nil {
 		// A subagent can message only its orchestrator; the executor refuses the rest.
-		if (send.agent != "" && send.agent != "orchestrator") || send.compact { return }
+		if (update.agent != "" && update.agent != "orchestrator") || update.action != .Message { return }
 		header.subagent = member.session
 		job.exec.subagent = member.session
-		chat_record(chat, header, journal.Subagent_Message{name = member.name}, transmute([]u8)send.message)
+		chat_record(chat, header, journal.Subagent_Message{name = member.name}, transmute([]u8)update.message)
 		return
 	}
-	if job.exec.agents == nil || send.agent == "" { return }
-	session, live, problem := subagent_control_plan(job.exec.agents, send)
+	if job.exec.agents == nil || update.agent == "" { return }
+	session, live, problem := subagent_control_plan(job.exec.agents, update)
 	if live {
 		if problem != "" {
-			send.refusal = problem
+			update.refusal = problem
 			return
 		}
 		header.subagent = session
 	} else {
-		session, problem = subagent_resume_plan(chat, job.exec.agents, send)
+		session, problem = subagent_resume_plan(chat, job.exec.agents, update)
 		if problem != "" {
-			send.refusal = problem
+			update.refusal = problem
 			return
 		}
 		header.subagent = session
 		start := header
 		start.kind = .Subagent_Started
 		started := journal.Subagent_Started {
-			program    = send.resume.program,
-			name       = send.agent,
-			provider   = send.provider,
-			model      = send.model,
-			effort     = send.effort,
+			program    = update.resume.program,
+			name       = update.agent,
+			provider   = update.provider,
+			model      = update.model,
+			effort     = update.effort,
 			background = true,
 		}
-		chat_record(chat, start, started, transmute([]u8)send.resume.instruction)
+		chat_record(chat, start, started, transmute([]u8)update.resume.instruction)
 	}
 	job.exec.subagent = session
 	// A compaction with no message continues the child with nothing to deliver.
-	if send.message == "" { return }
-	chat_record(chat, header, journal.Subagent_Message{name = send.agent}, transmute([]u8)send.message)
+	if update.message == "" { return }
+	chat_record(chat, header, journal.Subagent_Message{name = update.agent}, transmute([]u8)update.message)
 }
 
 // tool_jobs_abandon answers a call that ignored its stop with an unknown outcome and retains
@@ -923,11 +934,11 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	// message was recorded with the call's dispatch, before its recipient could hear of it.
 	opened := false
 	switch args in job.arguments {
-	case Agent_Spawn_Args:
+	case Agent_Start_Args:
 		opened = delegation.subagent != {}
-	case Agent_Send_Args:
+	case Agent_Message_Args:
 		opened = args.resume.name != ""
-	case Read_Args, Write_Args, Patch_Args, Shell_Args, List_Skills_Args, Load_Skill_Args, Codemode_Args, Agent_Stop_Args, Agent_Status_Args:
+	case Read_Args, Write_Args, Edit_Args, Shell_Args, Skills_Args, Skill_Args, Codemode_Args, Agent_Stop_Args, Agents_Args:
 	case nil:
 	}
 	if opened && !job.exec.subagent_started {

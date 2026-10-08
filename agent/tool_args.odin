@@ -13,34 +13,32 @@ Tool_Kind :: enum {
 	Custom,
 	Read,
 	Write,
-	Patch,
+	Edit,
 	Shell,
-	List_Skills,
-	Load_Skill,
+	Skills,
+	Skill,
 	Compact,
 	Codemode,
 	MCP,
-	Agent_Spawn,
-	Agent_Send,
-	Agent_Stop,
-	Agent_Status,
+	Agent,
+	Agents,
 }
 
 // Tool_Args is one call's arguments, typed by the tool that will run it. Strings borrow
-// the admitted document; a patch's files, hunks, and lines are allocated beside it and
+// the admitted document; an edit's files, hunks, and lines are allocated beside it and
 // released by tool_args_destroy.
 Tool_Args :: union {
 	Read_Args,
 	Write_Args,
-	Patch_Args,
+	Edit_Args,
 	Shell_Args,
-	List_Skills_Args,
-	Load_Skill_Args,
+	Skills_Args,
+	Skill_Args,
 	Codemode_Args,
-	Agent_Spawn_Args,
-	Agent_Send_Args,
+	Agent_Start_Args,
+	Agent_Message_Args,
 	Agent_Stop_Args,
-	Agent_Status_Args,
+	Agents_Args,
 }
 
 Read_Args :: struct {
@@ -54,7 +52,7 @@ Write_Args :: struct {
 	content: string,
 }
 
-Patch_Args :: struct {
+Edit_Args :: struct {
 	files: []Patch_File,
 	hunks: []Patch_Hunk,
 	lines: []Patch_Line,
@@ -66,13 +64,13 @@ Shell_Args :: struct {
 	timeout:           time.Duration,
 }
 
-List_Skills_Args :: struct {
+Skills_Args :: struct {
 	query:  string,
 	offset: int,
 	limit:  int,
 }
 
-Load_Skill_Args :: struct {
+Skill_Args :: struct {
 	name: string,
 }
 
@@ -92,26 +90,22 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return tool_read_args(ctx, object)
 	case .Write:
 		return tool_write_args(ctx, object)
-	case .Patch:
-		return tool_patch_args(ctx, object)
+	case .Edit:
+		return tool_edit_args(ctx, object)
 	case .Shell:
 		return tool_shell_args(ctx, object)
-	case .List_Skills:
-		return tool_list_skills_args(ctx, object)
-	case .Load_Skill:
-		return tool_load_skill_args(ctx, object)
+	case .Skills:
+		return tool_skills_args(ctx, object)
+	case .Skill:
+		return tool_skill_args(ctx, object)
 	case .Compact:
 		return nil, tool_fields_known(object, nil, allocator = ctx.allocator)
 	case .Codemode:
 		return tool_codemode_args(ctx, object)
-	case .Agent_Spawn:
-		return tool_agent_spawn_args(ctx, object)
-	case .Agent_Send:
-		return tool_agent_send_args(ctx, object)
-	case .Agent_Stop:
-		return tool_agent_stop_args(ctx, object)
-	case .Agent_Status:
-		return tool_agent_status_args(ctx, object)
+	case .Agent:
+		return tool_agent_args(ctx, object)
+	case .Agents:
+		return tool_agents_args(ctx, object)
 	case .Custom, .MCP:
 		// The tool validates its own arguments, so none are handed over and the document
 		// travels as admitted, with only its integer fields repaired from the schema.
@@ -121,9 +115,9 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 	return nil, nil
 }
 
-// tool_args_destroy releases what one typed call owns: the patch arrays, which are the only
+// tool_args_destroy releases what one typed call owns: the edit arrays, which are the only
 // part of the union that is not borrowed.
 tool_args_destroy :: proc(args: ^Tool_Args, allocator := context.allocator) {
-	if patch, is_patch := &args.(Patch_Args); is_patch { patch_args_destroy(patch, allocator) }
+	if edit, is_edit := &args.(Edit_Args); is_edit { patch_args_destroy(edit, allocator) }
 	args^ = nil
 }

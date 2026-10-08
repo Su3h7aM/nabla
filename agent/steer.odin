@@ -231,7 +231,7 @@ chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
 }
 
 // inbox_text is the text a User node carries for one inbox record, and the origin the
-// node names. The text matches what the model knows: a child is named as the spawn call
+// node names. The text matches what the model knows: a child is named as the start call
 // named it, and a record that has no name, such as one recovery wrote, names the child's
 // session. A completion report names the child's session and, for a child that did not
 // complete, the cause and the last text the child committed. Text is in temp memory.
@@ -264,7 +264,7 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		message: journal.Subagent_Message
 		_ = journal.payload_decode(record.data, &message, context.temp_allocator)
 		name := message.name if message.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
-		return fmt.tprintf("Message from subagent %s, which is still working (reply with agent_send if it asks something):\n%s", name, body), .Agent
+		return fmt.tprintf("Message from subagent %s, which is still working (reply with agent action message if it asks something):\n%s", name, body), .Agent
 	}
 	return body, .Agent
 }
