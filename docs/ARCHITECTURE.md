@@ -750,18 +750,18 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 
 | Tool | Access | Placement |
 | --- | --- | --- |
-| `builtin_read` | Read(path) | Worker |
-| `builtin_write` | Write(path) | Worker |
-| `builtin_patch` | Write(paths) | Worker |
-| `builtin_shell` | Process | Worker |
-| `builtin_codemode` | None | Lua |
-| `builtin_list_skills` | Session | Worker |
-| `builtin_load_skill` | Read(skill file) | Worker |
+| `read` | Read(path) | Worker |
+| `write` | Write(path) | Worker |
+| `edit` | Write(paths) | Worker |
+| `shell` | Process | Worker |
+| `codemode` | None | Lua |
+| `skills` | Session | Worker |
+| `skill` | Read(skill file) | Worker |
 | `agent_spawn` (main sessions only) | Read(all) or Process, by scope | Worker |
 | `agent_send` | Session | Owner |
 | `agent_stop` (main sessions only) | Session | Owner |
 | `agent_status` (main sessions only, read-only) | Session | Owner |
-| `context_compact` | Session | Owner |
+| `compact` | Session | Owner |
 | MCP tools `<server>_<tool>` | External(client lane) | Worker |
 
 `catalog_search` and `task_run` (section 18) are not built. Each native tool's description and schema are constants in its own file (`TOOL_<NAME>_DESCRIPTION`, `TOOL_<NAME>_SCHEMA`), except the shell's description, which `tool_shell_description` builds for the shell the process runs. A description states what the tool does, when to use it instead of another tool, the exact shape of its result, and the facts a call gets wrong; each statement must match the code.
@@ -789,7 +789,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 - The executor renders the model-visible bytes once with the tool's `render` procedure when it builds the result, while it holds the typed output. At commit the owner adds any repair note, applies retention, and stores those bytes in the `tool.completed` body. The projection uses the stored bytes from then on, so resume and cache stay byte-stable. Lua parents receive typed values converted from `Tool_Output`, never the rendering.
 - Rendering format: first line `ok` or `error <kind>: <message>`, then tool-specific `key: value` lines, then a blank line and the raw body (file text, stdout and stderr sections). Raw text avoids JSON escaping inside provider JSON; the format is kept only while measured tokens per successful task confirm it.
 - Retention: a result is never discarded. One larger than what the model is shown is written whole to `$XDG_CACHE_HOME/nabla/tool-output/<session>/<call>.txt`, which outlives the process so a resumed session can still read it. The journal stores the text the model was shown, so the file is non-essential: when the user clears the cache, a read of it fails as ordinary feedback. If the file cannot be written, the result is sent whole instead.
-- Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. For a `builtin_read` result the notice also gives the complete lines of the read that were shown and the `offset` that continues the file, taken from the result's `first_line`, so the model reads the next window of the original file. The model reads the rest of any other result from the kept file with `builtin_read`; there is no separate result-reading tool.
+- Preview: the model is shown at most `TOOL_RESULT_PREVIEW_BYTES` of one result, cut at a line break, followed by a notice with the shown and total byte counts and the file path. For a `read` result the notice also gives the complete lines of the read that were shown and the `offset` that continues the file, taken from the result's `first_line`, so the model reads the next window of the original file. The model reads the rest of any other result from the kept file with `read`; there is no separate result-reading tool.
 - Context budget: a batch charges root results in call order against the room left in the context, reserving `TOOL_RESULT_NOTICE_TOKENS` for each later result, and a result's preview shrinks to its allowance, down to the notice alone. The decision is stored with the result, so later requests project identical bytes.
 
 ### 14.4 Native tools
@@ -830,7 +830,7 @@ Never: invent a missing argument, drop or rename an unknown field, pick a file, 
 
 ## 16. Patch contract
 
-`builtin_patch{patch}` replaces old/new edits:
+`edit{patch}` replaces old/new edits:
 
 ```text
 *** Begin Patch
@@ -879,18 +879,18 @@ Code Mode and Tasks run model-written programs, so they carry only external limi
 ### 17.1 Code Mode API
 
 ```lua
-local h1 = job.start("builtin_read", {path = "a.odin"})
-local h2 = job.start("builtin_shell", {command = "odin check ."})
+local h1 = job.start("read", {path = "a.odin"})
+local h2 = job.start("shell", {command = "odin check ."})
 local a, b = job.wait(h1), job.wait(h2)
-local c = tools.builtin_read({path = "b.odin"})   -- equals job.wait(job.start(...))
+local c = tools.read({path = "b.odin"})   -- equals job.wait(job.start(...))
 return {ok = a.outcome == "success", errors = b.output.stderr}
 ```
 
 - `job.start` yields a host request; the owner admits a child through section 14.2 and returns an integer handle. `job.wait(h)` yields until that child's result commits and returns its typed table (`outcome`, `message`, `output`). An unknown or already consumed handle raises a Lua error.
 - A script may hold any number of unfinished children. They queue in the batch's job table and run as their lanes and `TOOL_JOBS_MAX_ACTIVE` allow.
 - When a script ends with unconsumed children, they are stopped, awaited, and reported in the parent result. A background `agent_spawn` (`wait` left false) is not stopped: its call returns at once, and the subagent it starts outlives the script, so `job.start` without `job.wait` is enough to start one.
-- `builtin_codemode` and `task_run` are not callable from Lua (nesting depth one). `agent_spawn` is callable from Lua in a main session.
-- A refusal the script can fix (an unknown tool name, which lists the tools; a bad handle; arguments that are not one table of named fields; a nested `builtin_codemode`) is a Lua error at the calling line, which `pcall` can catch. Reading a name that is not a tool from `tools` raises the same error; `rawget(tools, name)` tests for one.
+- `codemode` and `task_run` are not callable from Lua (nesting depth one). `agent_spawn` is callable from Lua in a main session.
+- A refusal the script can fix (an unknown tool name, which lists the tools; a bad handle; arguments that are not one table of named fields; a nested `codemode`) is a Lua error at the calling line, which `pcall` can catch. Reading a name that is not a tool from `tools` raises the same error; `rawget(tools, name)` tests for one.
 - The owner never pushes onto a suspended script. It records an answer (a handle, a kept result, or an error message), and the host function's continuation pushes it inside the resume, where a Lua error is caught. A committed child result is built into a Lua table under `lua_pcall`, so a lack of memory fails the parent as `out_of_memory` instead of aborting. Host callbacks allocate from a per-run scratch arena reset after each resume, because a Lua error unwinds them without running defers.
 - Value conversion is one checked walk over the Lua value that writes text directly: a Lua literal for the returned value and `print`, JSON for a child's arguments (admitted through section 14.2 like a provider call) and `json.encode`. It accepts finite numbers; UTF-8 strings; dense 1-based arrays; string-keyed tables, written in name order; the `json.null` sentinel. Cycles, sparse or mixed tables, functions, threads, and userdata are refused with a bounded path. Raw table access only. `json.decode` and a tool output's typed fields are pushed as Lua values without an intermediate document, except a field that holds a peer's JSON.
 - Parent result: the return value, the print log, and the child list, projected through the context budget like any tool result; or a typed failure kind (`syntax_error` with line and message, `runtime_error` with the message as the result message and the traceback as its own section, `invalid_value` with the value path, `out_of_memory`, `cancelled`, `timed_out`) with the print log and the list of children already executed. A non-string error value is written as its Lua literal. Every failure is returned to the model, which may fix the script and run it again.
@@ -904,7 +904,7 @@ return {
   description = "Run tests for one package and summarize failures",
   params = { package = "string", verbose = "boolean?" },
   run = function(args)
-    local r = tools.builtin_shell({command = "odin test " .. args.package})
+    local r = tools.shell({command = "odin test " .. args.package})
     return {failed = r.output.exit_code ~= 0, stderr = r.output.stderr}
   end,
 }
@@ -1050,7 +1050,7 @@ The raw estimate is bytes / 4 plus 8 per message, reported per part (instruction
 
 - At most one per session: a `Compaction` job (tool-free provider request) over a frozen prefix through `F`, keeping the newest `COMPACT_KEEP_MESSAGES` and never splitting an assistant/results pair.
 - Compaction runs in the background and never pauses the agent. While the job runs, the turn keeps sending requests over the unchanged projection, so the provider prefix and its cache stay intact. Install swaps only the prefix through `F` for the summary: every node committed after `F`, including the steps the agent took while the summary was computed, stays in the projection after the checkpoint (section 10.3).
-- Triggers: estimate at `trigger`, explicit command or `context_compact`, proven provider overflow, pending selection that needs a smaller context. Triggers coalesce. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
+- Triggers: estimate at `trigger`, explicit command or `compact`, proven provider overflow, pending selection that needs a smaller context. Triggers coalesce. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
 - Explicit commands wake the owner and start from committed history at its next collection step, including during provider work, tool work, or retry backoff. They do not wait in the turn's ordinary command queue or wait for a request boundary. Agent tool intent is serviced by the same collection step. All existing start checks still apply; only installation waits for a safe boundary.
 - A summary is accepted only with a normal stop reason, no tool calls, non-empty text, and a saving of at least `COMPACT_MIN_REDUCTION` tokens. A pending selection accepts any strictly positive saving; the target fit check determines whether another summary is useful.
 - Install at a request boundary or while idle: verify base and coverage, commit the `Checkpoint` node (section 10.3) and `checkpoint.installed` in one transaction, reload the projection, reset the encode cache.
@@ -1121,7 +1121,7 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `TOOL_STREAM_MEMORY_BYTES` | 1 MiB | shell output held in memory per stream; the rest goes to its kept file (section 14.4) |
 | `LUA_SLICE_INSTRUCTIONS` | 10,000 | scheduling quantum |
 | `CONFIG_INSTRUCTIONS` | 200,000 | config Lua run length; keeps the thread that evaluates it responsive |
-| `SKILL_INLINE_CATALOG_BYTES` | 16 KiB | inline catalog versus `builtin_list_skills` |
+| `SKILL_INLINE_CATALOG_BYTES` | 16 KiB | inline catalog versus `skills` |
 | `CATALOG_REFRESH_COOLDOWN` | 10 min | network use |
 | `CHAT_DEFAULT_CONTEXT_WINDOW` | 131072 | used only when the catalog has no window, and flagged |
 | `CHAT_DEFAULT_OUTPUT_TOKENS` | 4096 | output a request asks for when the catalog states no maximum; the window bound (section 23.1) still applies |

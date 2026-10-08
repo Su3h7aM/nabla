@@ -15,7 +15,7 @@ import "nabla:agent/journal"
 Tool_Output :: union {
 	Read_Output,
 	Write_Output,
-	Patch_Output,
+	Edit_Output,
 	Shell_Output,
 	Skills_Output,
 	Skill_Output,
@@ -41,9 +41,9 @@ Write_Output :: struct {
 	bytes: int,
 }
 
-// Patch_Output is what a patch changed. summary has one line per file, in patch order, such as
+// Edit_Output is what a patch changed. summary has one line per file, in patch order, such as
 // `updated <path>` or `moved <path> to <path>`.
-Patch_Output :: struct {
+Edit_Output :: struct {
 	files:                     int,
 	whitespace_repaired_hunks: int,
 	summary:                   string,
@@ -184,7 +184,7 @@ tool_result_render :: proc(
 	case Write_Output:
 		render_field(&head, "path", value.path) or_return
 		render_field(&head, "bytes", value.bytes) or_return
-	case Patch_Output:
+	case Edit_Output:
 		render_field(&head, "files", value.files) or_return
 		if value.whitespace_repaired_hunks > 0 { render_field(&head, "whitespace_repaired_hunks", value.whitespace_repaired_hunks) or_return }
 		render_text(&body, value.summary) or_return
@@ -420,7 +420,7 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		borrowed := value
 		value.path = ""
 		value.path = strings.clone(borrowed.path, allocator) or_return
-	case Patch_Output:
+	case Edit_Output:
 		borrowed := value
 		value.summary = ""
 		value.summary = strings.clone(borrowed.summary, allocator) or_return
@@ -522,7 +522,7 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.content, allocator)
 	case Write_Output:
 		delete(value.path, allocator)
-	case Patch_Output:
+	case Edit_Output:
 		delete(value.summary, allocator)
 	case Shell_Output:
 		delete(value.stdout, allocator)

@@ -6,9 +6,9 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:os"
 
-TOOL_PATCH_NAME :: "builtin_patch"
+TOOL_EDIT_NAME :: "edit"
 
-TOOL_PATCH_DESCRIPTION :: `Edit text files with one patch: add, delete, move, or change any number of files in a single call. Use it to change part of an existing file or to create files in directories that may not exist yet; use builtin_write to replace a whole file with new content. Relative paths start at the session workspace, and absolute paths are used as given. Every file is checked in memory before any is written, so a patch with a hunk that does not apply changes nothing.
+TOOL_EDIT_DESCRIPTION :: `Edit text files with one patch: add, delete, move, or change any number of files in a single call. Use it to change part of an existing file or to create files in directories that may not exist yet; use write to replace a whole file with new content. Relative paths start at the session workspace, and absolute paths are used as given. Every file is checked in memory before any is written, so a patch with a hunk that does not apply changes nothing.
 
 *** Begin Patch
 *** Add File: <path>
@@ -25,17 +25,17 @@ TOOL_PATCH_DESCRIPTION :: `Edit text files with one patch: add, delete, move, or
 
 Each @@ line starts a hunk, and a file may have several. A hunk's unchanged and removed lines must match exactly one place in the file. When a removed line is unique in the file, the hunk can be only "-old" and "+new" lines with no unchanged lines around them; add unchanged lines, or an @@ anchor, only to tell apart text that occurs more than once. A hunk that matches several places fails as ambiguous, and one that matches none fails with the nearest lines; neither writes anything. A hunk with only added lines goes after its @@ line, or at the end of the file. A hunk that matches only when whitespace is ignored is applied and counted in the result. A file path may appear in one section only, and a file that is changed more than once needs one section with several hunks. Put nothing after the final *** End Patch line: a file section after it is refused. A unified diff is accepted too.`
 
-TOOL_PATCH_SCHEMA :: `{"type":"object","properties":{"patch":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch."}},"required":["patch"],"additionalProperties":false}`
+TOOL_EDIT_SCHEMA :: `{"type":"object","properties":{"patch":{"type":"string","description":"The whole patch, from *** Begin Patch to *** End Patch."}},"required":["patch"],"additionalProperties":false}`
 
-TOOL_PATCH_FIELDS :: []string{"patch"}
+TOOL_EDIT_FIELDS :: []string{"patch"}
 
-TOOL_PATCH_DEFINITION :: Tool_Definition {
-	name = TOOL_PATCH_NAME,
-	description = TOOL_PATCH_DESCRIPTION,
-	input_schema = TOOL_PATCH_SCHEMA,
+TOOL_EDIT_DEFINITION :: Tool_Definition {
+	name = TOOL_EDIT_NAME,
+	description = TOOL_EDIT_DESCRIPTION,
+	input_schema = TOOL_EDIT_SCHEMA,
 	hints = {read_only = .No, destructive = .Yes, idempotent = .No, open_world = .No},
-	kind = .Patch,
-	execute = tool_patch_execute,
+	kind = .Edit,
+	execute = tool_edit_execute,
 }
 
 Patch_Failure_Kind :: enum u8 {
@@ -76,8 +76,8 @@ Patch_Error :: union {
 }
 
 @(require_results)
-tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Patch_Args, err: Tool_Argument_Error) {
-	tool_fields_known(arguments, TOOL_PATCH_FIELDS, allocator = ctx.allocator) or_return
+tool_edit_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Edit_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_EDIT_FIELDS, allocator = ctx.allocator) or_return
 	patch := tool_field_string(arguments, "patch", allocator = ctx.allocator) or_return
 	parsed, problem, allocation_error := patch_parse(patch, ctx.allocator)
 	if allocation_error != nil { return {}, tool_argument_error(.Out_Of_Memory) }
@@ -86,8 +86,8 @@ tool_patch_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Pa
 }
 
 @(require_results)
-tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
-	args := arguments.(Patch_Args)
+tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Edit_Args)
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { return patch_failure_result(ctx, arena_error) }
 	defer virtual.arena_destroy(&arena)
@@ -101,7 +101,7 @@ tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 		if !cancelled && write_error == nil { continue }
 		applied_files := index
 		if target_written { applied_files += 1 }
-		applied := Patch_Output {
+		applied := Edit_Output {
 			files   = applied_files,
 			summary = summary[:changes[applied_files - 1].summary_end] if applied_files > 0 else "",
 		}
@@ -122,7 +122,7 @@ tool_patch_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 		message := fmt.tprintf("could not write %s: %s%s", args.files[index].path, os.error_string(write_error), applied_note)
 		return tool_result_of(ctx, .Tool_Failed, message, applied, "write failed")
 	}
-	output := Patch_Output {
+	output := Edit_Output {
 		files                     = len(changes),
 		whitespace_repaired_hunks = repaired_hunks,
 		summary                   = summary,

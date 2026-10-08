@@ -7,14 +7,14 @@ import "core:strings"
 import "core:time"
 import "nabla:subprocess"
 
-TOOL_SHELL_NAME :: "builtin_shell"
+TOOL_SHELL_NAME :: "shell"
 
 // TOOL_SHELL_BODY is what the shell tool does, after the sentence that names the shell it
 // does it with. It is a format: the preview size in KiB, the in-memory size of one stream in
 // MiB, and the default timeout in seconds.
-TOOL_SHELL_BODY :: `The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with builtin_write or builtin_patch, not with a heredoc or echo redirection. This is not a terminal.
+TOOL_SHELL_BODY :: `The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with write or patch, not with a heredoc or echo redirection. This is not a terminal.
 
-The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with builtin_read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
+The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
 
 // TOOL_SHELL_FISH_NOTES follows the body when the shell is fish, whose syntax models most
 // often get wrong because they write bash.

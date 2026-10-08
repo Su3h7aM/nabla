@@ -13,7 +13,7 @@ INSTRUCTIONS_AGENTS_DIR :: ".agents"
 INSTRUCTIONS_AGENTS_FILE :: "AGENTS.md"
 
 // SKILL_INLINE_CATALOG_BYTES is the catalog size above which the model is told to read the
-// catalog through builtin_list_skills rather than receive it inline. It picks how the
+// catalog through skills rather than receive it inline. It picks how the
 // metadata is disclosed; no skill metadata is dropped either way.
 SKILL_INLINE_CATALOG_BYTES :: 16 * 1024
 
@@ -256,7 +256,7 @@ render_instructions :: proc(
 		if len(encoded) <= SKILL_INLINE_CATALOG_BYTES {
 			if !instruction_write_string(&builder, "\n\nAvailable skills: ") || !instruction_write_string(&builder, encoded) { return "", .Out_Of_Memory }
 			if len(catalog.skills) == 0 && !instruction_write_string(&builder, "No skills are available.") { return "", .Out_Of_Memory }
-		} else if !instruction_write_string(&builder, "\n\nAvailable skills are listed through builtin_list_skills.") {
+		} else if !instruction_write_string(&builder, "\n\nAvailable skills are listed through skills.") {
 			return "", .Out_Of_Memory
 		}
 	}

@@ -772,10 +772,7 @@ acp_test_session_protocol :: proc(t: ^testing.T, scenario: ACP_Test_Session_Scen
 		return
 	}
 	call_event := strings.builder_make(context.temp_allocator)
-	strings.write_string(
-		&call_event,
-		`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"builtin_read","arguments":`,
-	)
+	strings.write_string(&call_event, `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":`)
 	strings.write_string(&call_event, string(quoted_arguments))
 	strings.write_string(&call_event, `}}]},"finish_reason":null}]}`)
 	replies := []string {

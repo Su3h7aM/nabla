@@ -1,11 +1,11 @@
 package agent
 
 
-// context_compact asks for a checkpoint while the agent keeps working. It records the
+// compact asks for a checkpoint while the agent keeps working. It records the
 // same intent as the automatic path and /compact, and returns immediately: the summary
 // is produced in the background and installed at the next boundary.
 
-TOOL_COMPACT_NAME :: "context_compact"
+TOOL_COMPACT_NAME :: "compact"
 
 TOOL_COMPACT_DESCRIPTION :: "Ask for the conversation so far to be replaced by a summary checkpoint, so later requests carry less context. The harness also does this on its own when the context nears its limit, so call it only at a natural break: one piece of work is finished and the next does not need its details. The call returns at once with state scheduled, already_running, or ready. The summary is written in the background while you keep working with the current context, and it is installed at the next request boundary; steps you take meanwhile stay after the checkpoint. After it is installed, reload any skill whose details you still need."
 

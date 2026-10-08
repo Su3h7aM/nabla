@@ -380,7 +380,7 @@ test_codemode_waiting_on_a_child_expires_and_stops_it :: proc(test: ^testing.T) 
 	defer tool_test_end(test, &tool_test)
 	chat := &tool_test.fixture.chat
 
-	source := `local result = tools.builtin_shell({command = "sleep 5", timeout_ms = 10000}) return result.outcome`
+	source := `local result = tools.shell({command = "sleep 5", timeout_ms = 10000}) return result.outcome`
 	arguments := make(json.Object, 2, context.temp_allocator)
 	arguments["code"] = json.String(source)
 	arguments["timeout_ms"] = json.Integer(100)

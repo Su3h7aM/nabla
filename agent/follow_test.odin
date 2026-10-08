@@ -140,7 +140,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	proposed.node = assistant
 	proposed.request = 1
 	proposed.call = 1
-	journal.append_record(store, proposed, journal.Tool_Proposed{provider_id = "call_1", name = "builtin_shell"}, follow_body(`{"command":"ls"}`))
+	journal.append_record(store, proposed, journal.Tool_Proposed{provider_id = "call_1", name = "shell"}, follow_body(`{"command":"ls"}`))
 	follow_commit(test, store)
 
 	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the first poll failed")
@@ -181,7 +181,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 
 	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the second poll failed")
 	testing.expect(test, !follow.working, "the turn completed")
-	expected := [?]string{"user:question", "assistant:looking", "call:builtin_shell", "result:builtin_shell:ok\nexit_code: 0", "user:from the follower"}
+	expected := [?]string{"user:question", "assistant:looking", "call:shell", "result:shell:ok\nexit_code: 0", "user:from the follower"}
 	if !testing.expect_value(test, len(log.events), len(expected)) { return }
 	for event, index in expected { testing.expect_value(test, log.events[index], event) }
 

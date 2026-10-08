@@ -71,14 +71,14 @@ test_build_request_uses_canonical_tool_names_directly :: proc(test: ^testing.T) 
 	arena: virtual.Arena
 	preparation := request_test_prepare(test, chat, tool_loop_connection, &arena)
 	defer virtual.arena_destroy(&arena)
-	found_builtin := false
+	found_native := false
 	found_mcp := false
 	for tool in preparation.request.Tools {
 		testing.expect(test, !strings.contains(tool.Name, "."), "provider tool names must not contain dots")
-		if tool.Name == TOOL_PATCH_NAME { found_builtin = true }
+		if tool.Name == TOOL_EDIT_NAME { found_native = true }
 		if tool.Name == "FFF_find_files" { found_mcp = true }
 	}
-	testing.expect(test, found_builtin, "built-in tools are advertised")
+	testing.expect(test, found_native, "native tools are advertised")
 	testing.expect(test, found_mcp, "MCP tools are advertised")
 }
 
@@ -170,7 +170,7 @@ test_response_replay_requires_matching_api_family :: proc(test: ^testing.T) {
 	chat.tools_enabled = true
 	_test_accept(test, chat, "run printf tool-ok")
 	request := journal.next_request(chat.store)
-	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"builtin_shell","arguments":"{\"command\":\"printf tool-ok\"}"}]`
+	output := `[{"type":"message","id":"msg_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Working."}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"printf tool-ok\"}"}]`
 	_test_response(test, chat, request, "Working.", output, .OpenAI_Responses)
 	request_test_call(test, chat, request, "call_1", `{"command":"printf tool-ok"}`, .Success, "fc_1")
 
@@ -342,7 +342,7 @@ test_anthropic_request_is_shaped_by_its_adapter :: proc(test: ^testing.T) {
 	if !testing.expect(test, call_blocks_ok && len(call_blocks) == 1) { return }
 	call_block := item_object(test, call_blocks, 0)
 	testing.expect_value(test, item_string(call_block, "type"), "tool_use")
-	testing.expect_value(test, item_string(call_block, "name"), "builtin_shell")
+	testing.expect_value(test, item_string(call_block, "name"), "shell")
 	result_turn := item_object(test, messages, 2)
 	result_blocks, result_blocks_ok := result_turn["content"].(json.Array)
 	if !testing.expect(test, result_blocks_ok && len(result_blocks) == 1) { return }

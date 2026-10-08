@@ -8,51 +8,51 @@ import "core:strings"
 
 import "nabla:agent/skills"
 
-TOOL_LIST_SKILLS_NAME :: "builtin_list_skills"
-TOOL_LIST_SKILLS_DESCRIPTION :: "Search the available skills by name and description. Use it to find which skill fits a task when your instructions do not already list them; it returns metadata only, so load the one you need with builtin_load_skill. query holds whitespace-separated terms, all of which must appear in the name or description (case-insensitive); a skill whose name equals the query comes first; leave query out to list every skill. The result gives total_matches, next_offset when more matches remain (pass it as offset for the next page), and for each skill its name, source, and description. limit defaults to 20 and offset to 0."
-TOOL_LIST_SKILLS_SCHEMA :: `{"type":"object","properties":{"query":{"type":["string","null"],"description":"Whitespace-separated terms; every term must occur in the name or description. Leave out to list all."},"offset":{"type":["integer","null"],"description":"Index of the first match to return, counting from 0. Default: 0. Use next_offset from the previous result."},"limit":{"type":["integer","null"],"description":"Maximum matches to return. Default: 20."}},"additionalProperties":false}`
-TOOL_LIST_SKILLS_FIELDS :: []string{"query", "offset", "limit"}
-TOOL_LIST_SKILLS_DEFAULT_LIMIT :: 20
+TOOL_SKILLS_NAME :: "skills"
+TOOL_SKILLS_DESCRIPTION :: "Search the available skills by name and description. Use it to find which skill fits a task when your instructions do not already list them; it returns metadata only, so load the one you need with skill. query holds whitespace-separated terms, all of which must appear in the name or description (case-insensitive); a skill whose name equals the query comes first; leave query out to list every skill. The result gives total_matches, next_offset when more matches remain (pass it as offset for the next page), and for each skill its name, source, and description. limit defaults to 20 and offset to 0."
+TOOL_SKILLS_SCHEMA :: `{"type":"object","properties":{"query":{"type":["string","null"],"description":"Whitespace-separated terms; every term must occur in the name or description. Leave out to list all."},"offset":{"type":["integer","null"],"description":"Index of the first match to return, counting from 0. Default: 0. Use next_offset from the previous result."},"limit":{"type":["integer","null"],"description":"Maximum matches to return. Default: 20."}},"additionalProperties":false}`
+TOOL_SKILLS_FIELDS :: []string{"query", "offset", "limit"}
+TOOL_SKILLS_DEFAULT_LIMIT :: 20
 
-TOOL_LOAD_SKILL_NAME :: "builtin_load_skill"
-TOOL_LOAD_SKILL_DESCRIPTION :: "Load one skill's complete instructions by its exact name, before doing work the skill covers. The name comes from your instructions or builtin_list_skills; an unknown name fails and suggests names that start with it. The result gives name, path (the skill's SKILL.md), directory (the skill's folder), and content_digest, and the instructions follow after a blank line."
-TOOL_LOAD_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The exact skill name, as listed in your instructions or by builtin_list_skills."}},"required":["name"],"additionalProperties":false}`
-TOOL_LOAD_SKILL_FIELDS :: []string{"name"}
+TOOL_SKILL_NAME :: "skill"
+TOOL_SKILL_DESCRIPTION :: "Load one skill's complete instructions by its exact name, before doing work the skill covers. The name comes from your instructions or skills; an unknown name fails and suggests names that start with it. The result gives name, path (the skill's SKILL.md), directory (the skill's folder), and content_digest, and the instructions follow after a blank line."
+TOOL_SKILL_SCHEMA :: `{"type":"object","properties":{"name":{"type":"string","description":"The exact skill name, as listed in your instructions or by skills."}},"required":["name"],"additionalProperties":false}`
+TOOL_SKILL_FIELDS :: []string{"name"}
 
-TOOL_LIST_SKILLS_DEFINITION :: Tool_Definition {
-	name = TOOL_LIST_SKILLS_NAME,
-	description = TOOL_LIST_SKILLS_DESCRIPTION,
-	input_schema = TOOL_LIST_SKILLS_SCHEMA,
+TOOL_SKILLS_DEFINITION :: Tool_Definition {
+	name = TOOL_SKILLS_NAME,
+	description = TOOL_SKILLS_DESCRIPTION,
+	input_schema = TOOL_SKILLS_SCHEMA,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
-	kind = .List_Skills,
-	execute = tool_list_skills_execute,
+	kind = .Skills,
+	execute = tool_skills_execute,
 }
 
-TOOL_LOAD_SKILL_DEFINITION :: Tool_Definition {
-	name = TOOL_LOAD_SKILL_NAME,
-	description = TOOL_LOAD_SKILL_DESCRIPTION,
-	input_schema = TOOL_LOAD_SKILL_SCHEMA,
+TOOL_SKILL_DEFINITION :: Tool_Definition {
+	name = TOOL_SKILL_NAME,
+	description = TOOL_SKILL_DESCRIPTION,
+	input_schema = TOOL_SKILL_SCHEMA,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
-	kind = .Load_Skill,
-	execute = tool_load_skill_execute,
+	kind = .Skill,
+	execute = tool_skill_execute,
 }
 
 @(require_results)
-tool_list_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: List_Skills_Args, err: Tool_Argument_Error) {
-	tool_fields_known(arguments, TOOL_LIST_SKILLS_FIELDS, allocator = ctx.allocator) or_return
+tool_skills_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Skills_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_SKILLS_FIELDS, allocator = ctx.allocator) or_return
 	args.query = tool_field_optional_string(arguments, "query", allocator = ctx.allocator) or_return
-	args.offset, args.limit = tool_fields_page(arguments, 0, 0, TOOL_LIST_SKILLS_DEFAULT_LIMIT, &ctx.repairs, allocator = ctx.allocator) or_return
+	args.offset, args.limit = tool_fields_page(arguments, 0, 0, TOOL_SKILLS_DEFAULT_LIMIT, &ctx.repairs, allocator = ctx.allocator) or_return
 	return
 }
 
 @(require_results)
-tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
-	args := arguments.(List_Skills_Args)
+tool_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Skills_Args)
 	query, offset, limit := args.query, args.offset, args.limit
 	if ctx.skills == nil {
 		return tool_result_failure(ctx, .Unavailable, "skills are unavailable in this session", "unavailable")
 	}
-	matches, match_error := list_skills_match(ctx.skills.skills, query, ctx.allocator)
+	matches, match_error := skills_match(ctx.skills.skills, query, ctx.allocator)
 	if match_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, "the skill listing could not be built: out of memory", "out of memory")
 	}
@@ -83,15 +83,15 @@ tool_list_skills_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 }
 
 @(require_results)
-tool_load_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Load_Skill_Args, err: Tool_Argument_Error) {
-	tool_fields_known(arguments, TOOL_LOAD_SKILL_FIELDS, allocator = ctx.allocator) or_return
+tool_skill_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Skill_Args, err: Tool_Argument_Error) {
+	tool_fields_known(arguments, TOOL_SKILL_FIELDS, allocator = ctx.allocator) or_return
 	args.name = tool_field_string(arguments, "name", allocator = ctx.allocator) or_return
 	return
 }
 
 @(require_results)
-tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
-	args := arguments.(Load_Skill_Args)
+tool_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
+	args := arguments.(Skill_Args)
 	name := args.name
 	if ctx.skills == nil {
 		return tool_result_failure(ctx, .Unavailable, "skills are unavailable in this session", "unavailable")
@@ -136,12 +136,12 @@ tool_load_skill_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	return result
 }
 
-// list_skills_match returns the matching skills in name order, owned by allocator, with the
+// skills_match returns the matching skills in name order, owned by allocator, with the
 // skill whose name is exactly the query first. It reports an allocator error when the
 // listing could not be built.
 @(require_results)
-list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> ([]^skills.Skill, mem.Allocator_Error) {
-	terms, terms_error := list_skills_terms(query, allocator)
+skills_match :: proc(catalog: []skills.Skill, query: string, allocator := context.allocator) -> ([]^skills.Skill, mem.Allocator_Error) {
+	terms, terms_error := skills_terms(query, allocator)
 	if terms_error != nil { return nil, terms_error }
 	defer {
 		for term in terms { delete(term, allocator) }
@@ -151,7 +151,7 @@ list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := c
 	if matches_error != nil { return nil, matches_error }
 	defer delete(matches)
 	for &skill in catalog {
-		matched, match_error := list_skills_matches(&skill, terms)
+		matched, match_error := skills_matches(&skill, terms)
 		if match_error != nil { return nil, match_error }
 		if !matched { continue }
 		if _, append_error := append(&matches, &skill); append_error != nil { return nil, append_error }
@@ -176,10 +176,10 @@ list_skills_match :: proc(catalog: []skills.Skill, query: string, allocator := c
 	return ordered, nil
 }
 
-// list_skills_terms returns the query's whitespace-separated terms, folded to lower case and
+// skills_terms returns the query's whitespace-separated terms, folded to lower case and
 // owned by allocator. It reports an allocator error when the terms could not be built.
 @(require_results)
-list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]string, mem.Allocator_Error) {
+skills_terms :: proc(query: string, allocator := context.allocator) -> ([]string, mem.Allocator_Error) {
 	fields, fields_error := strings.fields(query, allocator)
 	if fields_error != nil { return nil, fields_error }
 	defer delete(fields, allocator)
@@ -202,9 +202,9 @@ list_skills_terms :: proc(query: string, allocator := context.allocator) -> ([]s
 	return terms[:], nil
 }
 
-// list_skills_matches reports whether every term occurs in the skill's name or description.
+// skills_matches reports whether every term occurs in the skill's name or description.
 @(require_results)
-list_skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> (bool, mem.Allocator_Error) {
+skills_matches :: proc(skill: ^skills.Skill, terms: []string) -> (bool, mem.Allocator_Error) {
 	// The folded copies exist to be searched and are released with the answer.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if len(terms) == 0 { return true, nil }

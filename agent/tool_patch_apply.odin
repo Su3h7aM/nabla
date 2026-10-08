@@ -43,7 +43,7 @@ Patch_Placement :: struct {
 @(private, require_results)
 patch_prepare :: proc(
 	workspace: string,
-	args: Patch_Args,
+	args: Edit_Args,
 	allocator: mem.Allocator,
 ) -> (
 	changes: []Patch_Change,

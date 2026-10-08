@@ -236,7 +236,7 @@ test_shell_runs_fish_without_touching_history :: proc(test: ^testing.T) {
 }
 
 @(test)
-test_shell_spools_sanitized_output_that_builtin_read_accepts :: proc(test: ^testing.T) {
+test_shell_spools_sanitized_output_that_read_accepts :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
 	tool_test_begin(test, &tool_test)
 	defer tool_test_end(test, &tool_test)

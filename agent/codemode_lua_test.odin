@@ -114,25 +114,41 @@ lua_failures_are_values_with_their_position :: proc(t: ^testing.T) {
 
 @(test)
 lua_host_requests_suspend_and_resume :: proc(t: ^testing.T) {
-	run := lua_test_start(t, `local first = tools.alpha({n = 1})
-local handle = job.start("beta", {n = 2})
-return first .. "|" .. handle`)
+	run := lua_test_start(
+		t,
+		`local first = tools.skills({n = 1})
+local second = tools.skill({n = 2})
+local third = tools.edit({n = 3})
+assert(type(tools.compact) == "function")
+local handle = job.start("compact", {})
+return first .. "|" .. second .. "|" .. third .. "|" .. handle`,
+	)
 	defer codemode_lua_destroy(run)
-	testing.expect(t, codemode_lua_install_tool(run, "alpha"), "alpha should install")
-	testing.expect(t, codemode_lua_install_tool(run, "beta"), "beta should install")
+	testing.expect(t, codemode_lua_install_tool(run, TOOL_SKILLS_NAME), "skills should install")
+	testing.expect(t, codemode_lua_install_tool(run, TOOL_SKILL_NAME), "skill should install")
+	testing.expect(t, codemode_lua_install_tool(run, TOOL_EDIT_NAME), "edit should install")
+	testing.expect(t, codemode_lua_install_tool(run, TOOL_COMPACT_NAME), "compact should install")
 
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
 	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Call)
-	testing.expect_value(t, run.request.name, "alpha")
+	testing.expect_value(t, run.request.name, "skills")
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
 	codemode_lua_answer_handle(run, 3)
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
-	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Start)
-	testing.expect_value(t, run.request.name, "beta")
+	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Call)
+	testing.expect_value(t, run.request.name, "skill")
+	codemode_lua_answer_handle(run, 5)
+	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
+	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Call)
+	testing.expect_value(t, run.request.name, "edit")
 	codemode_lua_answer_handle(run, 7)
+	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Host_Request)
+	testing.expect_value(t, run.request.kind, Lua_Request_Kind.Start)
+	testing.expect_value(t, run.request.name, "compact")
+	codemode_lua_answer_handle(run, 9)
 	testing.expect_value(t, codemode_lua_resume(run), Lua_Event.Returned)
 	value, _ := codemode_lua_returned_string(run)
-	testing.expect_value(t, value, "3|7")
+	testing.expect_value(t, value, "3|5|7|9")
 }
 
 // Refusals are Lua errors at the script's line, so a script can catch them with pcall.
@@ -215,7 +231,7 @@ lua_install_refuses_a_bad_name :: proc(t: ^testing.T) {
 	testing.expect(t, !codemode_lua_install_tool(run, ""), "an empty name should be refused")
 	testing.expect(t, !codemode_lua_install_tool(run, "alpha\x00beta"), "a name with a NUL should be refused")
 	testing.expect(t, !codemode_lua_install_tool(run, "builtin.read"), "a dotted name should be refused")
-	testing.expect(t, codemode_lua_install_tool(run, "builtin_read"), "a canonical name should install")
+	testing.expect(t, codemode_lua_install_tool(run, "read"), "a canonical name should install")
 }
 
 @(test)

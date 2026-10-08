@@ -63,7 +63,7 @@ Patch_Parser :: struct {
 	hunk_open: bool,
 }
 
-patch_args_destroy :: proc(args: ^Patch_Args, allocator: mem.Allocator) {
+patch_args_destroy :: proc(args: ^Edit_Args, allocator: mem.Allocator) {
 	delete(args.files, allocator)
 	delete(args.hunks, allocator)
 	delete(args.lines, allocator)
@@ -76,7 +76,7 @@ patch_args_destroy :: proc(args: ^Patch_Args, allocator: mem.Allocator) {
 // the arrays are owned by allocator. problem names what has no single reading, is "" for a
 // patch that parsed, and is allocated in the temp allocator.
 @(require_results)
-patch_parse :: proc(patch: string, allocator: mem.Allocator) -> (args: Patch_Args, problem: string, err: mem.Allocator_Error) {
+patch_parse :: proc(patch: string, allocator: mem.Allocator) -> (args: Edit_Args, problem: string, err: mem.Allocator_Error) {
 	parser: Patch_Parser
 	defer if problem != "" || err != nil {
 		delete(parser.files)

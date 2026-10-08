@@ -401,7 +401,7 @@ test_patch_applies_every_file_or_none :: proc(test: ^testing.T) {
 
 	// The first hunk matches only once trailing spaces are ignored.
 	patch := `{"patch":"*** Begin Patch\n*** Update File: code.txt\n@@\n one\n-two\n+TWO\n three\n@@\n-five\n+FIVE\n*** Add File: new/added.txt\n+hello\n*** Delete File: gone.txt\n*** End Patch"}`
-	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	result := tool_run(test, &tool_test, TOOL_EDIT_NAME, patch)
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
 	tool_file_is(test, code, "one\nTWO\nthree\nfour\nFIVE\n")
 	tool_file_is(test, added, "hello\n")
@@ -410,7 +410,7 @@ test_patch_applies_every_file_or_none :: proc(test: ^testing.T) {
 	// A hunk that matches twice fails the whole patch, so no file in it is written.
 	if !tool_write_file(test, code, "same\nsame\n") { return }
 	ambiguous := `{"patch":"*** Begin Patch\n*** Add File: later.txt\n+x\n*** Update File: code.txt\n-same\n+once\n*** End Patch"}`
-	failed := tool_run(test, &tool_test, TOOL_PATCH_NAME, ambiguous)
+	failed := tool_run(test, &tool_test, TOOL_EDIT_NAME, ambiguous)
 	testing.expect_value(test, failed.outcome, journal.Tool_Outcome.Tool_Failed)
 	tool_file_is(test, code, "same\nsame\n")
 	testing.expect(test, !os.exists(later), "a failed patch adds no file")
@@ -433,7 +433,7 @@ test_patch_missing_file_writes_nothing :: proc(test: ^testing.T) {
 		`{"patch":"*** Begin Patch\n*** Update File: code.txt\n-two\n+TWO\n*** Update File: absent.txt\n-x\n+y\n*** Add File: later.txt\n+x\n*** End Patch"}`,
 	}
 	for patch in patches {
-		result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+		result := tool_run(test, &tool_test, TOOL_EDIT_NAME, patch)
 		testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
 		testing.expect(test, strings.contains(result.content, "absent.txt does not exist"), result.content)
 		tool_file_is(test, code, "one\ntwo\n")
@@ -453,7 +453,7 @@ test_patch_section_after_end_marker_writes_nothing :: proc(test: ^testing.T) {
 	if !tool_write_file(test, code, "one\ntwo\n") { return }
 
 	patch := `{"patch":"*** Begin Patch\n*** Update File: code.txt\n-two\n+TWO\n*** End Patch\n*** Add File: later.txt\n+x\n*** End Patch"}`
-	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	result := tool_run(test, &tool_test, TOOL_EDIT_NAME, patch)
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Invalid_Arguments)
 	testing.expect(test, strings.contains(result.content, "after *** End Patch") && strings.contains(result.content, "line 6"), result.content)
 	tool_file_is(test, code, "one\ntwo\n")
@@ -467,12 +467,12 @@ test_patch_rejects_unknown_section_markers :: proc(test: ^testing.T) {
 	defer tool_test_end(test, &tool_test)
 
 	for patch in ([]string{`{"patch":"*** Update File: code.txt\n@@\n-one\n+two\n*** Updat File: other.txt"}`, `{"patch":"*** Delete File: code.txt\n\n\n\n*** Delet File:"}`}) {
-		result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+		result := tool_run(test, &tool_test, TOOL_EDIT_NAME, patch)
 		testing.expect_value(test, result.outcome, journal.Tool_Outcome.Invalid_Arguments)
 		testing.expect(test, strings.contains(result.content, "line 5"), result.content)
 	}
 
-	added := tool_run(test, &tool_test, TOOL_PATCH_NAME, `{"patch":"*** Add File: raw.txt\n*** Updat File: literal"}`)
+	added := tool_run(test, &tool_test, TOOL_EDIT_NAME, `{"patch":"*** Add File: raw.txt\n*** Updat File: literal"}`)
 	testing.expect_value(test, added.outcome, journal.Tool_Outcome.Success)
 	path := strings.concatenate({tool_test.workspace, "/raw.txt"}, context.temp_allocator)
 	tool_file_is(test, path, "*** Updat File: literal\n")
@@ -492,7 +492,7 @@ test_patch_add_refuses_a_dangling_symlink :: proc(test: ^testing.T) {
 	}
 
 	patch := `{"patch":"*** Begin Patch\n*** Add File: dangling.txt\n+new\n*** End Patch"}`
-	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	result := tool_run(test, &tool_test, TOOL_EDIT_NAME, patch)
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Tool_Failed)
 	testing.expect(test, strings.contains(result.content, "dangling.txt already exists"), "the model is told the path already exists")
 
@@ -522,7 +522,7 @@ test_patch_move_reports_destination_when_source_removal_fails :: proc(test: ^tes
 	}
 
 	patch := `{"patch":"*** Begin Patch\n*** Update File: source/moving.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch"}`
-	result := tool_run(test, &tool_test, TOOL_PATCH_NAME, patch)
+	result := tool_run(test, &tool_test, TOOL_EDIT_NAME, patch)
 	restore_error := os.chmod(source_directory, os.Permissions_Default_Directory)
 	if !testing.expect(test, restore_error == nil, "the source directory permissions are restored") { return }
 
@@ -552,13 +552,13 @@ test_patch_reads_loose_patches_with_one_meaning :: proc(test: ^testing.T) {
 	// A unified diff without the envelope, whose line number picks one of two equal places.
 	if !tool_write_file(test, code, "same\nx\nsame\nx\n") { return }
 	unified := `{"patch":"--- a/code.txt\n+++ b/code.txt\n@@ -3,1 +3,1 @@\n-same\n+SAME\n"}`
-	testing.expect_value(test, tool_run(test, &tool_test, TOOL_PATCH_NAME, unified).outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(test, tool_run(test, &tool_test, TOOL_EDIT_NAME, unified).outcome, journal.Tool_Outcome.Success)
 	tool_file_is(test, code, "same\nx\nSAME\nx\n")
 
 	// A hunk that lost the file's indentation matches, and its added lines take that indentation.
 	if !tool_write_file(test, code, "if x {\n\tfoo()\n}\n") { return }
 	unindented := `{"patch":"*** Update File: code.txt\n if x {\n-foo()\n+bar()\n }\n"}`
-	testing.expect_value(test, tool_run(test, &tool_test, TOOL_PATCH_NAME, unindented).outcome, journal.Tool_Outcome.Success)
+	testing.expect_value(test, tool_run(test, &tool_test, TOOL_EDIT_NAME, unindented).outcome, journal.Tool_Outcome.Success)
 	tool_file_is(test, code, "if x {\n\tbar()\n}\n")
 }
 
@@ -693,7 +693,7 @@ test_registry_rejects_invalid_definitions :: proc(test: ^testing.T) {
 // provider limit. Everything outside it needs no round trip to be refused.
 @(test)
 test_canonical_name_grammar :: proc(test: ^testing.T) {
-	valid := []string{"builtin_read", "fff_grep", "github_create_issue", "a", "_", "A9_z"}
+	valid := []string{"read", "fff_grep", "github_create_issue", "a", "_", "A9_z"}
 	for name in valid { testing.expectf(test, tool_name_valid(name), "%q should be a valid tool name", name) }
 
 	invalid := []string{"", "builtin.read", "fff-grep", "builtin read", "9lives", "\u00e9cho", "a.b-c"}
@@ -856,7 +856,7 @@ test_patch_cancelled_before_rename_keeps_destination :: proc(test: ^testing.T) {
 	defer tool_arguments_destroy(&arguments, context.allocator)
 	object, is_object := arguments.value.(json.Object)
 	if !testing.expect(test, is_object, "the arguments should parse") { return }
-	result := tool_test_execute(&tool_context, TOOL_PATCH_DEFINITION, object)
+	result := tool_test_execute(&tool_context, TOOL_EDIT_DEFINITION, object)
 	defer tool_result_destroy(&result)
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Cancelled)
 	tool_file_is(test, path, "alpha\n")

@@ -40,7 +40,7 @@ tool_skills_arguments :: proc(test: ^testing.T, raw: string) -> json.Object {
 }
 
 @(test)
-test_list_and_load_skills_round_trip :: proc(test: ^testing.T) {
+test_skills_and_skill_round_trip :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
 	tool_test_begin(test, &tool_test)
 	defer tool_test_end(test, &tool_test)
@@ -60,7 +60,7 @@ test_list_and_load_skills_round_trip :: proc(test: ^testing.T) {
 	}
 	list_arguments := tool_skills_arguments(test, `{}`)
 	defer json.destroy_value(list_arguments, context.allocator)
-	list_result := tool_test_execute(&list_context, TOOL_LIST_SKILLS_DEFINITION, list_arguments)
+	list_result := tool_test_execute(&list_context, TOOL_SKILLS_DEFINITION, list_arguments)
 	defer tool_result_destroy(&list_result)
 	testing.expect_value(test, list_result.outcome, journal.Tool_Outcome.Success)
 	testing.expect(test, len(list_result.content) > 0)
@@ -76,7 +76,7 @@ test_list_and_load_skills_round_trip :: proc(test: ^testing.T) {
 	}
 	page_arguments := tool_skills_arguments(test, `{"offset":5}`)
 	defer json.destroy_value(page_arguments, context.allocator)
-	page_result := tool_test_execute(&page_context, TOOL_LIST_SKILLS_DEFINITION, page_arguments)
+	page_result := tool_test_execute(&page_context, TOOL_SKILLS_DEFINITION, page_arguments)
 	defer tool_result_destroy(&page_result)
 	testing.expect_value(test, page_result.outcome, journal.Tool_Outcome.Success)
 	testing.expect(test, strings.contains(page_result.content, `total_matches: 2`))
@@ -90,7 +90,7 @@ test_list_and_load_skills_round_trip :: proc(test: ^testing.T) {
 	}
 	unknown_arguments := tool_skills_arguments(test, `{"name":"missing"}`)
 	defer json.destroy_value(unknown_arguments, context.allocator)
-	unknown_result := tool_test_execute(&unknown_context, TOOL_LOAD_SKILL_DEFINITION, unknown_arguments)
+	unknown_result := tool_test_execute(&unknown_context, TOOL_SKILL_DEFINITION, unknown_arguments)
 	defer tool_result_destroy(&unknown_result)
 	testing.expect_value(test, unknown_result.outcome, journal.Tool_Outcome.Tool_Failed)
 
@@ -102,7 +102,7 @@ test_list_and_load_skills_round_trip :: proc(test: ^testing.T) {
 	}
 	load_arguments := tool_skills_arguments(test, `{"name":"pdf"}`)
 	defer json.destroy_value(load_arguments, context.allocator)
-	load_result := tool_test_execute(&load_context, TOOL_LOAD_SKILL_DEFINITION, load_arguments)
+	load_result := tool_test_execute(&load_context, TOOL_SKILL_DEFINITION, load_arguments)
 	defer tool_result_destroy(&load_result)
 	testing.expect_value(test, load_result.outcome, journal.Tool_Outcome.Success)
 	testing.expect_value(test, tool_result_body(load_result.content), load_result.output.(Skill_Output).instructions)

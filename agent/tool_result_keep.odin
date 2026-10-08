@@ -10,7 +10,7 @@ import "nabla:agent/journal"
 
 // A tool result is always kept whole, but the model is shown at most a preview of it.
 // A larger result is written under the session's output directory, and the model sees
-// its beginning followed by a notice naming that file, which it reads with builtin_read.
+// its beginning followed by a notice naming that file, which it reads with read.
 
 // TOOL_RESULT_PREVIEW_BYTES is how much of one result the model is shown at once.
 TOOL_RESULT_PREVIEW_BYTES :: 32 * 1024
