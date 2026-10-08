@@ -17,6 +17,10 @@ import "nabla:ai"
 // as the turn it was passed to can still report. `assistant_text` may be called
 // any number of times with arbitrarily split fragments, always in the order the
 // model produced them.
+//
+// tool_output is the one exception to the rules above: it may run concurrently on a tool
+// worker thread, and after turn_finished. Its user_data must therefore outlive every
+// producer, abandoned workers included.
 Chat_Observer :: struct {
 	user_data:        rawptr,
 	// turn_finished runs after the turn's final events. No call from that turn can
@@ -43,6 +47,14 @@ Chat_Observer :: struct {
 	// directly. name and the proposed arguments are borrowed for the duration of the
 	// callback.
 	tool_result:      proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^Tool_Result),
+	// tool_output streams the live output of a running call, for display only. It may be
+	// called on a tool worker thread. chunk is borrowed for the call only: the callee copies
+	// it and returns fast; it may take a short mutex but never waits on I/O or other work. Chunks are sanitized like the final result (split
+	// UTF-8 joined, control bytes replaced). A chunk can arrive after the call's result or
+	// after turn_finished and must then be dropped. It is not journaled, so followers and
+	// replay never receive it, and a job streams only to the observer of the session that
+	// admitted it.
+	tool_output:      proc(user_data: rawptr, call, parent_call: journal.Call_Id, chunk: string),
 	message:          proc(user_data: rawptr, kind: Chat_Message_Kind, text: string),
 	usage:            proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event),
 	// request_prepared is called once for each provider request the turn is about to

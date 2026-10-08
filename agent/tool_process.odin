@@ -165,12 +165,18 @@ Tool_Stream :: struct {
 }
 
 // tool_stream_take sanitizes one chunk, then adds those same bytes to memory and any spool.
+// Those same sanitized bytes, when there are any, go to sink.report after the write, and
+// the sink never changes the result.
 @(private, require_results)
-tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
+tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8, sink := Tool_Stream_Sink{}) -> os.Error {
 	stream.total += len(chunk)
 	sanitized: [TOOL_STREAM_SANITIZE_BYTES]u8
 	sanitized_len := tool_stream_sanitize(stream, chunk, false, sanitized[:])
-	return tool_stream_write(stream, sanitized[:sanitized_len])
+	write_error := tool_stream_write(stream, sanitized[:sanitized_len])
+	if sink.report != nil && sanitized_len > 0 {
+		sink.report(sink.user_data, sink.call, sink.parent_call, string(sanitized[:sanitized_len]))
+	}
+	return write_error
 }
 
 // tool_stream_finish writes an incomplete final UTF-8 sequence as replacement text.
@@ -287,6 +293,7 @@ tool_drain_pipes :: proc(
 	control: Tool_Control,
 	data: ^Shell_Output,
 	spool_base: string,
+	sink: Tool_Stream_Sink,
 	allocator: mem.Allocator,
 ) -> (
 	stop: Tool_Stop,
@@ -384,7 +391,7 @@ tool_drain_pipes :: proc(
 				stream.open = false
 				wait_error = tool_stream_finish(&stream)
 			} else {
-				wait_error = tool_stream_take(&stream, scratch[:n])
+				wait_error = tool_stream_take(&stream, scratch[:n], sink)
 			}
 			if wait_error != nil {
 				stop = .Wait_Failed

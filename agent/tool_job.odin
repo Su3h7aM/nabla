@@ -377,6 +377,12 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	// the proposal itself. The result that follows names the same call id whatever the
 	// harness decided here.
 	_, parent_call := tool_job_record_placement(chat, job)
+	job.exec.stream = {
+		report      = observer.tool_output,
+		user_data   = observer.user_data,
+		call        = job.call.call,
+		parent_call = parent_call,
+	}
 	_observer_tool_call(
 		observer,
 		Chat_Tool_Event{call = job.call.call, parent_call = parent_call, call_id = job.call_id, name = job.name, arguments = job.call.arguments},

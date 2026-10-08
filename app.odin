@@ -55,6 +55,11 @@ Entry :: struct {
 	// spinner and the working border until the result replaces its text and outcome.
 	call:            journal.Call_Id,
 	running:         bool,
+	// stream is the bounded tail of the output a running call has streamed, owned and
+	// freed when the box settles. It is display only. stream_prefix is the length of
+	// the box text before the tail was added to it.
+	stream:          [dynamic]u8, // owned,
+	stream_prefix:   int,
 	// tool_scroll is the first preview row a tool box shows, so a long result can
 	// be read inside its own box. The box clamps it to the rows it has, which is
 	// why the value is only a request until the next frame resolves it.
@@ -695,6 +700,12 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 		// the thread that is using it.
 		return true
 	}
+	// A tool worker that ignored its stop may still use the tool backends and report through
+	// the observer into the snapshot and the wake, so the process exits with all of them
+	// rather than freeing them under it.
+	if app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&app.setup.session) {
+		return true
+	}
 	// The worker and the catalog refresh are gone, so nothing signals the wake. The
 	// registrations clear first because a signal handler can still run on any thread.
 	if wake, armed := app.run.wake.?; armed {
@@ -731,11 +742,6 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	input.parser_destroy(&app.parser)
 	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
-	// A tool worker that ignored its stop may still use the tool backends, so the process
-	// exits with them rather than freeing them under it.
-	if app.setup.workers_abandoned || agent.chat_session_workers_outstanding(&app.setup.session) {
-		return true
-	}
 	run_setup_destroy(&app.setup)
 	catalog_run_destroy(app)
 	return false
@@ -747,6 +753,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 // anyway, so both callers release it the same way.
 snapshot_destroy :: proc(app: ^App) {
 	for &entry in app.run.snap.entries {
+		delete(entry.stream)
 		if entry.text != nil {
 			delete(entry.text)
 		}

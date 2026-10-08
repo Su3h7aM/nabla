@@ -70,6 +70,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	_ = session_store_close(app.setup.store, app.setup.alloc)
 	app.setup.store = nil
 	for &entry in app.run.snap.entries {
+		delete(entry.stream)
 		if entry.text != nil { delete(entry.text) }
 	}
 	delete(app.run.snap.entries)
@@ -1110,6 +1111,59 @@ test_a_tool_box_is_running_until_its_result_settles_it :: proc(t: ^testing.T) {
 	testing.expect(t, !entry.running, "a settled call is finished")
 	testing.expect_value(t, entry.tool_outcome, journal.Tool_Outcome.Success)
 	testing.expect_value(t, string(entry.text[:]), "shell\nstdout:\nfirst\n")
+}
+
+// Streamed output shows under a running box and is replaced, not kept, by the result.
+@(test)
+test_a_running_shell_box_shows_streamed_output_until_its_result :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app_observe_call(&app, 3, 0, "shell", `{"command":"ls"}`)
+	observer_tool_output(&app, 3, 0, "one\ntw")
+	observer_tool_output(&app, 3, 0, "o\nthree\n")
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "shell\none\ntwo\nthree\n")
+	testing.expect(t, app.run.snap.entries[0].running, "the box still runs")
+
+	result := agent.Tool_Result {
+		content = "ok\nexit_code: 0\n\nstdout:\nfirst\n",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 3, 0, "shell", `{"command":"ls"}`, &result)
+	entry := &app.run.snap.entries[0]
+	testing.expect(t, !entry.running, "a settled call is finished")
+	testing.expect_value(t, string(entry.text[:]), "shell\nstdout:\nfirst\n")
+	testing.expect_value(t, len(entry.stream), 0)
+}
+
+// Output that arrives after the box settled, by result or by the end of the turn, is dropped.
+@(test)
+test_streamed_output_after_a_box_settles_is_dropped :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	app_observe_call(&app, 3, 0, "shell", `{"command":"ls"}`)
+	app_observe_call(&app, 4, 0, "shell", `{"command":"ls"}`)
+	observer_tool_output(&app, 4, 0, "late\n")
+	result := agent.Tool_Result {
+		content = "ok\nexit_code: 0\n\nstdout:\nfirst\n",
+		outcome = .Success,
+	}
+	observer_tool_result(&app, 3, 0, "shell", `{"command":"ls"}`, &result)
+	observer_turn_finished(&app)
+	if !testing.expect_value(t, len(app.run.snap.entries), 2) { return }
+	settled := string(app.run.snap.entries[0].text[:])
+	unknown := string(app.run.snap.entries[1].text[:])
+	testing.expect_value(t, unknown, "shell\n")
+
+	observer_tool_output(&app, 3, 0, "after result\n")
+	observer_tool_output(&app, 4, 0, "after turn\n")
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), settled)
+	testing.expect_value(t, string(app.run.snap.entries[1].text[:]), unknown)
+	testing.expect_value(t, len(app.run.snap.entries[0].stream) + len(app.run.snap.entries[1].stream), 0)
 }
 
 // The outer box of a script lists each inner call as it starts and settles, and each

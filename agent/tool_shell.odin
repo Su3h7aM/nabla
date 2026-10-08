@@ -170,6 +170,7 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 		ctx.control,
 		&data,
 		ctx.output_base,
+		ctx.stream,
 		ctx.allocator,
 	)
 	switch stop {

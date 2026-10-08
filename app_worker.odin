@@ -791,6 +791,7 @@ session_replay_queued :: proc(app: ^App) {
 snapshot_clear :: proc(app: ^App) {
 	sync.mutex_guard(&app.run.mu)
 	for &entry in app.run.snap.entries {
+		delete(entry.stream)
 		if entry.text != nil { delete(entry.text) }
 	}
 	clear(&app.run.snap.entries)
@@ -965,6 +966,7 @@ snap_entry_make :: proc(app: ^App, kind: Entry_Kind, text: string) -> Entry {
 		kind = kind,
 	}
 	entry.text.allocator = app.run.alloc
+	entry.stream.allocator = app.run.alloc
 	app.run.snap.next_entry_id += 1
 	entry.id = app.run.snap.next_entry_id
 	snap_entry_set_text(app, &entry, text)
@@ -990,7 +992,7 @@ snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 // so a very long run of very short lines is bounded by the same number as a short
 // run of very long ones.
 snap_entry_account :: proc(entry: ^Entry) {
-	entry.bytes = size_of(Entry) + cap(entry.text)
+	entry.bytes = size_of(Entry) + cap(entry.text) + cap(entry.stream)
 }
 
 // snap_entry_append_text adds display text to one entry. A buffer that cannot
@@ -1021,6 +1023,7 @@ snap_push_locked :: proc(app: ^App, entry: Entry) {
 		// dynamic array releases through its own allocator, which the entry's text
 		// was given when it was made.
 		delete(entry.text)
+		delete(entry.stream)
 		snap_report_dropped_locked(app)
 		return
 	}
@@ -1038,6 +1041,7 @@ snap_trim_locked :: proc(app: ^App) {
 		app.run.snap.entries_bytes -= dropped.bytes
 		ordered_remove(&app.run.snap.entries, 0)
 		delete(dropped.text)
+		delete(dropped.stream)
 		app.run.snap.transcript_trimmed = true
 	}
 	if app.run.snap.transcript_trimmed && !was_trimmed {
@@ -1061,6 +1065,7 @@ run_observer :: proc(app: ^App) -> agent.Chat_Observer {
 		user_text = observer_user_text,
 		tool_call = observer_tool_call,
 		tool_result = observer_tool_result,
+		tool_output = observer_tool_output,
 		turn_finished = observer_turn_finished,
 		message = observer_message,
 		usage = observer_usage,
@@ -1213,6 +1218,75 @@ observer_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_
 	}
 }
 
+// STREAM_TAIL_BYTES and STREAM_TAIL_LINES bound what a running box shows of the output
+// its call streams: the bytes kept of it and the last lines drawn from them. They are
+// display bounds only; the call's result is whole.
+STREAM_TAIL_BYTES :: 8 * 1024
+STREAM_TAIL_LINES :: 20
+
+// observer_tool_output shows the tail of the output a running call has streamed so far
+// in its own box, below the text the box has while running. It runs on a tool worker
+// thread, possibly after the turn finished, and takes only the runtime mutex. A chunk for a box that is not
+// running, or that does not exist, arrived after the result or the end of the turn and
+// is dropped. A Code Mode inner call has its own box, so its output never changes its
+// script's box. The output is not journaled.
+observer_tool_output :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, chunk: string) {
+	app := cast(^App)user_data
+	if len(chunk) == 0 { return }
+	// The tool worker streams for the whole run and never resets its temporary memory.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	sync.mutex_guard(&app.run.mu)
+	entry := snap_tool_entry_locked(app, call)
+	if entry == nil || !entry.running { return }
+	if len(entry.stream) == 0 { entry.stream_prefix = len(entry.text) }
+	kept := chunk
+	if len(kept) > STREAM_TAIL_BYTES { kept = kept[len(kept) - STREAM_TAIL_BYTES:] }
+	if _, append_error := append(&entry.stream, ..transmute([]byte)kept); append_error != nil {
+		snap_report_dropped_locked(app)
+		return
+	}
+	cut := max(len(entry.stream) - STREAM_TAIL_BYTES, 0)
+	for cut < len(entry.stream) && entry.stream[cut] & 0xC0 == 0x80 { cut += 1 }
+	if cut > 0 {
+		remaining := copy(entry.stream[:], entry.stream[cut:])
+		_ = resize(&entry.stream, remaining)
+	}
+	// The stream is charged before the text is rebuilt, so a text that cannot be set
+	// still leaves the budget true and gets trimmed.
+	snap_entry_recharge_locked(app, entry)
+	defer snap_trim_locked(app)
+	base := string(entry.text[:entry.stream_prefix])
+	separator := "" if len(base) == 0 || strings.has_suffix(base, "\n") else "\n"
+	tail := text_last_lines(string(entry.stream[:]), STREAM_TAIL_LINES)
+	text, concatenate_error := strings.concatenate({base, separator, tail}, context.temp_allocator)
+	if concatenate_error != nil {
+		snap_report_dropped_locked(app)
+		return
+	}
+	if !snap_entry_rewrite_locked(app, entry, text) { return }
+	entry.tool_scroll = max(int)
+	snap_publish_locked(app)
+}
+
+// snap_entry_recharge_locked charges the transcript's budget for the change in what an
+// entry holds since it was last accounted.
+snap_entry_recharge_locked :: proc(app: ^App, entry: ^Entry) {
+	before := entry.bytes
+	snap_entry_account(entry)
+	app.run.snap.entries_bytes += entry.bytes - before
+}
+
+// snap_stream_release_locked frees the streamed tail of a box that ends and charges the
+// transcript's budget for the smaller entry.
+snap_stream_release_locked :: proc(app: ^App, entry: ^Entry) {
+	if cap(entry.stream) == 0 { return }
+	delete(entry.stream)
+	entry.stream = nil
+	entry.stream.allocator = app.run.alloc
+	entry.stream_prefix = 0
+	snap_entry_recharge_locked(app, entry)
+}
+
 // snap_push_tool_locked appends a tool box under a held runtime mutex. kind is the box
 // the entry draws as: a Code Mode inner call draws as .Codemode even though its text
 // reads like a normal tool box. Live, follower, and replay build their boxes through it.
@@ -1246,6 +1320,7 @@ snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_
 	if !snap_entry_rewrite_locked(app, entry, text) { return }
 	entry.tool_outcome = outcome
 	entry.running = false
+	snap_stream_release_locked(app, entry)
 	snap_publish_locked(app)
 	snap_trim_locked(app)
 }
@@ -1355,6 +1430,11 @@ observer_turn_finished :: proc(user_data: rawptr) {
 		if !entry.running { continue }
 		entry.running = false
 		entry.tool_outcome = .Unknown
+		if len(entry.stream) > 0 {
+			// The box settles with the text it had before the tail was added.
+			_ = snap_entry_rewrite_locked(app, &entry, string(entry.text[:entry.stream_prefix]))
+			snap_stream_release_locked(app, &entry)
+		}
 		pending, found := app.run.codemode_pending[entry.call]
 		if entry.kind != .Codemode || !found { continue }
 		for &inner in pending.inner {

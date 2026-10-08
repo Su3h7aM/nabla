@@ -272,6 +272,20 @@ tool_entry_text_titled :: proc(call: Tool_Display_Call, title, content, fallback
 	return fmt.tprintf("%s\n%s", title, preview)
 }
 
+// text_last_lines returns a view of the last count lines of text, or all of it when it
+// has fewer. A newline that ends the text ends its last line and does not start another.
+text_last_lines :: proc(text: string, count: int) -> string {
+	body := text
+	if strings.has_suffix(body, "\n") { body = body[:len(body) - 1] }
+	start := len(body)
+	for _ in 0 ..< count {
+		newline := strings.last_index_byte(body[:start], '\n')
+		if newline < 0 { return text }
+		start = newline
+	}
+	return text[start + 1:]
+}
+
 // Codemode_Inner is one call a Code Mode script made, as the script's box lists it:
 // the call's journal id, the tool, the arguments it ran with, and how it ended. While
 // running is set the call has no outcome yet. The strings are borrowed.

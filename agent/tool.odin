@@ -46,12 +46,26 @@ tool_wake_close :: proc(wake: ^Tool_Wake) {
 	wake^ = {}
 }
 
+// Tool_Stream_Sink is where a running tool may show its output live, for display only;
+// the model still gets only the final result. The zero value streams nowhere. report may
+// run on the tool's worker thread with chunk borrowed for the call only, and it must
+// return fast and never block. The admitting thread fills the sink before dispatch and
+// the worker only reads it.
+Tool_Stream_Sink :: struct {
+	report:      proc(user_data: rawptr, call, parent_call: journal.Call_Id, chunk: string),
+	user_data:   rawptr,
+	call:        journal.Call_Id,
+	parent_call: journal.Call_Id,
+}
+
 // Tool_Context is what one execution is given besides its arguments. Every
 // string is borrowed and lives for the call.
 Tool_Context :: struct {
 	call_id:          string,
 	workspace:        string,
 	control:          Tool_Control,
+	// stream is where the tool may show output live; the zero value is off.
+	stream:           Tool_Stream_Sink,
 	// arguments_json is the admitted argument text, exactly as the dispatch record
 	// holds it. A tool that reads fields uses arguments; an executor that forwards
 	// the call elsewhere sends this text.
