@@ -242,3 +242,69 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	testing.expect(t, frame.cursor.visible && frame.cursor.placed)
 	testing.expect_value(t, frame.cursor.position, term.Position{3, 1})
 }
+
+@(test)
+test_scroll_follows_or_pins_while_range_grows :: proc(t: ^testing.T) {
+	following: Scroll
+	scroll_set_range(&following, 10)
+	testing.expect_value(t, scroll_offset(following), 10)
+	scroll_set_range(&following, 15)
+	testing.expect_value(t, scroll_offset(following), 15)
+
+	pinned: Scroll
+	scroll_set_range(&pinned, 10)
+	scroll_to(&pinned, 4)
+	scroll_set_range(&pinned, 15)
+	testing.expect_value(t, scroll_offset(pinned), 4)
+	scroll_set_range(&pinned, 3)
+	testing.expect_value(t, scroll_offset(pinned), 3)
+	testing.expect(t, pinned.top == nil)
+}
+
+@(test)
+test_scroll_by_reports_boundaries :: proc(t: ^testing.T) {
+	scroll := Scroll {
+		range = 10,
+	}
+	testing.expect(t, !scroll_by(&scroll, 3))
+	testing.expect(t, scroll_by(&scroll, -4))
+	testing.expect_value(t, scroll_offset(scroll), 6)
+	testing.expect(t, scroll_by(&scroll, -100))
+	testing.expect_value(t, scroll_offset(scroll), 0)
+	testing.expect(t, !scroll_by(&scroll, -1))
+	testing.expect(t, scroll_by(&scroll, 100))
+	testing.expect(t, scroll.top == nil)
+}
+
+@(test)
+test_scroll_reveal_moves_the_least :: proc(t: ^testing.T) {
+	testing.expect_value(t, scroll_reveal(5, 4, 6), 5)
+	testing.expect_value(t, scroll_reveal(5, 4, 3), 3)
+	testing.expect_value(t, scroll_reveal(5, 4, 10), 7)
+	testing.expect_value(t, scroll_reveal(5, 4, 6, 3), 5)
+	testing.expect_value(t, scroll_reveal(5, 4, 20, 9), 20)
+}
+
+@(test)
+test_list_select_first_last_page :: proc(t: ^testing.T) {
+	state := List_State {
+		selected = -1,
+	}
+	list_select_page(&state, 10, 4)
+	testing.expect_value(t, state.selected, 0)
+	list_select_page(&state, 10, 4)
+	testing.expect_value(t, state.selected, 4)
+	list_select_page(&state, 10, 100)
+	testing.expect_value(t, state.selected, 9)
+	list_select_page(&state, 10, -4)
+	testing.expect_value(t, state.selected, 5)
+	list_select_first(&state, 10)
+	testing.expect_value(t, state.selected, 0)
+	list_select_last(&state, 10)
+	testing.expect_value(t, state.selected, 9)
+	state.selected = -1
+	list_select_page(&state, 10, -4)
+	testing.expect_value(t, state.selected, 9)
+	list_select_last(&state, 0)
+	testing.expect_value(t, state.selected, -1)
+}

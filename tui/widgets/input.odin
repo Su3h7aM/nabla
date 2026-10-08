@@ -327,7 +327,7 @@ _Input_Window :: struct {
 @(private)
 _input_window :: proc(input: ^Input, lines: []Input_Line, rect: tui.Cell_Rect, profile: text.Width_Profile) -> _Input_Window {
 	row := input_cursor_row(input, lines)
-	start := clamp(row - rect.height + 1, 0, max(len(lines) - rect.height, 0))
+	start := scroll_reveal(0, rect.height, row)
 	column := text.text_columns(input_text(input)[lines[row].start:input.cursor], profile)
 	return {start = start, row = row, column = clamp(column, 0, max(rect.width - 1, 0))}
 }

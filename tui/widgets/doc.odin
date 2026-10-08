@@ -13,6 +13,11 @@
 // item rows through layout, then render each resolved node with tui.element and
 // tui.text. This avoids a second layout system inside widgets.
 //
+// Scroll is the one scroll model: a first visible row that either follows the
+// bottom or is pinned, over a range that layout reports. List and Input keep a
+// plain row offset and share scroll_reveal, the math that keeps a row visible.
+// List navigation covers next, previous, first, last, page, and index.
+//
 // Widget model state belongs to the caller. Input owns its dynamic text buffer
 // between input_init and input_destroy. List_State owns selection and scroll
 // position. Widgets do not own terminal sessions, input events, or layout

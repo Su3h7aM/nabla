@@ -38,6 +38,35 @@ list_select_previous :: proc(state: ^List_State, count: int) {
 	}
 }
 
+// list_select_index selects index clamped to the items, or nothing when there are
+// none.
+list_select_index :: proc(state: ^List_State, count, index: int) {
+	state.selected = clamp(index, 0, count - 1) if count > 0 else -1
+}
+
+list_select_first :: proc(state: ^List_State, count: int) {
+	list_select_index(state, count, 0)
+}
+
+list_select_last :: proc(state: ^List_State, count: int) {
+	list_select_index(state, count, count - 1)
+}
+
+// list_select_page moves the selection by page items, forward when page is
+// positive and back when negative, stopping at the ends. With nothing selected
+// it selects the first item going forward and the last going back, as
+// list_select_next and list_select_previous do.
+list_select_page :: proc(state: ^List_State, count, page: int) {
+	switch {
+	case state.selected >= 0:
+		list_select_index(state, count, state.selected + page)
+	case page > 0:
+		list_select_first(state, count)
+	case page < 0:
+		list_select_last(state, count)
+	}
+}
+
 // draw_list draws the visible items into rect, scrolling offset so the selected
 // item stays visible, and returns the rows written.
 draw_list :: proc(buffer: ^term.Frame_Buffer, rect: tui.Cell_Rect, list: List, state: ^List_State) -> (rows: int) {
@@ -55,11 +84,7 @@ draw_list :: proc(buffer: ^term.Frame_Buffer, rect: tui.Cell_Rect, list: List, s
 	}
 	state.offset = clamp(state.offset, 0, max(count - rect.height, 0))
 	if state.selected >= 0 {
-		if state.selected < state.offset {
-			state.offset = state.selected
-		} else if state.selected >= state.offset + rect.height {
-			state.offset = state.selected - rect.height + 1
-		}
+		state.offset = scroll_reveal(state.offset, rect.height, state.selected)
 	}
 
 	visible := min(rect.height, count - state.offset)
