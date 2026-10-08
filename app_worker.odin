@@ -800,6 +800,7 @@ snapshot_clear :: proc(app: ^App) {
 	}
 	clear(&app.run.snap.entries)
 	app.run.snap.entries_bytes = 0
+	app.run.snap.image_bytes = 0
 	app.run.snap.transcript_trimmed = false
 	codemode_pending_clear_locked(app)
 	snap_publish_locked(app)
@@ -994,9 +995,9 @@ snap_entry_set_text :: proc(app: ^App, entry: ^Entry, text: string) {
 // snap_entry_account charges one entry for everything it holds: its own slot in
 // the transcript and the text buffer behind it. One budget then covers both costs,
 // so a very long run of very short lines is bounded by the same number as a short
-// run of very long ones.
+// run of very long ones. Pictures have their own budget, TRANSCRIPT_IMAGE_MAX_BYTES.
 snap_entry_account :: proc(entry: ^Entry) {
-	entry.bytes = size_of(Entry) + cap(entry.text) + cap(entry.stream) + cap(entry.image.pixels)
+	entry.bytes = size_of(Entry) + cap(entry.text) + cap(entry.stream)
 }
 
 // snap_entry_append_text adds display text to one entry. A buffer that cannot
@@ -1024,6 +1025,7 @@ snap_push_locked :: proc(app: ^App, entry: Entry) {
 	app.run.snap.entries_bytes += entry.bytes
 	if _, append_error := append(&app.run.snap.entries, entry); append_error != nil {
 		app.run.snap.entries_bytes -= entry.bytes
+		app.run.snap.image_bytes -= entry.image.bytes
 		// Nothing holds the buffer now: the array did not take the entry. A
 		// dynamic array releases through its own allocator, which the entry's text
 		// was given when it was made.
@@ -1043,6 +1045,7 @@ snap_trim_locked :: proc(app: ^App) {
 	for len(app.run.snap.entries) > 1 && app.run.snap.entries_bytes > TRANSCRIPT_MAX_BYTES {
 		dropped := app.run.snap.entries[0]
 		app.run.snap.entries_bytes -= dropped.bytes
+		app.run.snap.image_bytes -= dropped.image.bytes
 		ordered_remove(&app.run.snap.entries, 0)
 		entry_destroy(&dropped)
 		app.run.snap.transcript_trimmed = true
@@ -1310,7 +1313,7 @@ snap_push_tool_locked :: proc(
 	entry.call = call
 	entry.tool_outcome = outcome
 	entry.running = running
-	if snap_entry_image_set_locked(app, &entry, image) { snap_entry_account(&entry) }
+	snap_entry_image_set_locked(app, &entry, image)
 	snap_push_locked(app, entry)
 }
 
@@ -1337,7 +1340,7 @@ snap_settle_tool_locked :: proc(app: ^App, kind: Entry_Kind, call: journal.Call_
 	entry.tool_outcome = outcome
 	entry.running = false
 	snap_stream_release_locked(app, entry)
-	if snap_entry_image_set_locked(app, entry, image) { snap_entry_recharge_locked(app, entry) }
+	snap_entry_image_set_locked(app, entry, image)
 	snap_publish_locked(app)
 	snap_trim_locked(app)
 }

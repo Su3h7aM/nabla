@@ -46,10 +46,12 @@ IMAGE_MAX_EDGE :: 1024
 // Entry_Image is the picture of one tool box. The terminal names it by id, which
 // is zero when the entry has none. pixels is what the terminal is sent, the RGB or RGBA
 // pixels the picture decoded to, at most IMAGE_MAX_EDGE on a side, owned by the
-// run's allocator.
+// run's allocator. bytes is what the picture charged to Snapshot.image_bytes. It stays
+// after images_collect moves the pixels to an upload, which holds bytes already counted.
 Entry_Image :: struct {
 	id:     term.Image_Id,
 	pixels: [dynamic]u8, // owned,
+	bytes:  int,
 	format: term.Image_Format,
 	width:  int,
 	height: int,
@@ -104,17 +106,41 @@ image_prepare :: proc(app: ^App, attachments: []ai.Provider_Attachment) -> (imag
 
 // snap_entry_image_set_locked moves a prepared picture into an entry and numbers
 // it, leaving image empty. A picture it cannot take stays with the caller, who
-// frees it. It reports whether the entry now owns a picture, so the caller can
-// charge the transcript's budget. The caller holds the runtime mutex.
-snap_entry_image_set_locked :: proc(app: ^App, entry: ^Entry, image: ^Entry_Image) -> bool {
+// frees it: one larger than budget, one for an entry that has a picture, or one
+// with no id left. Otherwise the oldest pictures are released until this one fits
+// in budget. The picture is charged to Snapshot.image_bytes here, and the charge
+// ends when the picture is released or its entry leaves the transcript; pixels
+// moved into Frame_Storage.uploads stay charged until then. The caller holds the
+// runtime mutex.
+snap_entry_image_set_locked :: proc(app: ^App, entry: ^Entry, image: ^Entry_Image, budget := TRANSCRIPT_IMAGE_MAX_BYTES) {
 	if image == nil || len(image.pixels) == 0 || entry.image.id != 0 || app.run.snap.next_image_id + 1 >= u32(term.IMAGE_ID_LIMIT) {
-		return false
+		return
 	}
+	image.bytes = cap(image.pixels)
+	if image.bytes > budget { return }
+	snap_images_release_locked(app, budget - image.bytes)
 	app.run.snap.next_image_id += 1
 	image.id = term.Image_Id(app.run.snap.next_image_id)
 	entry.image = image^
 	image^ = {}
-	return true
+	app.run.snap.image_bytes += entry.image.bytes
+}
+
+// snap_images_release_locked releases the pictures of the oldest entries, oldest
+// first, until the snapshot holds at most limit bytes of pictures. The boxes keep
+// their text. The next frame deletes the terminal image of each: images_collect
+// finds its id gone from the entries, deletes the placed image, and frees pixels
+// still waiting in an upload. The caller holds the runtime mutex.
+snap_images_release_locked :: proc(app: ^App, limit: int) {
+	for &entry in app.run.snap.entries {
+		if app.run.snap.image_bytes <= limit { return }
+		if entry.image.id == 0 { continue }
+		app.run.snap.image_bytes -= entry.image.bytes
+		delete(entry.image.pixels)
+		entry.image = {}
+		entry.revision += 1
+		snap_publish_locked(app)
+	}
 }
 
 // image_decode decodes a PNG or JPEG file into prepared, whose pixels the decoder

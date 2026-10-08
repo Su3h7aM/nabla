@@ -116,6 +116,12 @@ Status :: struct {
 // display cost and never a limit on the run.
 TRANSCRIPT_MAX_BYTES :: 1 * mem.Megabyte
 
+// TRANSCRIPT_IMAGE_MAX_BYTES bounds the pixels the transcript holds for tool-box pictures,
+// apart from TRANSCRIPT_MAX_BYTES, because one shrunk photo is larger than the whole text
+// budget. Past it the oldest pictures are released and their boxes show the text preview;
+// no entry is dropped for picture bytes. The store keeps the files, so this is a display cost.
+TRANSCRIPT_IMAGE_MAX_BYTES :: 64 * mem.Megabyte
+
 // TRANSCRIPT_TRIMMED_NOTICE is said once, when the transcript first drops an old
 // line. A screen that quietly loses its oldest rows looks like a screen that lost
 // them for another reason.
@@ -160,6 +166,9 @@ Snapshot :: struct {
 	// entries_bytes is what the resident entries hold: each entry's own slot and
 	// the text it keeps, the number the transcript's budget is spent from.
 	entries_bytes:      int,
+	// image_bytes is the pixels the entries' pictures hold, whether still in the entry or
+	// moved to a pending upload, the number TRANSCRIPT_IMAGE_MAX_BYTES is spent from.
+	image_bytes:        int,
 	// display_incomplete records that a line or status field could not be kept.
 	display_incomplete: bool,
 	// transcript_trimmed records that the transcript dropped old lines, so the

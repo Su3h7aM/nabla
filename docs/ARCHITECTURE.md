@@ -1120,6 +1120,7 @@ These values schedule work, size internal buffers, and time the harness's own th
 | Name | Default | Kind |
 | --- | --- | --- |
 | `TRANSCRIPT_MAX_BYTES` | 1 MiB | TUI display memory; older lines reload from the journal |
+| `TRANSCRIPT_IMAGE_MAX_BYTES` | 64 MiB | TUI display memory for tool-box pictures; older pictures are released and their boxes keep the text |
 | `SPINNER_INTERVAL` | 100 ms | redraw while busy |
 | `TOOL_JOBS_MAX_ACTIVE` | `max(4, core count)` | concurrency; excess jobs queue |
 | `SUBAGENTS_MAX_RUNNING` | 4 | default of the `subagents_max_running` option; concurrency, excess children queue |
