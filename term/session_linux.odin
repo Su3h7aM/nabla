@@ -470,6 +470,8 @@ _session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
 	}
 	result.columns = int(size.columns)
 	result.rows = int(size.rows)
+	result.width_pixels = int(size.x_pixels)
+	result.height_pixels = int(size.y_pixels)
 	return
 }
 

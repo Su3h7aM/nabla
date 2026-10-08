@@ -64,7 +64,8 @@
 //   supplies the new root extent to layout, and forces a complete redraw.
 //   set_resize_wake only wakes a caller blocked in poll on another
 //   descriptor; viewport remains authoritative.
-// - Viewport has no pixel field in the v1 surface.
+// - Viewport also carries the cell area's size in pixels (zero when the
+//   terminal does not report it), for scaling an image to a cell placement.
 //
 // Terminal mode contract:
 // - The session assumes a documented entry baseline and restores it on close
@@ -103,6 +104,25 @@
 //   terminal through OSC 52 and reports the bytes it wrote, not whether the
 //   terminal kept them: the clipboard belongs to the terminal, and a terminal
 //   that ignores the sequence is indistinguishable from one that accepted it.
+//
+// Inline images:
+// - graphics.odin draws images with the Kitty graphics protocol and Unicode
+//   placeholders. graphics_transmit sends PNG or raw RGB/RGBA pixels under an
+//   Image_Id and creates a virtual placement of columns by rows cells;
+//   graphics_place resizes the placement, and graphics_delete frees the image.
+//   Like clipboard_set, each is one sequence written through the shared write
+//   path, reports the bytes written rather than whether the terminal kept
+//   them, and sends no query (q=2 silences the replies).
+// - The image appears wherever cells hold GRAPHICS_PLACEHOLDER with the id as
+//   their 24-bit foreground color. graphics_placeholder_rows[row] is the text
+//   of a row's first cell (placeholder, row mark, column-0 mark); the cells
+//   after it are bare placeholders and inherit the next column. The table's
+//   length, GRAPHICS_MAX_ROWS, is the protocol's limit on rows and columns.
+//   Placeholder cells are ordinary width-1 cells, so present needs no support.
+// - graphics_detect decides from TERM, TERM_PROGRAM, KITTY_WINDOW_ID, TMUX,
+//   and STY, because the package has no query path: kitty and Ghostty at
+//   TrueColor depth outside tmux and screen. An unrecognized terminal that
+//   supports the protocol reports false.
 //
 // Frame validation and encoding:
 // - present/encode validate the whole frame before a single byte is written:
