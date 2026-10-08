@@ -154,9 +154,10 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 		user: journal.User
 		if journal.payload_decode(node.data, &user, context.temp_allocator) != nil { return nil }
 		if follow.input != 0 && user.message == follow.input { follow.turn = node.turn }
+		// A node delivering a user.input line repeats a line already shown;
+		// any other delivery is that report's first display.
+		if user.message != 0 && follow_delivered_input(store, user.message) { return nil }
 		origin, _ := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
-		// A node delivering a user.input line repeats a line already shown.
-		if user.message != 0 && origin != .Agent { return nil }
 		// A delivered agent report shows as user text with its origin, so the
 		// front-end renders it as a subagent entry rather than a notice.
 		if origin == .Prompt || origin == .Agent {
@@ -175,6 +176,17 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 		_observer_message(observer, .Notice, "(earlier turns are summarized)")
 	}
 	return nil
+}
+
+// follow_delivered_input reports whether the inbox record a User node delivers is a
+// `user.input` line, which follow_record already showed when its record arrived. A
+// read that fails or finds nothing shows the node: a report is never hidden because
+// its source could not be read.
+@(private = "file", require_results)
+follow_delivered_input :: proc(store: ^journal.Journal, message: journal.Journal_Seq) -> bool {
+	source, _, read_error := journal.read_records(store, {}, message - 1, 1, context.temp_allocator)
+	if read_error != nil || len(source) != 1 || source[0].seq != message { return false }
+	return source[0].kind == .User_Input
 }
 
 // follow_tool_result reports a finished call. The call's name is looked up from its

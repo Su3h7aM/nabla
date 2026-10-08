@@ -116,6 +116,38 @@ test_a_follower_shows_a_delivered_agent_report_as_user_text :: proc(test: ^testi
 	if !testing.expect_value(test, len(log.events), 1) { return }
 	testing.expect_value(test, log.events[0], "user:agent-1 answered\nforty-two:agent")
 }
+// A follower shows a line another agent sent exactly once: the `user.input`
+// record shows it, and the User node that delivers it is a repeat of the line,
+// whatever origin the line carries.
+@(test)
+test_a_follower_shows_a_delivered_agent_input_once :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	session := fixture.chat.session
+
+	follower: journal.Journal
+	follow_open(test, &fixture, &follower)
+	defer _ = journal.close(&follower)
+	follow, start_error := follow_start(&follower, session)
+	if !testing.expect(test, start_error == nil, "the follow could not start") { return }
+
+	log: Follow_Log
+	defer follow_log_destroy(&log)
+	observer := follow_log_observer(&log)
+
+	if input_error := journal.append_input(&follower, "agent-1 asks\nwhat next", .Agent); input_error != nil {
+		testing.fail_now(test, "the agent line was not accepted")
+	}
+	if !testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the first poll failed") { return }
+	if !testing.expect_value(test, len(log.events), 1) { return }
+	testing.expect_value(test, log.events[0], "user:agent-1 asks\nwhat next:agent")
+
+	accepted := chat_session_accept_message(&fixture.chat, "", .Agent, {})
+	if !testing.expect_value(test, accepted, Chat_Accept.Accepted) { return }
+	if !testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the second poll failed") { return }
+	testing.expect_value(test, len(log.events), 1)
+}
 
 // A follower shows what the runner commits through the same callbacks a runner's own
 // front-end has, in order: a line it sent shows once, though the User node that delivers it
