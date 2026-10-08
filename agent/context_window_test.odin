@@ -217,8 +217,9 @@ test_a_request_that_does_not_fit_waits_for_the_running_summary :: proc(test: ^te
 	before, before_error := chat_prepare(chat, connection, context.temp_allocator)
 	if !testing.expect_value(test, before_error, nil) { return }
 	answer_bytes := 20_000
-	window := before.estimate + answer_bytes / CHAT_CHARS_PER_TOKEN / 2 + 2 * CHAT_MARGIN_MIN_TOKENS
+	window := before.estimate + answer_bytes / CHAT_CHARS_PER_TOKEN / 2 + 2 * 1024
 	chat_test_capacity(chat, window)
+	chat.capacity.trigger = before.estimate + 1
 	if !testing.expect(test, chat.capacity.trigger > before.estimate, "the first request starts no summary") { return }
 
 	answer := context_window_test_reply("done", "end_turn")

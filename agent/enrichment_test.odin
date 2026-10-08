@@ -155,7 +155,7 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(test: ^testing.
 	assumed := model_capacity(Catalog_Model{})
 	testing.expect_value(test, assumed.window, CHAT_DEFAULT_CONTEXT_WINDOW)
 	testing.expect_value(test, CHAT_DEFAULT_CONTEXT_WINDOW, 128 * 1024)
-	testing.expect(test, chat_capacity_input_ceiling(assumed) > 0)
+	testing.expect_value(test, assumed.trigger, CHAT_DEFAULT_CONTEXT_WINDOW / 2)
 
 	// A window a source stated is used as stated, including an explicit zero, which
 	// stays zero and is refused by admission rather than becoming the default.
@@ -163,7 +163,7 @@ test_enrichment_unknown_model_assumes_the_default_window :: proc(test: ^testing.
 	testing.expect_value(test, stated.window, 8192)
 	zeroed := model_capacity(Catalog_Model{context_window = 0})
 	testing.expect_value(test, zeroed.window, 0)
-	testing.expect_value(test, chat_capacity_input_ceiling(zeroed), 0)
+	testing.expect(test, !model_capacity_admits(zeroed, 0))
 }
 
 @(test)

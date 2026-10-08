@@ -293,13 +293,8 @@ chat_build_request_selection_into :: proc(
 		tools        = chat_calibrated_estimate(calibration, prep.sizes.tools),
 		conversation = chat_calibrated_estimate(calibration, prep.sizes.conversation),
 	}
-	// What this request may generate depends on what it carries, because the window is one
-	// budget: a fuller context asks for a smaller answer rather than being refused. The
-	// estimate does not depend on the bound, which is why it is computed first. A
-	// summarization request gets the same rule and a larger answer, because its input is
-	// the prefix rather than the whole context.
 	prep.request.Max_Output_Tokens_Present = true
-	prep.request.Max_Output_Tokens, _ = chat_request_output_bound(capacity, prep.estimate)
+	prep.request.Max_Output_Tokens = capacity.model_max_output
 	return nil
 }
 
@@ -629,7 +624,7 @@ chat_pdf_page_count :: proc(data: []u8) -> int {
 
 // Admission is approximate and says so: character counts divided by four plus
 // a per-message overhead cannot replace endpoint token counting, so the resolved
-// model's capacity keeps a margin and refuses over-budget requests instead of
+// model's capacity refuses requests that do not fit its window instead of
 // sending them. Measured usage from the endpoint is evidence, never the estimate.
 CHAT_CHARS_PER_TOKEN :: 4
 CHAT_MESSAGE_OVERHEAD_TOKENS :: 8
@@ -659,19 +654,19 @@ chat_request_sizes :: proc(instructions: string, messages: []ai.Provider_Message
 // exceeds what the window can hold is the whole reason nothing sent here fits, and naming
 // it is the difference between shortening a prompt that cannot help and changing what can.
 @(private)
-chat_admission_advice :: proc(sizes: Chat_Request_Sizes, ceiling: int) -> string {
+chat_admission_advice :: proc(sizes: Chat_Request_Sizes, window: int) -> string {
 	switch {
-	case sizes.instructions > ceiling:
+	case sizes.instructions >= window:
 		return "the instructions alone are larger than the window can hold; shorten them or raise the limits"
-	case sizes.tools > ceiling:
+	case sizes.tools >= window:
 		return "the tool schemas alone are larger than the window can hold; disable tools or raise the limits"
-	case sizes.conversation > ceiling:
+	case sizes.conversation >= window:
 		return "the conversation alone is larger than the window can hold; compact or raise the limits"
 	}
 	return "shorten the prompt, compact, or raise the limits"
 }
 
-// chat_admission_check asks whether the estimate leaves room for an answer. It is not a
+// chat_admission_check asks whether the estimate leaves any room in the window. It is not a
 // check against a reserved budget: there is none. The message is temp-allocated; the
 // caller clones it when the turn must record the failure.
 @(require_results)
@@ -683,7 +678,6 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int, sizes: Chat_Req
 	admission := journal.Request_Admitted {
 		estimate            = estimate,
 		context_window      = capacity.window,
-		margin              = capacity.margin,
 		instructions_tokens = sizes.instructions,
 		tools_tokens        = sizes.tools,
 		conversation_tokens = sizes.conversation,
@@ -699,21 +693,17 @@ chat_admission_check :: proc(chat: ^Chat_Session, estimate: int, sizes: Chat_Req
 		chat_record(chat, header, admission)
 		return "context admission needs context_window: add context_window to the model in config.lua", false
 	}
-	output, fits := chat_request_output_bound(capacity, estimate)
+	fits := model_capacity_admits(capacity, estimate)
 	admission.decision = journal.ADMISSION_DECISION_NAMES[.Fits if fits else .Refused]
-	admission.output = output
 	chat_record(chat, header, admission)
 	if fits {
 		return "", true
 	}
 	return fmt.tprintf(
-			"request estimated at ~%d input tokens exceeds the ~%d the %d-token window can hold (%d for estimator error, %d for an answer): %s",
+			"request estimated at ~%d input tokens does not fit the %d-token window: %s",
 			estimate,
-			chat_capacity_input_ceiling(capacity),
 			capacity.window,
-			capacity.margin,
-			CHAT_OUTPUT_MIN_TOKENS,
-			chat_admission_advice(sizes, chat_capacity_input_ceiling(capacity)),
+			chat_admission_advice(sizes, capacity.window),
 		),
 		false
 }

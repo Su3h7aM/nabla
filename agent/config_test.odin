@@ -161,6 +161,30 @@ test_config_resolve_credential_reads_env_and_keeps_a_literal :: proc(t: ^testing
 }
 
 @(test)
+test_lua_config_compaction_trigger :: proc(t: ^testing.T) {
+	path := fmt.aprintf("/tmp/nabla-config-test-trigger-%d.lua", os.get_pid(), allocator = context.temp_allocator)
+	defer os.remove(path)
+	valid := `return { providers = { acme = { models = { chat = { compaction_trigger = 50000 } } } } }`
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)valid) == nil)
+	sources, _, servers, err, detail := load_lua_config(path)
+	testing.expect_value(t, err, Config_Error.None)
+	testing.expect_value(t, sources[0].models[0].compaction_trigger.?, 50000)
+	if detail != "" { delete(detail) }
+	mcp_servers_destroy(&servers)
+	catalog_sources_destroy(&sources)
+
+	zero := `return { providers = { acme = { models = { chat = { compaction_trigger = 0 } } } } }`
+	testing.expect(t, os.write_entire_file(path, transmute([]u8)zero) == nil)
+	sources, _, servers, err, detail = load_lua_config(path)
+	testing.expect_value(t, err, Config_Error.Invalid)
+	testing.expect(t, strings.contains(detail, "compaction_trigger: expected positive integer"), detail)
+	testing.expect_value(t, len(sources), 0)
+	if detail != "" { delete(detail) }
+	mcp_servers_destroy(&servers)
+	catalog_sources_destroy(&sources)
+}
+
+@(test)
 test_lua_config_failures_leave_no_partial_sources :: proc(t: ^testing.T) {
 	cases := []string {
 		`return { providers = { acme = { models = { chat = { cost = { input = -1 } } } } } }`,

@@ -73,20 +73,6 @@ chat_checkpoint_text :: proc(summary: string, allocator: mem.Allocator) -> (stri
 
 // --- pressure ----------------------------------------------------------------
 
-// chat_compact_trigger is the input size at which a summary starts, and at which a
-// finished summary is installed. One threshold serves both, because both decisions are
-// about the same point: the context has reached the size where it needs the summary.
-// Installing before it would break the cache prefix for no gain, and starting after it
-// would leave the summary less room to finish in.
-//
-// It is a threshold for background work and not a limit on what may be sent. The request
-// path keeps sending until the window itself runs out; what the trigger changes is that a
-// summary is already being written by then.
-@(private)
-chat_compact_trigger :: proc(chat: ^Chat_Session) -> int {
-	return chat.capacity.trigger
-}
-
 // chat_compact_seam finds where the kept tail starts so the newest entries stay
 // verbatim. Coherence beats the count: the seam must not fall inside a call/result
 // run, because a result kept without its call is malformed history and a call
@@ -624,14 +610,6 @@ chat_compact_start :: proc(
 		return false
 	}
 
-	// The request carries the same rule as any other: it asks for the room the window has
-	// left. Its input is the prefix rather than the whole context, so it is given more room
-	// than the foreground request that started it, which is what keeps a summary complete.
-	if !model_capacity_admits(chat.capacity, compact_prep.estimate) {
-		_observer_message(observer, .Warning, "the active context is too large to compact in one request; start a fresh session for a new topic")
-		return false
-	}
-
 	// The job is allocated from the same heap its worker-owned storage comes from: it may outlive
 	// the session, which releases its own allocator at teardown.
 	job, job_error := new(Compact_Job, os.heap_allocator())
@@ -1039,13 +1017,14 @@ chat_compact_install :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> bo
 
 // chat_compact_install_due reports whether a ready candidate should be installed
 // now. An explicit request installs as soon as it is ready; a pressure one waits
-// until the context has reached the size it was started for.
+// until the context has reached the trigger it was started for. One threshold serves
+// both start and install: installing earlier would break the cache prefix for no gain.
 @(private)
 chat_compact_install_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 	control := &chat.compact
 	if control.state != .Ready { return false }
 	if compact_trigger_explicit(control.trigger) { return true }
-	return estimate >= chat_compact_trigger(chat)
+	return estimate >= chat.capacity.trigger
 }
 
 // chat_compact_start_due reports whether pressure alone calls for a new job. An
@@ -1053,7 +1032,7 @@ chat_compact_install_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
 // there is nothing to make room for.
 @(private)
 chat_compact_start_due :: proc(chat: ^Chat_Session, estimate: int) -> bool {
-	return chat.capacity.trigger > 0 && estimate >= chat_compact_trigger(chat)
+	return chat.capacity.trigger > 0 && estimate >= chat.capacity.trigger
 }
 
 // chat_compact_service adopts a finished job and installs a candidate that is due.

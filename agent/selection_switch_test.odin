@@ -70,7 +70,7 @@ test_selection_gate_refuses_oversized_default_without_compaction :: proc(test: ^
 	large := strings.repeat("work ", 3000, context.temp_allocator) or_else ""
 	_ = _test_user(test, chat, large, .Prompt)
 
-	target := selection_test_target(test, .OpenAI_Responses, 4096)
+	target := selection_test_target(test, .OpenAI_Responses, 2_048)
 	defer model_selection_destroy(&target, context.allocator)
 	before_head := chat.head
 	before_model := chat.model_id
@@ -151,7 +151,7 @@ test_selection_pending_keeps_foreground_tail_and_rechecks_it :: proc(test: ^test
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = compact_provider_endpoint(&setup.foreground, context.temp_allocator),
 	}
-	target := selection_test_target(test, .OpenAI_Chat_Completions, 10_000)
+	target := selection_test_target(test, .OpenAI_Chat_Completions, 8_000)
 	defer model_selection_destroy(&target, context.allocator)
 
 	transition: Selection_Transition
@@ -218,7 +218,7 @@ test_selection_compaction_failure_is_terminal :: proc(test: ^testing.T) {
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(current.Endpoint, chat.allocator)
-	target := selection_test_target(test, .OpenAI_Chat_Completions, 10_000)
+	target := selection_test_target(test, .OpenAI_Chat_Completions, 8_000)
 	defer model_selection_destroy(&target, context.allocator)
 	transition: Selection_Transition
 	status, _, error := chat_selection_check(chat, target, &transition, true, current)
@@ -242,7 +242,7 @@ test_selection_compaction_cancel_is_terminal :: proc(test: ^testing.T) {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
 	}
-	target := selection_test_target(test, .OpenAI_Chat_Completions, 10_000)
+	target := selection_test_target(test, .OpenAI_Chat_Completions, 8_000)
 	defer model_selection_destroy(&target, context.allocator)
 	transition: Selection_Transition
 	status, _, error := chat_selection_check(chat, target, &transition, true, current)
@@ -282,7 +282,7 @@ test_selection_compacts_again_only_after_target_estimate_decreases :: proc(test:
 		Endpoint = agent_provider_endpoint(&provider, chat.allocator),
 	}
 	defer delete(current.Endpoint, chat.allocator)
-	target := selection_test_target(test, .OpenAI_Chat_Completions, 10_500)
+	target := selection_test_target(test, .OpenAI_Chat_Completions, 8_500)
 	defer model_selection_destroy(&target, context.allocator)
 	transition: Selection_Transition
 	status, _, error := chat_selection_check(chat, target, &transition, true, current)

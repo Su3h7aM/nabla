@@ -34,7 +34,7 @@ The harness gets out of the model's way. It adds no limit of its own, turns ever
 A limit exists only when an external constraint imposes it: the provider or its API (request size, rate, error responses), the model (context window, maximum output), a protocol (a frame format, a JSON-RPC rule), or the operating system (memory, file descriptors, process limits). Nabla and its packages never invent a cap on tool arguments, tool output, calls per response, requests per turn, script size, instruction counts, or execution time. `http`, `sse`, `ai`, `mcp`, and `acp` report what the peer sent in full; they do not refuse data for being large. The one bounded schedule is the resend of a failed provider request (section 11.3): it is not model work, and a failure that outlasts it is not a passing one. A stream idle timeout exists only when the user configures one for a provider (section 11.3).
 
 - A limit is data from its source: a catalog fact (`context_window`, `max_output`), a provider refusal classified by `ai`, or an OS error. A constant in source that caps model-driven work is a defect.
-- The context window is the one limit the harness applies before sending, because it is the model's own. Large content is kept whole in a file and the model is shown a preview that names it (section 14.3); the bytes are never discarded.
+- The context window is the one limit the harness applies before sending, because it is the model's own, and it is applied as stated: a request is sent when its calibrated estimate is below the window. Large content is kept whole in a file and the model is shown a preview that names it (section 14.3); the bytes are never discarded.
 - A timeout is a default the model may override with any value, never a maximum. A model-supplied timeout is honored as given.
 - Internal buffers (journal batch, ACP writer queue) size memory, not work, and never refuse or truncate model-visible data.
 - Hooks, config, and material metadata run user code on the owner or the watcher. Their wall-time bound (section 17) keeps those threads responsive; it is a system constraint on the harness's own threads, not a limit on the model.
@@ -681,17 +681,18 @@ Model_Facts :: struct {
 	api:            ai.Api_Family,
 	transport:      ai.Transport,
 	context_window: Maybe(int),
+	compaction_trigger: Maybe(int),          // token count the user sets; absent means half the window
 	max_output:     Maybe(int),
 	tools:          Maybe(bool),
 	input_modalities, output_modalities: bit_set[Modality],
 	reasoning:      Maybe(Reasoning_Facts),  // supported, toggle, valid effort levels
 	cost:           Cost,                    // USD per million tokens: input, output, cache_read, cache_write, each optional
 	flags:          bit_set[Model_Flag],
-	capacity:       Capacity,                // computed once, section 23
+	capacity:       Capacity,                // window and compaction trigger, computed once, section 23
 }
 ```
 
-- `Catalog_Snapshot` is immutable, built in its own arena, and published like config (section 13). Frontends, request construction, tool exposure, transport selection, subagent model choice, and capacity all read the same snapshot. No code derives capabilities from model names. `input_modalities` decides which attachments a request carries: `image` admits the image formats and `pdf` admits PDF, and an absent list admits none (section 14.5).
+- `Catalog_Snapshot` is immutable, built in its own arena, and published like config (section 13). `context_window` and `compaction_trigger` are facts the user can set per model in configuration (section 13). Frontends, request construction, tool exposure, transport selection, subagent model choice, and capacity all read the same snapshot. No code derives capabilities from model names. `input_modalities` decides which attachments a request carries: `image` admits the image formats and `pdf` admits PDF, and an absent list admits none (section 14.5).
 - Refresh runs on the catalog thread: on demand (model menu, ACP config request) at most once per `CATALOG_REFRESH_COOLDOWN`, and at startup when a cache is older than `CATALOG_CACHE_TTL`. models.dev is parsed into a temporary arena, extracted into compact tables, and the arena is destroyed. A provider that fails keeps its previous listing.
 
 ## 13. Live configuration
@@ -710,6 +711,8 @@ Project definitions win over user definitions of the same name. No ancestor walk
 Top-level options in `config.lua` that tune the harness, each read at launch: `compact_on_switch` (boolean, section 23.3), `instructions.project` (boolean), and `subagents_max_running` (positive integer, default `SUBAGENTS_MAX_RUNNING`, the number of subagents that run at once, section 21.1). A value that is not of the stated type, or an integer below one, fails validation with `<option>: expected <type>, got <lua type>`, like every other option.
 
 A provider entry may set `stream_idle_timeout_ms`, a non-negative integer, where 0 or absence means no timeout (section 11.3). It is read from the live catalog at each request.
+
+A model entry may set `compaction_trigger` next to `context_window`: a positive integer token count at which background compaction starts (section 23.1). It is a per-model field, not a top-level option, and a value that is not a positive integer fails validation like every other option. A user sets it to keep a model under a provider pricing threshold, for example a price step at 272K tokens.
 
 ### 13.2 Reload pipeline
 
@@ -1050,34 +1053,32 @@ A failed child's partial text is committed and reported with the failure, but pr
 Computed once per model into `Capacity` in the catalog snapshot:
 
 ```text
-W       = context_window, or CHAT_DEFAULT_CONTEXT_WINDOW flagged as assumed; a stated 0 or negative refuses requests
-M       = max(W / 20, 1024)               estimator margin
-F       = min(1024, max_output)           minimum useful answer
-ceiling = W - M - F                       admission limit for the input estimate
-trigger = max(ceiling - W / 10, 0)        compaction pressure point
-output  = min(W - M - estimate, max_output)
+window  = context_window as stated, or CHAT_DEFAULT_CONTEXT_WINDOW flagged as assumed when unstated; a stated 0 admits nothing
+trigger = compaction_trigger when set, otherwise window / 2
 ```
 
-For W = 200k this admits about 189k of input and starts compaction at 169k (about 85%); for W = 1M, 949k and 849k. The `W / 10` between the trigger and the ceiling is the room the turn keeps working in while the background summary is written.
+Admission is one predicate: a request is sent when its calibrated estimate is below the window. Each request asks for the model's own maximum output, `max_output` from the catalog or `CHAT_DEFAULT_OUTPUT_TOKENS` when it states none; nothing computed from the remaining window lowers it. An estimate that is still short is caught by the provider's overflow refusal, which the harness repairs (section 2.2).
 
-The raw estimate is bytes / 4 plus 8 per message, reported per part (instructions, tools, conversation). It is wrong in both directions: code and JSON run denser than four bytes a token, and opaque replay items (encrypted reasoning, native output items) count far fewer tokens than their bytes. The provider's own count corrects it. Each attempt keeps the raw estimate of the body it sent; when the provider reports that attempt's input tokens, the session keeps the pair `(measured, estimated)` for its current selection, and every later estimate is `raw * measured / estimated`. A selection change (provider, model, or API) drops the pair, and the raw estimate is used until the next report. Admission, the trigger, and the output bound all read the calibrated estimate, so one number decides all three. An estimate that is still short is caught by the provider's overflow refusal, which the harness repairs (section 2.2).
+Background compaction starts when the calibrated estimate reaches the trigger. A `compaction_trigger` set in the model's configuration always takes precedence, even above half the window. The user can use it to keep a model under a provider pricing threshold, for example a price step at 272K tokens. `/status` shows the window and the compaction trigger, and the TUI footer shows token counts to the nearest thousand below a million (`977k`) and in millions to one decimal place above (`1M`, `1.5M`).
+
+The raw estimate is bytes / 4 plus 8 per message, reported per part (instructions, tools, conversation). It is wrong in both directions: code and JSON run denser than four bytes a token, and opaque replay items (encrypted reasoning, native output items) count far fewer tokens than their bytes. The provider's own count corrects it. Each attempt keeps the raw estimate of the body it sent; when the provider reports that attempt's input tokens, the session keeps the pair `(measured, estimated)` for its current selection, and every later estimate is `raw * measured / estimated`. A selection change (provider, model, or API) drops the pair, and the raw estimate is used until the next report. Admission and the trigger both read the calibrated estimate, so one number decides both.
 
 ### 23.2 Compaction
 
 - At most one per session: a `Compaction` job (tool-free provider request) over a frozen prefix through `F`, keeping the newest `COMPACT_KEEP_MESSAGES` and never splitting an assistant/results pair.
 - Compaction runs in the background and never pauses the agent. While the job runs, the turn keeps sending requests over the unchanged projection, so the provider prefix and its cache stay intact. Install swaps only the prefix through `F` for the summary: every node committed after `F`, including the steps the agent took while the summary was computed, stays in the projection after the checkpoint (section 10.3).
-- Triggers: estimate at `trigger`, explicit command or `compact`, proven provider overflow, pending selection that needs a smaller context. Triggers coalesce. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
+- Triggers: calibrated estimate at `trigger` (section 23.1), explicit command or `compact`, proven provider overflow, pending selection that needs a smaller context. Triggers coalesce. A compaction always starts when due; no check on whether its own request fits refuses it. Automatic starts require new nodes since the last attempt and respect `COMPACT_COOLDOWN`. Auth, quota, and invalid-request failures suppress automatic starts until configuration or explicit intent changes.
 - Explicit commands wake the owner and start from committed history at its next collection step, including during provider work, tool work, or retry backoff. They do not wait in the turn's ordinary command queue or wait for a request boundary. Agent tool intent is serviced by the same collection step. All existing start checks still apply; only installation waits for a safe boundary.
 - A summary is accepted only with a normal stop reason, no tool calls, non-empty text, and a saving of at least `COMPACT_MIN_REDUCTION` tokens. A pending selection accepts any strictly positive saving; the target fit check determines whether another summary is useful.
 - Install at a request boundary or while idle: verify base and coverage, commit the `Checkpoint` node (section 10.3) and `checkpoint.installed` in one transaction, reload the projection, reset the encode cache.
-- The foreground does not wait for a summary it does not need. When admission refuses, a ready candidate is installed and admission reruns; without one, the turn waits for a compaction and continues after the install. The turn ends with `Context_Exhausted` only when nothing a checkpoint can remove would make room, which is the model's window refusing the instructions and tools themselves; the user is told which part is too large.
+- The foreground does not wait for a summary it does not need. When a request is not admitted, or the provider refuses it for context overflow, while a background summary is running, the turn waits for the summary, installs it, rebuilds the request, and sends it, with no user action. A ready candidate is installed at once and admission reruns. With no summary running, a compaction starts and the turn waits for it the same way. The turn ends with `Context_Exhausted` only when nothing a checkpoint can remove would make room, which is the model's window refusing the instructions and tools themselves; the user is told which part is too large.
 - The summary directive asks for goals, constraints, decisions with evidence, exact identifiers, current and pending work, failures, and unknowns, and tells the model to reload skills before relying on their details.
 
 ### 23.3 Session selection changes
 
 Model, provider, and API changes use one owner-controlled selection path. A frozen request keeps its original selection and connection until its borrows end; a new selection applies at a settled request boundary or while idle. Provider-native replay follows section 11.2, so switching APIs retains neutral conversation content without sending opaque replay to a different endpoint.
 
-Before applying a target, project the current instructions, tools, and conversation for the target API, provider, and model, and check its capacity with the same estimator and admission arithmetic used for requests. A refused switch leaves the current selection and foreground work unchanged. `selection.fit` records the target, API, estimate, window, output allowance, margin, and decision before the switch or compaction effect; a session whose first prompt has not created it yet has no row to carry one, and its first turn records the selection it starts with instead.
+Before applying a target, project the current instructions, tools, and conversation for the target API, provider, and model, and check its capacity with the same estimator and admission arithmetic used for requests. A refused switch leaves the current selection and foreground work unchanged. `selection.fit` records the target, API, estimate, window, and decision before the switch or compaction effect; a session whose first prompt has not created it yet has no row to carry one, and its first turn records the selection it starts with instead.
 
 An installed selection is recorded as session-scoped `selection.applied` before reporting success. The process-wide `selection.changed` default remains separate, so a change in an ACP session does not become the next interactive launch's default.
 
@@ -1141,8 +1142,8 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `CONFIG_INSTRUCTIONS` | 200,000 | config Lua run length; keeps the thread that evaluates it responsive |
 | `SKILL_INLINE_CATALOG_BYTES` | 16 KiB | inline catalog versus `skills` |
 | `CATALOG_REFRESH_COOLDOWN` | 10 min | network use |
-| `CHAT_DEFAULT_CONTEXT_WINDOW` | 131072 | used only when the catalog has no window, and flagged |
-| `CHAT_DEFAULT_OUTPUT_TOKENS` | 4096 | output a request asks for when the catalog states no maximum; the window bound (section 23.1) still applies |
+| `CHAT_DEFAULT_CONTEXT_WINDOW` | 131072 | used only when the catalog has no window, and flagged; the trigger defaults to half the window unless `compaction_trigger` is set |
+| `CHAT_DEFAULT_OUTPUT_TOKENS` | 4096 | output a request asks for when the catalog states no maximum (section 23.1) |
 | `CHAT_COMPACT_KEEP_MESSAGES` / `CHAT_COMPACT_MIN_REDUCTION_TOKENS` / `CHAT_COMPACT_COOLDOWN` | 10 / 1024 tokens / 30 s | compaction policy |
 | `JOURNAL_BATCH_RECORDS` / `JOURNAL_BATCH_BYTES` / `JOURNAL_BATCH_AGE` | 256 / 1 MiB / 1 s | write batching |
 | `TOOL_LIST_SKILLS_DEFAULT_LIMIT` | 20 | skills returned when the model gives no limit |

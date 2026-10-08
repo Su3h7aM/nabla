@@ -39,31 +39,18 @@ chat_notice_status :: proc(chat: ^Chat_Session, observer: Chat_Observer, now_ms:
 
 	capacity := chat.capacity
 	if capacity.window > 0 {
-		chat_status_line(
-			observer,
-			"context",
-			fmt.tprintf(
-				"%d window, %d for estimator error, compaction at %d (%d for input)",
-				capacity.window,
-				capacity.margin,
-				capacity.trigger,
-				chat_capacity_input_ceiling(capacity),
-			),
-		)
+		chat_status_line(observer, "context", fmt.tprintf("%d window, compaction at %d", capacity.window, capacity.trigger))
 	} else {
 		chat_status_line(observer, "context", "not configured for this model")
 	}
 
 	estimate := "none"
-	answer_room := "none"
 	if chat.last_estimate > 0 {
 		estimate = fmt.tprintf("%d", chat.last_estimate)
-		output, _ := chat_request_output_bound(capacity, chat.last_estimate)
-		answer_room = fmt.tprintf("%d", output)
 	}
 	measured := "none"
 	if value, present := chat.last_input_measured.?; present { measured = fmt.tprintf("%d", value) }
-	chat_status_line(observer, "usage", fmt.tprintf("estimate %s, measured %s, answer room %s", estimate, measured, answer_room))
+	chat_status_line(observer, "usage", fmt.tprintf("estimate %s, measured %s", estimate, measured))
 
 	// Session usage is a query over finished requests, so this line also fails
 	// when the store does: a status that hid a storage failure would be lying

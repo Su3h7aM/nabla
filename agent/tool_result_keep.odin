@@ -41,7 +41,7 @@ Tool_Budget :: struct {
 // known yet charges nothing, so only the preview size applies.
 chat_tool_budget_open :: proc(chat: ^Chat_Session, count: int) -> Tool_Budget {
 	if chat.capacity.window <= 0 { return {remaining = max(int) / 2, pending = count} }
-	remaining := chat_capacity_input_ceiling(chat.capacity) - (chat.last_estimate + chat.response_cost)
+	remaining := chat.capacity.window - (chat.last_estimate + chat.response_cost)
 	return {remaining = max(remaining, 0), pending = count}
 }
 

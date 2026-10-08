@@ -129,9 +129,9 @@ STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit
 // frame, so the solved scroll range can be looked up after the solve.
 CONVERSATION_ID :: layout.Id(1)
 
-// FOOTER_KIB_ROUNDING and KIBIBYTE keep footer token counts rounded to the nearest KiB.
-FOOTER_KIB_ROUNDING :: 512
-KIBIBYTE :: 1024
+// TOKENS_PER_THOUSAND and TOKENS_PER_TENTH_MILLION are the units footer token counts round to.
+TOKENS_PER_THOUSAND :: 1000
+TOKENS_PER_TENTH_MILLION :: 100_000
 
 // CONVERSATION_CAPACITIES is where one transcript frame's budget starts: room for about a
 // screen of entries, not for every entry a session ever produced. A frame that outgrows a
@@ -1323,15 +1323,9 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 			// the footer is the only place a reader can see that from.
 			if status.session_hit_partial { cache = fmt.tprintf("%s (partial)", cache) }
 		} else if cache_read, cache_ok := status.session_cache_read.?; cache_ok {
-			cache = fmt.tprintf("cache %dk", (cache_read + FOOTER_KIB_ROUNDING) / KIBIBYTE)
+			cache = fmt.tprintf("cache %s", footer_token_count(int(cache_read)))
 		}
-		left = fmt.tprintf(
-			"%dk/%dk | cost %s | %s",
-			(status.est_input + FOOTER_KIB_ROUNDING) / KIBIBYTE,
-			(status.context_window + FOOTER_KIB_ROUNDING) / KIBIBYTE,
-			cost,
-			cache,
-		)
+		left = fmt.tprintf("%s/%s | cost %s | %s", footer_token_count(status.est_input), footer_token_count(status.context_window), cost, cache)
 		right = fmt.tprintf("(%s) %s", status.provider_id, status.model_id)
 		if effort_text := strings.trim_space(status.effort); effort_text != "" {
 			right = fmt.tprintf("%s | %s", right, effort_text)
@@ -1361,6 +1355,17 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		height = 1,
 	}
 	_, _ = tui.draw_text(&storage.buffer, right_rect, right, FOOTER_TEXT)
+}
+
+// footer_token_count formats a token count for the footer: the nearest thousand below a
+// million ("977k"), otherwise millions to one decimal place ("1M", "1.5M"). The string is
+// allocated with context.temp_allocator.
+footer_token_count :: proc(count: int) -> string {
+	thousands := (count + TOKENS_PER_THOUSAND / 2) / TOKENS_PER_THOUSAND
+	if thousands < 1000 { return fmt.tprintf("%dk", thousands) }
+	tenths := (count + TOKENS_PER_TENTH_MILLION / 2) / TOKENS_PER_TENTH_MILLION
+	if tenths % 10 == 0 { return fmt.tprintf("%dM", tenths / 10) }
+	return fmt.tprintf("%d.%dM", tenths / 10, tenths % 10)
 }
 
 // shorten_home replaces a leading home directory with "~", the way the

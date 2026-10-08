@@ -106,6 +106,7 @@ test_admission_refuses_without_window_or_budget :: proc(test: ^testing.T) {
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 
+	chat.capacity = {}
 	message, admitted := chat_admission_check(chat, 100, {})
 	testing.expect(test, !admitted)
 	testing.expect(test, strings.contains(message, "context_window"))
@@ -114,10 +115,10 @@ test_admission_refuses_without_window_or_budget :: proc(test: ^testing.T) {
 	_, admitted = chat_admission_check(chat, 100, {})
 	testing.expect(test, admitted)
 
-	// 490000 estimated plus default reserve plus margin does not fit 500000.
-	message, admitted = chat_admission_check(chat, 490000, {})
+	// An estimate that fills the window is not admitted.
+	message, admitted = chat_admission_check(chat, 500000, {})
 	testing.expect(test, !admitted)
-	testing.expect(test, strings.contains(message, "exceeds"))
+	testing.expect(test, strings.contains(message, "does not fit"))
 	_ = message
 }
 
@@ -146,7 +147,7 @@ test_admission_names_the_part_that_alone_does_not_fit :: proc(test: ^testing.T) 
 	preparation := request_test_prepare(test, chat, tool_loop_connection, &arena)
 	defer virtual.arena_destroy(&arena)
 	// The window cannot hold the schemas alone, and the estimate says so.
-	testing.expect(test, preparation.sizes.tools > chat_capacity_input_ceiling(chat.capacity), "the fixture must not fit")
+	testing.expect(test, preparation.sizes.tools >= chat.capacity.window, "the fixture must not fit")
 	message, admitted := chat_admission_check(chat, preparation.estimate, preparation.sizes)
 	testing.expect(test, !admitted, "a request whose tools alone do not fit is refused")
 	testing.expect(test, strings.contains(message, "tool schemas"), message)

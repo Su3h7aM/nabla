@@ -69,18 +69,19 @@ catalog_cost_of :: proc(cost: Catalog_Cost, input, output, cache_read, cache_wri
 }
 
 Catalog_Model_Source :: struct {
-	id:                string,
-	disabled:          Maybe(bool),
+	id:                 string,
+	disabled:           Maybe(bool),
 	// Absent means the model is served through its provider's family.
-	api:               Maybe(string),
-	display_name:      Maybe(string),
-	context_window:    Maybe(int),
-	max_output_tokens: Maybe(int),
-	input_modalities:  Maybe([]string),
-	output_modalities: Maybe([]string),
-	tools:             Maybe(bool),
-	thinking:          Catalog_Thinking_Source,
-	cost:              Catalog_Cost,
+	api:                Maybe(string),
+	display_name:       Maybe(string),
+	context_window:     Maybe(int),
+	compaction_trigger: Maybe(int),
+	max_output_tokens:  Maybe(int),
+	input_modalities:   Maybe([]string),
+	output_modalities:  Maybe([]string),
+	tools:              Maybe(bool),
+	thinking:           Catalog_Thinking_Source,
+	cost:               Catalog_Cost,
 }
 
 Provider_Transport :: enum {
@@ -125,20 +126,21 @@ Catalog_Provider_Source :: struct {
 // `capacity` is derived, not stated: resolution fills it from the merged window and
 // output fields, and everything that needs a context budget reads it from here.
 Catalog_Model :: struct {
-	provider_id:       string,
-	id:                string,
+	provider_id:        string,
+	id:                 string,
 	// The family this model is served through: its own statement where it has
 	// one, otherwise the provider's.
-	api:               Maybe(string),
-	display_name:      Maybe(string),
-	context_window:    Maybe(int),
-	max_output_tokens: Maybe(int),
-	capacity:          Model_Capacity,
-	input_modalities:  Maybe([]string),
-	output_modalities: Maybe([]string),
-	tools:             Maybe(bool),
-	thinking:          Catalog_Thinking_Source,
-	cost:              Catalog_Cost,
+	api:                Maybe(string),
+	display_name:       Maybe(string),
+	context_window:     Maybe(int),
+	compaction_trigger: Maybe(int),
+	max_output_tokens:  Maybe(int),
+	capacity:           Model_Capacity,
+	input_modalities:   Maybe([]string),
+	output_modalities:  Maybe([]string),
+	tools:              Maybe(bool),
+	thinking:           Catalog_Thinking_Source,
+	cost:               Catalog_Cost,
 }
 
 Catalog_Provider :: struct {
@@ -242,6 +244,7 @@ catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
 		model.api != nil ||
 		model.display_name != nil ||
 		model.context_window != nil ||
+		model.compaction_trigger != nil ||
 		model.max_output_tokens != nil ||
 		model.input_modalities != nil ||
 		model.output_modalities != nil ||
@@ -357,6 +360,9 @@ catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allo
 	}
 	if dst.context_window == nil && src.context_window != nil {
 		dst.context_window = src.context_window
+	}
+	if dst.compaction_trigger == nil && src.compaction_trigger != nil {
+		dst.compaction_trigger = src.compaction_trigger
 	}
 	if dst.max_output_tokens == nil && src.max_output_tokens != nil {
 		dst.max_output_tokens = src.max_output_tokens

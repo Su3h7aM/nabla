@@ -236,6 +236,14 @@ load_model :: proc(
 		out^.context_window = value
 	}
 	lua.settop(state, base)
+	lua_field(state, idx, "compaction_trigger")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_int(state, -1)
+		if !ok ||
+		   value < 1 { return .Invalid, config_model_field_detail(provider_id, model_id, "compaction_trigger", "positive integer", state, -1, allocator) }
+		out^.compaction_trigger = value
+	}
+	lua.settop(state, base)
 	lua_field(state, idx, "max_output_tokens")
 	if lua.type(state, -1) != .NIL {
 		value, ok := lua_int(state, -1)

@@ -131,8 +131,7 @@ test_a_compaction_request_shares_the_conversation_prefix :: proc(test: ^testing.
 	testing.expect(test, len(prep.request.Tools) > 0, "a compaction request keeps the conversation's tools")
 	testing.expect_value(test, prep.request.Prompt_Cache_Key, chat_session_text(chat))
 	testing.expect(test, prep.request.Max_Output_Tokens_Present)
-	expected, _ := chat_request_output_bound(chat.capacity, prep.estimate)
-	testing.expect_value(test, prep.request.Max_Output_Tokens, expected)
+	testing.expect_value(test, prep.request.Max_Output_Tokens, chat.capacity.model_max_output)
 	if !testing.expect_value(test, len(prep.request.Messages), 2) { return }
 	testing.expect_value(test, prep.request.Messages[0].Content, "first")
 	testing.expect_value(test, prep.request.Messages[1].Content, CHAT_COMPACT_DIRECTIVE)

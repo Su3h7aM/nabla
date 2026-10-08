@@ -117,7 +117,7 @@ test_a_result_the_batch_cannot_afford_is_still_kept_whole :: proc(test: ^testing
 	}
 	// Almost no room is left, so the batch bound rather than the result's own size decides.
 	chat_test_capacity(chat, 8_000, 4_096)
-	chat.last_estimate = chat_capacity_input_ceiling(chat.capacity) - 256
+	chat.last_estimate = chat.capacity.window - 256
 
 	result := budget_test_result(test, chat)
 	testing.expect(test, len(result.content) < 1024, "only the notice fits")

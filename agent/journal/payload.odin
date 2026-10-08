@@ -262,8 +262,6 @@ Selection_Fit :: struct {
 	decision:       string, // SELECTION_FIT_DECISION_NAMES
 	estimate:       int,
 	context_window: int,
-	margin:         int,
-	output:         int,
 	reason:         string,
 }
 
@@ -343,16 +341,12 @@ ADMISSION_DECISION_NAMES := [Admission_Decision]string {
 	.Unconfigured = "unconfigured",
 }
 
-// Request_Admitted is whether a request fits its model's window. output is the
-// answer bound the request would be sent with; margin is what
-// the window keeps back for estimator error.
+// Request_Admitted is whether a request fits its model's window.
 Request_Admitted :: struct {
 	version:             int,
 	decision:            string, // ADMISSION_DECISION_NAMES
 	estimate:            int,
 	context_window:      int,
-	margin:              int,
-	output:              int,
 	instructions_tokens: int,
 	tools_tokens:        int,
 	conversation_tokens: int,

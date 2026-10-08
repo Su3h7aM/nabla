@@ -130,12 +130,11 @@ chat_selection_check :: proc(
 	)
 	if build_error != nil { return .Refused, "the target request could not be prepared", build_error }
 
-	ceiling := chat_capacity_input_ceiling(target.capacity)
-	part_too_large := target.capacity.window <= 0 || prep.sizes.instructions > ceiling || prep.sizes.tools > ceiling
-	_, fits := chat_request_output_bound(target.capacity, prep.estimate)
+	window := target.capacity.window
+	part_too_large := window <= 0 || prep.sizes.instructions >= window || prep.sizes.tools >= window
 	decision := journal.Selection_Fit_Decision.Compact
 	reason := "the target estimate exceeds its admission budget"
-	if fits {
+	if model_capacity_admits(target.capacity, prep.estimate) {
 		decision = .Fits
 		reason = ""
 	} else if part_too_large || !allow_compact {
@@ -143,9 +142,9 @@ chat_selection_check :: proc(
 		switch {
 		case target.capacity.window <= 0:
 			reason = "the target has no usable context window"
-		case prep.sizes.instructions > ceiling:
+		case prep.sizes.instructions >= window:
 			reason = "the instructions alone exceed the target admission budget"
-		case prep.sizes.tools > ceiling:
+		case prep.sizes.tools >= window:
 			reason = "the tool schemas alone exceed the target admission budget"
 		case:
 			reason = "the target estimate exceeds its admission budget and compact_on_switch is disabled"
@@ -155,7 +154,6 @@ chat_selection_check :: proc(
 		decision = .Refused
 		reason = "compaction did not reduce the target estimate"
 	}
-	output, _ := chat_request_output_bound(target.capacity, prep.estimate)
 	recheck := transition.phase == .Needs_Recheck
 	// A session nobody prompted has no row to carry the decision; its first turn records the
 	// selection it starts with instead.
@@ -170,8 +168,6 @@ chat_selection_check :: proc(
 				decision = journal.SELECTION_FIT_DECISION_NAMES[decision],
 				estimate = prep.estimate,
 				context_window = target.capacity.window,
-				margin = target.capacity.margin,
-				output = output,
 				reason = reason,
 			},
 		)

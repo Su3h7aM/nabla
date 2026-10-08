@@ -117,6 +117,7 @@ chat_test_attach :: proc(
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
 	fixture.chat.model_api = .OpenAI_Chat_Completions
+	chat_test_capacity(&fixture.chat, CHAT_DEFAULT_CONTEXT_WINDOW)
 	fixture.chat.skill_instructions = test_skill_instructions(&fixture.chat)
 	// Kept outputs go under the fixture's own directory, never the user's cache directory.
 	delete(fixture.chat.tool_output_directory, context.allocator)

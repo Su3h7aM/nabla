@@ -565,11 +565,9 @@ test_pressure_starts_a_compaction_before_the_window_is_full :: proc(test: ^testi
 	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
 	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
 
-	// The trigger is where a summary starts, and it has to leave room for the
-	// foreground to keep working, so the fixture stays below what the window admits.
-	trigger := chat_compact_trigger(chat)
+	trigger := chat.capacity.trigger
 	testing.expect(test, prep.estimate >= trigger, "the fixture must cross the compaction trigger")
-	testing.expect(test, prep.estimate <= chat_capacity_input_ceiling(chat.capacity), "the fixture must still be sendable")
+	testing.expect(test, model_capacity_admits(chat.capacity, prep.estimate), "the fixture must still be sendable")
 
 	// A started summary says so, once, so the front-end can time it. Nothing was
 	// started before this point, so no notice was emitted.
@@ -716,7 +714,7 @@ test_a_rejected_payload_waits_for_a_summary_that_is_not_ready :: proc(test: ^tes
 
 	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
 	if prep_error != nil { testing.fail_now(test, "chat_prepare failed") }
-	testing.expect(test, prep.estimate < chat_compact_trigger(chat), "the summary is not started by pressure")
+	testing.expect(test, prep.estimate < chat.capacity.trigger, "the summary is not started by pressure")
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
 
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the overflow repaired after compaction")
