@@ -592,7 +592,8 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 	return true
 }
 
-// draw_conversation_image draws a picture's placeholder cells into a view of the grid that ends at the transcript's last row, so the part below it is clipped, and records it as shown.
+// draw_conversation_image draws a picture's placeholder cells into a view of the grid that ends at the transcript's last row,
+// so the part below it is clipped, and records it as shown.
 @(require_results)
 draw_conversation_image :: proc(storage: ^Frame_Storage, bounds: layout.Rect, id: term.Image_Id, viewport: tui.Cell_Rect) -> bool {
 	rect, project_err := tui.project_rect_integral(bounds)

@@ -2447,6 +2447,74 @@ test_an_inner_result_after_the_script_settled_changes_nothing :: proc(t: ^testin
 	testing.expect_value(t, len(app.run.codemode_pending), 0)
 }
 
+// A follower that attaches mid-turn shows the proposed call as a running box that the completion settles in place,
+// and shows a notice node once.
+@(test)
+test_a_follower_shows_the_calls_running_when_it_attached :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner: journal.Journal
+	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); error != nil {
+		testing.fail_now(t, "runner open failed")
+	}
+	defer _ = journal.close(&runner)
+	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	turn := journal.next_turn(&runner)
+	journal.append_record(&runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
+	prompt := journal.append_node(
+		&runner,
+		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
+		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt]},
+		transmute([]u8)string("list files"),
+	)
+	assistant := journal.append_node(
+		&runner,
+		{session = id, branch = journal.INITIAL_BRANCH, parent = prompt, kind = .Assistant, turn = turn},
+		journal.Assistant{request = 1},
+	)
+	call := journal.next_call(&runner)
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Proposed, session = id, branch = journal.INITIAL_BRANCH, node = assistant, turn = turn, call = call},
+		journal.Tool_Proposed{provider_id = "first", name = "shell"},
+		transmute([]u8)string(`{"command":"ls"}`),
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "commit failed") }
+	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
+	session_opened_show(&app)
+	running := 0
+	for entry in app_entries(&app) {
+		if entry.call == call && entry.running { running += 1 }
+	}
+	testing.expect_value(t, running, 1)
+
+	journal.append_record(
+		&runner,
+		{kind = .Tool_Completed, session = id, branch = journal.INITIAL_BRANCH, node = assistant, turn = turn, call = call},
+		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+		transmute([]u8)string("ok\nexit_code: 0\n\nstdout:\nfile\n"),
+	)
+	_ = journal.append_node(
+		&runner,
+		{session = id, branch = journal.INITIAL_BRANCH, parent = assistant, kind = .Notice, turn = turn},
+		journal.Notice{},
+		transmute([]u8)string("a harness note"),
+	)
+	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "completion commit failed") }
+	_ = app_follow_poll(&app, run_observer(&app))
+	testing.expect_value(t, app_entries_count(&app, "a harness note"), 1)
+	boxes := 0
+	for entry in app_entries(&app) {
+		if entry.call != call { continue }
+		boxes += 1
+		testing.expect(t, !entry.running, "the completion settled the box")
+	}
+	testing.expect_value(t, boxes, 1)
+}
+
 // A completion the replay already showed, read again by the poll, does not add a second box.
 @(test)
 test_a_follower_does_not_repeat_a_result_the_replay_showed :: proc(t: ^testing.T) {

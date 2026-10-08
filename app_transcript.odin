@@ -12,7 +12,8 @@ import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:layout"
 
-// TRANSCRIPT_WINDOW_SCREENS is the screens of history kept in memory (the visible one, two above, two below), so scrolling back to the first prompt costs memory only for what can be seen next.
+// TRANSCRIPT_WINDOW_SCREENS is the screens of history kept in memory: the visible one, two above, two below.
+// Memory then follows what can be seen next, however far the user scrolls back.
 TRANSCRIPT_WINDOW_SCREENS :: 5
 
 // TRANSCRIPT_LOAD_SCREENS is how near the window's edge the view may come before the next page is read.
@@ -359,7 +360,8 @@ codemode_inner_list :: proc(nested: []agent.Projected_Nested_Call, parent_call: 
 	return list[:]
 }
 
-// transcript_order returns the entries a frame draws, oldest first, in the temporary allocator. A live entry follows its node's entries and is hidden until the window reaches it.
+// transcript_order returns the entries a frame draws, oldest first, in the temporary allocator.
+// A live entry follows its node's entries and is hidden until the window reaches it.
 transcript_order :: proc(app: ^App) -> []^Entry {
 	transcript := &app.transcript
 	live := app.run.snap.entries[:]
@@ -452,7 +454,7 @@ transcript_node_rows :: proc(transcript: ^Transcript, node: journal.Node_Id) -> 
 	return rows
 }
 
-// transcript_reduce drops the live entries the window now shows, and those not running or streaming that lie before the window.
+// transcript_reduce drops the live entries the window now shows (a follower reports notice nodes live too), and those not running or streaming that lie before the window.
 transcript_reduce :: proc(app: ^App) {
 	transcript := &app.transcript
 	last: journal.Node_Id
@@ -470,7 +472,7 @@ transcript_reduce :: proc(app: ^App) {
 			covered ||= transcript_has_call(transcript, entry.call)
 		case entry.kind == .Assistant:
 			covered ||= entry.complete && last > entry.after
-		case entry.kind == .User || entry.kind == .Subagent:
+		case entry.kind == .User || entry.kind == .Subagent || entry.kind == .Notice:
 			covered ||= transcript_has_text(transcript, entry)
 		}
 		if !covered { continue }

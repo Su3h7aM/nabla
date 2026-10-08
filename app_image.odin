@@ -33,7 +33,8 @@ IMAGE_CELL_HEIGHT :: 16
 // IMAGE_MAX_EDGE is the longest side, in pixels, a prepared picture keeps; a larger one only costs transfer time and memory.
 IMAGE_MAX_EDGE :: 1024
 
-// Entry_Image is the picture of one tool box. id is zero when there is none. pixels are RGB or RGBA, at most IMAGE_MAX_EDGE on a side, owned by the run's allocator; bytes is what it charged to Snapshot.image_bytes.
+// Entry_Image is the picture of one tool box; id is zero when there is none. pixels are RGB or RGBA, at most IMAGE_MAX_EDGE on a side,
+// owned by the run's allocator, and bytes is what it charged to Snapshot.image_bytes.
 Entry_Image :: struct {
 	id:     term.Image_Id,
 	pixels: [dynamic]u8, // owned,
@@ -254,7 +255,8 @@ image_upload_find :: proc(uploads: []Image_Upload, id: term.Image_Id) -> int {
 	return -1
 }
 
-// images_sync brings the terminal to what images_collect found. It runs on the main thread without the lock; a failed write is reported once and retried next frame.
+// images_sync brings the terminal to what images_collect found. It runs on the main thread without the lock;
+// a failed write is reported once and retried next frame.
 images_sync :: proc(app: ^App, storage: ^Frame_Storage) {
 	for id in storage.stale {
 		_, delete_error := term.graphics_delete(app.terminal, id, context.temp_allocator)

@@ -640,6 +640,60 @@ session_opened_show :: proc(app: ^App) {
 			snap_append(app, user_entry_kind(agent.user_input_origin(record)), string(record.body))
 		}
 	}
+	session_running_calls_show(app)
+}
+
+// session_running_calls_show shows as running boxes the calls a follower found proposed and not completed in the turn it attached to,
+// and the calls of their scripts. Calls with a committed completion are the window's.
+session_running_calls_show :: proc(app: ^App) {
+	setup := &app.setup
+	if !setup.follow.working { return }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	session := setup.session.session
+	started, found, started_error := journal.read_latest(setup.store, {session = session, kinds = {.Turn_Started}}, context.temp_allocator)
+	if started_error != nil || !found { return }
+	records, _, read_error := journal.read_records(
+		setup.store,
+		{session = session, kinds = {.Tool_Proposed, .Tool_Completed}},
+		started.seq,
+		0,
+		context.temp_allocator,
+	)
+	if read_error != nil { return }
+	completed := make(map[journal.Call_Id]journal.Record, context.temp_allocator)
+	for record in records {
+		if record.kind == .Tool_Completed { completed[record.call] = record }
+	}
+	for record in records {
+		if record.kind != .Tool_Proposed || record.seq > setup.follow.last { continue }
+		done, is_done := completed[record.call]
+		if is_done && record.parent_call == 0 { continue }
+		if record.parent_call in completed { continue }
+		proposed: journal.Tool_Proposed
+		if journal.payload_decode(record.data, &proposed, context.temp_allocator) != nil { continue }
+		arguments := string(record.body)
+		observer_tool_call(
+			app,
+			agent.Chat_Tool_Event {
+				call = record.call,
+				parent_call = record.parent_call,
+				call_id = proposed.provider_id,
+				name = proposed.name,
+				arguments = arguments,
+			},
+		)
+		if !is_done { continue }
+		completion: journal.Tool_Completed
+		if journal.payload_decode(done.data, &completion, context.temp_allocator) != nil { continue }
+		outcome, _ := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
+		result := agent.Tool_Result {
+			outcome   = outcome,
+			reason    = journal.TOOL_OUTCOME_NAMES[outcome],
+			content   = string(done.body),
+			allocator = context.temp_allocator,
+		}
+		observer_tool_result(app, record.call, record.parent_call, proposed.name, arguments, &result)
+	}
 }
 
 // head_publish publishes the session shown and its committed head for the transcript window.
