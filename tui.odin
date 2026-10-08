@@ -492,8 +492,8 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 		) {
 			if len(order) == 0 {
 				if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
-					layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = layout_text_style(TITLE_STYLE)})
-					layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = layout_text_style(HINT_STYLE)})
+					layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = tui.text_style(TITLE_STYLE)})
+					layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = tui.text_style(HINT_STYLE)})
 				}
 			} else {
 				for entry in order {
@@ -582,7 +582,7 @@ draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout
 		}
 		line.x += viewport.x
 		line.y += viewport.y
-		style := term_text_style(text_data.style)
+		style := tui.term_style(text_data.style)
 		// Only a user message has a background.
 		if style.background != nil {
 			// A user message is a band across the whole terminal, not a block inside
@@ -719,7 +719,7 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 		return
 	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
-	body_style := layout_text_style(entry_style(entry.kind))
+	body_style := tui.text_style(entry_style(entry.kind))
 	// A user message is a band, and the band's padding rows are painted too, so
 	// they keep the band's style rather than the body's wrapping one.
 	band_style := body_style
@@ -758,9 +758,9 @@ declare_subagent_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
 		heading = cleaned[:split]
 		rest = cleaned[split + 1:]
 	}
-	heading_style := layout_text_style(SUBAGENT_LABEL)
+	heading_style := tui.text_style(SUBAGENT_LABEL)
 	heading_style.wrap = .Words
-	band_style := layout_text_style(SUBAGENT_TEXT)
+	band_style := tui.text_style(SUBAGENT_TEXT)
 	body_style := band_style
 	body_style.wrap = .Words
 	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
@@ -788,13 +788,13 @@ declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, li
 		for line_index in 0 ..< len(lines.line_ends) {
 			line := markdown_line(lines, line_index)
 			if len(line) == 0 {
-				layout.text(ctx, layout.Text_Desc{text = " ", style = layout_text_style({})})
+				layout.text(ctx, layout.Text_Desc{text = " ", style = tui.text_style({})})
 				continue
 			}
 			if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
 				for segment in line {
 					link := frame_link_id(storage, segment.link)
-					layout.text(ctx, layout.Text_Desc{text = segment.text, style = layout_text_style(segment.style), user = layout.User_Tag(link)})
+					layout.text(ctx, layout.Text_Desc{text = segment.text, style = tui.text_style(segment.style), user = layout.User_Tag(link)})
 				}
 			}
 		}
@@ -876,8 +876,8 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 		ctx,
 		layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}, user = layout.User_Tag(entry.id)},
 	) {
-		border := layout_text_style(border_style)
-		body := layout_text_style(TOOL_BODY)
+		border := tui.text_style(border_style)
+		body := tui.text_style(TOOL_BODY)
 		layout.text(ctx, layout.Text_Desc{text = top, style = border})
 		remaining := preview
 		row_index := 0
@@ -1015,48 +1015,6 @@ declare_tool_row :: proc(ctx: ^layout.Context, content: string, border, body: la
 		layout.text(ctx, layout.Text_Desc{text = vertical, style = border})
 	}
 }
-
-// layout_text_style packs a palette style into layout.Text_Style.font, which
-// layout never interprets: the modifiers in the low byte, then the indexed
-// foreground and background, each stored plus one so zero is the terminal
-// default. RGB colors are not carried. Wrap is the declaration's choice.
-layout_text_style :: proc(style: term.Style) -> layout.Text_Style {
-	font := u32(transmute(u8)style.modifiers)
-	if index, ok := style.foreground.(term.Indexed_Color); ok {
-		font |= (u32(index) + 1) << FONT_FOREGROUND_SHIFT
-	}
-	if index, ok := style.background.(term.Indexed_Color); ok {
-		font |= (u32(index) + 1) << FONT_BACKGROUND_SHIFT
-	}
-	return layout.Text_Style {
-		size  = 1,
-		font  = layout.Font(font),
-		wrap  = .None,
-		// Layout uses alpha as command visibility. RGB is ignored by this
-		// terminal adapter, which restores terminal-default or ANSI styling.
-		color = layout.Color{0, 0, 0, 255},
-	}
-}
-
-// term_text_style unpacks a solved text command's style: the inverse of
-// layout_text_style, so the transcript's styles have one origin.
-term_text_style :: proc(style: layout.Text_Style) -> term.Style {
-	font := u32(style.font)
-	result: term.Style
-	result.modifiers = transmute(term.Modifiers)u8(font)
-	if foreground := (font >> FONT_FOREGROUND_SHIFT) & FONT_COLOR_MASK; foreground != 0 {
-		result.foreground = term.Indexed_Color(foreground - 1)
-	}
-	if background := (font >> FONT_BACKGROUND_SHIFT) & FONT_COLOR_MASK; background != 0 {
-		result.background = term.Indexed_Color(background - 1)
-	}
-	return result
-}
-
-// A packed color is an index plus one, so each field needs nine bits.
-FONT_FOREGROUND_SHIFT :: 8
-FONT_BACKGROUND_SHIFT :: 17
-FONT_COLOR_MASK :: 0x1ff
 
 // draw_menu renders the open choice list: the title, the last selection error
 // when there is one, and one line per choice with its detail column. The cursor
