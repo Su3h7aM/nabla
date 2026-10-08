@@ -818,3 +818,68 @@ test_accepted_input_stays_pending_until_a_node_delivers_it :: proc(test: ^testin
 	defer records_destroy(remaining, context.allocator)
 	testing.expect_value(test, len(remaining), 0)
 }
+
+@(test)
+test_read_path_crosses_checkpoints_and_forks_and_read_nodes_keeps_order :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	journal: Journal
+	_open_journal(test, &journal, directory)
+	defer _close_journal(test, &journal)
+
+	session := _create_session(test, &journal, {workspace = "/tmp/project", role = .Main})
+	branch := Branch_Id(INITIAL_BRANCH)
+	head := Node_Id(0)
+	for _ in 0 ..< 5 {
+		head = append_node(
+			&journal,
+			Node{session = session, parent = head, branch = branch, kind = .User, turn = 1},
+			_Test_Payload{detail = "line"},
+			_body("line"),
+		)
+	}
+	checkpoint := append_node(
+		&journal,
+		Node{session = session, parent = head, branch = branch, kind = .Checkpoint, turn = 1, covers = 2},
+		_Test_Payload{detail = "summary"},
+		_body("summary"),
+	)
+	// The fork's base is node 3, so its path crosses into the first branch.
+	fork := append_branch(&journal, 3)
+	forked := append_node(&journal, Node{session = session, parent = 3, branch = fork, kind = .User, turn = 2}, _Test_Payload{detail = "fork"}, _body("fork"))
+	_commit_ok(test, &journal)
+
+	path, path_error := read_path(&journal, session, checkpoint, context.allocator)
+	_expect_ok(test, path_error)
+	defer delete(path)
+	testing.expect_value(test, len(path), 6)
+	for id, index in path { testing.expect_value(test, id, Node_Id(index + 1)) }
+
+	forked_path, forked_error := read_path(&journal, session, forked, context.allocator)
+	_expect_ok(test, forked_error)
+	defer delete(forked_path)
+	forked_expected := [?]Node_Id{1, 2, 3, 7}
+	if !testing.expect_value(test, len(forked_path), len(forked_expected)) { return }
+	for id, index in forked_path { testing.expect_value(test, id, forked_expected[index]) }
+
+	empty, empty_error := read_path(&journal, session, 0, context.allocator)
+	_expect_ok(test, empty_error)
+	testing.expect_value(test, len(empty), 0)
+	_, missing_error := read_path(&journal, session, 99, context.allocator)
+	_expect_error(test, missing_error, .Corrupt)
+
+	wanted := [?]Node_Id{7, 2, 6, 5}
+	nodes, nodes_error := read_nodes(&journal, session, wanted[:], context.allocator)
+	_expect_ok(test, nodes_error)
+	defer nodes_destroy(nodes, context.allocator)
+	if !testing.expect_value(test, len(nodes), len(wanted)) { return }
+	for node, index in nodes { testing.expect_value(test, node.id, wanted[index]) }
+	testing.expect_value(test, string(nodes[0].body), "fork")
+	testing.expect_value(test, nodes[2].kind, Node_Kind.Checkpoint)
+	testing.expect(test, nodes[2].data != "", "the node carries its data")
+
+	absent := [?]Node_Id{2, 99}
+	_, absent_error := read_nodes(&journal, session, absent[:], context.allocator)
+	_expect_error(test, absent_error, .Corrupt)
+}

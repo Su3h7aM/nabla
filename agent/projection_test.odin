@@ -131,3 +131,72 @@ test_projection_lists_unanswered_calls_and_unsettled_children :: proc(test: ^tes
 	testing.expect_value(test, projection.nested[1].call, children[1])
 	testing.expect(test, projection.nested[1].settled, "a child with a completion is settled")
 }
+
+// A window that starts at a Results node whose Assistant node is outside it, and ends at
+// an Assistant node whose Results node is outside it, loads: the first Results node's
+// calls are skipped and the last Assistant node's calls keep their completions.
+@(test)
+test_projection_load_nodes_accepts_a_window_cut_through_tool_exchanges :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	store := &fixture.store
+	session := fixture.chat.session
+	branch := fixture.chat.branch
+	exchange_calls: [2]journal.Call_Id
+	assistants: [2]journal.Node_Id
+	parent := journal.Node_Id(0)
+	for index in 0 ..< 2 {
+		assistants[index] = journal.append_node(
+			store,
+			{session = session, parent = parent, branch = branch, kind = .Assistant},
+			journal.Assistant{request = journal.Request_Id(index + 1)},
+		)
+		call := journal.next_call(store)
+		exchange_calls[index] = call
+		journal.append_record(
+			store,
+			{kind = .Tool_Proposed, session = session, node = assistants[index], call = call},
+			journal.Tool_Proposed{provider_id = fmt.tprintf("call_%d", call), name = "shell"},
+			transmute([]u8)string(`{}`),
+		)
+		journal.append_record(
+			store,
+			{kind = .Tool_Completed, session = session, node = assistants[index], call = call},
+			journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+			transmute([]u8)string("ok"),
+		)
+		if index == 0 {
+			parent = journal.append_node(
+				store,
+				{session = session, parent = assistants[index], branch = branch, kind = .Results},
+				journal.Results{calls = {call}},
+			)
+		} else {
+			parent = assistants[index]
+		}
+	}
+	if _, error := journal.commit(store); error != nil { testing.fail_now(test, "history commit failed") }
+
+	// The window is the first Results node and the second Assistant node.
+	path, path_error := journal.read_path(store, session, assistants[1], context.allocator)
+	if path_error != nil { testing.fail_now(test, "path read failed") }
+	defer delete(path)
+	if !testing.expect_value(test, len(path), 3) { return }
+	window, window_error := journal.read_nodes(store, session, path[1:], context.allocator)
+	if window_error != nil { testing.fail_now(test, "window read failed") }
+	defer journal.nodes_destroy(window, context.allocator)
+	testing.expect_value(test, window[0].kind, journal.Node_Kind.Results)
+
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil { testing.fail_now(test, "projection arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection, error := projection_load_nodes(store, session, window, virtual.arena_allocator(&arena))
+	if !testing.expect(test, error == nil, "a window cut through tool exchanges must load") { return }
+	testing.expect_value(test, projection.head, assistants[1])
+	if !testing.expect_value(test, len(projection.items), 1) { return }
+	call, is_call := projection.items[0].payload.(Projected_Call)
+	testing.expect(test, is_call && call.call == exchange_calls[1], "the call inside the window is kept")
+	if !testing.expect_value(test, len(projection.unanswered), 1) { return }
+	testing.expect_value(test, projection.unanswered[0].call, exchange_calls[1])
+}

@@ -107,7 +107,8 @@ Projected_Nested_Call :: struct {
 PROJECTION_RECORD_KINDS :: bit_set[journal.Record_Kind;u128]{.Response_Committed, .Tool_Proposed, .Tool_Admitted, .Tool_Completed}
 
 // projection_load reads the projection of session from head into arena, which
-// the caller releases whether or not the load succeeds.
+// the caller releases whether or not the load succeeds. Every call a Results node
+// names must have been proposed in the ancestry.
 @(require_results)
 projection_load :: proc(
 	store: ^journal.Journal,
@@ -118,9 +119,53 @@ projection_load :: proc(
 	projection: Projection,
 	error: journal.Error,
 ) {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = arena == context.temp_allocator)
-	projection.head = head
 	nodes := journal.read_ancestry(store, session, head, arena) or_return
+	projection = projection_build(store, session, nodes, true, arena) or_return
+	projection.head = head
+	return projection, nil
+}
+
+// projection_load_nodes builds the projection of nodes, oldest first, which may be
+// any slice of a branch's history, for example a window the user scrolled to. The
+// caller owns nodes and arena and releases arena whether or not the load succeeds.
+// head is the last node's id.
+//
+// A Results node whose Assistant node is outside nodes has its calls skipped, since
+// nothing in the window proposed them. An Assistant node whose Results node is outside
+// nodes keeps its calls, and a completion is read by the Assistant node (the
+// Tool_Completed record carries it), so the call's result is in unanswered. A call
+// proposed inside nodes that its Results node names without a completion is still
+// Corrupt.
+@(require_results)
+projection_load_nodes :: proc(
+	store: ^journal.Journal,
+	session: journal.Session_Id,
+	nodes: []journal.Node,
+	arena: mem.Allocator,
+) -> (
+	projection: Projection,
+	error: journal.Error,
+) {
+	return projection_build(store, session, nodes, false, arena)
+}
+
+// projection_build is the shared body of projection_load and projection_load_nodes.
+// With strict set, a Results node naming a call that has no completion is Corrupt
+// whether or not the call was proposed in nodes; without it, such a call is skipped
+// unless nodes proposed it.
+@(private, require_results)
+projection_build :: proc(
+	store: ^journal.Journal,
+	session: journal.Session_Id,
+	nodes: []journal.Node,
+	strict: bool,
+	arena: mem.Allocator,
+) -> (
+	projection: Projection,
+	error: journal.Error,
+) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = arena == context.temp_allocator)
+	if len(nodes) > 0 { projection.head = nodes[len(nodes) - 1].id }
 
 	assistants := make([dynamic]journal.Node_Id, context.temp_allocator) or_return
 	for node in nodes {
@@ -142,10 +187,12 @@ projection_load :: proc(
 	admitted := make(map[journal.Call_Id]string, allocator = context.temp_allocator)
 	completed := make(map[journal.Call_Id]^journal.Record, allocator = context.temp_allocator)
 	answered := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
+	proposed := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
 	for &record in records {
 		// The filter reads PROJECTION_RECORD_KINDS only.
 		#partial switch record.kind {
 		case .Response_Committed, .Tool_Proposed:
+			if record.kind == .Tool_Proposed { proposed[record.call] = true }
 			list := responses[record.node]
 			if list == nil { list = make([dynamic]^journal.Record, context.temp_allocator) or_return }
 			append(&list, &record) or_return
@@ -184,7 +231,10 @@ projection_load :: proc(
 			journal.payload_decode(node.data, &results, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
 			for call in results.calls {
 				record, found := completed[call]
-				if !found { return {}, journal.Journal_Error.Corrupt }
+				if !found {
+					if strict || proposed[call] { return {}, journal.Journal_Error.Corrupt }
+					continue
+				}
 				result := projection_result(store, record, arena) or_return
 				answered[call] = true
 				append(&items, Projection_Item{node = node.id, turn = node.turn, payload = result}) or_return

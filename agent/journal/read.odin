@@ -248,6 +248,93 @@ read_ancestry :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, all
 	return list[:], nil
 }
 
+// read_path returns the id of every node on the parent chain from head back to the
+// root, oldest first, and no bodies. Unlike read_ancestry it does not stop at a
+// Checkpoint, and it crosses the base of a forked branch into the branch it forked
+// from, so it is the full history the user can scroll through. A zero head returns an
+// empty path. A head or parent the session does not hold is Corrupt. The result is
+// owned by allocator; release it with delete.
+@(require_results)
+read_path :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocator: mem.Allocator) -> (path: []Node_Id, error: Error) {
+	assert(journal.open)
+	if head == 0 { return nil, nil }
+	session := session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
+	db.query(&journal.connection, &rows, PATH_QUERY, {db.Value(session[:]), db.Value(i64(head))}) or_return
+
+	list := make([dynamic]Node_Id, allocator) or_return
+	defer if error != nil { delete(list) }
+	oldest_parent := Node_Id(0)
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values = values,
+		}
+		id := Node_Id(row_int(&row))
+		parent := Node_Id(row_int(&row))
+		if row.error != nil { return nil, corrupt(journal, row.error, session, 0) }
+		if len(list) == 0 { oldest_parent = parent }
+		append(&list, id) or_return
+	}
+	// The newest row is head, and the oldest must be the root; anything else is a
+	// parent the tree promised and the session does not hold.
+	if len(list) == 0 || list[len(list) - 1] != head || oldest_parent != 0 {
+		return nil, corrupt(journal, Journal_Error.Corrupt, session, 0)
+	}
+	return list[:], nil
+}
+
+// read_nodes returns the nodes of session named by ids, with data and body, in the
+// order of ids, in one query. ids must be distinct, and a node the session does not
+// hold is Corrupt. The ids are bound parameters, so their count is bounded by SQLite's
+// variable limit. The result is owned by allocator; release it with nodes_destroy.
+@(require_results)
+read_nodes :: proc(journal: ^Journal, session: Session_Id, ids: []Node_Id, allocator: mem.Allocator) -> (nodes: []Node, error: Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
+	assert(journal.open)
+	if len(ids) == 0 { return nil, nil }
+	session := session
+	query := Query{}
+	query_start(&query, "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ?", db.Value(session[:])) or_return
+	query_add(&query, " AND node IN (") or_return
+	positions := make(map[Node_Id]int, len(ids), context.temp_allocator) or_return
+	for id, index in ids {
+		query_add(&query, ", ?" if index > 0 else "?", i64(id)) or_return
+		positions[id] = index
+	}
+	query_add(&query, ")") or_return
+
+	rows: db.Rows
+	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
+	db.query(&journal.connection, &rows, strings.to_string(query.sql), query.arguments[:]) or_return
+
+	// A zero id marks a slot no row has filled.
+	list := make([]Node, len(ids), allocator) or_return
+	defer if error != nil { nodes_destroy(list, allocator) }
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		node, failed_session, failed_seq, scanned_ok := scan_node_checked(&row, allocator)
+		if !scanned_ok { return nil, corrupt(journal, row.error, failed_session, failed_seq) }
+		index, wanted := positions[node.id]
+		if !wanted || list[index].id != 0 {
+			node_destroy(&node, allocator)
+			return nil, corrupt(journal, Journal_Error.Corrupt, session, 0)
+		}
+		list[index] = node
+	}
+	for node in list {
+		if node.id == 0 { return nil, corrupt(journal, Journal_Error.Corrupt, session, 0) }
+	}
+	return list, nil
+}
+
 // session_head returns the active branch (the latest `branch.selected`, else
 // the initial one) and its head (its highest node, else its base node).
 @(require_results)
@@ -469,10 +556,23 @@ branch_summaries_destroy :: proc(summaries: []Branch_Summary, allocator := conte
 RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, job, call, parent_call, task, subagent, hook, provider, model, data, body"
 
 @(private)
-NODE_QUERY :: "SELECT session, node, parent, branch, kind, turn, covers, seq, data, body FROM nodes WHERE session = ? AND node = ?"
+NODE_COLUMNS :: "session, node, parent, branch, kind, turn, covers, seq, data, body"
 
 @(private)
-NODE_LAST_QUERY :: "SELECT session, node, parent, branch, kind, turn, covers, seq, data, body FROM nodes WHERE session = ? AND kind = ? ORDER BY node DESC LIMIT 1"
+NODE_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND node = ?"
+
+@(private)
+NODE_LAST_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND kind = ? ORDER BY node DESC LIMIT 1"
+
+// The parent chain of node ?2 in session ?1. UNION drops a node it already holds, so a
+// damaged parent that points back cannot loop. Ids grow in commit order, so the chain
+// ordered by id is oldest first.
+@(private)
+PATH_QUERY :: `WITH RECURSIVE chain(node, parent) AS (
+	SELECT node, parent FROM nodes WHERE session = ?1 AND node = ?2
+	UNION
+	SELECT nodes.node, nodes.parent FROM nodes JOIN chain ON nodes.session = ?1 AND nodes.node = chain.parent)
+SELECT node, parent FROM chain ORDER BY node ASC`
 
 @(private)
 SESSION_LIST_QUERY :: `SELECT * FROM (
