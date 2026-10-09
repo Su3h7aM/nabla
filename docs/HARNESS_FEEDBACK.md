@@ -45,3 +45,16 @@ Each report has a dated heading with a short name, then four parts:
 - Attempt: `edit` again, which refuses or mis-applies hunks whose unchanged lines occur several times in the file.
 - Gap: the sub-agent had no Code Mode tool, so it could not replace by counted occurrence in Lua.
 - Workaround: a Python one-liner through the shell. The orchestrator now tells sub-agents to avoid repeated-hunk edits and to ask when a patch cannot be applied.
+
+## 2026-10-08 Action-specific agent arguments
+
+- Goal: send subagent messages and list configured models through the native tools, without wrapping a single tool call in Code Mode.
+- Attempt: call `agent` with `action="message"` and the generated schema's required common fields, including null-valued configuration fields. Call `agents` with `action="models"` and the required `agent` field.
+- Gap: the message handler accepts only `action`, `agent`, and `message`. It rejects `wait`, `prompt`, `effort`, `acp_agent`, and `instruction`, even when null. The model-listing handler accepts only `action` and rejects `agent`. The generated schema requires fields that these actions do not accept.
+- Workaround: call `tools.agent({action="message", agent=id, message=text})` and `tools.agents({action="models"})` from Code Mode with only action-specific arguments. Group these calls with independent work where possible. The native schemas need to match each action's accepted arguments.
+
+## 2026-10-09 Subagent follow-up progress
+
+I asked agent-9 to review the completed navigation change. The message tool accepted the follow-ups, but status continued to show running, a last record of turn.completed older than 40 minutes, and two unread messages. No new request record appeared during the checks. I stopped the child and reviewed the final diff directly instead of waiting longer.
+
+Status should distinguish a queued follow-up, an active request, and a completed turn, and say why accepted messages are waiting. This would make it possible to decide whether to wait or replace the work without relying on an old assistant answer.
