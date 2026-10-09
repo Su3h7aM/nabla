@@ -12,9 +12,11 @@ import "core:sync"
 import "core:time"
 
 import "nabla:layout"
+import "nabla:markdown"
 import "nabla:term"
 import "nabla:text"
 import "nabla:tui"
+import "nabla:tui/markdown_view"
 import "nabla:tui/widgets"
 
 // The prompt shows at most five wrapped rows. Its border adds two more, then
@@ -642,8 +644,8 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 		return
 	}
 	if entry.kind == .Assistant {
-		if lines, render_error := markdown_cache_lines(&storage.markdown, entry, width); render_error == nil {
-			declare_markdown_entry(ctx, storage, lines)
+		if document, parse_error := markdown_cache_document(&storage.markdown, entry); parse_error == nil {
+			declare_markdown_entry(ctx, storage, document, width)
 			return
 		}
 	}
@@ -701,29 +703,45 @@ declare_subagent_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, en
 	}
 }
 
-// declare_markdown_entry adds an assistant message rendered from Markdown. The
-// lines arrive wrapped to the transcript width, so each is one row of unwrapped
-// segments, and an empty line still holds its row.
-declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, lines: Markdown_Lines) {
+// MARKDOWN_LINK_SCHEMES are the destinations a click may open. Links come from model
+// output, so schemes that run or read something locally (file, javascript, custom
+// handlers) stay text.
+MARKDOWN_LINK_SCHEMES := [?]string{"http", "https", "mailto"}
+
+// markdown_theme is the Markdown look. Nabla has no theme, so it uses only the
+// terminal's default colors, ANSI indices 1 to 6, and modifiers, and follows whatever
+// theme the terminal has.
+markdown_theme :: proc() -> markdown_view.Theme {
+	theme := markdown_view.Theme {
+		code = {foreground = term.Indexed_Color(6)},
+		link = {foreground = term.Indexed_Color(4), modifiers = {.Underline}},
+		dim = {modifiers = {.Dim}},
+		table_header = {modifiers = {.Bold}},
+		link_schemes = MARKDOWN_LINK_SCHEMES[:],
+	}
+	for &heading, index in theme.headings {
+		heading.modifiers = {.Bold, .Underline} if index < 2 else {.Bold}
+	}
+	return theme
+}
+
+// declare_markdown_entry adds an assistant message rendered from Markdown. Layout
+// wraps it; width is only what table columns are fitted to. An allocation failure
+// leaves the entry partial for this frame, and the next frame declares it again.
+declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, document: markdown.Document, width: int) {
 	entry_layout := layout.Layout_Style {
 		flow = .Column,
-		sizing = layout.Sizing{width = layout.fit(), height = layout.fit()},
+		sizing = layout.Sizing{width = layout.grow(), height = layout.fit()},
 		padding = layout.Edges{bottom = 1},
 	}
 	if layout.element(ctx, layout.Element_Desc{layout = entry_layout}) {
-		for line_index in 0 ..< len(lines.line_ends) {
-			line := markdown_line(lines, line_index)
-			if len(line) == 0 {
-				layout.text(ctx, layout.Text_Desc{text = " ", style = {size = 1, wrap = .None}, paint = storage_paint(storage, {})})
-				continue
-			}
-			if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
-				for segment in line {
-					paint := storage_paint(storage, {style = segment.style, link = frame_link_id(storage, segment.link)})
-					layout.text(ctx, layout.Text_Desc{text = segment.text, style = {size = 1, wrap = .None}, paint = paint})
-				}
-			}
+		target := markdown_view.Target {
+			ctx     = ctx,
+			paints  = &storage.paints,
+			links   = &storage.links,
+			columns = width,
 		}
+		_ = markdown_view.declare(target, document, markdown_theme(), context.temp_allocator)
 	}
 }
 
@@ -731,17 +749,6 @@ declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, li
 storage_paint :: proc(storage: ^Frame_Storage, value: tui.Paint) -> layout.Paint {
 	id, _ := tui.paint(&storage.paints, value)
 	return id
-}
-
-// frame_link_id returns the frame's link id for uri, adding it to the table the first
-// time. An empty uri, or one the table cannot hold, gets zero and is drawn unlinked.
-frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
-	if uri == "" { return 0 }
-	for link, index in storage.links {
-		if link == uri { return term.Link_Id(index + 1) }
-	}
-	if _, append_error := append(&storage.links, uri); append_error != nil { return 0 }
-	return term.Link_Id(len(storage.links))
 }
 
 // declare_tool_entry draws one tool call as a bordered box: the call's name on the top

@@ -162,7 +162,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 ## 4. Package map
 
 ```text
-foundation   text  markdown  input  term  layout  tui  tui/widgets
+foundation   text  markdown  input  term  layout  tui  tui/widgets  tui/markdown_view
 libraries    dns  tls  http  http/client  sse  websocket  subprocess  ai  mcp  acp  db  db/sqlite
 harness      agent  agent/journal  agent/material  root package (nabla executable)
 ```
