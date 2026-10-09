@@ -463,6 +463,7 @@ tui_run :: proc(
 	app.home = os.get_env("HOME", app.run.alloc)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
+	widgets.history_init(&app.history, app.run.alloc)
 	app.storage = frame_storage_new(app.run.alloc)
 	if app.storage == nil {
 		fmt.eprintln("nabla: cannot allocate the frame budget")
@@ -747,7 +748,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
-	history_destroy(app)
+	widgets.history_destroy(&app.history)
 	delete(app.home, app.run.alloc)
 	widgets.input_destroy(&app.input)
 	input.parser_destroy(&app.parser)

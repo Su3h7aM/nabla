@@ -146,15 +146,9 @@ App :: struct {
 	completion_query:           string, // owned,
 	completion_index:           int,
 	completion_active:          bool,
-	// history holds the prompts submitted this run, oldest first; history_index is the
-	// entry the prompt line shows, or len(history) while a fresh line is composed. Only
-	// prompts enter it, because submit routes a slash command to dispatch_command.
-	history:                    [dynamic]string, // owned,
-	history_index:              int,
-	// history_draft is the fresh line as the arrow keys left it: stepping forward past the
-	// newest entry puts it back. It never joins history. The empty string means nothing is
-	// kept.
-	history_draft:              string, // owned,
+	// history holds the prompts submitted this run. Only prompts enter it, because submit
+	// routes a slash command to dispatch_command.
+	history:                    widgets.History,
 	columns:                    int,
 	rows:                       int,
 	// conversation_rect is the cells the transcript occupied in the last frame. A

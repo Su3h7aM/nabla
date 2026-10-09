@@ -190,7 +190,8 @@ ctrl_c_app :: proc(t: ^testing.T, text: string, running: bool) -> App {
 	app: App
 	app.run.alloc = context.allocator
 	widgets.input_init(&app.input, context.allocator)
-	testing.expect(t, widgets.input_insert(&app.input, text))
+	widgets.history_init(&app.history, context.allocator)
+	testing.expect(t, widgets.input_insert(&app.input, text) == nil)
 	app.run.snap.status.running = running
 	return app
 }
@@ -355,6 +356,7 @@ test_unapplied_steering_returns_to_the_prompt :: proc(t: ^testing.T) {
 		widgets.input_destroy(&app.input)
 	}
 	widgets.input_init(&app.input, app.run.alloc)
+	widgets.history_init(&app.history, app.run.alloc)
 
 	testing.expect(t, agent.steer_push(&app.run.steer, "check the logs"))
 	testing.expect(t, agent.steer_push(&app.run.steer, "and the config"))
@@ -376,6 +378,7 @@ test_paste_keeps_line_breaks :: proc(t: ^testing.T) {
 	defer free(app)
 	app.run.alloc = context.allocator
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	defer widgets.input_destroy(&app.input)
 
 	paste_insert(app, "first\r\nsecond\nthird\tend\x07")
@@ -392,6 +395,7 @@ test_arrow_keys_move_between_prompt_rows :: proc(t: ^testing.T) {
 	app.run.alloc = context.allocator
 	app.columns = 40
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	defer widgets.input_destroy(&app.input)
 
 	paste_insert(app, "one\ntwo\nthree")

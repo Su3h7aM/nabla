@@ -6,6 +6,7 @@ import "core:strings"
 import "core:unicode"
 import "core:unicode/utf8"
 
+import keys "nabla:input"
 import "nabla:term"
 import "nabla:text"
 import "nabla:tui"
@@ -88,65 +89,70 @@ input_destroy :: proc(input: ^Input) {
 
 // input_insert inserts value at the cursor after text.sanitizer_write's rule: line breaks
 // and tabs are kept, CR and CRLF become one line break, escape sequences and other control
-// characters are removed, and invalid UTF-8 becomes U+FFFD. It returns false on an
-// allocation failure and leaves the text unchanged.
+// characters are removed, and invalid UTF-8 becomes U+FFFD. It returns an allocation
+// failure and leaves the text unchanged.
 @(require_results)
-input_insert :: proc(input: ^Input, value: string) -> bool {
+input_insert :: proc(input: ^Input, value: string) -> mem.Allocator_Error {
 	if len(value) == 0 {
-		return true
+		return nil
 	}
 	_input_record(input, .Insert) or_return
 	_input_insert(input, value) or_return
 	if last, _ := utf8.decode_last_rune(input.text[:input.cursor]); unicode.is_space(last) {
 		input.last_edit = .None
 	}
-	return true
+	return nil
 }
 
 @(private)
-_input_insert :: proc(input: ^Input, value: string) -> bool {
+_input_insert :: proc(input: ^Input, value: string) -> mem.Allocator_Error {
 	previous_length := len(input.text)
 	sanitizer: text.Sanitizer
-	if text.sanitizer_write(&sanitizer, &input.text, value) != nil || text.sanitizer_flush(&sanitizer, &input.text) != nil {
+	err := text.sanitizer_write(&sanitizer, &input.text, value)
+	if err == nil {
+		err = text.sanitizer_flush(&sanitizer, &input.text)
+	}
+	if err != nil {
 		resize(&input.text, previous_length)
-		return false
+		return err
 	}
 	slice.rotate_left(input.text[input.cursor:], previous_length - input.cursor)
 	input.cursor += len(input.text) - previous_length
-	return true
+	return nil
 }
 
 @(require_results)
-input_insert_rune :: proc(input: ^Input, value: rune) -> bool {
+input_insert_rune :: proc(input: ^Input, value: rune) -> mem.Allocator_Error {
 	encoded, width := utf8.encode_rune(value)
 	return input_insert(input, string(encoded[:width]))
 }
 
 @(require_results)
-input_insert_newline :: proc(input: ^Input) -> bool {
+input_insert_newline :: proc(input: ^Input) -> mem.Allocator_Error {
 	return input_insert(input, "\n")
 }
 
-input_backspace :: proc(input: ^Input) -> bool {
+// The edits below that return (changed, err) report changed false when there was
+// nothing to edit, and an allocation failure as err with the text unchanged.
+input_backspace :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	if input.cursor <= 0 {
-		return false
+		return false, nil
 	}
 	start := text.prev_grapheme_offset(input_text(input), input.cursor)
 	_input_record(input, .Delete_Back) or_return
-	if !_input_remove(input, start, input.cursor) {
-		return false
-	}
+	_input_remove(input, start, input.cursor)
 	input.cursor = start
-	return true
+	return true, nil
 }
 
-input_delete :: proc(input: ^Input) -> bool {
+input_delete :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	value := input_text(input)
 	if input.cursor >= len(value) {
-		return false
+		return false, nil
 	}
 	_input_record(input, .Delete_Forward) or_return
-	return _input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor))
+	_input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor))
+	return true, nil
 }
 
 input_move_word_left :: proc(input: ^Input) -> bool {
@@ -166,15 +172,15 @@ input_move_word_right :: proc(input: ^Input) -> bool {
 }
 
 // input_delete_word_back, input_kill_to_end and input_kill_to_start remove text
-// and store it in the kill slot, replacing the previous kill. They return false
-// when there is nothing to remove or on an allocation failure, with the text
-// unchanged. The kill ends at the line: input_kill_to_end at the end of a line
+// and store it in the kill slot, replacing the previous kill. They return changed
+// false when there is nothing to remove, and an allocation failure as err with the
+// text unchanged. The kill ends at the line: input_kill_to_end at the end of a line
 // removes the line break, and input_kill_to_start stops after the previous one.
-input_delete_word_back :: proc(input: ^Input) -> bool {
+input_delete_word_back :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	return _input_kill(input, text.word_previous_offset(input_text(input), input.cursor), input.cursor)
 }
 
-input_kill_to_end :: proc(input: ^Input) -> bool {
+input_kill_to_end :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	value := input_text(input)
 	end := len(value)
 	if relative := strings.index_byte(value[input.cursor:], '\n'); relative >= 0 {
@@ -183,29 +189,30 @@ input_kill_to_end :: proc(input: ^Input) -> bool {
 	return _input_kill(input, input.cursor, end)
 }
 
-input_kill_to_start :: proc(input: ^Input) -> bool {
+input_kill_to_start :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	start := strings.last_index_byte(input_text(input)[:input.cursor], '\n') + 1
 	return _input_kill(input, start, input.cursor)
 }
 
-// input_yank inserts the kill slot at the cursor. It returns false when the
-// slot is empty or on an allocation failure.
-input_yank :: proc(input: ^Input) -> bool {
+// input_yank inserts the kill slot at the cursor. It returns changed false when
+// the slot is empty, and an allocation failure as err.
+input_yank :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	if len(input.kill) == 0 {
-		return false
+		return false, nil
 	}
 	_input_record(input, .Other) or_return
-	return _input_insert(input, string(input.kill[:]))
+	_input_insert(input, string(input.kill[:])) or_return
+	return true, nil
 }
 
 // input_undo restores the text and cursor taken before the last run of edits,
-// and input_redo returns to the state input_undo left. Both return false when
-// there is nothing to restore or on an allocation failure.
-input_undo :: proc(input: ^Input) -> bool {
+// and input_redo returns to the state input_undo left. Both return changed false
+// when there is nothing to restore, and an allocation failure as err.
+input_undo :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	return _input_restore(input, &input.undo, &input.redo)
 }
 
-input_redo :: proc(input: ^Input) -> bool {
+input_redo :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	return _input_restore(input, &input.redo, &input.undo)
 }
 
@@ -245,6 +252,120 @@ input_move_end :: proc(input: ^Input) -> bool {
 	input.cursor = end
 	input.last_edit = .None
 	return true
+}
+
+// input_key applies one key press to the text and reports whether input
+// binds it. A bound key is handled even when it changes nothing, such as Left
+// at the start. Up and Down are handled only when the caret moves between the
+// rows drawn at width, so a caller can use them for history. An edit that
+// cannot allocate leaves the text unchanged and returns the error. Release
+// events and keys with a modifier other than the ones a binding names are not
+// handled.
+input_key :: proc(input: ^Input, key: keys.Key_Event, width: int, profile: text.Width_Profile) -> (handled: bool, err: mem.Allocator_Error) {
+	if key.kind == .Release || .Super in key.modifiers {
+		return false, nil
+	}
+	control := .Control in key.modifiers
+	alt := .Alt in key.modifiers
+	shift := .Shift in key.modifiers
+	bare := !control && !alt
+	switch key.code {
+	case .Left:
+		if control || alt {
+			_ = input_move_word_left(input)
+		} else {
+			_ = input_move_left(input)
+		}
+	case .Right:
+		if control || alt {
+			_ = input_move_word_right(input)
+		} else {
+			_ = input_move_right(input)
+		}
+	case .Home:
+		_ = input_move_home(input)
+	case .End:
+		_ = input_move_end(input)
+	case .Up:
+		return bare && input_move_up(input, width, profile), nil
+	case .Down:
+		return bare && input_move_down(input, width, profile), nil
+	case .Backspace:
+		if control {
+			return false, nil
+		}
+		if alt {
+			_ = input_delete_word_back(input) or_return
+		} else {
+			_ = input_backspace(input) or_return
+		}
+	case .Delete:
+		if !bare {
+			return false, nil
+		}
+		_ = input_delete(input) or_return
+	case .Enter:
+		if control || !(shift || alt) {
+			return false, nil
+		}
+		input_insert_newline(input) or_return
+	case .Character:
+		return _input_key_character(input, key)
+	case .Tab, .Escape, .Page_Up, .Page_Down, .Insert, .F1, .F2, .F3, .F4, .F5, .F6, .F7, .F8, .F9, .F10, .F11, .F12:
+		return false, nil
+	}
+	return true, nil
+}
+
+@(private)
+_input_key_character :: proc(input: ^Input, key: keys.Key_Event) -> (handled: bool, err: mem.Allocator_Error) {
+	control := .Control in key.modifiers
+	alt := .Alt in key.modifiers
+	shift := .Shift in key.modifiers
+	switch {
+	case control && !alt:
+		switch unicode.to_lower(key.character) {
+		case 'a':
+			_ = input_move_home(input)
+		case 'e':
+			_ = input_move_end(input)
+		case 'h':
+			_ = input_backspace(input) or_return
+		case 'w':
+			_ = input_delete_word_back(input) or_return
+		case 'k':
+			_ = input_kill_to_end(input) or_return
+		case 'u':
+			_ = input_kill_to_start(input) or_return
+		case 'y':
+			_ = input_yank(input) or_return
+		case 'z':
+			if shift {
+				_ = input_redo(input) or_return
+			} else {
+				_ = input_undo(input) or_return
+			}
+		case:
+			return false, nil
+		}
+	case alt && !control:
+		switch key.character {
+		case 'b':
+			_ = input_move_word_left(input)
+		case 'f':
+			_ = input_move_word_right(input)
+		case:
+			return false, nil
+		}
+	case !control && !alt:
+		if key.character < 0x20 || key.character == 0x7f {
+			return false, nil
+		}
+		input_insert_rune(input, key.character) or_return
+	case:
+		return false, nil
+	}
+	return true, nil
 }
 
 // input_lines splits the text into the rows a caller draws at `width`: a logical
@@ -443,69 +564,69 @@ draw_input :: proc {
 }
 
 @(private)
-_input_kill :: proc(input: ^Input, start, end: int) -> bool {
+_input_kill :: proc(input: ^Input, start, end: int) -> (changed: bool, err: mem.Allocator_Error) {
 	if start >= end {
-		return false
+		return false, nil
 	}
 	_input_record(input, .Other) or_return
 	clear(&input.kill)
-	if _, err := append(&input.kill, ..input.text[start:end]); err != nil {
+	if _, err = append(&input.kill, ..input.text[start:end]); err != nil {
 		clear(&input.kill)
-		return false
+		return false, err
 	}
-	_input_remove(input, start, end) or_return
+	_input_remove(input, start, end)
 	input.cursor = start
-	return true
+	return true, nil
 }
 
 // _input_record is called before an edit: it pushes a snapshot when the edit
 // starts a new run (every kill, yank and word delete is its own run), and drops
-// the redo history. It returns false on an
+// the redo history. It returns an
 // allocation failure, and the edit must not happen.
 @(private)
-_input_record :: proc(input: ^Input, kind: Input_Edit_Kind) -> bool {
+_input_record :: proc(input: ^Input, kind: Input_Edit_Kind) -> (err: mem.Allocator_Error) {
 	if kind != input.last_edit || kind == .Other {
 		snapshot := _input_snapshot(input) or_return
-		if _, err := append(&input.undo, snapshot); err != nil {
+		if _, err = append(&input.undo, snapshot); err != nil {
 			delete(snapshot.text, input.text.allocator)
-			return false
+			return err
 		}
 	}
 	_input_snapshots_clear(&input.redo)
 	input.last_edit = kind
-	return true
+	return nil
 }
 
 @(private)
-_input_snapshot :: proc(input: ^Input) -> (snapshot: Input_Snapshot, ok: bool) {
-	cloned, err := slice.clone(input.text[:], input.text.allocator)
-	return {text = cloned, cursor = input.cursor}, err == nil
+_input_snapshot :: proc(input: ^Input) -> (snapshot: Input_Snapshot, err: mem.Allocator_Error) {
+	cloned := slice.clone(input.text[:], input.text.allocator) or_return
+	return {text = cloned, cursor = input.cursor}, nil
 }
 
 // _input_restore pops the newest snapshot of from into the input and pushes the
 // state it replaces onto to.
 @(private)
-_input_restore :: proc(input: ^Input, from, to: ^[dynamic]Input_Snapshot) -> bool {
+_input_restore :: proc(input: ^Input, from, to: ^[dynamic]Input_Snapshot) -> (changed: bool, err: mem.Allocator_Error) {
 	if len(from) == 0 {
-		return false
+		return false, nil
 	}
 	replaced := _input_snapshot(input) or_return
 	restored := from[len(from) - 1]
-	if _, err := append(to, replaced); err != nil {
+	if _, err = append(to, replaced); err != nil {
 		delete(replaced.text, input.text.allocator)
-		return false
+		return false, err
 	}
-	if resize(&input.text, len(restored.text)) != nil {
+	if err = resize(&input.text, len(restored.text)); err != nil {
 		pop(to)
 		delete(replaced.text, input.text.allocator)
-		return false
+		return false, err
 	}
 	pop(from)
 	copy(input.text[:], restored.text)
 	input.cursor = restored.cursor
 	input.last_edit = .None
 	delete(restored.text, input.text.allocator)
-	return true
+	return true, nil
 }
 
 @(private)
@@ -516,11 +637,10 @@ _input_snapshots_clear :: proc(snapshots: ^[dynamic]Input_Snapshot) {
 	clear(snapshots)
 }
 
-// _input_remove deletes [start, end) and reports whether the buffer holds the
-// shortened text. The asserted span makes the resize a shrink, which cannot
-// allocate.
-_input_remove :: proc(input: ^Input, start, end: int) -> bool {
+// _input_remove deletes [start, end). The asserted span makes the resize a
+// shrink, which cannot allocate.
+_input_remove :: proc(input: ^Input, start, end: int) {
 	assert(start >= 0 && end >= start && end <= len(input.text))
 	copy(input.text[start:], input.text[end:])
-	return resize(&input.text, len(input.text) - (end - start)) == nil
+	resize(&input.text, len(input.text) - (end - start))
 }

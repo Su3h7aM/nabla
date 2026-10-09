@@ -26,6 +26,11 @@
 // Input also edits by word and by line (kill and yank through one kill slot) and
 // keeps unbounded undo and redo snapshots, all released by input_destroy.
 //
+// input_key is the one key map of Input: cursor motion, deletion, kill and yank,
+// undo and redo, and typed characters. It leaves Enter, Escape, Tab, paging and
+// vertical motion at the first or last row to the caller. History keeps submitted
+// entries and one draft, and walks them with history_previous and history_next.
+//
 // Scrollbar draws a vertical track and thumb in a Cell_Rect with draw_scrollbar.
 // scrollbar_thumb is the geometry alone: where the thumb starts and how long it
 // is on a track, for content, viewport, and offset in rows.

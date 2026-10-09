@@ -822,8 +822,7 @@ app_entries :: proc(app: ^App) -> []^Entry {
 
 app_frame_storage :: proc(rows: int) -> ^Frame_Storage {
 	storage := frame_storage_new(context.allocator)
-	storage.cells = make([]term.Cell, 80 * rows, context.allocator)
-	if !tui.init(&storage.buffer, 80, rows, storage.cells) { return nil }
+	if _, err := tui.screen_begin(&storage.screen, 80, rows); err != nil { return nil }
 	return storage
 }
 
@@ -1097,10 +1096,10 @@ app_history_shell :: proc(app: ^App, parent: journal.Node_Id, lines: int) -> jou
 
 // app_row_with returns the first screen row whose text contains needle, or -1.
 app_row_with :: proc(storage: ^Frame_Storage, needle: string) -> int {
-	for row in 0 ..< storage.buffer.rows {
+	for row in 0 ..< storage.screen.buffer.rows {
 		line := strings.builder_make(context.temp_allocator)
-		for column in 0 ..< storage.buffer.columns {
-			strings.write_string(&line, storage.buffer.cells[row * storage.buffer.columns + column].grapheme)
+		for column in 0 ..< storage.screen.buffer.columns {
+			strings.write_string(&line, storage.screen.buffer.cells[row * storage.screen.buffer.columns + column].grapheme)
 		}
 		if strings.contains(strings.to_string(line), needle) { return row }
 	}
@@ -1978,13 +1977,14 @@ test_input_during_a_turn_is_steered_not_dropped :: proc(t: ^testing.T) {
 	defer chan.destroy(&app.run.work)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
+	widgets.history_init(&app.history, app.run.alloc)
 	defer widgets.input_destroy(&app.input)
 	// Both lines below are prompts, so submit stores them in the recall history.
-	defer history_destroy(&app)
+	defer widgets.history_destroy(&app.history)
 
 	// A running turn takes the line as steering.
 	set_running(&app, true)
-	testing.expect(t, widgets.input_insert(&app.input, "use the other file"))
+	testing.expect(t, widgets.input_insert(&app.input, "use the other file") == nil)
 	submit(&app)
 	line, queued := agent.steer_pop(&app.run.steer)
 	if !testing.expect(t, queued, "a line typed during a turn should be queued") { return }
@@ -1993,7 +1993,7 @@ test_input_during_a_turn_is_steered_not_dropped :: proc(t: ^testing.T) {
 
 	// The same text on an idle session is a new turn, so it goes to the worker.
 	set_running(&app, false)
-	testing.expect(t, widgets.input_insert(&app.input, "hello"))
+	testing.expect(t, widgets.input_insert(&app.input, "hello") == nil)
 	submit(&app)
 	_, still_queued := agent.steer_pop(&app.run.steer)
 	testing.expect(t, !still_queued, "an idle prompt is not steering")

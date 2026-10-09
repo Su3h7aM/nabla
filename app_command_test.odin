@@ -20,6 +20,7 @@ command_app :: proc(t: ^testing.T, app: ^App) {
 	app.run.snap.entries = make([dynamic]Entry, 0, 4, app.run.alloc)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
+	widgets.history_init(&app.history, app.run.alloc)
 	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
 }
 
@@ -38,7 +39,7 @@ command_app_end :: proc(app: ^App) {
 	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
 	delete(app.run.snap.status.effort_levels)
 	chan.destroy(&app.run.work)
-	history_destroy(app)
+	widgets.history_destroy(&app.history)
 	widgets.input_destroy(&app.input)
 }
 
@@ -81,7 +82,7 @@ test_tab_cycles_every_command :: proc(t: ^testing.T) {
 	command_app(t, &app)
 	defer command_app_end(&app)
 
-	testing.expect(t, widgets.input_insert(&app.input, "/"))
+	testing.expect(t, widgets.input_insert(&app.input, "/") == nil)
 	for step in 0 ..< len(COMMANDS) {
 		complete_command(&app)
 		testing.expect_value(t, widgets.input_text(&app.input), COMMANDS[step].name)
@@ -97,13 +98,13 @@ test_tab_completes_a_unique_prefix :: proc(t: ^testing.T) {
 	command_app(t, &app)
 	defer command_app_end(&app)
 
-	testing.expect(t, widgets.input_insert(&app.input, "/he"))
+	testing.expect(t, widgets.input_insert(&app.input, "/he") == nil)
 	complete_command(&app)
 	testing.expect_value(t, widgets.input_text(&app.input), "/help")
 
 	// A capital is a typo rather than a miss.
 	widgets.input_clear(&app.input)
-	testing.expect(t, widgets.input_insert(&app.input, "/HE"))
+	testing.expect(t, widgets.input_insert(&app.input, "/HE") == nil)
 	complete_command(&app)
 	testing.expect_value(t, widgets.input_text(&app.input), "/help")
 }
@@ -114,7 +115,7 @@ test_editing_starts_a_new_cycle :: proc(t: ^testing.T) {
 	command_app(t, &app)
 	defer command_app_end(&app)
 
-	testing.expect(t, widgets.input_insert(&app.input, "/"))
+	testing.expect(t, widgets.input_insert(&app.input, "/") == nil)
 	complete_command(&app)
 	complete_command(&app)
 	testing.expect_value(t, widgets.input_text(&app.input), "/help")
@@ -149,7 +150,7 @@ test_a_leading_path_is_a_prompt_and_an_unknown_command_stays :: proc(t: ^testing
 	command_app(t, &app)
 	defer command_app_end(&app)
 
-	if !testing.expect(t, widgets.input_insert(&app.input, "/tmp/shot.png what is this?")) { return }
+	if !testing.expect(t, widgets.input_insert(&app.input, "/tmp/shot.png what is this?") == nil) { return }
 	submit(&app)
 	work, received := chan.try_recv(app.run.work)
 	if !testing.expect(t, received, "the prompt should be queued for the worker") { return }
@@ -160,7 +161,7 @@ test_a_leading_path_is_a_prompt_and_an_unknown_command_stays :: proc(t: ^testing
 		testing.expect(t, entry.kind != .Notice, "a path is not an unknown command")
 	}
 
-	if !testing.expect(t, widgets.input_insert(&app.input, "/hepl")) { return }
+	if !testing.expect(t, widgets.input_insert(&app.input, "/hepl") == nil) { return }
 	submit(&app)
 	testing.expect_value(t, widgets.input_text(&app.input), "/hepl")
 	_, queued := chan.try_recv(app.run.work)
@@ -258,10 +259,10 @@ test_up_arrow_walks_prompt_history :: proc(t: ^testing.T) {
 	// The example: two commands around one prompt, and only the prompt counts.
 	sequence := [?]string{"/help", "Explain how this works", "/help"}
 	for typed in sequence {
-		if !testing.expect(t, widgets.input_insert(&app.input, typed)) { return }
+		if !testing.expect(t, widgets.input_insert(&app.input, typed) == nil) { return }
 		submit(&app)
 	}
-	if !testing.expect_value(t, len(app.history), 1) { return }
+	if !testing.expect_value(t, len(app.history.entries), 1) { return }
 
 	// One step back shows the only prompt, and there is nowhere further back.
 	handle_key(&app, {code = .Up})
@@ -281,7 +282,7 @@ test_up_arrow_walks_prompt_history :: proc(t: ^testing.T) {
 	handle_key(&app, {code = .Up})
 	handle_key(&app, {code = .Backspace})
 	submit(&app)
-	if !testing.expect_value(t, len(app.history), 2) { return }
+	if !testing.expect_value(t, len(app.history.entries), 2) { return }
 	handle_key(&app, {code = .Up})
 	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this work")
 
@@ -302,11 +303,11 @@ test_submitting_a_prompt_jumps_to_the_bottom :: proc(t: ^testing.T) {
 	widgets.scroll_set_range(&app.conversation_scroll, 100)
 
 	widgets.scroll_to(&app.conversation_scroll, 10)
-	if !testing.expect(t, widgets.input_insert(&app.input, "/help")) { return }
+	if !testing.expect(t, widgets.input_insert(&app.input, "/help") == nil) { return }
 	submit(&app)
 	testing.expect_value(t, app.conversation_scroll.top, Maybe(int)(10))
 
-	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works")) { return }
+	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works") == nil) { return }
 	submit(&app)
 	testing.expect(t, app.conversation_scroll.top == nil, "a submitted prompt follows the bottom")
 
@@ -331,13 +332,13 @@ test_history_keeps_the_line_being_typed :: proc(t: ^testing.T) {
 	app.columns = 80
 
 	// One submitted prompt for the history to hold.
-	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works")) { return }
+	if !testing.expect(t, widgets.input_insert(&app.input, "Explain how this works") == nil) { return }
 	submit(&app)
-	if !testing.expect_value(t, len(app.history), 1) { return }
+	if !testing.expect_value(t, len(app.history.entries), 1) { return }
 
 	// The user starts composing, then a stray up arrow walks into history.
 	draft := "Write a detailed explanation about..."
-	if !testing.expect(t, widgets.input_insert(&app.input, draft)) { return }
+	if !testing.expect(t, widgets.input_insert(&app.input, draft) == nil) { return }
 	handle_key(&app, {code = .Up})
 	testing.expect_value(t, widgets.input_text(&app.input), "Explain how this works")
 
@@ -346,7 +347,7 @@ test_history_keeps_the_line_being_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, widgets.input_text(&app.input), draft)
 
 	// ...the draft never entered history itself...
-	testing.expect_value(t, len(app.history), 1)
+	testing.expect_value(t, len(app.history.entries), 1)
 
 	// ...and the next walk finds the same single entry.
 	handle_key(&app, {code = .Up})

@@ -5,6 +5,7 @@ package widgets
 
 import "core:testing"
 import "core:time"
+import keys "nabla:input"
 import "nabla:layout"
 import "nabla:term"
 import "nabla:text"
@@ -79,18 +80,18 @@ test_input_edits_by_cluster :: proc(t: ^testing.T) {
 	defer input_destroy(&input)
 
 	// e + combining acute is one cluster; backspace removes the whole cluster.
-	testing.expect(t, input_insert(&input, "e\u0301x"))
+	testing.expect(t, input_insert(&input, "e\u0301x") == nil)
 	testing.expect_value(t, input_text(&input), "e\u0301x")
 	testing.expect(t, input_move_left(&input))
-	testing.expect(t, input_backspace(&input))
+	testing.expect(t, input_backspace(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "x")
 
 	testing.expect(t, input_move_end(&input))
-	testing.expect(t, input_insert(&input, "a\nb\tc"))
+	testing.expect(t, input_insert(&input, "a\nb\tc") == nil)
 	testing.expect_value(t, input_text(&input), "xa\nb\tc")
 
 	testing.expect(t, input_move_home(&input))
-	testing.expect(t, input_delete(&input))
+	testing.expect(t, input_delete(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "a\nb\tc")
 }
 
@@ -100,9 +101,9 @@ test_input_insert_sanitizes_untrusted_text :: proc(t: ^testing.T) {
 	input_init(&input)
 	defer input_destroy(&input)
 
-	testing.expect(t, input_insert(&input, "ad"))
+	testing.expect(t, input_insert(&input, "ad") == nil)
 	testing.expect(t, input_move_left(&input))
-	testing.expect(t, input_insert(&input, "b\r\nc\re\x1b[31m\u0085\x07\xff\x1b[2"))
+	testing.expect(t, input_insert(&input, "b\r\nc\re\x1b[31m\u0085\x07\xff\x1b[2") == nil)
 	testing.expect_value(t, input_text(&input), "ab\nc\ne\uFFFDd")
 	testing.expect_value(t, input_cursor(&input), len("ab\nc\ne\uFFFD"))
 }
@@ -112,9 +113,9 @@ test_input_keeps_explicit_newlines :: proc(t: ^testing.T) {
 	input: Input
 	input_init(&input)
 	defer input_destroy(&input)
-	testing.expect(t, input_insert(&input, "first"))
-	testing.expect(t, input_insert_newline(&input))
-	testing.expect(t, input_insert(&input, "second"))
+	testing.expect(t, input_insert(&input, "first") == nil)
+	testing.expect(t, input_insert_newline(&input) == nil)
+	testing.expect(t, input_insert(&input, "second") == nil)
 	accounting := "first\nsecond"
 	testing.expect_value(t, input_text(&input), accounting)
 	testing.expect_value(t, input_cursor(&input), len(accounting))
@@ -128,7 +129,7 @@ test_input_moves_between_drawn_rows :: proc(t: ^testing.T) {
 	input: Input
 	input_init(&input)
 	defer input_destroy(&input)
-	testing.expect(t, input_insert(&input, "one\ntwo\nthree"))
+	testing.expect(t, input_insert(&input, "one\ntwo\nthree") == nil)
 
 	// The caret starts at the end of the last row. Moving up keeps the column
 	// where the row reaches it, and "two" is too short, so the caret falls to its
@@ -150,7 +151,7 @@ test_input_moves_between_drawn_rows :: proc(t: ^testing.T) {
 	wrapped: Input
 	input_init(&wrapped)
 	defer input_destroy(&wrapped)
-	testing.expect(t, input_insert(&wrapped, "abcdefgh"))
+	testing.expect(t, input_insert(&wrapped, "abcdefgh") == nil)
 	testing.expect(t, input_move_home(&wrapped))
 	testing.expect(t, input_move_down(&wrapped, 3))
 	testing.expect_value(t, input_cursor(&wrapped), 3)
@@ -169,7 +170,7 @@ test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	input: Input
 	input_init(&input)
 	defer input_destroy(&input)
-	testing.expect(t, input_insert(&input, "ab界"))
+	testing.expect(t, input_insert(&input, "ab界") == nil)
 
 	// The text is exactly as wide as the rect, so it is one row and the caret has
 	// no cell past it to sit in.
@@ -188,7 +189,7 @@ test_input_caret_tracks_the_visible_window :: proc(t: ^testing.T) {
 	lines: Input
 	input_init(&lines)
 	defer input_destroy(&lines)
-	testing.expect(t, input_insert(&lines, "one\ntwo\nthree"))
+	testing.expect(t, input_insert(&lines, "one\ntwo\nthree") == nil)
 	line_storage: [10]term.Cell
 	line_frame := _frame(line_storage[:], 5, 2)
 	line_cursor, _ := draw_input(&line_frame, {width = 5, height = 2}, &lines, {})
@@ -234,7 +235,7 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	input: Input
 	input_init(&input)
 	defer input_destroy(&input)
-	testing.expect(t, input_insert(&input, "ok"))
+	testing.expect(t, input_insert(&input, "ok") == nil)
 	cells: [50]term.Cell
 	ctx: tui.Context
 	if tui.frame(&ctx, layout_result, cells[:]) {
@@ -430,7 +431,7 @@ test_input_word_motion_and_deletion :: proc(t: ^testing.T) {
 	input_init(&input)
 	defer input_destroy(&input)
 
-	testing.expect(t, input_insert(&input, "foo bar.baz"))
+	testing.expect(t, input_insert(&input, "foo bar.baz") == nil)
 	testing.expect(t, input_move_word_left(&input))
 	testing.expect_value(t, input_cursor(&input), len("foo bar."))
 	testing.expect(t, input_move_word_left(&input))
@@ -439,11 +440,11 @@ test_input_word_motion_and_deletion :: proc(t: ^testing.T) {
 	testing.expect(t, input_move_word_right(&input))
 	testing.expect_value(t, input_cursor(&input), len("foo bar"))
 
-	testing.expect(t, input_delete_word_back(&input))
+	testing.expect(t, input_delete_word_back(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "foo .baz")
 	testing.expect_value(t, string(input.kill[:]), "bar")
 	testing.expect(t, input_move_home(&input))
-	testing.expect(t, !input_delete_word_back(&input))
+	testing.expect(t, !(input_delete_word_back(&input) or_else false))
 	testing.expect(t, !input_move_word_left(&input))
 }
 
@@ -453,20 +454,20 @@ test_input_kill_and_yank :: proc(t: ^testing.T) {
 	input_init(&input)
 	defer input_destroy(&input)
 
-	testing.expect(t, !input_yank(&input))
-	testing.expect(t, input_insert(&input, "one two\nthree"))
-	testing.expect(t, input_kill_to_start(&input))
+	testing.expect(t, !(input_yank(&input) or_else false))
+	testing.expect(t, input_insert(&input, "one two\nthree") == nil)
+	testing.expect(t, input_kill_to_start(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "one two\n")
-	testing.expect(t, !input_kill_to_start(&input))
+	testing.expect(t, !(input_kill_to_start(&input) or_else false))
 	testing.expect(t, input_move_home(&input))
 	testing.expect(t, input_move_word_right(&input))
-	testing.expect(t, input_kill_to_end(&input))
+	testing.expect(t, input_kill_to_end(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "one\n")
 	testing.expect_value(t, string(input.kill[:]), " two")
-	testing.expect(t, input_kill_to_end(&input))
+	testing.expect(t, input_kill_to_end(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "one")
-	testing.expect(t, !input_kill_to_end(&input))
-	testing.expect(t, input_yank(&input))
+	testing.expect(t, !(input_kill_to_end(&input) or_else false))
+	testing.expect(t, input_yank(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "one\n")
 	testing.expect_value(t, input_cursor(&input), 4)
 }
@@ -477,35 +478,35 @@ test_input_undo_groups_runs_and_redo_clears_on_edit :: proc(t: ^testing.T) {
 	input_init(&input)
 	defer input_destroy(&input)
 
-	testing.expect(t, !input_undo(&input))
-	testing.expect(t, !input_redo(&input))
+	testing.expect(t, !(input_undo(&input) or_else false))
+	testing.expect(t, !(input_redo(&input) or_else false))
 	for part in ([]string{"a", "b", " ", "c", "d"}) {
-		testing.expect(t, input_insert(&input, part))
+		testing.expect(t, input_insert(&input, part) == nil)
 	}
-	testing.expect(t, input_backspace(&input))
-	testing.expect(t, input_backspace(&input))
-	testing.expect(t, input_delete_word_back(&input))
+	testing.expect(t, input_backspace(&input) or_else false)
+	testing.expect(t, input_backspace(&input) or_else false)
+	testing.expect(t, input_delete_word_back(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "")
 
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab ")
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab cd")
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab ")
 	testing.expect_value(t, input_cursor(&input), 3)
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "")
-	testing.expect(t, !input_undo(&input))
+	testing.expect(t, !(input_undo(&input) or_else false))
 
-	testing.expect(t, input_redo(&input))
+	testing.expect(t, input_redo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab ")
-	testing.expect(t, input_redo(&input))
+	testing.expect(t, input_redo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab cd")
 
-	testing.expect(t, input_undo(&input))
-	testing.expect(t, input_insert(&input, "x"))
-	testing.expect(t, !input_redo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
+	testing.expect(t, input_insert(&input, "x") == nil)
+	testing.expect(t, !(input_redo(&input) or_else false))
 }
 
 @(test)
@@ -514,22 +515,85 @@ test_input_undo_steps_split_at_motion_and_kills :: proc(t: ^testing.T) {
 	input_init(&input)
 	defer input_destroy(&input)
 
-	testing.expect(t, input_insert(&input, "ab"))
+	testing.expect(t, input_insert(&input, "ab") == nil)
 	testing.expect(t, input_move_left(&input))
-	testing.expect(t, input_insert(&input, "x"))
+	testing.expect(t, input_insert(&input, "x") == nil)
 	testing.expect_value(t, input_text(&input), "axb")
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab")
 
 	testing.expect(t, input_move_end(&input))
-	testing.expect(t, input_kill_to_start(&input))
-	testing.expect(t, input_yank(&input))
-	testing.expect(t, input_yank(&input))
+	testing.expect(t, input_kill_to_start(&input) or_else false)
+	testing.expect(t, input_yank(&input) or_else false)
+	testing.expect(t, input_yank(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "abab")
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab")
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "")
-	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab")
+}
+
+@(test)
+test_input_key_dispatches_bindings :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	for character in "foo bar" {
+		testing.expect(t, input_key(&input, {code = .Character, character = character}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	}
+	testing.expect(t, input_key(&input, {code = .Character, character = 'w', modifiers = {.Control}}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	testing.expect_value(t, input_text(&input), "foo ")
+	testing.expect(t, input_key(&input, {code = .Character, character = 'z', modifiers = {.Control}}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	testing.expect_value(t, input_text(&input), "foo bar")
+	testing.expect(t, input_key(&input, {code = .Character, character = 'a', modifiers = {.Control}}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	testing.expect_value(t, input_cursor(&input), 0)
+	testing.expect(t, input_key(&input, {code = .Enter, modifiers = {.Alt}}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	testing.expect_value(t, input_text(&input), "\nfoo bar")
+
+	testing.expect(t, !(input_key(&input, {code = .Enter}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "plain Enter belongs to the caller")
+	testing.expect(t, !(input_key(&input, {code = .Character, character = 'x', modifiers = {.Control, .Alt}}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false))
+	testing.expect(t, !(input_key(&input, {code = .Character, character = 'x', kind = .Release}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false))
+	testing.expect(t, input_key(&input, {code = .Up}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	testing.expect(t, !(input_key(&input, {code = .Up}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "no row above the first")
+	testing.expect(t, input_key(&input, {code = .Down}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
+	testing.expect(t, !(input_key(&input, {code = .Down}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "no row below the last")
+}
+
+@(test)
+test_history_keeps_the_draft :: proc(t: ^testing.T) {
+	history: History
+	history_init(&history)
+	defer history_destroy(&history)
+
+	_, ok := history_previous(&history, "draft")
+	testing.expect(t, !ok, "an empty history has nothing to recall")
+	testing.expect(t, history_push(&history, "one"))
+	testing.expect(t, history_push(&history, "two"))
+
+	entry: string
+	entry, ok = history_previous(&history, "draft")
+	testing.expect(t, ok)
+	testing.expect_value(t, entry, "two")
+	entry, _ = history_previous(&history, "ignored")
+	testing.expect_value(t, entry, "one")
+	_, ok = history_previous(&history, "ignored")
+	testing.expect(t, !ok, "nothing older than the first entry")
+
+	entry, _ = history_next(&history)
+	testing.expect_value(t, entry, "two")
+	entry, ok = history_next(&history)
+	testing.expect(t, ok)
+	testing.expect_value(t, entry, "draft")
+	_, ok = history_next(&history)
+	testing.expect(t, !ok, "not browsing past the draft")
+
+	_, _ = history_previous(&history, "again")
+	history_reset(&history)
+	entry, _ = history_previous(&history, "fresh")
+	testing.expect_value(t, entry, "two")
+	entry, _ = history_next(&history)
+	testing.expect_value(t, entry, "fresh")
 }
