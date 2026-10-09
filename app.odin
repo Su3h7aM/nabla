@@ -71,7 +71,7 @@ Entry :: struct {
 	hidden_lines:  int,
 	tool_rows:     int,
 	// full is the whole text of an expanded box, borrowed from the transcript for one frame.
-	// selected marks the box the keyboard selected.
+	// selected marks the tool box selected by mouse or keyboard.
 	full:          string,
 	selected:      bool,
 	// image is the picture of the call's result; its id is zero when there is none.

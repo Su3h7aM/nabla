@@ -1038,7 +1038,10 @@ test_live_entries_give_way_to_their_committed_form :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(entries[1].text[:]), "streaming")
 	testing.expect(t, entries[2].running, "the call runs in the live layer")
 
-	content := "ok\nexit_code: 0\n\nstdout:\nfile\n"
+	lines, content_error := strings.repeat("file\n", 40, context.allocator)
+	defer delete(lines, context.allocator)
+	if content_error != nil { testing.fail_now(t, "the tool result could not be allocated") }
+	content := fmt.tprintf("ok\nexit_code: 0\n\nstdout:\n%s", lines)
 	result := agent.Tool_Result {
 		content = content,
 		outcome = .Success,
@@ -1054,6 +1057,18 @@ test_live_entries_give_way_to_their_committed_form :: proc(t: ^testing.T) {
 		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
 		transmute([]u8)content,
 	)
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the completion could not be committed") }
+	app.transcript.focused = true
+	app.transcript.selected_entry = entries[2].id
+	live_id := entries[2].id
+	handle_event(&app, input.Key_Event{code = .Enter})
+	entries = app_entries(&app)
+	handle_event(&app, input.Key_Event{code = .Up})
+	handle_event(&app, input.Key_Event{code = .Up})
+	selected_offset := widgets.scroll_offset(app_tool_scroll(t, &app, call))
+	handle_event(&app, input.Key_Event{code = .Escape})
+	testing.expect(t, selected_offset > 0 && selected_offset < app_tool_scroll(t, &app, call).range, "the selected tool is internally scrolled")
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
 	_ = journal.append_node(
 		store,
 		{session = chat.session, branch = chat.branch, parent = assistant, turn = chat.turn, kind = .Results},
@@ -1064,6 +1079,9 @@ test_live_entries_give_way_to_their_committed_form :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, len(entries), 3) { return }
 	for entry in entries { testing.expect(t, entry.node != 0, "every entry is the journal's now") }
 	testing.expect_value(t, len(app.run.snap.entries), 0)
+	testing.expect_value(t, app_keyboard_entry(t, &app).call, call)
+	testing.expect(t, app_keyboard_entry(t, &app).id != live_id, "inactive tool selection follows the committed representation")
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), selected_offset)
 }
 
 // app_history_shell appends an assistant node that ran a shell call whose result has lines numbered lines, and returns the results node.
@@ -1114,13 +1132,13 @@ app_click :: proc(app: ^App, storage: ^Frame_Storage, needle: string) {
 		x      = 3,
 		y      = row,
 	}
-	handle_mouse(app, press)
+	handle_event(app, press)
 	press.release = true
-	handle_mouse(app, press)
+	handle_event(app, press)
 }
 
 // A box is collapsed by default and never takes the wheel. A click expands it with its whole result read
-// from the journal and a second click collapses it, and the keyboard reaches the same boxes through Tab, Down and Enter.
+// from the journal and a second click collapses it. Tab and Enter activate the same box without collapsing an already expanded one.
 @(test)
 test_a_click_expands_a_tool_box_from_the_journal :: proc(t: ^testing.T) {
 	app: App
@@ -1151,19 +1169,68 @@ test_a_click_expands_a_tool_box_from_the_journal :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(app.transcript.expanded), 1)
 	testing.expect(t, app_row_with(storage, "line 9") >= 0, "the expanded box shows its window")
 
+	clicked := app_keyboard_entry(t, &app).call
+	testing.expect(t, app.transcript.focused && app.transcript.active_call == clicked, "click expansion activates its own keyboard target")
+	view_top := widgets.scroll_offset(app.conversation_scroll)
+	before := widgets.scroll_offset(app_tool_scroll(t, &app, clicked))
+	delta := 1 if before < app_tool_scroll(t, &app, clicked).range else -1
+	handle_event(&app, input.Key_Event{code = .Down if delta > 0 else .Up})
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, clicked)), before + delta)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	handle_event(&app, input.Key_Event{code = .Escape})
+	before = widgets.scroll_offset(app_tool_scroll(t, &app, clicked))
+	wheel := input.Mouse_Event {
+		button = .Wheel_Down,
+		x      = 3,
+		y      = app_row_with(storage, "shell") + 1,
+	}
+	handle_event(&app, wheel)
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, app.transcript.active_call, clicked)
+	testing.expect_value(t, app_keyboard_entry(t, &app).call, clicked)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, clicked)), min(before + MOUSE_WHEEL_LINES, app_tool_scroll(t, &app, clicked).range))
+	before = widgets.scroll_offset(app_tool_scroll(t, &app, clicked))
+	handle_event(&app, input.Key_Event{code = .Up})
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, clicked)), max(before - 1, 0))
+	handle_event(&app, input.Key_Event{code = .Escape})
+	app_click(&app, storage, "shell")
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, len(app.transcript.expanded), 1)
+	testing.expect_value(t, app.transcript.active_call, clicked)
 	app_click(&app, storage, "shell")
 	app_settle(&app, storage, SCROLL_ROWS)
 	testing.expect_value(t, len(app.transcript.expanded), 0)
+	app_click(&app, storage, "line 1")
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, len(app.transcript.expanded), 1)
+	app_click(&app, storage, "line 1")
+	app_settle(&app, storage, SCROLL_ROWS)
+	testing.expect_value(t, len(app.transcript.expanded), 0)
 
+	handle_event(&app, input.Key_Event{code = .Tab})
+	testing.expect(t, !app.transcript.focused, "Tab leaves the mouse-focused transcript")
 	handle_key(&app, {code = .Tab})
 	testing.expect(t, app.transcript.focused, "tab with nothing to complete moves the keyboard to the transcript")
-	handle_key(&app, {code = .Up})
+	_ = app_keyboard_tool(t, &app, storage, 0)
 	handle_key(&app, {code = .Enter})
 	app_settle(&app, storage, SCROLL_ROWS)
 	testing.expect_value(t, len(app.transcript.expanded), 1)
+	testing.expect_value(t, app.transcript.active_call, app_keyboard_entry(t, &app).call)
 	handle_key(&app, {code = .Down})
 	handle_key(&app, {code = .Enter})
-	testing.expect_value(t, len(app.transcript.expanded), 2)
+	testing.expect_value(t, len(app.transcript.expanded), 0)
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
+	handle_key(&app, {code = .Enter})
+	app_settle(&app, storage, SCROLL_ROWS)
+	handle_key(&app, {code = .Escape})
+	testing.expect(t, app.transcript.focused, "escape deactivates the box before leaving the transcript")
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
+	testing.expect_value(t, len(app.transcript.expanded), 1)
+	handle_key(&app, {code = .Enter})
+	testing.expect_value(t, len(app.transcript.expanded), 1)
+	handle_key(&app, {code = .Escape})
 	handle_key(&app, {code = .Escape})
 	testing.expect(t, !app.transcript.focused, "escape returns the keyboard to the prompt")
 }
@@ -2891,8 +2958,9 @@ test_batched_page_up_through_mixed_history :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 	widgets.input_init(&app.input, app.run.alloc)
 	defer widgets.input_destroy(&app.input)
-	large_markdown_body := strings.repeat("lorem ipsum ", 3_750, context.allocator)
+	large_markdown_body, body_error := strings.repeat("lorem ipsum ", 3_750, context.allocator)
 	defer delete(large_markdown_body, context.allocator)
+	if body_error != nil { testing.fail_now(t, "the oversized Markdown fixture could not be allocated") }
 	large_markdown, concatenate_error := strings.concatenate({"# large response\n\n", large_markdown_body}, context.allocator)
 	if concatenate_error != nil { testing.fail_now(t, "the oversized Markdown fixture could not be allocated") }
 	defer delete(large_markdown, context.allocator)
@@ -3064,5 +3132,651 @@ app_render_settle :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage) {
 		if status != .None { testing.fail_now(t, "the transcript could not be rendered") }
 		if !transcript_slide(app) { return }
 		free_all(context.temp_allocator)
+	}
+}
+// Active tool boxes own arrow keys even at their boundaries; page keys always move the transcript.
+@(test)
+test_keyboard_arrows_scroll_only_the_active_tool_box :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	head := app_history_turns(t, &app, 0, 1, 8)
+	head = app_history_shell(&app, head, 120)
+	head = app_history_shell(&app, head, 120)
+	head = app_history_turns(t, &app, head, 9, 16)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	for _ in 0 ..< len(app.transcript.path) {
+		if app.transcript.first == 0 { break }
+		handle_event(&app, input.Key_Event{code = .Page_Up})
+		app_render_settle(t, &app, storage)
+	}
+	handle_event(&app, input.Key_Event{code = .Tab})
+	call := app_keyboard_tool(t, &app, storage, 0)
+	top := 0
+	for entry in transcript_order(&app) {
+		if entry.call == call { transcript_scroll_to(&app, top); break }
+		top += entry.rows
+	}
+	app_render_settle(t, &app, storage)
+	view_top := widgets.scroll_offset(app.conversation_scroll)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, app.transcript.active_call, call)
+	testing.expect(t, call in app.transcript.expanded, "Enter expands and activates the selected box")
+	tool_scroll := app_tool_scroll(t, &app, call)
+	if !testing.expect(t, tool_scroll.range > 1, "the result has scrollable content") { return }
+	testing.expect_value(t, widgets.scroll_offset(tool_scroll), 0)
+	handle_event(&app, input.Key_Event{code = .Up})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), 0)
+	handle_event(&app, input.Key_Event{code = .Down})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), 1)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	for _ in 0 ..= tool_scroll.range { handle_event(&app, input.Key_Event{code = .Down}) }
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), tool_scroll.range)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	handle_event(&app, input.Key_Event{code = .Up})
+	tool_top := widgets.scroll_offset(app_tool_scroll(t, &app, call))
+	handle_event(&app, input.Key_Event{code = .Page_Up})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top - SCROLL_ROWS)
+	testing.expect_value(t, app.transcript.active_call, call)
+	testing.expect_value(t, app_keyboard_entry(t, &app).call, call)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), tool_top)
+	handle_event(&app, input.Key_Event{code = .Page_Down})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	testing.expect_value(t, app.transcript.active_call, call)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), tool_top)
+	handle_event(&app, input.Key_Event{code = .Escape})
+	testing.expect(t, app.transcript.focused && app.transcript.active_call == 0, "Escape only deactivates the box")
+	handle_event(&app, input.Key_Event{code = .Down})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), tool_top)
+	handle_event(&app, input.Key_Event{code = .Up})
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, app.transcript.active_call, call)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	testing.expect(t, !app.transcript.focused && app.transcript.active_call == 0, "Tab returns to the prompt and deactivates the box")
+	testing.expect(t, call in app.transcript.expanded, "leaving focus does not collapse the box")
+	handle_event(&app, input.Key_Event{code = .Tab})
+	_ = app_keyboard_tool(t, &app, storage, 0)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	transcript_scroll_to(&app, view_top - 1)
+	app_render_settle(t, &app, storage)
+	app_click(&app, storage, "shell")
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
+	testing.expect(t, call not_in app.transcript.expanded, "mouse collapse also deactivates the keyboard box")
+	handle_event(&app, input.Key_Event{code = .Enter})
+	handle_event(&app, input.Mouse_Event{button = .Left, x = app.columns - 1, y = app.rows - 1})
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
+	testing.expect(t, call in app.transcript.expanded, "an outside press deactivates without collapsing")
+	handle_event(&app, input.Key_Event{code = .Enter})
+	handle_event(&app, input.Key_Event{code = .Character, character = 'x'})
+	testing.expect(t, !app.transcript.focused && app.transcript.active_call == 0, "typing leaves transcript focus and deactivates the box")
+	handle_event(&app, input.Key_Event{code = .Tab})
+	_ = app_keyboard_tool(t, &app, storage, 0)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, app.transcript.active_call, call)
+	_ = app_history_turns(t, &app, head, 17, 96)
+	head_publish(&app)
+	transcript_sync(&app)
+	transcript_jump_bottom(&app)
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
+	testing.expect(t, call not_in app.transcript.expanded, "releasing the box from history clears activation and its full text")
+}
+
+app_tool_scroll :: proc(t: ^testing.T, app: ^App, call: journal.Call_Id) -> widgets.Scroll {
+	for entry in transcript_order(app) {
+		if entry.call == call { return entry.tool_scroll }
+	}
+	testing.fail_now(t, "the tool box left the window unexpectedly")
+}
+// Window refreshes preserve a surviving box's scroll and activation; changing sessions clears them.
+@(test)
+test_active_tool_box_keeps_its_scroll_across_window_refreshes :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	head := app_history_turns(t, &app, 0, 1, 8)
+	head = app_history_shell(&app, head, 120)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the tool call could not be committed") }
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	_ = app_keyboard_tool(t, &app, storage, 0)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	app_render_settle(t, &app, storage)
+	call := app.transcript.active_call
+	if !testing.expect(t, call != 0, "the last tool box is active") { return }
+	// A trimmed window may end at the box's node rather than at the empty results node after it.
+	for entry in transcript_order(&app) {
+		if entry.call != call { continue }
+		for node, index in app.transcript.path {
+			if node == entry.node { app.transcript.end = index + 1; break }
+		}
+	}
+	for _ in 0 ..< 9 { handle_event(&app, input.Key_Event{code = .Down}) }
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), 9)
+	box_end := app.transcript.end
+	_ = app_history_turns(t, &app, head, 9, 9)
+	head_publish(&app)
+	transcript_sync(&app)
+	transcript_jump_bottom(&app)
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, app.transcript.active_call, call)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), 9)
+	for app.transcript.end > box_end {
+		transcript_pop_node(&app, app.transcript.path[app.transcript.end - 1])
+		app.transcript.end -= 1
+	}
+	end := app.transcript.end
+	if !testing.expect(t, end < len(app.transcript.path), "the new history is not loaded yet") { return }
+	handle_event(&app, input.Key_Event{code = .Page_Down})
+	app_render_settle(t, &app, storage)
+	testing.expect(t, app.transcript.end > end, "Page Down loads newer history")
+	testing.expect_value(t, app.transcript.active_call, call)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), 9)
+	// A different tail on the same history prefix replaces the window while keeping the tool's node.
+	old_tail := app.transcript.path[app.transcript.end - 1]
+	_ = app_history_turns(t, &app, head, 10, 10)
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	testing.expect(t, app.transcript.path[app.transcript.end - 1] != old_tail, "the loaded path's tail was replaced")
+	testing.expect_value(t, app.transcript.active_call, call)
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), 9)
+	if !testing.expect(t, session_switch(&app, Start_Fresh{}), "the session can be changed") { return }
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	testing.expect(t, !app.transcript.focused && app.transcript.active_call == 0, "a session change clears transcript focus and activation")
+	testing.expect_value(t, len(app.transcript.expanded), 0)
+}
+// Keyboard focus reaches a toolbox from the session bottom, and the box keeps its own arrows and boundaries.
+@(test)
+test_keyboard_navigation_reaches_every_transcript_block_at_the_bottom :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	head := app_history_turns(t, &app, 0, 1, 8)
+	head = app_history_shell(&app, head, 30)
+	head = app_history_node(
+		&app,
+		head,
+		.User,
+		"between prompt with enough ordinary text to wrap across the viewport and let the cursor stop in the middle of the message, with more words that keep the middle distinct from either message boundary",
+	)
+	head = app_history_node(&app, head, .Assistant, "between response")
+	snap_append(
+		&app,
+		.Subagent,
+		"subagent reply with enough ordinary text to wrap across the viewport and inspect a middle row, followed by more ordinary text instead of a tool box",
+	)
+	app.run.snap.entries[len(app.run.snap.entries) - 1].after = head
+	_ = app_history_shell(&app, head, 30)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the history could not be committed") }
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	first_id: u64
+	first_call, lower_call: journal.Call_Id
+	rows_after_first := 0
+	for entry in transcript_order(&app) {
+		if entry.kind == .Tool {
+			if first_id == 0 {
+				first_id = entry.id
+				first_call = entry.call
+			} else {
+				lower_call = entry.call
+			}
+		}
+		if first_id != 0 { rows_after_first += entry.rows }
+	}
+	if !testing.expect(t, first_id != 0 && lower_call != 0, "both tool boxes are loaded") { return }
+	app.rows = rows_after_first + 5
+	app_render_settle(t, &app, storage)
+	visible, visible_row := app_visible_entry(&app)
+	if !testing.expect(t, visible == first_id && visible_row == 0, "the first box starts the viewport at the session bottom") { return }
+	view_top := widgets.scroll_offset(app.conversation_scroll)
+	if !testing.expect_value(t, view_top, app.conversation_scroll.range) { return }
+	handle_event(&app, input.Key_Event{code = .Tab})
+	testing.expect(t, app.transcript.focused, "Tab focuses the transcript")
+	testing.expect_value(t, app_keyboard_tool(t, &app, storage, 0), first_call)
+	testing.expect_value(t, app_keyboard_tool(t, &app, storage, first_call), lower_call)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, app.transcript.active_call, lower_call)
+	handle_event(&app, input.Key_Event{code = .Up})
+	handle_event(&app, input.Key_Event{code = .Down})
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, lower_call)), 1)
+	for _ in 0 ..= app_tool_scroll(t, &app, lower_call).range { handle_event(&app, input.Key_Event{code = .Down}) }
+	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, lower_call)), app_tool_scroll(t, &app, lower_call).range)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
+	handle_event(&app, input.Key_Event{code = .Escape})
+	testing.expect(t, app.transcript.focused && app.transcript.active_call == 0, "Escape returns to block navigation without collapsing")
+}
+
+// app_keyboard_entry returns the selected toolbox. Ordinary text has no keyboard target, so ordinary checks use the scroll offset.
+app_keyboard_entry :: proc(t: ^testing.T, app: ^App) -> ^Entry {
+	for entry in transcript_order(app) {
+		if entry.selected { return entry }
+	}
+	testing.fail_now(t, "no toolbox is selected")
+}
+
+// app_keyboard_tool presses Down until a toolbox other than after is selected, and returns its call.
+app_keyboard_tool :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage, after: journal.Call_Id) -> journal.Call_Id {
+	for _ in 0 ..< 200 {
+		app_render_settle(t, app, storage)
+		for entry in transcript_order(app) {
+			if entry.selected && (entry.kind == .Tool || entry.kind == .Codemode) && entry.call != 0 && entry.call != after { return entry.call }
+		}
+		handle_event(app, input.Key_Event{code = .Down})
+	}
+	testing.fail_now(t, "keyboard navigation did not reach a loaded toolbox")
+}
+// Row navigation exposes a long response's middle and replays moves across a loaded edge.
+@(test)
+test_block_navigation_pages_past_a_tall_loaded_edge :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	head := app_history_turns(t, &app, 0, 1, 8)
+	head = app_history_node(&app, head, .User, "tall question")
+	half, body_error := strings.repeat("this is a tall response paragraph that wraps when the viewport narrows.\n\n", 50, context.allocator)
+	defer delete(half, context.allocator)
+	if body_error != nil { testing.fail_now(t, "the response fixture could not be allocated") }
+	body := fmt.tprintf("%sMIDDLE RESPONSE MARKER\n\n%s", half, half)
+	tall := app_history_node(&app, head, .Assistant, body)
+	_ = app_history_turns(t, &app, tall, 9, 12)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	if !testing.expect(t, app.transcript.focused, "Tab focuses the transcript") { return }
+	testing.expect(t, !app_frame_contains(t, &app, storage, "MIDDLE RESPONSE MARKER"), "the middle starts outside the visible tail")
+	top_row, tall_rows := 0, 0
+	for entry in transcript_order(&app) {
+		if entry.node == tall {
+			tall_rows = entry.rows
+			break
+		}
+		top_row += entry.rows
+	}
+	target := top_row + tall_rows / 2 - SCROLL_ROWS / 2
+	for widgets.scroll_offset(app.conversation_scroll) != target {
+		before := widgets.scroll_offset(app.conversation_scroll)
+		code := input.Key_Code.Up if before > target else input.Key_Code.Down
+		step := -1 if before > target else 1
+		handle_event(&app, input.Key_Event{code = code})
+		app_render_settle(t, &app, storage)
+		if !testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), before + step) { return }
+	}
+	testing.expect(t, app_frame_contains(t, &app, storage, "MIDDLE RESPONSE MARKER"), "reverse navigation exposes actual middle content")
+	for _ in 0 ..< 5 {
+		before := widgets.scroll_offset(app.conversation_scroll)
+		handle_event(&app, input.Key_Event{code = .Down})
+		app_render_settle(t, &app, storage)
+		if !testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), before + 1) { return }
+	}
+	testing.expect(t, app_frame_contains(t, &app, storage, "MIDDLE RESPONSE MARKER"), "forward navigation keeps the rendered middle")
+	loaded_end := app.transcript.end
+	old_range := app.conversation_scroll.range
+	first_before := app.transcript.first
+	if !testing.expect(
+		t,
+		app.transcript.end < len(app.transcript.path) &&
+		app.conversation_scroll.range - widgets.scroll_offset(app.conversation_scroll) > app.conversation_rect.height,
+		"newer blocks are unloaded and the loaded bottom is far away",
+	) { return }
+	transcript_scroll_to(&app, old_range)
+	for _ in 0 ..< 3 { handle_event(&app, input.Key_Event{code = .Down}) }
+	testing.expect_value(t, app.transcript.selection_step, 3)
+	app_render_settle(t, &app, storage)
+	testing.expect(t, app.transcript.end > loaded_end, "Down past the loaded tail loads newer history")
+	testing.expect_value(t, app.transcript.selection_step, 0)
+	testing.expect(t, app.conversation_scroll.top != nil, "paging keeps an explicit history pin")
+	if app.transcript.first == first_before {
+		testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), old_range + 3)
+	}
+}
+// app_frame_contains reads actual presented text through the transcript copy path.
+app_frame_contains :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage, expected: string) -> bool {
+	anchor, cursor := app.selection_anchor, app.selection_cursor
+	defer { app.selection_anchor, app.selection_cursor = anchor, cursor }
+	for row in 0 ..< app.conversation_rect.height {
+		app.selection_anchor = {0, row}
+		app.selection_cursor = {app.conversation_rect.width - 1, row}
+		text, ok := selection_text(app, storage, context.allocator)
+		defer delete(text, context.allocator)
+		if !ok { testing.fail_now(t, "the rendered row could not be read") }
+		if strings.contains(text, expected) { return true }
+	}
+	return false
+}
+@(test)
+test_clicking_ordinary_text_selects_its_rendered_row_for_keyboard_navigation :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	prefix, prefix_error := strings.repeat("ordinary row\n", 50, context.allocator)
+	defer delete(prefix, context.allocator)
+	if prefix_error != nil { testing.fail_now(t, "the ordinary message could not be allocated") }
+	head := app_history_node(&app, 0, .User, fmt.tprintf("%ssecond distinctive line\nthird line\nfourth line", prefix))
+	_ = app_history_node(&app, head, .Assistant, "answer")
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the history could not be committed") }
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	row := app_row_with(storage, "second distinctive line")
+	if !testing.expect(t, row >= 0, "the clicked content is actually visible") { return }
+	press := input.Mouse_Event {
+		button = .Left,
+		x      = app.conversation_rect.x + 2,
+		y      = row,
+	}
+	handle_event(&app, press)
+	press.release = true
+	handle_event(&app, press)
+	app_render_settle(t, &app, storage)
+	testing.expect(t, app.transcript.focused && app.transcript.active_call == 0, "ordinary clicks focus text without activating a tool")
+	testing.expect(t, app_frame_contains(t, &app, storage, "second distinctive line"), "the clicked text stays on screen")
+	clicked_offset := widgets.scroll_offset(app.conversation_scroll)
+	handle_event(&app, input.Key_Event{code = .Up})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), clicked_offset - 1)
+	handle_event(&app, input.Key_Event{code = .Down})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), clicked_offset)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	app_render_settle(t, &app, storage)
+	testing.expect(t, !app.transcript.focused, "Tab moves focus from the transcript to the prompt")
+	view_top := widgets.scroll_offset(app.conversation_scroll)
+	handle_event(&app, input.Mouse_Event{button = .Wheel_Up, x = app.conversation_rect.x + 2, y = row})
+	app_render_settle(t, &app, storage)
+	testing.expect(t, app.transcript.focused, "a global wheel from prompt focus transfers focus to the transcript")
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top - MOUSE_WHEEL_LINES)
+	testing.expect_value(t, app.transcript.active_call, journal.Call_Id(0))
+	visible_offset := widgets.scroll_offset(app.conversation_scroll)
+	handle_event(&app, input.Key_Event{code = .Down})
+	app_render_settle(t, &app, storage)
+	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), visible_offset + 1)
+}
+
+@(test)
+test_arrow_keys_move_ordinary_scroll_one_row_per_press :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	prefix, prefix_error := strings.repeat("ordinary row\n", 50, context.allocator)
+	defer delete(prefix, context.allocator)
+	if prefix_error != nil { testing.fail_now(t, "the ordinary message could not be allocated") }
+	head := app_history_node(&app, 0, .User, fmt.tprintf("%slast distinctive line", prefix))
+	_ = app_history_node(&app, head, .Assistant, "answer")
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the history could not be committed") }
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	if !testing.expect(t, app.transcript.focused && app.transcript.active_call == 0, "Tab focuses ordinary text without activating a box") { return }
+	// Each press moves the ordinary transcript exactly one row, in both directions, at two viewport heights.
+	steps := []int{-1, -1, -1, 1, -1, 1, 1, 1, -1}
+	for height in ([]int{SCROLL_ROWS + 5, SCROLL_ROWS + 12}) {
+		app.rows = height
+		app_render_settle(t, &app, storage)
+		offset := widgets.scroll_offset(app.conversation_scroll)
+		if !testing.expect(t, offset >= 6, "the long message leaves room to move both ways") { return }
+		for step in steps {
+			code := input.Key_Code.Up if step < 0 else input.Key_Code.Down
+			handle_event(&app, input.Key_Event{code = code})
+			app_render_settle(t, &app, storage)
+			testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), offset + step)
+			offset += step
+		}
+	}
+}
+
+// Down never moves the offset back and Up never moves it forward. The window is one fixed shell, so the offset origin never shifts.
+@(test)
+test_tool_box_arrows_never_reverse_direction :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	_ = app_history_shell(&app, 0, 120)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the history could not be committed") }
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, 12
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	testing.expect(t, app.transcript.focused && app.transcript.selected_entry != 0, "Tab selects the visible clipped toolbox")
+	testing.expect(t, app.transcript.active_call == 0, "the box stays inactive")
+	if !testing.expect(t, app.conversation_scroll.range > 0, "the clipped box is taller than the viewport") { return }
+	for _ in 0 ..< 2 {
+		for _ in 0 ..< 40 {
+			before := widgets.scroll_offset(app.conversation_scroll)
+			handle_event(&app, input.Key_Event{code = .Down})
+			app_render_settle(t, &app, storage)
+			after := widgets.scroll_offset(app.conversation_scroll)
+			if !testing.expect(
+				t,
+				after >= before,
+				fmt.tprintf("Down moved the offset back: %d -> %d (range %d)", before, after, app.conversation_scroll.range),
+			) { return }
+		}
+		for _ in 0 ..< 40 {
+			before := widgets.scroll_offset(app.conversation_scroll)
+			handle_event(&app, input.Key_Event{code = .Up})
+			app_render_settle(t, &app, storage)
+			after := widgets.scroll_offset(app.conversation_scroll)
+			if !testing.expect(
+				t,
+				after <= before,
+				fmt.tprintf("Up moved the offset forward: %d -> %d (range %d)", before, after, app.conversation_scroll.range),
+			) { return }
+		}
+	}
+}
+
+// Box_Span places one tool box among the transcript rows, so a test can compare the box the keyboard
+// selected with the box nearest the middle of the viewport.
+Box_Span :: struct {
+	call: journal.Call_Id,
+	top:  int,
+	rows: int,
+}
+
+// app_box_spans lists the tool boxes the frame draws, top to bottom, with the transcript row each starts at.
+// The caller owns the result and deletes it; a frame frees the temporary allocator, so it must not live there.
+app_box_spans :: proc(app: ^App) -> [dynamic]Box_Span {
+	spans := make([dynamic]Box_Span)
+	top := 0
+	for entry in transcript_order(app) {
+		if transcript_is_box(entry) { append(&spans, Box_Span{call = entry.call, top = top, rows = entry.rows}) }
+		top += entry.rows
+	}
+	return spans
+}
+
+// app_selected_call returns the journal call of the selected tool box, or zero when none is selected.
+app_selected_call :: proc(app: ^App) -> journal.Call_Id {
+	for entry in transcript_order(app) {
+		if entry.selected { return entry.call }
+	}
+	return 0
+}
+
+// app_box_in_view reports whether any row of the box lies in the viewport that starts at offset.
+app_box_in_view :: proc(box: Box_Span, offset, height: int) -> bool {
+	return box.top < offset + height && box.top + box.rows > offset
+}
+
+// app_box_distance is how many rows the middle row lies outside the box, and zero when it lies inside.
+app_box_distance :: proc(box: Box_Span, middle: int) -> int {
+	if middle < box.top { return box.top - middle }
+	if middle >= box.top + box.rows { return middle - (box.top + box.rows - 1) }
+	return 0
+}
+
+// app_focused_span returns the index of the selected box in spans, or -1 when no box is selected. It fails
+// unless the selected box is in view and is nearest the middle row of the viewport among the boxes in view.
+app_focused_span :: proc(t: ^testing.T, app: ^App, spans: []Box_Span) -> int {
+	selected := app_selected_call(app)
+	if selected == 0 { return -1 }
+	offset := widgets.scroll_offset(app.conversation_scroll)
+	height := app.conversation_rect.height
+	middle := offset + height / 2
+	nearest := -1
+	focused := -1
+	for box, index in spans {
+		if box.call == selected { focused = index }
+		if !app_box_in_view(box, offset, height) { continue }
+		distance := app_box_distance(box, middle)
+		if nearest < 0 || distance < nearest { nearest = distance }
+	}
+	if focused < 0 || !app_box_in_view(spans[focused], offset, height) {
+		testing.expect(t, false, fmt.tprintf("the selected box is not in view (offset %d, height %d)", offset, height))
+		return -1
+	}
+	testing.expect(
+		t,
+		app_box_distance(spans[focused], middle) == nearest,
+		fmt.tprintf("the selected box is not nearest the middle row %d (offset %d, height %d)", middle, offset, height),
+	)
+	return focused
+}
+
+// app_two_box_session shows two collapsed shell boxes in a 12-row viewport, settled at the tail with nothing selected.
+app_two_box_session :: proc(t: ^testing.T, app: ^App) -> ^Frame_Storage {
+	head := app_history_shell(app, 0, 120)
+	_ = app_history_shell(app, head, 120)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the history could not be committed") }
+	storage := frame_storage_new(context.allocator)
+	app.storage = storage
+	app.columns, app.rows = 80, 12
+	head_publish(app)
+	app_render_settle(t, app, storage)
+	return storage
+}
+
+// app_walk_one_row presses code until the offset reaches the edge it moves toward. Each press must move the
+// offset by exactly step, and each focused box is marked in seen.
+app_walk_one_row :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage, code: input.Key_Code, step: int, seen: []bool) {
+	spans := app_box_spans(app)
+	defer delete(spans)
+	for {
+		before := widgets.scroll_offset(app.conversation_scroll)
+		if (step < 0 && before == 0) || (step > 0 && before == app.conversation_scroll.range) { return }
+		handle_event(app, input.Key_Event{code = code})
+		app_render_settle(t, app, storage)
+		after := widgets.scroll_offset(app.conversation_scroll)
+		if !testing.expect(t, after == before + step, fmt.tprintf("%v moved the offset from %d to %d, not by %d", code, before, after, step)) { return }
+		if focused := app_focused_span(t, app, spans[:]); focused >= 0 { seen[focused] = true }
+	}
+}
+
+// Up and Down move the offset by exactly one row per press across two collapsed boxes, and the selected box
+// is the one nearest the middle of the viewport after each press. Each box must be that box at least once in each direction.
+@(test)
+test_arrow_steps_cross_two_boxes_one_row_at_a_time :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	storage := app_two_box_session(t, &app)
+	defer frame_storage_destroy(storage)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	if !testing.expect(t, app.transcript.focused, "Tab focuses the transcript") { return }
+	spans := app_box_spans(&app)
+	defer delete(spans)
+	if !testing.expect_value(t, len(spans), 2) { return }
+	if !testing.expect(t, app.conversation_scroll.range > 0, "the boxes are taller than the viewport") { return }
+	up_seen := make([]bool, len(spans))
+	defer delete(up_seen)
+	app_walk_one_row(t, &app, storage, .Up, -1, up_seen)
+	if !testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), 0) { return }
+	down_seen := make([]bool, len(spans))
+	defer delete(down_seen)
+	app_walk_one_row(t, &app, storage, .Down, 1, down_seen)
+	if !testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), app.conversation_scroll.range) { return }
+	for box, index in spans {
+		testing.expect(t, up_seen[index], fmt.tprintf("box %d (top %d) was never the one nearest the middle going Up", index, box.top))
+		testing.expect(t, down_seen[index], fmt.tprintf("box %d (top %d) was never the one nearest the middle going Down", index, box.top))
+	}
+}
+
+// A box cut off at the top or bottom edge can take focus, and Enter activates it.
+@(test)
+test_a_half_visible_box_takes_focus_and_enter_activates_it :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	storage := app_two_box_session(t, &app)
+	defer frame_storage_destroy(storage)
+	handle_event(&app, input.Key_Event{code = .Tab})
+	spans := app_box_spans(&app)
+	defer delete(spans)
+	height := app.conversation_rect.height
+	for {
+		offset := widgets.scroll_offset(app.conversation_scroll)
+		if index := app_focused_span(t, &app, spans[:]); index >= 0 {
+			box := spans[index]
+			if box.top < offset || box.top + box.rows > offset + height {
+				handle_event(&app, input.Key_Event{code = .Enter})
+				app_render_settle(t, &app, storage)
+				testing.expect_value(t, app.transcript.active_call, box.call)
+				return
+			}
+		}
+		if offset == 0 {
+			testing.fail_now(t, "no focused box was cut off at an edge while scrolling Up")
+		}
+		handle_event(&app, input.Key_Event{code = .Up})
+		app_render_settle(t, &app, storage)
 	}
 }

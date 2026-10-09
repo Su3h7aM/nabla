@@ -2,12 +2,15 @@
 #+private file
 package main
 
+import "core:encoding/base64"
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:testing"
 
+import "nabla:agent/journal"
 import "nabla:input"
 import "nabla:layout"
 import "nabla:term"
@@ -766,11 +769,9 @@ test_wheel_ignores_a_stale_tool_box_ordinal :: proc(t: ^testing.T) {
 	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
 }
 
-// A tool box owns the wheel only while it can move the way the wheel asks. At its
-// first or last row the report belongs to the transcript behind it, so scrolling
-// over a box never traps the pointer inside the box.
+// An expanded tool box consumes wheel reports at both boundaries, just as active keyboard arrows do.
 @(test)
-test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
+test_wheel_consumes_tool_box_boundaries :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
 		boxes_collapse_all(app)
@@ -804,25 +805,25 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 		y      = box_row + 1,
 	}
 
-	// At the first row there is nothing above to show, so the transcript scrolls.
+	// The first and last rows consume outward wheel reports without moving the transcript.
 	entry.tool_scroll.top = 0
 	scroll_back(app, 0)
-	wheel_scroll(app, report)
+	handle_event(app, report)
 	testing.expect_value(t, widgets.scroll_offset(entry.tool_scroll), 0)
-	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
+	testing.expect_value(t, scrolled_back(app), 0)
 
-	// At the last row there is nothing below, so the transcript scrolls back.
+
 	entry.tool_scroll.top = entry.tool_scroll.range
 	scroll_back(app, 10)
 	report.button = .Wheel_Down
-	wheel_scroll(app, report)
+	handle_event(app, report)
 	testing.expect_value(t, widgets.scroll_offset(entry.tool_scroll), entry.tool_scroll.range)
-	testing.expect_value(t, scrolled_back(app), 10 - MOUSE_WHEEL_LINES)
+	testing.expect_value(t, scrolled_back(app), 10)
 
 	// In the middle the box still has rows either way, so it keeps the report.
 	entry.tool_scroll.top = 5
 	scroll_back(app, 10)
-	wheel_scroll(app, report)
+	handle_event(app, report)
 	testing.expect_value(t, widgets.scroll_offset(entry.tool_scroll), 5 + MOUSE_WHEEL_LINES)
 	testing.expect_value(t, scrolled_back(app), 10)
 }
@@ -975,4 +976,155 @@ test_selection_follows_the_mouse_and_reports_a_failed_copy :: proc(t: ^testing.T
 	// A press below the transcript is not a drag over it.
 	selection_mouse(app, selection_report(.Left, 1, 19))
 	testing.expect(t, !app.selecting, "a press outside the transcript must not select")
+}
+// Box drags copy only displayed content regardless of expansion, keyboard activation, or presenter kind.
+@(test)
+test_tool_box_drag_excludes_borders_and_hidden_preview_rows :: proc(t: ^testing.T) {
+	for kind in ([]Entry_Kind{.Tool, .Codemode}) {
+		for expanded in ([]bool{false, true}) {
+			for activated in ([]bool{false, true}) {
+				if activated && !expanded { continue }
+				app := new(App)
+				defer {
+					boxes_collapse_all(app)
+					delete(app.transcript.expanded)
+					selection_app_destroy(app)
+				}
+				app.run.alloc = context.allocator
+				app.columns, app.rows = 40, 40
+				scratch: [8192]byte
+				tool_box_fixture(app, tool_result_fixture(25, scratch[:]), expanded)
+				app.run.snap.entries[0].kind = kind
+				app.run.snap.entries[0].tool_scroll.top = 3
+				if activated { app.transcript.focused = true; app.transcript.active_call = 5 }
+				app.storage = frame_storage_new(context.allocator)
+				_, err := render_frame(app, app.storage)
+				if err != .None { testing.fail_now(t, "the box could not be rendered") }
+				entry := &app.run.snap.entries[0]
+				rect, found := tool_box_rect(app, entry.id)
+				if !found { testing.fail_now(t, "the box was not laid out") }
+				left := app.conversation_rect.x + int(rect.position.x)
+				top := app.conversation_rect.y + int(rect.position.y)
+				right := int(rect.size.x) - 1
+				last := entry.tool_rows
+				gestures := [4]struct {
+					press_column, press_row, motion_column, motion_row, first, last: int,
+				}{{0, 0, right, last + 1, 1, last}, {right, last + 1, 0, 0, 1, last}, {0, 1, right, 2, 1, 2}, {2, 2, 2, 5, 2, 5}}
+				for gesture in gestures {
+					body := strings.builder_make(context.temp_allocator)
+					offset := 3 if expanded else 0
+					for line in gesture.first ..= gesture.last {
+						if line > gesture.first { strings.write_byte(&body, '\n') }
+						fmt.sbprintf(&body, "line %d", offset + line)
+					}
+					selection_box_copy(
+						t,
+						app,
+						selection_report(.Left, left + gesture.press_column, top + gesture.press_row),
+						selection_report(.Left, left + gesture.motion_column, top + gesture.motion_row, motion = true),
+						strings.to_string(body),
+					)
+					testing.expect_value(t, app.transcript.active_call, journal.Call_Id(5 if activated else 0))
+					testing.expect_value(t, len(app.transcript.expanded), 1 if expanded else 0)
+				}
+				body := strings.builder_make(context.temp_allocator)
+				for line in (4 if expanded else 1) ..= (16 if expanded else 10) {
+					if line > (4 if expanded else 1) { strings.write_byte(&body, '\n') }
+					fmt.sbprintf(&body, "line %d", line)
+				}
+				selection_box_copy(
+					t,
+					app,
+					selection_report(.Left, left, top),
+					selection_report(.Left, left, top + int(rect.size.y), motion = true),
+					strings.to_string(body),
+				)
+				testing.expect_value(t, widgets.scroll_offset(app.run.snap.entries[0].tool_scroll), 6 if expanded else 3)
+			}
+		}
+	}
+}
+
+@(test)
+test_box_selection_wraps_unicode_and_handles_empty_content :: proc(t: ^testing.T) {
+	for body in ([]string{"你你你你\n🙂界🙂界\nfinal\n", ""}) {
+		app := new(App)
+		defer {
+			boxes_collapse_all(app)
+			delete(app.transcript.expanded)
+			selection_app_destroy(app)
+		}
+		app.run.alloc = context.allocator
+		app.columns, app.rows = 12, 20
+		tool_box_fixture(app, body, false)
+		app.storage = frame_storage_new(context.allocator)
+		_, err := render_frame(app, app.storage)
+		if err != .None { testing.fail_now(t, "the box could not be rendered") }
+		entry := &app.run.snap.entries[0]
+		rect, found := tool_box_rect(app, entry.id)
+		if !found { testing.fail_now(t, "the box was not laid out") }
+		left := app.conversation_rect.x + int(rect.position.x)
+		top := app.conversation_rect.y + int(rect.position.y)
+		press := selection_report(.Left, left, top)
+		motion := selection_report(.Left, left, top + int(rect.size.y) - 1, motion = true)
+		if body != "" {
+			selection_box_copy(t, app, press, motion, "你你你\n你\n🙂界🙂\n界\nfinal")
+		} else {
+			handle_event(app, press)
+			handle_event(app, motion)
+			testing.expect_value(t, app.box_drag.anchor, 0)
+			testing.expect_value(t, app.box_drag.cursor, 0)
+			motion.motion, motion.release = false, true
+			handle_event(app, motion)
+			testing.expect_value(t, len(app.run.snap.entries), 1)
+			testing.expect(t, !app.box_drag.active && !app.selecting, "an empty content drag ends without copying or toggling")
+		}
+	}
+}
+
+// selection_box_copy checks the clipboard write produced by real mouse reports without terminal I/O to process streams.
+selection_box_copy :: proc(t: ^testing.T, app: ^App, press, motion: input.Mouse_Event, expected: string) {
+	reader, writer, pipe_error := os.pipe()
+	if pipe_error != nil { testing.fail_now(t, "the clipboard pipe could not be created") }
+	defer _ = os.close(reader)
+	session := term.Session {
+		opened = true,
+		impl = {file = writer},
+	}
+	app.terminal = &session
+	defer app.terminal = nil
+	handle_event(app, press)
+	testing.expect(t, app.box_drag.active && !app.selecting, "a box press selects content rather than raw frame cells")
+	handle_event(app, motion)
+	handle_event(app, input.Mouse_Event{button = .Left, x = motion.x, y = motion.y, release = true})
+	if err := os.close(writer); err != nil { testing.fail_now(t, "the clipboard writer could not be closed") }
+	buffer: [8192]byte
+	count, read_error := os.read(reader, buffer[:])
+	if read_error != nil { testing.fail_now(t, "the clipboard write could not be read") }
+	encoded, encode_error := base64.encode(transmute([]byte)expected, allocator = context.temp_allocator)
+	if encode_error != nil { testing.fail_now(t, "the expected clipboard text could not be encoded") }
+	testing.expect_value(t, string(buffer[:count]), fmt.tprintf("\x1b]52;c;%s\x07", encoded))
+	testing.expect(t, !app.box_drag.active && !app.selecting, "release ends the box drag")
+}
+// Running boxes display a scrollable live tail without being expanded.
+@(test)
+test_running_box_selection_copies_the_visible_live_rows :: proc(t: ^testing.T) {
+	for kind in ([]Entry_Kind{.Tool, .Codemode}) {
+		app := new(App)
+		defer selection_app_destroy(app)
+		app.run.alloc = context.allocator
+		app.columns, app.rows = 40, 20
+		scratch: [8192]byte
+		snap_append(app, kind, fmt.tprintf("shell\n%s", tool_result_fixture(25, scratch[:])))
+		app.run.snap.entries[0].running = true
+		app.run.snap.entries[0].tool_scroll.top = 3
+		app.storage = frame_storage_new(context.allocator)
+		_, err := render_frame(app, app.storage)
+		if err != .None { testing.fail_now(t, "the box could not be rendered") }
+		rect, found := tool_box_rect(app, app.run.snap.entries[0].id)
+		if !found { testing.fail_now(t, "the box was not laid out") }
+		left := app.conversation_rect.x + int(rect.position.x)
+		top := app.conversation_rect.y + int(rect.position.y)
+		selection_box_copy(t, app, selection_report(.Left, left, top + 1), selection_report(.Left, left, top + 2, motion = true), "line 4\nline 5")
+	}
 }

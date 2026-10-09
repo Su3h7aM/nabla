@@ -32,20 +32,22 @@ CHECKPOINT_NOTICE :: "(earlier turns are summarized)"
 
 // Transcript is the window onto the shown session's node path. Main thread only.
 Transcript :: struct {
-	store:         journal.Journal, // read-only, opened by the first read
-	session:       journal.Session_Id,
-	path:          []journal.Node_Id, // owned by the run's allocator; the active branch, oldest first, as of head
-	head:          journal.Node_Id,
-	first:         int, // the window is path[first:end]
-	end:           int,
-	entries:       [dynamic]Entry, // owned; the entries of the window's nodes, oldest first
-	failed:        bool, // a page read failed; cleared by a new head or session
-	measured:      bool, // the transcript was laid out since the last slide
-	viewport_rows: int,
-	anchor:        Maybe(int), // rows below the view when a page was loaded above it
-	expanded:      map[journal.Call_Id]string, // owned; the whole text of each expanded box
-	focused:       bool, // the keyboard drives the transcript instead of the prompt
-	selected:      journal.Call_Id, // the box the keyboard selected
+	store:          journal.Journal, // read-only, opened by the first read
+	session:        journal.Session_Id,
+	path:           []journal.Node_Id, // owned by the run's allocator; the active branch, oldest first, as of head
+	head:           journal.Node_Id,
+	first:          int, // the window is path[first:end]
+	end:            int,
+	entries:        [dynamic]Entry, // owned; the entries of the window's nodes, oldest first
+	failed:         bool, // a page read failed; cleared by a new head or session
+	measured:       bool, // the transcript was laid out since the last slide
+	viewport_rows:  int,
+	anchor:         Maybe(int), // rows below the view when a page was loaded above it
+	expanded:       map[journal.Call_Id]string, // owned; the whole text of each expanded box
+	focused:        bool, // the keyboard drives the transcript instead of the prompt
+	selected_entry: u64, // the tool box the keyboard or a press selected; zero is none
+	selection_step: int, // arrow moves waiting for a page and its measured rows
+	active_call:    journal.Call_Id, // the expanded box whose content takes the arrow keys
 }
 
 transcript_destroy :: proc(app: ^App) {
@@ -78,7 +80,8 @@ transcript_sync :: proc(app: ^App) {
 		transcript.measured = false
 		transcript.anchor = nil
 		transcript.focused = false
-		transcript.selected = 0
+		transcript.selected_entry = 0
+		transcript.selection_step = 0
 		boxes_collapse_all(app)
 		widgets.scroll_follow(&app.conversation_scroll)
 	}
@@ -111,7 +114,7 @@ transcript_follow :: proc(app: ^App, head: journal.Node_Id) {
 		old := transcript.path
 		kept := transcript.end <= len(path) && path[transcript.first] == old[transcript.first] && path[transcript.end - 1] == old[transcript.end - 1]
 		if !kept {
-			entries_destroy(&transcript.entries)
+			// The replacement read borrows scroll state before releasing the old entries.
 			transcript.first, transcript.end = 0, 0
 			transcript.anchor = nil
 			loaded = false
@@ -119,7 +122,10 @@ transcript_follow :: proc(app: ^App, head: journal.Node_Id) {
 	}
 	delete(transcript.path, app.run.alloc)
 	transcript.path = path
-	if !loaded && len(path) > 0 { transcript_page_tail(app) }
+	if !loaded {
+		if len(path) > 0 { transcript_page_tail(app) }
+		if len(path) == 0 || transcript.failed { entries_destroy(&transcript.entries) }
+	}
 }
 
 @(require_results)
@@ -242,6 +248,22 @@ transcript_read :: proc(app: ^App, first, end: int) -> (entries: [dynamic]Entry,
 	entries.allocator = app.run.alloc
 	defer if error != nil { entries_destroy(&entries) }
 	window_entries(app, projection, &entries) or_return
+	selected_call: journal.Call_Id
+	for previous in transcript.entries {
+		if previous.id == transcript.selected_entry { selected_call = previous.call; break }
+	}
+	if selected_call != 0 {
+		for entry in entries {
+			if entry.call == selected_call { transcript.selected_entry = entry.id; break }
+		}
+	}
+	previous_index := 0
+	for &entry in entries {
+		for previous_index < len(transcript.entries) && transcript.entries[previous_index].id < entry.id { previous_index += 1 }
+		if previous_index == len(transcript.entries) { break }
+		previous := &transcript.entries[previous_index]
+		if previous.id == entry.id && previous.call == entry.call { entry.tool_scroll = previous.tool_scroll }
+	}
 	return entries, nil
 }
 
@@ -431,10 +453,18 @@ transcript_order :: proc(app: ^App) -> []^Entry {
 	for ; next < len(live); next += 1 {
 		if live[next].after < unloaded { append(&order, &live[next]) }
 	}
+	if transcript.active_call != 0 {
+		for entry in order {
+			if entry.call == transcript.active_call { transcript.selected_entry = entry.id; break }
+		}
+	}
+	selected_found := false
 	for entry in order {
 		entry.full = transcript.expanded[entry.call] or_else ""
-		entry.selected = transcript.focused && entry.call != 0 && entry.call == transcript.selected
+		selected_found ||= entry.id == transcript.selected_entry
+		entry.selected = transcript.focused && entry.id == transcript.selected_entry
 	}
+	if transcript.selected_entry != 0 && !selected_found { transcript.selected_entry, transcript.selection_step = 0, 0 }
 	return order[:]
 }
 
@@ -450,6 +480,24 @@ transcript_measure :: proc(app: ^App, order: []^Entry, frame_result: layout.Fram
 		if !more { return }
 		entry.rows = int(child.outer.size.y)
 	}
+	transcript := &app.transcript
+	if transcript.focused && transcript.active_call == 0 {
+		if transcript.anchor == nil {
+			for transcript.selection_step != 0 {
+				delta := 1 if transcript.selection_step > 0 else -1
+				if !transcript_move(app, order, delta) {
+					if transcript.failed || (delta < 0 && transcript.first == 0) || (delta > 0 && transcript.end == len(transcript.path)) {
+						transcript.selection_step = 0
+					} else {
+						transcript_scroll_to(app, 0 if delta < 0 else app.conversation_scroll.range)
+					}
+					break
+				}
+				transcript.selection_step -= delta
+			}
+		}
+	}
+	for entry in order { entry.selected = transcript.focused && entry.id == transcript.selected_entry }
 }
 
 // transcript_slide reads or releases pages after a layout and reports whether the frame must be laid out again. It adjusts the scroll so the view does not move.
@@ -541,6 +589,14 @@ transcript_reduce :: proc(app: ^App) {
 			covered ||= transcript_has_text(transcript, entry)
 		}
 		if !covered { continue }
+		if entry.call != 0 {
+			for &stored in transcript.entries {
+				if stored.call != entry.call { continue }
+				stored.tool_scroll = entry.tool_scroll
+				if entry.id == transcript.selected_entry { transcript.selected_entry = stored.id }
+				break
+			}
+		}
 		app.run.snap.image_bytes -= entry.image.bytes
 		entry_destroy(entry)
 		ordered_remove(entries, index)
@@ -577,6 +633,7 @@ entry_find :: proc(app: ^App, id: u64) -> ^Entry {
 
 // boxes_collapse_all frees the whole text of every expanded box.
 boxes_collapse_all :: proc(app: ^App) {
+	app.transcript.active_call = 0
 	for _, full in app.transcript.expanded { delete(full, app.run.alloc) }
 	clear(&app.transcript.expanded)
 }
@@ -584,6 +641,12 @@ boxes_collapse_all :: proc(app: ^App) {
 // boxes_prune collapses the boxes that left the window and the live layer. The caller holds the runtime mutex.
 boxes_prune :: proc(app: ^App) {
 	transcript := &app.transcript
+	if transcript.selected_entry != 0 && entry_find(app, transcript.selected_entry) == nil {
+		transcript.selected_entry, transcript.selection_step = 0, 0
+	}
+	if call := transcript.active_call; call != 0 && !transcript_has_call(transcript, call) && snap_tool_entry_locked(app, call) == nil {
+		transcript.active_call = 0
+	}
 	gone := make([dynamic]journal.Call_Id, context.temp_allocator)
 	for call in transcript.expanded {
 		if transcript_has_call(transcript, call) || snap_tool_entry_locked(app, call) != nil { continue }
@@ -620,6 +683,7 @@ box_toggle :: proc(app: ^App, call: journal.Call_Id) {
 	if full, expanded := transcript.expanded[call]; expanded {
 		delete(full, app.run.alloc)
 		delete_key(&transcript.expanded, call)
+		if transcript.active_call == call { transcript.active_call = 0 }
 		return
 	}
 	prefix, found := box_prefix(app, call)
@@ -662,60 +726,178 @@ box_toggle :: proc(app: ^App, call: journal.Call_Id) {
 	slot^ = full
 }
 
-Box_Row :: struct {
-	call: journal.Call_Id,
-	top:  int,
-	rows: int,
-}
-
-// transcript_boxes lists the tool boxes with a call, oldest first, with the row each starts at
-// in the laid out transcript, in the temporary allocator. The caller holds the runtime mutex.
-transcript_boxes :: proc(app: ^App) -> []Box_Row {
-	boxes := make([dynamic]Box_Row, context.temp_allocator)
-	top := 0
-	for entry in transcript_order(app) {
-		if (entry.kind == .Tool || entry.kind == .Codemode) && entry.call != 0 {
-			append(&boxes, Box_Row{call = entry.call, top = top, rows = entry.rows})
-		}
-		top += entry.rows
-	}
-	return boxes[:]
-}
-
-// transcript_focus gives the keyboard to the transcript and selects the first box in view,
-// or the box nearest to the view when none is in it.
+// transcript_focus gives the keyboard to the transcript and focuses the box nearest the middle of the view, if any.
 transcript_focus :: proc(app: ^App) {
 	sync.mutex_guard(&app.run.mu)
 	transcript := &app.transcript
-	transcript.focused = true
-	boxes := transcript_boxes(app)
-	view_top := widgets.scroll_offset(app.conversation_scroll)
-	view_bottom := view_top + transcript.viewport_rows
-	best, best_distance := -1, max(int)
-	for box, index in boxes {
-		distance := max(view_top - (box.top + box.rows), box.top - view_bottom, 0)
-		if distance < best_distance { best, best_distance = index, distance }
-	}
-	if best >= 0 { transcript.selected = boxes[best].call }
+	transcript.selection_step = 0
+	transcript_select_visible(app, transcript_order(app))
 }
 
-// transcript_select_move selects the box after (delta 1) or before (delta -1) the selected one and
-// scrolls it into view. Past the last or first box loaded it scrolls a page, which loads more.
-transcript_select_move :: proc(app: ^App, delta: int) {
+// transcript_target is the one setter for the keyboard and mouse target. It focuses the transcript and
+// selects entry when it is a box; ordinary text and nil select no box. A box that is not entry's
+// deactivates. It does not touch selection_step, which the caller resets for new input intent.
+// The caller holds the runtime mutex.
+transcript_target :: proc(app: ^App, entry: ^Entry) {
+	transcript := &app.transcript
+	transcript.focused = true
+	transcript.selected_entry = entry.id if entry != nil && transcript_is_box(entry) else 0
+	if entry == nil || transcript.active_call != entry.call { transcript.active_call = 0 }
+}
+
+// transcript_blur returns the keyboard to the prompt and drops the target and any active box.
+transcript_blur :: proc(app: ^App) {
+	transcript := &app.transcript
+	transcript.active_call = 0
+	transcript.focused = false
+	transcript.selected_entry, transcript.selection_step = 0, 0
+}
+
+// transcript_press_document handles a press that is not on a tool box: it focuses the transcript and
+// drops the box selection, any active box, and pending keyboard steps. The press maps no row.
+transcript_press_document :: proc(app: ^App) {
 	sync.mutex_guard(&app.run.mu)
 	transcript := &app.transcript
-	boxes := transcript_boxes(app)
-	current := -1
-	for box, index in boxes {
-		if box.call == transcript.selected { current = index }
+	transcript.selection_step = 0
+	transcript_target(app, nil)
+}
+
+// transcript_reselect focuses the box nearest the middle of the view after a wheel scroll that did not land on
+// an expanded box, and drops any active box.
+transcript_reselect :: proc(app: ^App) {
+	sync.mutex_guard(&app.run.mu)
+	transcript := &app.transcript
+	transcript.active_call = 0
+	transcript.selection_step = 0
+	transcript_select_visible(app, transcript_order(app))
+}
+
+// transcript_tool_scroll moves the window of the active box by delta rows. The wheel and the arrow keys
+// share this step. It scrolls the selected entry itself, and reports false when that entry is not the
+// active box, so the caller can drop the activation. The caller holds the runtime mutex.
+@(require_results)
+transcript_tool_scroll :: proc(app: ^App, delta: int) -> bool {
+	transcript := &app.transcript
+	entry := entry_find(app, transcript.selected_entry)
+	if entry == nil || transcript.active_call == 0 || entry.call != transcript.active_call { return false }
+	_ = widgets.scroll_by(&entry.tool_scroll, delta)
+	return true
+}
+
+// transcript_is_box reports whether entry is an atomic box: a tool or a Code Mode call.
+transcript_is_box :: proc(entry: ^Entry) -> bool {
+	return entry.kind == .Tool || entry.kind == .Codemode
+}
+
+// transcript_select_visible selects the box in view nearest the middle of the viewport, or no box when none is in view.
+// Focus follows the scroll offset; it never moves it. The caller holds the runtime mutex.
+transcript_select_visible :: proc(app: ^App, order: []^Entry) {
+	top := widgets.scroll_offset(app.conversation_scroll)
+	bottom := top + app.transcript.viewport_rows
+	middle := top + app.transcript.viewport_rows / 2
+	best: ^Entry
+	best_distance := max(int)
+	start := 0
+	for entry in order {
+		if transcript_is_box(entry) && entry.rows > 0 && start + entry.rows > top && start < bottom {
+			distance := max(start - middle, middle - (start + entry.rows - 1), 0)
+			if distance < best_distance { best, best_distance = entry, distance }
+		}
+		start += entry.rows
 	}
-	next := current + delta if current >= 0 else (0 if delta > 0 else len(boxes) - 1)
-	if next < 0 || next >= len(boxes) {
-		scroll_page(app, up = delta < 0)
+	transcript_target(app, best)
+}
+
+// transcript_select_neighbor selects the nearest box in view beyond the selected one in delta, for a
+// view that cannot scroll that way, so the boxes at the true edge stay reachable. It reports false
+// when no such box is left. The caller holds the runtime mutex.
+@(require_results)
+transcript_select_neighbor :: proc(app: ^App, order: []^Entry, delta: int) -> bool {
+	transcript := &app.transcript
+	top := widgets.scroll_offset(app.conversation_scroll)
+	bottom := top + transcript.viewport_rows
+	anchor := top - 1 if delta > 0 else bottom
+	start := 0
+	for entry in order {
+		if transcript.selected_entry != 0 && entry.id == transcript.selected_entry {
+			anchor = start
+			break
+		}
+		start += entry.rows
+	}
+	chosen: ^Entry
+	start = 0
+	for entry in order {
+		if transcript_is_box(entry) && entry.rows > 0 && start + entry.rows > top && start < bottom {
+			if delta > 0 && start > anchor {
+				chosen = entry
+				break
+			}
+			if delta < 0 && start < anchor { chosen = entry }
+		}
+		start += entry.rows
+	}
+	if chosen == nil { return false }
+	transcript_target(app, chosen)
+	return true
+}
+
+// transcript_move scrolls the view one row, reading only the actual scroll offset, then focuses the box
+// nearest the middle of the view. A box never moves the offset, so scrolling up and down is the same smooth step.
+// At the offset's true edge with no step left, it selects the next box in view instead. It returns false when
+// the offset cannot move and either the loaded window ends before the step, so the caller loads a page and
+// replays, or no box is left at the edge. The caller holds the runtime mutex.
+@(require_results)
+transcript_move :: proc(app: ^App, order: []^Entry, delta: int) -> bool {
+	transcript := &app.transcript
+	scroll := &app.conversation_scroll
+	top := widgets.scroll_offset(scroll^)
+	target := clamp(top + delta, 0, scroll.range)
+	if target != top {
+		transcript_scroll_to(app, target)
+		transcript_select_visible(app, order)
+		return true
+	}
+	edge := transcript.failed || (delta < 0 && transcript.first == 0) || (delta > 0 && transcript.end == len(transcript.path))
+	return edge && transcript_select_neighbor(app, order, delta)
+}
+
+// transcript_arrow scrolls the active box, consuming boundary arrows, or steps the transcript one row or box.
+transcript_arrow :: proc(app: ^App, delta: int) {
+	sync.mutex_guard(&app.run.mu)
+	transcript := &app.transcript
+	order := transcript_order(app)
+	if transcript.active_call != 0 {
+		if transcript_tool_scroll(app, delta) { return }
+		transcript.active_call = 0
+	}
+	if transcript.selection_step == 0 && transcript_move(app, order, delta) { return }
+	transcript.selection_step += delta
+	if transcript.selection_step == 0 { return }
+	if transcript.failed ||
+	   (transcript.selection_step < 0 && transcript.first == 0) ||
+	   (transcript.selection_step > 0 && transcript.end == len(transcript.path)) {
+		transcript.selection_step = 0
 		return
 	}
-	box := boxes[next]
-	transcript.selected = box.call
-	view_top := widgets.scroll_offset(app.conversation_scroll)
-	transcript_scroll_to(app, widgets.scroll_reveal(view_top, transcript.viewport_rows, box.top, box.rows))
+	transcript_scroll_to(app, 0 if transcript.selection_step < 0 else app.conversation_scroll.range)
+}
+
+// transcript_activate toggles off the active box or activates the selected toolbox. Ordinary blocks do not activate tools.
+transcript_activate :: proc(app: ^App) {
+	transcript := &app.transcript
+	if transcript.active_call != 0 {
+		box_toggle(app, transcript.active_call)
+		return
+	}
+	call: journal.Call_Id
+	if sync.mutex_guard(&app.run.mu) {
+		if entry := entry_find(app, transcript.selected_entry); entry != nil && (entry.kind == .Tool || entry.kind == .Codemode) {
+			call = entry.call
+		}
+	}
+	if call == 0 { return }
+	transcript.selection_step = 0
+	if call not_in transcript.expanded { box_toggle(app, call) }
+	if call in transcript.expanded { transcript.active_call = call }
 }

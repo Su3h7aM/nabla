@@ -22,7 +22,6 @@ import "nabla:tui/widgets"
 // The prompt shows at most five wrapped rows. Its border adds two more, then
 // the working directory and status each use one row.
 INPUT_MAX_ROWS :: 5
-TUI_FOOTER_ROWS :: INPUT_MAX_ROWS + 4
 
 // Styles use the terminal's default foreground/background and ANSI palette.
 // Indexed status colors follow the user's terminal theme instead of defining a
@@ -113,7 +112,8 @@ TOOL_WINDOW_ROWS :: 10
 TOOL_CONTENT_START :: 1
 
 // FOCUS_HINT is on the prompt's border while the keyboard drives the transcript.
-FOCUS_HINT :: " ↑↓ box · enter expand · tab prompt "
+FOCUS_HINT :: " ↑↓ rows/boxes · enter tool · tab prompt "
+ACTIVE_BOX_HINT :: " ↑↓ box · enter collapse · esc deactivate "
 
 // STARTUP_HINT is what an empty transcript shows under the title.
 STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
@@ -373,6 +373,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 	order := transcript_order(app)
 
 	for pass in 0 ..< 2 {
+		selected_before := app.transcript.selected_entry
 		frame_result, solved := conversation_solve(app, storage, viewport, rect.width, offset, order)
 		if !solved {
 			return false
@@ -382,12 +383,12 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			return false
 		}
 		transcript_scroll_set_range(app, int(node.scroll_range.y))
+		transcript_measure(app, order, frame_result, rect.height)
 		corrected := widgets.scroll_offset(app.conversation_scroll)
-		if corrected == offset || pass == 1 {
+		if (corrected == offset && selected_before == app.transcript.selected_entry) || pass == 1 {
 			// The last solve declared every entry this frame draws, so the
 			// Markdown it did not ask for belongs to entries that are gone.
 			markdown_cache_sweep(&storage.markdown)
-			transcript_measure(app, order, frame_result, rect.height)
 			if !draw_bands(storage, frame_result, rect) { return false }
 			if tui.draw_commands(&storage.screen.buffer, storage.paints[:], frame_result, rect, &storage.shown) != .None { return false }
 			selection_paint(app, storage, rect)
@@ -565,15 +566,16 @@ selection_paint :: proc(app: ^App, storage: ^Frame_Storage, viewport: tui.Cell_R
 	}
 }
 
-// box_drag_paint marks the rows of the whole result that a drag inside an expanded box covers, where the box shows them.
+// box_drag_paint marks selected content rows inside the box, excluding its border.
 box_drag_paint :: proc(app: ^App, storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) {
 	drag := app.box_drag
 	entry := entry_find(app, drag.id)
 	if !drag.active || !drag.moved || entry == nil { return }
+	offset := widgets.scroll_offset(entry.tool_scroll) if entry.full != "" || entry.running else 0
 	for node in frame_result.nodes {
 		if u64(node.user) != drag.id { continue }
 		for shown in 0 ..< entry.tool_rows {
-			row := widgets.scroll_offset(entry.tool_scroll) + shown
+			row := offset + shown
 			if row < min(drag.anchor, drag.cursor) || row > max(drag.anchor, drag.cursor) { continue }
 			y := int(node.outer.position.y) + 1 + shown
 			if y < 0 || y >= viewport.height { continue }
@@ -1059,10 +1061,11 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (
 	border_style := RULE_STYLE
 	widgets.draw_block(&storage.screen.buffer, rect, widgets.Block{border = tui.BORDER_ROUNDED, style = border_style})
 	if app.transcript.focused {
+		hint := ACTIVE_BOX_HINT if app.transcript.active_call != 0 else FOCUS_HINT
 		_, _ = tui.draw_text(
 			&storage.screen.buffer,
-			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(FOCUS_HINT), rect.width - 4), height = 1},
-			FOCUS_HINT,
+			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(hint), rect.width - 4), height = 1},
+			hint,
 			HINT_STYLE,
 		)
 	} else if app.run.snap.status.running {
