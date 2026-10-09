@@ -4,9 +4,9 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
-import "core:unicode/utf8"
 import "nabla:agent/journal"
 import "nabla:subprocess"
+import "nabla:text"
 
 // Tool_Stop is why a drain loop stopped short of the child exiting on its own.
 // Wait_Failed means the system refused the wait itself, so the child was stopped
@@ -140,11 +140,6 @@ TOOL_STREAM_MEMORY_BYTES :: 1024 * 1024
 // TOOL_STREAM_READ_BYTES is the fixed read buffer size, not an output limit.
 TOOL_STREAM_READ_BYTES :: 4096
 
-// TOOL_STREAM_SANITIZE_BYTES holds three replacement bytes per byte read, plus a partial UTF-8 sequence.
-TOOL_STREAM_SANITIZE_BYTES :: 3 * (TOOL_STREAM_READ_BYTES + 3)
-
-TOOL_STREAM_REPLACEMENT :: "\ufffd"
-
 // Tool_Stream is one captured output stream while it is drained. kept holds the whole
 // stream until it outgrows memory, and its beginning after that. spool_path names the
 // file the whole stream goes to from the start, so an interrupted call leaves what it
@@ -152,97 +147,47 @@ TOOL_STREAM_REPLACEMENT :: "\ufffd"
 // stream has bytes beyond kept, which makes the spool file the only whole copy.
 @(private)
 Tool_Stream :: struct {
-	file:        ^os.File,
-	kept:        [dynamic]u8,
-	open:        bool,
-	overflow:    bool,
-	total:       int,
-	spool_path:  string,
-	spool:       ^os.File,
-	pending:     [3]u8,
-	pending_len: int,
-	invalid_run: bool,
+	file:       ^os.File,
+	kept:       [dynamic]u8,
+	open:       bool,
+	overflow:   bool,
+	total:      int,
+	spool_path: string,
+	spool:      ^os.File,
+	sanitizer:  text.Sanitizer,
 }
 
-// tool_stream_take sanitizes one chunk, then adds those same bytes to memory and any spool.
-// Those same sanitized bytes, when there are any, go to sink.report after the write, and
-// the sink never changes the result.
+// TOOL_STREAM_SANITIZE_BYTES holds three replacement bytes per byte read, plus a partial UTF-8 sequence.
+TOOL_STREAM_SANITIZE_BYTES :: 3 * (TOOL_STREAM_READ_BYTES + 3)
+
+// tool_stream_sanitized returns an empty buffer backed by storage, so writes never allocate.
+@(private)
+tool_stream_sanitized :: proc(storage: ^[TOOL_STREAM_SANITIZE_BYTES]u8) -> [dynamic]u8 {
+	return mem.buffer_from_slice(storage[:])
+}
+
+// tool_stream_take sanitizes one chunk, stores it, then reports the same bytes to the sink.
 @(private, require_results)
 tool_stream_take :: proc(stream: ^Tool_Stream, chunk: []u8, sink := Tool_Stream_Sink{}) -> os.Error {
 	stream.total += len(chunk)
-	sanitized: [TOOL_STREAM_SANITIZE_BYTES]u8
-	sanitized_len := tool_stream_sanitize(stream, chunk, false, sanitized[:])
-	write_error := tool_stream_write(stream, sanitized[:sanitized_len])
-	if sink.report != nil && sanitized_len > 0 {
-		sink.report(sink.user_data, sink.call, sink.parent_call, string(sanitized[:sanitized_len]))
+	assert(len(chunk) <= TOOL_STREAM_READ_BYTES)
+	sanitized_buffer: [TOOL_STREAM_SANITIZE_BYTES]u8
+	sanitized := tool_stream_sanitized(&sanitized_buffer)
+	text.sanitizer_write(&stream.sanitizer, &sanitized, string(chunk)) or_return
+	write_error := tool_stream_write(stream, sanitized[:])
+	if sink.report != nil && len(sanitized) > 0 {
+		sink.report(sink.user_data, sink.call, sink.parent_call, string(sanitized[:]))
 	}
 	return write_error
 }
 
-// tool_stream_finish writes an incomplete final UTF-8 sequence as replacement text.
+// tool_stream_finish flushes the sanitizer into the stream.
 @(private, require_results)
 tool_stream_finish :: proc(stream: ^Tool_Stream) -> os.Error {
-	sanitized: [TOOL_STREAM_SANITIZE_BYTES]u8
-	sanitized_len := tool_stream_sanitize(stream, nil, true, sanitized[:])
-	return tool_stream_write(stream, sanitized[:sanitized_len])
-}
-
-// tool_stream_sanitize replaces invalid UTF-8 and disallowed control bytes, carrying a partial rune into the next chunk.
-@(private)
-tool_stream_sanitize :: proc(stream: ^Tool_Stream, chunk: []u8, final: bool, output: []u8) -> int {
-	assert(len(chunk) <= TOOL_STREAM_READ_BYTES)
-	combined: [TOOL_STREAM_READ_BYTES + 3]u8
-	combined_len := stream.pending_len + len(chunk)
-	copy(combined[:], stream.pending[:stream.pending_len])
-	copy(combined[stream.pending_len:combined_len], chunk)
-	stream.pending_len = 0
-
-	process_len := combined_len
-	if !final {
-		pending_len := tool_stream_incomplete_utf8_suffix(combined[:combined_len])
-		process_len -= pending_len
-		stream.pending_len = pending_len
-		copy(stream.pending[:pending_len], combined[process_len:combined_len])
-	}
-
-	output_len := 0
-	for index := 0; index < process_len; {
-		rune, width := utf8.decode_rune_in_bytes(combined[index:process_len])
-		invalid := rune == utf8.RUNE_ERROR && width == 1
-		if invalid {
-			if !stream.invalid_run {
-				copy(output[output_len:], TOOL_STREAM_REPLACEMENT)
-				output_len += len(TOOL_STREAM_REPLACEMENT)
-			}
-			stream.invalid_run = true
-			index += width
-			continue
-		}
-
-		stream.invalid_run = false
-		breaks := rune == utf8.RUNE_ERROR || rune < 0x20 && rune != '\n' && rune != '\t' || rune == 0x7F
-		if breaks {
-			copy(output[output_len:], TOOL_STREAM_REPLACEMENT)
-			output_len += len(TOOL_STREAM_REPLACEMENT)
-		} else {
-			copy(output[output_len:], combined[index:index + width])
-			output_len += width
-		}
-		index += width
-	}
-	return output_len
-}
-
-// tool_stream_incomplete_utf8_suffix retains an incomplete final rune without buffering invalid encodings.
-@(private)
-tool_stream_incomplete_utf8_suffix :: proc(bytes: []u8) -> int {
-	for distance := 0; distance < len(bytes) && distance <= 3; distance += 1 {
-		start := len(bytes) - distance - 1
-		if !utf8.rune_start(bytes[start]) { continue }
-		if !utf8.full_rune(bytes[start:]) { return len(bytes) - start }
-		return 0
-	}
-	return 0
+	sanitized_buffer: [TOOL_STREAM_SANITIZE_BYTES]u8
+	sanitized := tool_stream_sanitized(&sanitized_buffer)
+	text.sanitizer_flush(&stream.sanitizer, &sanitized) or_return
+	return tool_stream_write(stream, sanitized[:])
 }
 
 // tool_stream_write stores sanitized bytes in the spool when there is one, and in memory up to the threshold.
@@ -270,7 +215,7 @@ tool_stream_write :: proc(stream: ^Tool_Stream, chunk: []u8) -> os.Error {
 	return nil
 }
 
-// tool_stream_finish_all flushes partial UTF-8 suffixes before a drain result transfers the streams.
+// tool_stream_finish_all flushes every stream's sanitizer before a drain result transfers the streams.
 @(private, require_results)
 tool_stream_finish_all :: proc(streams: []Tool_Stream) -> os.Error {
 	for &stream in streams {

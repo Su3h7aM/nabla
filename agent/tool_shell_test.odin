@@ -260,8 +260,8 @@ test_shell_spools_sanitized_output_that_read_accepts :: proc(test: ^testing.T) {
 	testing.expect_value(test, read.outcome, journal.Tool_Outcome.Success)
 	spooled, read_error := os.read_entire_file(path, context.temp_allocator)
 	testing.expect_value(test, read_error, nil)
-	testing.expect_value(test, len(spooled), size + 6)
-	testing.expect(test, strings.has_suffix(string(spooled), "\ufffd\ufffd"), "the spooled NUL and invalid UTF-8 are replacement text")
+	testing.expect_value(test, len(spooled), size + 3)
+	testing.expect(test, strings.has_suffix(string(spooled), "a\ufffd"), "the spooled NUL is dropped and invalid UTF-8 is replacement text")
 }
 
 Shell_Interrupted_Run :: struct {

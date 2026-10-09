@@ -261,7 +261,7 @@ test_shell_runs_a_command_and_reports_what_it_did :: proc(test: ^testing.T) {
 }
 
 // A stream larger than memory holds is written whole to its file as sanitized text, and the
-// model is shown where to read it. Each NUL becomes the three-byte replacement character.
+// model is shown where to read it. Each invalid byte becomes the three-byte replacement character.
 @(test)
 test_shell_keeps_output_larger_than_memory_in_a_file :: proc(test: ^testing.T) {
 	tool_test: Tool_Test
@@ -269,7 +269,7 @@ test_shell_keeps_output_larger_than_memory_in_a_file :: proc(test: ^testing.T) {
 	defer tool_test_end(test, &tool_test)
 
 	size :: 3 * TOOL_STREAM_MEMORY_BYTES
-	command := fmt.tprintf(`{{"command":"head -c %d /dev/zero | tr '\\\\000' a"}}`, size)
+	command := fmt.tprintf(`{{"command":"head -c %d /dev/zero | tr '\\000' '\\377'"}}`, size)
 	result := tool_run(test, &tool_test, TOOL_SHELL_NAME, command)
 	testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
 	testing.expect(test, strings.contains(result.content, fmt.tprintf("stdout_bytes: %d\n", size)), "the whole size is reported")
@@ -281,7 +281,7 @@ test_shell_keeps_output_larger_than_memory_in_a_file :: proc(test: ^testing.T) {
 	path := rest[:strings.index_byte(rest, '\n')]
 	info, stat_error := os.stat(path, context.temp_allocator)
 	testing.expect(test, stat_error == nil, "the stream file exists")
-	testing.expect_value(test, info.size, i64(size * len(TOOL_STREAM_REPLACEMENT)))
+	testing.expect_value(test, info.size, i64(size * len("\ufffd")))
 }
 
 @(test)
