@@ -3,6 +3,7 @@ package widgets
 import "core:mem"
 import "core:slice"
 import "core:strings"
+import "core:unicode"
 import "core:unicode/utf8"
 
 import "nabla:term"
@@ -13,8 +14,30 @@ import "nabla:tui"
 // grapheme cluster boundary. The text may hold line breaks, so a caller draws it
 // through input_lines rather than as one row. The caller owns text: input_init
 // pins its allocator, input_destroy releases it.
+//
+// kill holds the text of the last kill, which input_yank inserts. undo and redo
+// hold owned snapshots of the text taken before an edit that starts a new run:
+// a run is consecutive edits of one Input_Edit_Kind, and typing ends a run at
+// whitespace. Their allocator is the one input_init pinned.
 Input :: struct {
-	text:   [dynamic]u8,
+	text:      [dynamic]u8,
+	cursor:    int,
+	kill:      [dynamic]u8,
+	undo:      [dynamic]Input_Snapshot,
+	redo:      [dynamic]Input_Snapshot,
+	last_edit: Input_Edit_Kind,
+}
+
+Input_Edit_Kind :: enum {
+	None,
+	Insert,
+	Delete_Back,
+	Delete_Forward,
+	Other,
+}
+
+Input_Snapshot :: struct {
+	text:   []u8,
 	cursor: int,
 }
 
@@ -30,6 +53,9 @@ Input_Line :: struct {
 
 input_init :: proc(input: ^Input, allocator := context.allocator) {
 	input.text = make([dynamic]u8, 0, 0, allocator)
+	input.kill = make([dynamic]u8, 0, 0, allocator)
+	input.undo = make([dynamic]Input_Snapshot, 0, 0, allocator)
+	input.redo = make([dynamic]Input_Snapshot, 0, 0, allocator)
 }
 
 input_text :: proc(input: ^Input) -> string {
@@ -40,12 +66,22 @@ input_cursor :: proc(input: ^Input) -> int {
 	return input.cursor
 }
 
+// input_clear empties the text and forgets the undo and redo history; the kill
+// slot stays.
 input_clear :: proc(input: ^Input) {
 	clear(&input.text)
 	input.cursor = 0
+	_input_snapshots_clear(&input.undo)
+	_input_snapshots_clear(&input.redo)
+	input.last_edit = .None
 }
 
 input_destroy :: proc(input: ^Input) {
+	_input_snapshots_clear(&input.undo)
+	_input_snapshots_clear(&input.redo)
+	delete(input.undo)
+	delete(input.redo)
+	delete(input.kill)
 	delete(input.text)
 	input^ = {}
 }
@@ -56,6 +92,19 @@ input_destroy :: proc(input: ^Input) {
 // allocation failure and leaves the text unchanged.
 @(require_results)
 input_insert :: proc(input: ^Input, value: string) -> bool {
+	if len(value) == 0 {
+		return true
+	}
+	_input_record(input, .Insert) or_return
+	_input_insert(input, value) or_return
+	if last, _ := utf8.decode_last_rune(input.text[:input.cursor]); unicode.is_space(last) {
+		input.last_edit = .None
+	}
+	return true
+}
+
+@(private)
+_input_insert :: proc(input: ^Input, value: string) -> bool {
 	previous_length := len(input.text)
 	sanitizer: text.Sanitizer
 	if text.sanitizer_write(&sanitizer, &input.text, value) != nil || text.sanitizer_flush(&sanitizer, &input.text) != nil {
@@ -83,6 +132,7 @@ input_backspace :: proc(input: ^Input) -> bool {
 		return false
 	}
 	start := text.prev_grapheme_offset(input_text(input), input.cursor)
+	_input_record(input, .Delete_Back) or_return
 	if !_input_remove(input, start, input.cursor) {
 		return false
 	}
@@ -95,7 +145,68 @@ input_delete :: proc(input: ^Input) -> bool {
 	if input.cursor >= len(value) {
 		return false
 	}
+	_input_record(input, .Delete_Forward) or_return
 	return _input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor))
+}
+
+input_move_word_left :: proc(input: ^Input) -> bool {
+	start := text.word_previous_offset(input_text(input), input.cursor)
+	moved := start != input.cursor
+	input.cursor = start
+	input.last_edit = .None
+	return moved
+}
+
+input_move_word_right :: proc(input: ^Input) -> bool {
+	end := text.word_next_offset(input_text(input), input.cursor)
+	moved := end != input.cursor
+	input.cursor = end
+	input.last_edit = .None
+	return moved
+}
+
+// input_delete_word_back, input_kill_to_end and input_kill_to_start remove text
+// and store it in the kill slot, replacing the previous kill. They return false
+// when there is nothing to remove or on an allocation failure, with the text
+// unchanged. The kill ends at the line: input_kill_to_end at the end of a line
+// removes the line break, and input_kill_to_start stops after the previous one.
+input_delete_word_back :: proc(input: ^Input) -> bool {
+	return _input_kill(input, text.word_previous_offset(input_text(input), input.cursor), input.cursor)
+}
+
+input_kill_to_end :: proc(input: ^Input) -> bool {
+	value := input_text(input)
+	end := len(value)
+	if relative := strings.index_byte(value[input.cursor:], '\n'); relative >= 0 {
+		end = input.cursor + max(relative, 1)
+	}
+	return _input_kill(input, input.cursor, end)
+}
+
+input_kill_to_start :: proc(input: ^Input) -> bool {
+	start := strings.last_index_byte(input_text(input)[:input.cursor], '\n') + 1
+	return _input_kill(input, start, input.cursor)
+}
+
+// input_yank inserts the kill slot at the cursor. It returns false when the
+// slot is empty or on an allocation failure.
+input_yank :: proc(input: ^Input) -> bool {
+	if len(input.kill) == 0 {
+		return false
+	}
+	_input_record(input, .Other) or_return
+	return _input_insert(input, string(input.kill[:]))
+}
+
+// input_undo restores the text and cursor taken before the last run of edits,
+// and input_redo returns to the state input_undo left. Both return false when
+// there is nothing to restore or on an allocation failure.
+input_undo :: proc(input: ^Input) -> bool {
+	return _input_restore(input, &input.undo, &input.redo)
+}
+
+input_redo :: proc(input: ^Input) -> bool {
+	return _input_restore(input, &input.redo, &input.undo)
 }
 
 input_move_left :: proc(input: ^Input) -> bool {
@@ -103,6 +214,7 @@ input_move_left :: proc(input: ^Input) -> bool {
 		return false
 	}
 	input.cursor = text.prev_grapheme_offset(input_text(input), input.cursor)
+	input.last_edit = .None
 	return true
 }
 
@@ -112,6 +224,7 @@ input_move_right :: proc(input: ^Input) -> bool {
 		return false
 	}
 	input.cursor = text.next_grapheme_offset(value, input.cursor)
+	input.last_edit = .None
 	return true
 }
 
@@ -120,6 +233,7 @@ input_move_home :: proc(input: ^Input) -> bool {
 		return false
 	}
 	input.cursor = 0
+	input.last_edit = .None
 	return true
 }
 
@@ -129,6 +243,7 @@ input_move_end :: proc(input: ^Input) -> bool {
 		return false
 	}
 	input.cursor = end
+	input.last_edit = .None
 	return true
 }
 
@@ -225,6 +340,7 @@ _input_move_row :: proc(input: ^Input, delta, width: int, profile: text.Width_Pr
 	}
 	column := text.text_columns(input_text(input)[lines[row].start:input.cursor], profile)
 	input.cursor = _input_row_offset(lines[target], column, profile)
+	input.last_edit = .None
 	return true
 }
 
@@ -324,6 +440,80 @@ _input_window :: proc(input: ^Input, lines: []Input_Line, rect: tui.Cell_Rect, p
 draw_input :: proc {
 	draw_input_rect,
 	draw_input_context,
+}
+
+@(private)
+_input_kill :: proc(input: ^Input, start, end: int) -> bool {
+	if start >= end {
+		return false
+	}
+	_input_record(input, .Other) or_return
+	clear(&input.kill)
+	if _, err := append(&input.kill, ..input.text[start:end]); err != nil {
+		clear(&input.kill)
+		return false
+	}
+	_input_remove(input, start, end) or_return
+	input.cursor = start
+	return true
+}
+
+// _input_record is called before an edit: it pushes a snapshot when the edit
+// starts a new run (every kill, yank and word delete is its own run), and drops
+// the redo history. It returns false on an
+// allocation failure, and the edit must not happen.
+@(private)
+_input_record :: proc(input: ^Input, kind: Input_Edit_Kind) -> bool {
+	if kind != input.last_edit || kind == .Other {
+		snapshot := _input_snapshot(input) or_return
+		if _, err := append(&input.undo, snapshot); err != nil {
+			delete(snapshot.text, input.text.allocator)
+			return false
+		}
+	}
+	_input_snapshots_clear(&input.redo)
+	input.last_edit = kind
+	return true
+}
+
+@(private)
+_input_snapshot :: proc(input: ^Input) -> (snapshot: Input_Snapshot, ok: bool) {
+	cloned, err := slice.clone(input.text[:], input.text.allocator)
+	return {text = cloned, cursor = input.cursor}, err == nil
+}
+
+// _input_restore pops the newest snapshot of from into the input and pushes the
+// state it replaces onto to.
+@(private)
+_input_restore :: proc(input: ^Input, from, to: ^[dynamic]Input_Snapshot) -> bool {
+	if len(from) == 0 {
+		return false
+	}
+	replaced := _input_snapshot(input) or_return
+	restored := from[len(from) - 1]
+	if _, err := append(to, replaced); err != nil {
+		delete(replaced.text, input.text.allocator)
+		return false
+	}
+	if resize(&input.text, len(restored.text)) != nil {
+		pop(to)
+		delete(replaced.text, input.text.allocator)
+		return false
+	}
+	pop(from)
+	copy(input.text[:], restored.text)
+	input.cursor = restored.cursor
+	input.last_edit = .None
+	delete(restored.text, input.text.allocator)
+	return true
+}
+
+@(private)
+_input_snapshots_clear :: proc(snapshots: ^[dynamic]Input_Snapshot) {
+	for snapshot in snapshots[:] {
+		delete(snapshot.text, snapshots.allocator)
+	}
+	clear(snapshots)
 }
 
 // _input_remove deletes [start, end) and reports whether the buffer holds the

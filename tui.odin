@@ -29,21 +29,12 @@ RULE_STYLE :: term.Style {
 	modifiers = {.Dim},
 }
 
-// The working indicator: the reference TUI's braille spinner on the rule row
-// above the input, shown only while a request is active.
-SPINNER_FRAMES :: 10
+// The working indicator: the reference TUI's braille spinner, shown only while a
+// request is active.
 WORKING_LABEL :: "Working"
 // SPINNER_INTERVAL is one spinner frame.
 SPINNER_INTERVAL :: 100 * time.Millisecond
 
-spinner_glyph :: proc(index: int) -> string {
-	glyphs := [10]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	return glyphs[index % len(glyphs)]
-}
-WORKING_SPINNER :: term.Style {
-	foreground = term.Indexed_Color(6),
-}
-WORKING_TEXT :: term.Style{}
 WORKING_BORDER_TEXT :: term.Style {
 	foreground = term.Indexed_Color(5),
 }
@@ -189,6 +180,15 @@ Frame_Storage :: struct {
 	cells:             []term.Cell,
 	buffer:            term.Frame_Buffer,
 	output:            []byte,
+	// previous is a copy of the last frame that reached the terminal, which term.present
+	// diffs against; its strings live in previous_text, because the grid's own point into
+	// frame scratch that the next frame recycles. It is only meaningful while
+	// previous_known is set: a failed present, or a frame never presented, leaves it unset.
+	previous:          term.Frame_Buffer,
+	previous_known:    bool,
+	previous_cells:    []term.Cell,
+	previous_text:     []byte,
+	previous_links:    [dynamic]string,
 	alloc:             mem.Allocator,
 	markdown:          Markdown_Cache,
 	// links is this frame's hyperlink table (term.Frame_Buffer.links); the URIs are
@@ -221,6 +221,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
 	storage.links = make([dynamic]string, alloc)
+	storage.previous_links = make([dynamic]string, alloc)
 	storage.paints = make(tui.Paints, alloc)
 	storage.shown = make([dynamic]tui.Image_Placement, alloc)
 	storage.placed = make([dynamic]tui.Image_Placement, alloc)
@@ -251,6 +252,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 
 frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 	delete(storage.links)
+	delete(storage.previous_links)
 	delete(storage.paints)
 	delete(storage.shown)
 	delete(storage.placed)
@@ -264,10 +266,61 @@ frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	if storage == nil { return }
 	if storage.cells != nil { delete(storage.cells, storage.alloc) }
 	if storage.output != nil { delete(storage.output, storage.alloc) }
+	if storage.previous_cells != nil { delete(storage.previous_cells, storage.alloc) }
+	if storage.previous_text != nil { delete(storage.previous_text, storage.alloc) }
 	markdown_cache_destroy(&storage.markdown)
 	frame_storage_tables_destroy(storage)
 	layout.destroy(&storage.layout_ctx)
 	free(storage, storage.alloc)
+}
+
+// frame_storage_remember copies the frame in storage.buffer into the previous frame, which
+// the next present diffs against. It returns false, and forgets the previous frame, when
+// the copy could not be allocated.
+@(require_results)
+frame_storage_remember :: proc(storage: ^Frame_Storage) -> bool {
+	storage.previous_known = false
+	buffer := storage.buffer
+	count := buffer.columns * buffer.rows
+	text_size := 0
+	for cell in buffer.cells[:count] { text_size += len(cell.grapheme) }
+	for uri in buffer.links { text_size += len(uri) }
+	if len(storage.previous_text) < text_size {
+		text, alloc_error := make([]byte, text_size, storage.alloc)
+		if alloc_error != nil { return false }
+		if storage.previous_text != nil { delete(storage.previous_text, storage.alloc) }
+		storage.previous_text = text
+	}
+	if len(storage.previous_cells) < count {
+		cells, alloc_error := make([]term.Cell, count, storage.alloc)
+		if alloc_error != nil { return false }
+		if storage.previous_cells != nil { delete(storage.previous_cells, storage.alloc) }
+		storage.previous_cells = cells
+	}
+	clear(&storage.previous_links)
+	used := 0
+	copy_text :: proc(text: []byte, used: ^int, value: string) -> string {
+		copy(text[used^:], value)
+		copied := string(text[used^:][:len(value)])
+		used^ += len(value)
+		return copied
+	}
+	for uri in buffer.links {
+		_, append_error := append(&storage.previous_links, copy_text(storage.previous_text, &used, uri))
+		if append_error != nil { return false }
+	}
+	for cell, i in buffer.cells[:count] {
+		storage.previous_cells[i] = cell
+		storage.previous_cells[i].grapheme = copy_text(storage.previous_text, &used, cell.grapheme)
+	}
+	storage.previous = {
+		columns = buffer.columns,
+		rows    = buffer.rows,
+		cells   = storage.previous_cells[:count],
+		links   = storage.previous_links[:],
+	}
+	storage.previous_known = true
+	return true
 }
 
 // ensure_frame grows the cell grid to the viewport: the grid holds one cell per terminal
@@ -306,7 +359,10 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 		if !transcript_slide(app) { break }
 	}
 	images_sync(app, storage)
-	_, required, present_err := term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
+	// Only a frame that is known to be on the terminal can be diffed against; a failed
+	// present or a changed size is answered with a full frame.
+	previous := &storage.previous if storage.previous_known else nil
+	_, required, present_err := term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output, previous)
 	if present_err == term.General_Error.Presentation_Workspace_Too_Small {
 		// The encoder reports the exact required count before writing anything,
 		// so the scratch can be grown once and the frame retried.
@@ -317,10 +373,15 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 		}
 		delete(storage.output, storage.alloc)
 		storage.output = output
-		_, _, present_err = term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output)
+		_, _, present_err = term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output, previous)
 	}
 	if present_err != nil {
+		storage.previous_known = false
 		fmt.eprintln("nabla: present:", present_err)
+		return
+	}
+	if !frame_storage_remember(storage) {
+		fmt.eprintln("nabla: present: the previous frame could not be kept")
 	}
 }
 
@@ -506,7 +567,7 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 				}
 			} else {
 				for entry in order {
-					declare_entry(&storage.layout_ctx, storage, entry, width, app.spin_frame)
+					declare_entry(&storage.layout_ctx, storage, entry, width, working_elapsed(app))
 				}
 			}
 		}
@@ -679,9 +740,9 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // cleaned body in an element whose bottom padding is the blank row that
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
-declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
+declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, elapsed: time.Duration) {
 	if entry.kind == .Tool || entry.kind == .Codemode {
-		declare_tool_entry(ctx, storage, entry, width, spin_frame)
+		declare_tool_entry(ctx, storage, entry, width, elapsed)
 		return
 	}
 	if entry.kind == .Assistant {
@@ -795,7 +856,7 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // are overlays on the border rows.
 // Only the border carries the outcome color. Code Mode calls draw here too, in blue on success.
 // A running call draws the spinner frame before its name and the working border color.
-declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
+declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, elapsed: time.Duration) {
 	outline := tui.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
@@ -811,7 +872,7 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 		name = value[:split]
 		preview = value[split + 1:]
 	}
-	if entry.running { name = fmt.tprintf("%s %s", spinner_glyph(spin_frame), name) }
+	if entry.running { name = fmt.tprintf("%s %s", widgets.spinner_frame(widgets.SPINNER_BRAILLE, elapsed, SPINNER_INTERVAL), name) }
 	// The corner, the leading rule, and the space after the name leave the name
 	// this much room; the rest of the top border is rule.
 	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
@@ -1061,42 +1122,17 @@ working_duration :: proc(total_seconds: i64) -> string {
 	return fmt.tprintf("%dh %dm %ds", hours, minutes, remaining_seconds)
 }
 
+// working_elapsed is the time since the active turn started.
+working_elapsed :: proc(app: ^App) -> time.Duration {
+	return time.tick_diff(app.run.snap.status.working_since, time.tick_now())
+}
+
 // working_label reports the elapsed time for the complete active turn. The
 // start survives provider requests, tool calls, and retries, and is replaced
 // only when a later prompt starts from idle.
 working_label :: proc(app: ^App) -> string {
-	status := &app.run.snap.status
-	elapsed := time.tick_diff(status.working_since, time.tick_now())
-	seconds := i64(time.duration_seconds(elapsed))
+	seconds := i64(time.duration_seconds(working_elapsed(app)))
 	return fmt.tprintf("Working for %s", working_duration(seconds))
-}
-
-// draw_working renders the rule row as the working indicator: dashes, a gap,
-// the braille frame, a gap, the label, then the rule continuing after it.
-draw_working :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect, frame_index: int, label: string) {
-	if rect.height <= 0 || rect.width <= 0 {
-		return
-	}
-	// "──" + gap + spinner + gap + label + gap.
-	prefix := 2 + 1 + 1 + 1 + text.text_columns(label) + 1
-	if rect.width < prefix + 2 {
-		draw_rule(storage, rect)
-		return
-	}
-	tui.fill(&storage.buffer, tui.Cell_Rect{x = rect.x, y = rect.y, width = 2, height = 1}, "─", RULE_STYLE)
-	_ = tui.put(&storage.buffer, rect.x + 3, rect.y, spinner_glyph(frame_index), WORKING_SPINNER)
-	_, _ = tui.draw_text(&storage.buffer, tui.Cell_Rect{x = rect.x + 5, y = rect.y, width = text.text_columns(label), height = 1}, label, WORKING_TEXT)
-	tail := rect.width - prefix
-	if tail > 0 {
-		tui.fill(&storage.buffer, tui.Cell_Rect{x = rect.x + prefix, y = rect.y, width = tail, height = 1}, "─", RULE_STYLE)
-	}
-}
-
-draw_rule :: proc(storage: ^Frame_Storage, rect: tui.Cell_Rect) {
-	if rect.height <= 0 || rect.width <= 0 {
-		return
-	}
-	tui.fill(&storage.buffer, rect, "─", RULE_STYLE)
 }
 
 @(require_results)
@@ -1124,7 +1160,7 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (
 			HINT_STYLE,
 		)
 	} else if app.run.snap.status.running {
-		title := fmt.tprintf(" %s %s ", spinner_glyph(app.spin_frame), working_label(app))
+		title := fmt.tprintf(" %s %s ", widgets.spinner_frame(widgets.SPINNER_BRAILLE, working_elapsed(app), SPINNER_INTERVAL), working_label(app))
 		_, _ = tui.draw_text(
 			&storage.buffer,
 			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(title), rect.width - 4), height = 1},

@@ -620,7 +620,6 @@ tui_run :: proc(
 		// The lap restarts even when no frame can be drawn, because tui_wait_ms would
 		// otherwise return zero and spin until a size arrives.
 		if advance_spinner {
-			app.spin_frame = (app.spin_frame + 1) % SPINNER_FRAMES
 			app.spin_lap = now
 		}
 		// A startup chooser closes once its selection applies on the worker; a menu

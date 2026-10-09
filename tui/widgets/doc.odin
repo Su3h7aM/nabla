@@ -23,6 +23,16 @@
 // plain row offset and share scroll_reveal, the math that keeps a row visible.
 // List navigation covers next, previous, first, last, page, and index.
 //
+// Input also edits by word and by line (kill and yank through one kill slot) and
+// keeps unbounded undo and redo snapshots, all released by input_destroy.
+//
+// Scrollbar draws a vertical track and thumb in a Cell_Rect with draw_scrollbar.
+// scrollbar_thumb is the geometry alone: where the thumb starts and how long it
+// is on a track, for content, viewport, and offset in rows.
+//
+// spinner_frame picks the frame to show for an elapsed time and a frame interval.
+// The caller owns the clock. SPINNER_BRAILLE is a ready frame set.
+//
 // Widget model state belongs to the caller. Input owns its dynamic text buffer
 // between input_init and input_destroy. List_State owns selection and scroll
 // position. Widgets do not own terminal sessions, input events, or layout

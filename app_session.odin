@@ -136,8 +136,7 @@ App :: struct {
 	// viewport_reported latches the one warning a terminal that reports no size
 	// produces. The loop reads it on the front-end's thread only.
 	viewport_reported:          bool,
-	spin_lap:                   time.Tick, // last working-frame advance,
-	spin_frame:                 int,
+	spin_lap:                   time.Tick, // last working-frame advance
 	// menu is the open choice list, when menu_open. One component serves every
 	// command whose argument is picked from a list.
 	menu:                       Menu,

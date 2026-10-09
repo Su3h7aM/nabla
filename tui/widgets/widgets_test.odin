@@ -4,6 +4,7 @@
 package widgets
 
 import "core:testing"
+import "core:time"
 import "nabla:layout"
 import "nabla:term"
 import "nabla:text"
@@ -383,4 +384,152 @@ test_block_declares_border_title_and_footer_cut_to_the_box :: proc(t: ^testing.T
 	testing.expect_value(t, frame.cells[3 * 12 + 5].grapheme, "m")
 	testing.expect_value(t, frame.cells[3 * 12 + 10].grapheme, "l")
 	testing.expect_value(t, frame.cells[3 * 12 + 11].grapheme, "╯")
+}
+
+@(test)
+test_scrollbar_thumb_geometry :: proc(t: ^testing.T) {
+	testing.expect_value(t, scrollbar_thumb(10, 5, 10, 0), Scrollbar_Thumb{})
+	testing.expect_value(t, scrollbar_thumb(10, 10, 10, 0), Scrollbar_Thumb{})
+	testing.expect_value(t, scrollbar_thumb(0, 100, 10, 0), Scrollbar_Thumb{})
+	// A tiny viewport still gets a one cell thumb.
+	testing.expect_value(t, scrollbar_thumb(10, 10000, 1, 0), Scrollbar_Thumb{start = 0, length = 1})
+	testing.expect_value(t, scrollbar_thumb(10, 20, 10, 0), Scrollbar_Thumb{start = 0, length = 5})
+	testing.expect_value(t, scrollbar_thumb(10, 20, 10, 10), Scrollbar_Thumb{start = 5, length = 5})
+	// The end sits at the track's end for any proportions, and offset is clamped.
+	testing.expect_value(t, scrollbar_thumb(7, 1001, 13, 988), Scrollbar_Thumb{start = 6, length = 1})
+	testing.expect_value(t, scrollbar_thumb(10, 20, 10, 99), Scrollbar_Thumb{start = 5, length = 5})
+	testing.expect_value(t, scrollbar_thumb(10, 20, 10, -3), Scrollbar_Thumb{start = 0, length = 5})
+}
+
+@(test)
+test_scrollbar_draws_thumb_over_track :: proc(t: ^testing.T) {
+	storage: [4]term.Cell
+	frame := _frame(storage[:], 1, 4)
+	draw_scrollbar(&frame, {x = 0, y = 0, width = 1, height = 4}, 8, 4, 4, Scrollbar{track_glyph = "│", thumb_glyph = "█"})
+	testing.expect_value(t, frame.cells[0].grapheme, "│")
+	testing.expect_value(t, frame.cells[1].grapheme, "│")
+	testing.expect_value(t, frame.cells[2].grapheme, "█")
+	testing.expect_value(t, frame.cells[3].grapheme, "█")
+}
+
+@(test)
+test_spinner_frame_advances_and_wraps :: proc(t: ^testing.T) {
+	frames := []string{"a", "b", "c"}
+	interval := 100 * time.Millisecond
+	testing.expect_value(t, spinner_frame(frames, 0, interval), "a")
+	testing.expect_value(t, spinner_frame(frames, 250 * time.Millisecond, interval), "c")
+	testing.expect_value(t, spinner_frame(frames, 300 * time.Millisecond, interval), "a")
+	testing.expect_value(t, spinner_frame(frames, -time.Second, interval), "a")
+	testing.expect_value(t, spinner_frame(nil, 0, interval), "")
+	testing.expect_value(t, spinner_frame(frames, 0, 0), "")
+}
+
+@(test)
+test_input_word_motion_and_deletion :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	testing.expect(t, input_insert(&input, "foo bar.baz"))
+	testing.expect(t, input_move_word_left(&input))
+	testing.expect_value(t, input_cursor(&input), len("foo bar."))
+	testing.expect(t, input_move_word_left(&input))
+	testing.expect(t, input_move_word_left(&input))
+	testing.expect_value(t, input_cursor(&input), len("foo "))
+	testing.expect(t, input_move_word_right(&input))
+	testing.expect_value(t, input_cursor(&input), len("foo bar"))
+
+	testing.expect(t, input_delete_word_back(&input))
+	testing.expect_value(t, input_text(&input), "foo .baz")
+	testing.expect_value(t, string(input.kill[:]), "bar")
+	testing.expect(t, input_move_home(&input))
+	testing.expect(t, !input_delete_word_back(&input))
+	testing.expect(t, !input_move_word_left(&input))
+}
+
+@(test)
+test_input_kill_and_yank :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	testing.expect(t, !input_yank(&input))
+	testing.expect(t, input_insert(&input, "one two\nthree"))
+	testing.expect(t, input_kill_to_start(&input))
+	testing.expect_value(t, input_text(&input), "one two\n")
+	testing.expect(t, !input_kill_to_start(&input))
+	testing.expect(t, input_move_home(&input))
+	testing.expect(t, input_move_word_right(&input))
+	testing.expect(t, input_kill_to_end(&input))
+	testing.expect_value(t, input_text(&input), "one\n")
+	testing.expect_value(t, string(input.kill[:]), " two")
+	testing.expect(t, input_kill_to_end(&input))
+	testing.expect_value(t, input_text(&input), "one")
+	testing.expect(t, !input_kill_to_end(&input))
+	testing.expect(t, input_yank(&input))
+	testing.expect_value(t, input_text(&input), "one\n")
+	testing.expect_value(t, input_cursor(&input), 4)
+}
+
+@(test)
+test_input_undo_groups_runs_and_redo_clears_on_edit :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	testing.expect(t, !input_undo(&input))
+	testing.expect(t, !input_redo(&input))
+	for part in ([]string{"a", "b", " ", "c", "d"}) {
+		testing.expect(t, input_insert(&input, part))
+	}
+	testing.expect(t, input_backspace(&input))
+	testing.expect(t, input_backspace(&input))
+	testing.expect(t, input_delete_word_back(&input))
+	testing.expect_value(t, input_text(&input), "")
+
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "ab ")
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "ab cd")
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "ab ")
+	testing.expect_value(t, input_cursor(&input), 3)
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "")
+	testing.expect(t, !input_undo(&input))
+
+	testing.expect(t, input_redo(&input))
+	testing.expect_value(t, input_text(&input), "ab ")
+	testing.expect(t, input_redo(&input))
+	testing.expect_value(t, input_text(&input), "ab cd")
+
+	testing.expect(t, input_undo(&input))
+	testing.expect(t, input_insert(&input, "x"))
+	testing.expect(t, !input_redo(&input))
+}
+
+@(test)
+test_input_undo_steps_split_at_motion_and_kills :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	testing.expect(t, input_insert(&input, "ab"))
+	testing.expect(t, input_move_left(&input))
+	testing.expect(t, input_insert(&input, "x"))
+	testing.expect_value(t, input_text(&input), "axb")
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "ab")
+
+	testing.expect(t, input_move_end(&input))
+	testing.expect(t, input_kill_to_start(&input))
+	testing.expect(t, input_yank(&input))
+	testing.expect(t, input_yank(&input))
+	testing.expect_value(t, input_text(&input), "abab")
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "ab")
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "")
+	testing.expect(t, input_undo(&input))
+	testing.expect_value(t, input_text(&input), "ab")
 }
