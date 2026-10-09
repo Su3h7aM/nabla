@@ -123,9 +123,17 @@ Measure_Error :: enum u8 {
 Measure_Proc :: #type proc(user_data: rawptr, request: Measure_Request) -> (Measure_Result, Measure_Error)
 
 Wrap :: enum u8 {
+	// Words wrap greedily at whitespace. A word wider than the line is split at
+	// grapheme boundaries when `Services.grapheme_end` is set.
 	Words,
+	// Lines break only at newlines.
 	Newlines,
+	// No breaking at all.
 	None,
+	// Preformatted text: every byte is kept, including spaces and leading
+	// indentation. Lines break at newlines and, when too wide, at the last
+	// grapheme boundary that fits (when `Services.grapheme_end` is set).
+	Characters,
 }
 Text_Align :: enum u8 {
 	Start,
@@ -173,6 +181,12 @@ Text_Break_Error :: enum u8 {
 // is borrowed).
 Text_Break_Proc :: #type proc(user_data: rawptr, text: string, offset: int) -> (piece_end: int, next_offset: int, kind: Text_Break_Kind, err: Text_Break_Error)
 
+// Text_Grapheme_Proc returns the end of the grapheme cluster that starts at
+// `offset` in `text`, the position where a line may break inside a word.
+//
+// Contract: `offset < len(text)` on every call, and `offset < end <= len(text)`.
+// It must not allocate and must not retain `text` (the buffer is borrowed).
+Text_Grapheme_Proc :: #type proc(user_data: rawptr, text: string, offset: int) -> (end: int)
 
 // Text_Run paints `length` bytes of a text node. Runs differ only in paint;
 // measurement and wrapping use the node's single `Text_Style`.
@@ -387,6 +401,9 @@ Services :: struct {
 	measure_text_user_data: rawptr,
 	break_text:             Text_Break_Proc,
 	break_text_user_data:   rawptr,
+	// grapheme_end is optional. Without it a word or line is never split inside.
+	grapheme_end:           Text_Grapheme_Proc,
+	grapheme_end_user_data: rawptr,
 }
 
 Context_Data_Error :: enum u8 {

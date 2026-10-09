@@ -306,7 +306,7 @@ declare_code_block :: proc(declarer: ^Declarer, block: markdown.Code_Block) -> m
 		}
 		if body != "" {
 			code := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.code}) or_return
-			layout.text(ctx, layout.Text_Desc{text = body, style = TEXT_STYLE, paint = code})
+			layout.text(ctx, layout.Text_Desc{text = body, style = {size = 1, wrap = .Characters}, paint = code})
 		}
 	}
 	return nil
@@ -488,7 +488,7 @@ declare_table_row :: proc(declarer: ^Declarer, cells: []markdown.Cell, alignment
 				sizing = {width = layout.fixed(layout.Scalar(widths[column] + 2 * TABLE_CELL_PADDING)), height = layout.fit(1)},
 				padding = {left = TABLE_CELL_PADDING, right = TABLE_CELL_PADDING},
 			}
-			if layout.element(ctx, layout.Element_Desc{layout = content, clip = {axes = {.X}}}) {
+			if layout.element(ctx, layout.Element_Desc{layout = content}) {
 				declare_inline(declarer, cell, base, text_align(alignments[column])) or_return
 			}
 			layout.content(ctx, bar_element)

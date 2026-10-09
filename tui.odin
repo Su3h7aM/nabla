@@ -228,6 +228,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	config := layout.Options {
 		capacities = storage.capacities,
 		cull       = .Visible,
+		snap       = 1,
 	}
 	// layout.init gives the context storage of its own, which is what makes the
 	// budget raisable: init_from_buffer storage belongs to the caller, and a
@@ -435,22 +436,19 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 	clear(&storage.links)
 	clear(&storage.paints)
 	// Services bind for one frame only, so every solve re-binds them.
-	layout.set_services(
-		&storage.layout_ctx,
-		layout.Services{measure_text = tui.measure_proc, measure_text_user_data = &storage.measure, break_text = tui.break_proc},
-	)
+	layout.set_services(&storage.layout_ctx, tui.layout_services(&storage.measure))
 	if layout.frame(&storage.layout_ctx, viewport) {
 		if layout.element(
-			&storage.layout_ctx,
-			layout.Element_Desc {
-				id = CONVERSATION_ID,
-				layout = layout.Layout_Style{flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.grow()}, align = .Stretch},
-				// The conversation is a vertical scroll container, so it clips
-				// horizontally too. An unbreakable token wider than the viewport
-				// must not widen the root, or every entry would wrap at that
-				// width and be truncated at the terminal edge.
-				clip = layout.Clip_Style{axes = {.X, .Y}, offset = {0, layout.Scalar(offset)}},
-			},
+		&storage.layout_ctx,
+		layout.Element_Desc {
+			id = CONVERSATION_ID,
+			layout = layout.Layout_Style{flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.grow()}, align = .Stretch},
+			// The conversation is a vertical scroll container, so it clips
+			// horizontally too. An unbreakable token wider than the viewport
+			// must not widen the root, or every entry would wrap at that
+			// width and be truncated at the terminal edge.
+			clip = layout.Clip_Style{axes = {.X, .Y}, offset = {0, layout.Scalar(offset)}},
+		},
 		) {
 			if len(order) == 0 {
 				if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {

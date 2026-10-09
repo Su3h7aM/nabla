@@ -15,7 +15,7 @@ Measure_Context :: struct {
 // frame. measure_context must remain alive through layout.frame's deferred
 // solve.
 layout_services :: proc(measure_context: ^Measure_Context) -> layout.Services {
-	return {measure_text = measure_proc, measure_text_user_data = measure_context, break_text = break_proc}
+	return {measure_text = measure_proc, measure_text_user_data = measure_context, break_text = break_proc, grapheme_end = grapheme_end_proc}
 }
 
 @(require_results)
@@ -63,6 +63,18 @@ break_proc :: proc(
 		kind = .Mandatory
 	}
 	return
+}
+
+// grapheme_end_proc is the layout.Services.grapheme_end callback. user_data is
+// unused.
+@(require_results)
+grapheme_end_proc :: proc(user_data: rawptr, value: string, offset: int) -> (end: int) {
+	iterator := text.grapheme_iterator_make(value[offset:])
+	_, grapheme, ok := text.grapheme_iterate(&iterator)
+	if !ok || len(grapheme.text) == 0 {
+		return len(value)
+	}
+	return offset + len(grapheme.text)
 }
 
 // _measure_max_columns maps the request's X axis onto a column bound: an

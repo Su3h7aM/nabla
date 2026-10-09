@@ -4,6 +4,7 @@ package layout
 
 import "core:math"
 import "core:testing"
+import "core:unicode/utf8"
 
 // Deterministic monospace metrics: one cell per byte and one line tall, so
 // wrapping arithmetic is exact.
@@ -361,5 +362,65 @@ test_invalid_text_runs_fall_back_to_paint :: proc(t: ^testing.T) {
 			}
 		}
 		testing.expect_value(t, texts, 1)
+	}
+}
+
+_grapheme_rune :: proc(user_data: rawptr, value: string, offset: int) -> int {
+	_ = user_data
+	_, size := utf8.decode_rune_in_string(value[offset:])
+	return offset + size
+}
+
+_services_with_graphemes :: proc() -> Services {
+	services := _services()
+	services.grapheme_end = _grapheme_rune
+	return services
+}
+
+@(test)
+test_wide_word_splits_at_grapheme_boundaries :: proc(t: ^testing.T) {
+	ctx: Context
+	testing.expect_value(t, init(&ctx, _test_options()), nil)
+	defer destroy(&ctx)
+
+	set_services(&ctx, _services_with_graphemes())
+	if frame(&ctx, {400, 400}) {
+		if element(&ctx, {layout = {sizing = {fixed(30), fit()}}}) {
+			text(&ctx, {text = "ab abcdefgh é", sizing = {grow(), fit()}})
+		}
+	}
+	split, split_error := result(&ctx)
+	testing.expect_value(t, split_error, Frame_Error.None)
+	testing.expect_value(t, len(diagnostics(&ctx)), 0)
+	lines := _text_lines_of(&ctx, 2)
+	expected := [?]string{"ab", "abc", "def", "gh", "é"}
+	testing.expect_value(t, len(lines), len(expected))
+	for line, index in lines {
+		testing.expect_value(t, line.text, expected[index])
+	}
+	// The floor is one grapheme, so the text shrinks to the fixed width.
+	_expect_close(t, split.nodes[2].outer.size.x, 30)
+}
+
+@(test)
+test_characters_keeps_spaces_and_breaks_at_graphemes :: proc(t: ^testing.T) {
+	ctx: Context
+	testing.expect_value(t, init(&ctx, _test_options()), nil)
+	defer destroy(&ctx)
+
+	set_services(&ctx, _services_with_graphemes())
+	if frame(&ctx, {400, 400}) {
+		if element(&ctx, {layout = {sizing = {fixed(50), fit()}}}) {
+			text(&ctx, {text = "  a  b\n    x\n\nabcdefghé", style = {wrap = .Characters}, sizing = {grow(), fit()}})
+		}
+	}
+	_, err := result(&ctx)
+	testing.expect_value(t, err, Frame_Error.None)
+	testing.expect_value(t, len(diagnostics(&ctx)), 0)
+	lines := _text_lines_of(&ctx, 2)
+	expected := [?]string{"  a  ", "b", "    x", "", "abcde", "fghé"}
+	testing.expect_value(t, len(lines), len(expected))
+	for line, index in lines {
+		testing.expect_value(t, line.text, expected[index])
 	}
 }

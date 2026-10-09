@@ -136,7 +136,10 @@ render :: proc(app: App, storage: ^Render_Storage) -> (frame: term.Frame_Buffer,
 			},
 		) {
 			for item, index in app.items {
-				layout.text(&storage.ctx, layout.Text_Desc{id = layout.Id(index + 2), text = item, sizing = {layout.fit(), layout.fit()}})
+				layout.text(
+					&storage.ctx,
+					layout.Text_Desc{id = layout.Id(index + 2), text = item, style = {wrap = .None}, sizing = {layout.fit(), layout.fit()}},
+				)
 			}
 		}
 	}

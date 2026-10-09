@@ -135,12 +135,15 @@ test_table_aligns_columns_and_shrinks_to_width :: proc(t: ^testing.T) {
 	)
 
 	narrow: Rendered
-	render(t, &narrow, &context_, "| firstlong | secondlong |\n| --- | --- |\n| abcdefgh | ijklmnop |", 16, 12, true)
+	render(t, &narrow, &context_, "| firstlong | secondlong |\n| --- | --- |\n| abcdefgh | ijklmnop |", 16, 12)
 	for row in narrow.rows {
 		testing.expect(t, text.text_columns(row) <= 16)
 	}
-	testing.expect_value(t, narrow.rows[0], "┌──────┬───────┐")
-	testing.expect_value(t, narrow.rows[4], "└──────┴───────┘")
+	testing.expect_value(
+		t,
+		strings.trim_right(strings.join(narrow.rows[:], "\n", context.temp_allocator), "\n"),
+		"┌──────┬───────┐\n│ firs │ secon │\n│ tlon │ dlong │\n│ g    │       │\n├──────┼───────┤\n│ abcd │ ijklm │\n│ efgh │ nop   │\n└──────┴───────┘",
+	)
 }
 
 @(test)
@@ -168,4 +171,17 @@ test_code_block_is_inset_and_keeps_blank_lines :: proc(t: ^testing.T) {
 	rendered: Rendered
 	render(t, &rendered, &context_, "```odin\na\n\nb\n```", 10, 5)
 	testing.expect_value(t, strings.join(rendered.rows[:], "\n", context.temp_allocator), "  odin\n  a\n\n  b\n")
+}
+
+@(test)
+test_code_block_keeps_indentation_and_splits_long_lines :: proc(t: ^testing.T) {
+	context_ := new_context(t)
+	defer layout.destroy(&context_)
+	rendered: Rendered
+	render(t, &rendered, &context_, "```\nif x {\n    y  =  1\n}\nabcdefghijkl\n```", 10, 6)
+	testing.expect_value(t, strings.join(rendered.rows[:], "\n", context.temp_allocator), "  if x {\n      y  =\n    1\n  }\n  abcdefgh\n  ijkl")
+
+	url: Rendered
+	render(t, &url, &context_, "see https://example.com/long", 10, 4)
+	testing.expect_value(t, strings.join(url.rows[:], "\n", context.temp_allocator), "see\nhttps://ex\nample.com/\nlong")
 }

@@ -306,8 +306,8 @@ _break_text :: proc(state: ^_Context_State, node: Node_Handle, text: string, off
 /*
 Measure the max-content size and the shrink floor of a text node.
 
-Width is the widest hard segment; the floor is the longest unbreakable run,
-which is the longest word when words may wrap and the whole segment otherwise.
+Width is the widest hard segment; the floor is the widest unbreakable run: the
+widest grapheme when words or characters may wrap, the whole segment otherwise.
 Height is the resolved line height times the hard-segment count, which is the
 line count before any soft wrapping.
 */
@@ -352,7 +352,7 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 			if wrap == .Words && piece_end > offset {
 				word := text[offset:piece_end]
 				word_measured := _measure_text_run_cached(state, node, word, _unbounded_request())
-				longest_unbreakable = math.max(longest_unbreakable, f64(word_measured.size.x))
+				longest_unbreakable = math.max(longest_unbreakable, _widest_grapheme(state, node, offset, piece_end))
 				natural_line_height = math.max(natural_line_height, f64(word_measured.size.y))
 
 				if recording {
@@ -394,7 +394,9 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 				measured := _measure_text_run_cached(state, node, segment, _unbounded_request())
 				widest = math.max(widest, f64(measured.size.x))
 				natural_line_height = math.max(natural_line_height, f64(measured.size.y))
-				if wrap != .Words {
+				if wrap == .Characters {
+					longest_unbreakable = math.max(longest_unbreakable, _widest_grapheme(state, node, segment_start, piece_end))
+				} else if wrap != .Words {
 					longest_unbreakable = math.max(longest_unbreakable, f64(measured.size.x))
 				}
 				segment_start = next_offset
@@ -426,6 +428,87 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 	}
 }
 
+/*
+Return the end of the grapheme at `offset` through the configured seam.
+
+A callback that returns an end outside `(offset, len(text)]` would spin the
+splitting loop, so a violation fails the frame like a stalled breaker.
+*/
+@(private)
+_grapheme_end :: proc(state: ^_Context_State, node: Node_Handle, text: string, offset: int) -> int {
+	end := state._services.grapheme_end(state._services.grapheme_end_user_data, text, offset)
+	if end <= offset || end > len(text) {
+		when ODIN_DEBUG {
+			assert(false, "layout: grapheme_end violated its contract (end outside (offset, len(text)])")
+		}
+		_append_diagnostic(state, .Text_Break_Stalled, node, loc = state._node_inputs[node].loc)
+		state._frame_error = .Text_Break_Stalled
+		return len(text)
+	}
+	return end
+}
+
+/*
+Measure the widest grapheme in `text[start:end]` of a text node, or the whole
+run when no `Services.grapheme_end` is set.
+*/
+@(private, require_results)
+_widest_grapheme :: proc(state: ^_Context_State, node: Node_Handle, start, end: int) -> f64 {
+	input := &state._node_inputs[node]
+	if state._services.grapheme_end == nil {
+		return f64(_measure_text_run_cached(state, node, input.text[start:end], _unbounded_request()).size.x)
+	}
+	widest: f64
+	for offset := start; offset < end; {
+		next := _grapheme_end(state, node, input.text[:end], offset)
+		if state._frame_error != .None {
+			break
+		}
+		widest = math.max(widest, f64(_measure_text_run_cached(state, node, input.text[offset:next], _unbounded_request()).size.x))
+		offset = next
+	}
+	return widest
+}
+
+/*
+Emit full lines from the front of `text[start:end]` until the remainder fits.
+
+Each line holds the most graphemes that fit `available`, and at least one. The
+remainder starts at `rest` and is left to the caller, so it can continue with
+the next word. Without `Services.grapheme_end`, or when the remainder is one
+grapheme, nothing is split. Returns false when the frame failed.
+*/
+@(private, require_results)
+_split_wide_run :: proc(state: ^_Context_State, node: Node_Handle, start, end: int, available: f64) -> (rest: int, rest_width: f64, ok: bool) {
+	input := &state._node_inputs[node]
+	rest = start
+	for {
+		rest_width = f64(_measure_text_run_cached(state, node, input.text[rest:end], _unbounded_request()).size.x)
+		if rest_width <= available || state._services.grapheme_end == nil {
+			return rest, rest_width, true
+		}
+		cut := _grapheme_end(state, node, input.text[:end], rest)
+		for cut < end && state._frame_error == .None {
+			next := _grapheme_end(state, node, input.text[:end], cut)
+			if state._frame_error != .None || f64(_measure_text_run_cached(state, node, input.text[rest:next], _unbounded_request()).size.x) > available {
+				break
+			}
+			cut = next
+		}
+		if state._frame_error != .None {
+			return rest, rest_width, false
+		}
+		if cut >= end {
+			return rest, rest_width, true
+		}
+		if _, appended := _append_text_line(state, node, input.text[rest:cut], input.text_line_count); !appended {
+			return rest, rest_width, false
+		}
+		input.text_line_count += 1
+		rest = cut
+	}
+}
+
 @(private, require_results)
 _append_text_line :: proc(state: ^_Context_State, node: Node_Handle, line: string, line_index: int) -> (Vec2, bool) {
 	measured := _measure_text_run_cached(state, node, line, _unbounded_request())
@@ -452,9 +535,10 @@ _append_text_line :: proc(state: ^_Context_State, node: Node_Handle, line: strin
 Break one text node into lines at its resolved width.
 
 Greedy word packing, as in every practical line breaker: a word that does not
-fit starts a new line, and a word too wide for an empty line occupies that line
-alone and overflows. `Wrap.Newlines` and `Wrap.None` never break inside a hard
-segment.
+fit starts a new line, and a word too wide for an empty line is split at
+grapheme boundaries (or overflows when no grapheme service is set).
+`Wrap.Characters` splits each hard segment the same way without regard to
+whitespace. `Wrap.Newlines` and `Wrap.None` never break inside a hard segment.
 */
 @(private, require_results)
 _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
@@ -479,7 +563,7 @@ _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 		input.text_line_count += 1
 		widest = math.max(widest, f64(size.x))
 	} else if wrap != .Words {
-		// Wrap.Newlines: one line per hard segment.
+		// Wrap.Newlines: one line per hard segment; Wrap.Characters: one or more.
 		offset := 0
 		segment_start := 0
 		for {
@@ -488,7 +572,15 @@ _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 				return false
 			}
 			if kind == .Mandatory || kind == .None {
-				size, appended := _append_text_line(state, node, input.text[segment_start:piece_end], input.text_line_count)
+				line_start := segment_start
+				if wrap == .Characters {
+					rest, _, split := _split_wide_run(state, node, segment_start, piece_end, available)
+					if !split {
+						return false
+					}
+					line_start = rest
+				}
+				size, appended := _append_text_line(state, node, input.text[line_start:piece_end], input.text_line_count)
 				if !appended {
 					return false
 				}
@@ -549,6 +641,14 @@ _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 					line_start = word_start
 					line_end = word_end
 					line_width = word_width
+					if line_width > available {
+						rest, rest_width, split := _split_wide_run(state, node, word_start, word_end, available)
+						if !split {
+							return false
+						}
+						line_start = rest
+						line_width = rest_width
+					}
 				}
 			}
 			if kind == .Mandatory || kind == .None {
@@ -671,6 +771,14 @@ _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, 
 		line_start = int(record.offset)
 		line_end = word_end
 		line_width = f64(record.width)
+		if line_width > available {
+			rest, rest_width, split := _split_wide_run(state, node, line_start, word_end, available)
+			if !split {
+				return false
+			}
+			line_start = rest
+			line_width = rest_width
+		}
 	}
 
 	if line_start >= 0 {

@@ -58,6 +58,8 @@
 // text draws the resolved lines emitted by layout.text, so layout owns wrapping
 // and line placement while nabla:text supplies width measurement.
 //
+// Terminal layouts use snap = 1 in layout.Options so every edge lands on a whole cell.
+//
 // Layout carries a layout.Paint id on every command it emits and never reads it.
 // tui resolves the id in a Paints table the caller fills while declaring the
 // frame: paint appends a Paint (terminal style, fill grapheme, border glyphs,
