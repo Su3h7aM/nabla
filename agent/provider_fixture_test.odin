@@ -21,6 +21,10 @@ import "core:time"
 // AGENT_PROVIDER_BOUND keeps a broken fixture from hanging the suite.
 AGENT_PROVIDER_BOUND :: 10 * time.Second
 
+// COMPACT_DIRECTIVE_MARKER is the directive's first sentence, which has no character a JSON
+// body escapes, so it appears verbatim in a compaction request.
+COMPACT_DIRECTIVE_MARKER :: "Summarize the conversation above into a checkpoint"
+
 // agent_provider_reply is one response the harness reads as a complete Chat
 // Completions stream: the text, then a stop, then the sentinel. It is built in the
 // calling test's temporary memory: it has to outlive the request it answers, and
@@ -81,6 +85,10 @@ Agent_Provider :: struct {
 	connection: net.TCP_Socket,
 	port:       int,
 	responses:  []string,
+	// summaries answers the requests that carry the compaction directive, in order, apart
+	// from responses: a compaction request is sent from a job thread, so where it falls among
+	// the other connections is not fixed. Set it before agent_provider_start.
+	summaries:  []string,
 	allocator:  mem.Allocator,
 	// requests holds what each connection sent, in order, so a test can assert what
 	// left this machine: an attempt chain that sends the same bytes sends equal ones.
@@ -133,9 +141,9 @@ agent_provider_failed :: proc(provider: ^Agent_Provider) -> bool {
 agent_provider_start :: proc(t: ^testing.T, provider: ^Agent_Provider, responses: []string, deferred := false) -> bool {
 	provider.responses = responses
 	provider.allocator = context.allocator
-	provider.requests = make([dynamic]string, 0, len(responses) + 1, provider.allocator)
+	provider.requests = make([dynamic]string, 0, len(responses) + len(provider.summaries) + 1, provider.allocator)
 
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, len(responses) + 1)
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, len(responses) + len(provider.summaries) + 1)
 	if listen_err != nil {
 		testing.expectf(t, false, "the scripted provider could not listen: %v", listen_err)
 		return false
@@ -207,7 +215,8 @@ agent_provider_endpoint :: proc(provider: ^Agent_Provider, allocator := context.
 
 agent_provider_serve :: proc(thread: ^thread.Thread) {
 	provider := cast(^Agent_Provider)thread.data
-	for response, index in provider.responses {
+	next, next_summary := 0, 0
+	for _ in 0 ..< len(provider.responses) + len(provider.summaries) {
 		socket, _, accept_err := net.accept_tcp(provider.listener)
 		if accept_err != nil {
 			agent_provider_note_failure(provider)
@@ -221,7 +230,19 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 			return
 		}
 		agent_provider_record(provider, request)
-		if provider.hold == index + 1 { _ = sync.sema_wait_with_timeout(&provider.release, AGENT_PROVIDER_BOUND) }
+		response: string
+		if next_summary < len(provider.summaries) && strings.contains(request, COMPACT_DIRECTIVE_MARKER) {
+			response = provider.summaries[next_summary]
+			next_summary += 1
+		} else if next < len(provider.responses) {
+			response = provider.responses[next]
+			next += 1
+			if provider.hold == next { _ = sync.sema_wait_with_timeout(&provider.release, AGENT_PROVIDER_BOUND) }
+		} else {
+			agent_provider_note_failure(provider)
+			agent_provider_release(provider, socket)
+			return
+		}
 		write_ok := agent_provider_write(socket, response)
 		agent_provider_release(provider, socket)
 		if !write_ok {

@@ -1424,10 +1424,11 @@ test_agent_configure_compacts_a_running_subagent_without_stopping_it :: proc(tes
 	bulk, _ := strings.repeat("forty-two ", 1000, context.temp_allocator)
 	// The first turn is six calls and an answer, so the child holds more than a summary
 	// keeps verbatim. The turn that follows is held at its first request, and the summary
-	// request is the next connection the fixture accepts.
+	// request is answered from the fixture's summaries wherever it falls among the child's.
 	responses := make([dynamic]string, context.temp_allocator)
 	for _ in 0 ..< 6 { append(&responses, tool) }
-	append(&responses, agent_provider_reply("done"), tool, agent_provider_reply(COMPACT_TEST_SUMMARY), tool, tool, agent_provider_reply("finished"))
+	append(&responses, agent_provider_reply("done"), tool, tool, tool, agent_provider_reply("finished"))
+	provider.summaries = {agent_provider_reply(COMPACT_TEST_SUMMARY)}
 	if !subagent_test_hold(test, &provider, responses[:], 8) { return }
 	defer agent_provider_stop(&provider)
 	endpoint := agent_provider_endpoint(&provider)
