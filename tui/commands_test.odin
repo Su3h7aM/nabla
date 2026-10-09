@@ -85,7 +85,35 @@ test_draw_commands_paints_fill_border_and_text_into_target :: proc(t: ^testing.T
 }
 
 @(test)
-test_paint_never_returns_zero_and_paint_of_rejects_unknown_ids :: proc(t: ^testing.T) {
+test_draw_commands_blank_border_glyph_is_space_and_wide_glyph_is_invalid :: proc(t: ^testing.T) {
+	layout_ctx: layout.Context
+	testing.expect_value(t, layout.init(&layout_ctx, _COMMANDS_TEST_OPTIONS), nil)
+	defer layout.destroy(&layout_ctx)
+
+	if layout.frame(&layout_ctx, {3, 3}) {
+		_ = layout.element(
+			&layout_ctx,
+			layout.Element_Desc{layout = {sizing = {layout.grow(), layout.grow()}}, paint = {border = {paint = 1, width = layout.pad_all(1)}}},
+		)
+	}
+	solved, layout_error := layout.result(&layout_ctx)
+	testing.expect_value(t, layout_error, layout.Frame_Error.None)
+
+	cells: [3 * 3]term.Cell
+	buffer: term.Frame_Buffer
+	testing.expect(t, init(&buffer, 3, 3, cells[:]))
+	paints: Paints
+	defer delete(paints)
+	_, _ = paint(&paints, {border = {top_left = "+"}})
+
+	testing.expect_value(t, draw_commands(&buffer, paints[:1], solved, {width = 3, height = 3}), Draw_Error.None)
+	testing.expect_value(t, buffer.cells[0].grapheme, "+")
+	testing.expect_value(t, buffer.cells[1].grapheme, " ")
+
+	paints[0].border.top_left = "界"
+	testing.expect_value(t, draw_commands(&buffer, paints[:1], solved, {width = 3, height = 3}), Draw_Error.Invalid_Border)
+}
+_and_paint_of_rejects_unknown_ids :: proc(t: ^testing.T) {
 	paints: Paints
 	defer delete(paints)
 	first, first_error := paint(&paints, {})

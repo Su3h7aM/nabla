@@ -8,6 +8,7 @@ Draw_Error :: enum u8 {
 	None,
 	Non_Integral_Geometry,
 	Allocation_Failed,
+	Invalid_Border,
 }
 
 // draw_commands paints a solved frame's render commands into buffer in paint
@@ -24,9 +25,10 @@ Draw_Error :: enum u8 {
 // is ignored, because a terminal cell cannot be rounded: the border glyph set
 // is the paint's choice. Custom_Cmd draws nothing.
 //
-// Draw_Error is Non_Integral_Geometry when a command or clip is not on the cell
-// grid, and Allocation_Failed when images could not grow; commands before the
-// failing one stay drawn.
+// An empty border glyph draws as a space. Draw_Error is Non_Integral_Geometry
+// when a command or clip is not on the cell grid, Invalid_Border when a border
+// glyph is not one cell wide under profile, and Allocation_Failed when images
+// could not grow; commands before the failing one stay drawn.
 draw_commands :: proc(
 	buffer: ^term.Frame_Buffer,
 	paints: []Paint,
@@ -58,7 +60,7 @@ draw_commands :: proc(
 			}
 		case layout.Border_Cmd:
 			if value, found := paint_of(paints, data.paint); found {
-				_draw_border(buffer, bounds, clip, value.border, data.width, value.style)
+				_draw_border(buffer, bounds, clip, value.border, data.width, value.style, profile) or_return
 			}
 		case layout.Text_Cmd:
 			if value, found := paint_of(paints, data.paint); found {
@@ -78,36 +80,61 @@ draw_commands :: proc(
 }
 
 @(private)
-_draw_border :: proc(buffer: ^term.Frame_Buffer, rect, clip: Cell_Rect, border: Border, width: layout.Edges, style: term.Style) {
-	if rect.width <= 0 || rect.height <= 0 || border.horizontal == "" || border.vertical == "" {
-		return
+_border_glyph :: proc(glyph: string, profile: width_text.Width_Profile) -> (cell: string, ok: bool) {
+	if glyph == "" {
+		return " ", true
+	}
+	return glyph, width_text.cluster_width(glyph, profile) == 1
+}
+
+@(private)
+_draw_border :: proc(
+	buffer: ^term.Frame_Buffer,
+	rect, clip: Cell_Rect,
+	border: Border,
+	width: layout.Edges,
+	style: term.Style,
+	profile: width_text.Width_Profile,
+) -> Draw_Error {
+	top_left, top_left_ok := _border_glyph(border.top_left, profile)
+	top_right, top_right_ok := _border_glyph(border.top_right, profile)
+	bottom_left, bottom_left_ok := _border_glyph(border.bottom_left, profile)
+	bottom_right, bottom_right_ok := _border_glyph(border.bottom_right, profile)
+	horizontal, horizontal_ok := _border_glyph(border.horizontal, profile)
+	vertical, vertical_ok := _border_glyph(border.vertical, profile)
+	if !(top_left_ok && top_right_ok && bottom_left_ok && bottom_right_ok && horizontal_ok && vertical_ok) {
+		return .Invalid_Border
+	}
+	if rect.width <= 0 || rect.height <= 0 {
+		return .None
 	}
 	right := rect.x + rect.width - 1
 	bottom := rect.y + rect.height - 1
 	top_edge, bottom_edge := width.top > 0, width.bottom > 0
 	left_edge, right_edge := width.left > 0, width.right > 0
 	if top_edge {
-		_ = _fill_clipped(buffer, {rect.x, rect.y, rect.width, 1}, clip, border.horizontal, style)
+		_ = _fill_clipped(buffer, {rect.x, rect.y, rect.width, 1}, clip, horizontal, style)
 	}
 	if bottom_edge {
-		_ = _fill_clipped(buffer, {rect.x, bottom, rect.width, 1}, clip, border.horizontal, style)
+		_ = _fill_clipped(buffer, {rect.x, bottom, rect.width, 1}, clip, horizontal, style)
 	}
 	if left_edge {
-		_ = _fill_clipped(buffer, {rect.x, rect.y, 1, rect.height}, clip, border.vertical, style)
+		_ = _fill_clipped(buffer, {rect.x, rect.y, 1, rect.height}, clip, vertical, style)
 	}
 	if right_edge {
-		_ = _fill_clipped(buffer, {right, rect.y, 1, rect.height}, clip, border.vertical, style)
+		_ = _fill_clipped(buffer, {right, rect.y, 1, rect.height}, clip, vertical, style)
 	}
 	if top_edge && left_edge {
-		_ = _fill_clipped(buffer, {rect.x, rect.y, 1, 1}, clip, border.top_left, style)
+		_ = _fill_clipped(buffer, {rect.x, rect.y, 1, 1}, clip, top_left, style)
 	}
 	if top_edge && right_edge {
-		_ = _fill_clipped(buffer, {right, rect.y, 1, 1}, clip, border.top_right, style)
+		_ = _fill_clipped(buffer, {right, rect.y, 1, 1}, clip, top_right, style)
 	}
 	if bottom_edge && left_edge {
-		_ = _fill_clipped(buffer, {rect.x, bottom, 1, 1}, clip, border.bottom_left, style)
+		_ = _fill_clipped(buffer, {rect.x, bottom, 1, 1}, clip, bottom_left, style)
 	}
 	if bottom_edge && right_edge {
-		_ = _fill_clipped(buffer, {right, bottom, 1, 1}, clip, border.bottom_right, style)
+		_ = _fill_clipped(buffer, {right, bottom, 1, 1}, clip, bottom_right, style)
 	}
+	return .None
 }

@@ -15,7 +15,7 @@ import "nabla:term"
 import "nabla:tui"
 
 // App is the whole slice state: a viewport and one selectable label. It is the
-// smallest model that exercises Key and Resize without inventing a framework.
+// smallest model that exercises Key without inventing a framework.
 App :: struct {
 	columns:  int,
 	rows:     int,
@@ -40,9 +40,6 @@ update :: proc(app: ^App, event: input.Event) {
 		case .Up:
 			app.selected = max(app.selected - 1, 0)
 		}
-	case input.Resize_Event:
-		app.columns = data.columns
-		app.rows = data.rows
 	case input.Paste:
 	// The slice test has no paste handling; the paste is ignored.
 	case input.End_Of_Input:
@@ -291,7 +288,8 @@ test_resize_recomputes_geometry :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Render_Error.None)
 	testing.expect_value(t, storage.buffer.columns, 24)
 
-	update(&app, input.Resize_Event{columns = 10, rows = 4})
+	app.columns = 10
+	app.rows = 4
 	_, resized_err := render(app, &storage)
 	testing.expect_value(t, resized_err, Render_Error.None)
 	testing.expect_value(t, storage.buffer.columns, 10)

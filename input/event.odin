@@ -60,11 +60,6 @@ Key_Event :: struct {
 	kind:      Key_Kind,
 }
 
-Resize_Event :: struct {
-	columns: int,
-	rows:    int,
-}
-
 // Mouse_Button names which control produced a mouse report: None for motion
 // with no button held, the three physical buttons, plus the four wheel
 // directions of the SGR protocol's 64..67 block.
@@ -113,7 +108,6 @@ Unknown_Input :: struct {}
 
 Event :: union #no_nil {
 	Key_Event,
-	Resize_Event,
 	Mouse_Event,
 	Paste,
 	End_Of_Input,

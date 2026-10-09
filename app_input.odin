@@ -468,7 +468,6 @@ handle_event :: proc(app: ^App, event: input.Event) {
 		if !app.menu_open {
 			handle_mouse(app, data)
 		}
-	case input.Resize_Event:
 	case input.Paste:
 		paste_insert(app, data.text)
 	case input.End_Of_Input:

@@ -5,7 +5,7 @@ import "base:runtime"
 import "nabla:layout"
 import "nabla:term"
 
-// Border is the glyph set a Border_Cmd draws with. The zero value draws nothing.
+// Border is the glyph set a Border_Cmd draws with. An empty glyph draws as a space.
 Border :: struct {
 	top_left, top_right, bottom_left, bottom_right: string,
 	horizontal, vertical:                           string,
