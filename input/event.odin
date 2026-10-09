@@ -75,7 +75,7 @@ Mouse_Button :: enum u8 {
 }
 
 // Mouse_Event is one SGR mouse report (DECSET 1002 + 1006). x and y are the
-// cell coordinates as the protocol sends them, 1-based. release marks a
+// zero-based cell the pointer is on; the protocol sends 1-based cells and the parser converts. release marks a
 // button release and motion a movement report (a drag, or button None for a
 // hover); wheel reports carry neither.
 Mouse_Event :: struct {

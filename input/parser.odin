@@ -541,8 +541,8 @@ parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, 
 		return parser_emit(events, Unknown_Input{}, allocator)
 	}
 	mouse := Mouse_Event {
-		x = x,
-		y = y,
+		x = x - 1,
+		y = y - 1,
 	}
 	if control_byte & 4 != 0 {
 		mouse.modifiers += {.Shift}

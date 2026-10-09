@@ -11,6 +11,7 @@ import input "nabla:input"
 import "nabla:layout"
 import "nabla:term"
 import "nabla:text"
+import "nabla:tui"
 import "nabla:tui/widgets"
 
 // --- input handling -------------------------------------------------------
@@ -199,7 +200,7 @@ MOUSE_WHEEL_LINES :: 3
 tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 	frame_result, frame_error := layout.result(&app.storage.layout_ctx)
 	if frame_error != .None { return 0 }
-	point := layout.Vec2{layout.Scalar(x - app.conversation_rect.x), layout.Scalar(y - app.conversation_rect.y)}
+	point := tui.layout_point(app.conversation_rect, x, y)
 	// The innermost hit is usually a text row inside the box, which carries no entry id.
 	stack_storage: [32]layout.Node_Handle
 	hits, _ := layout.hit_stack(frame_result, point, stack_storage[:])
@@ -231,8 +232,7 @@ tool_box_scroll :: proc(entry: ^Entry, button: input.Mouse_Button) -> bool {
 // the messages area. The box is asked first and asked of the frame itself, so it keeps
 // the wheel wherever it sits in the transcript.
 wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
-	// The terminal reports mouse cells one-based; the frame is solved from zero.
-	if entry_id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1); entry_id != 0 {
+	if entry_id := tool_box_entry_id(app, mouse.x, mouse.y); entry_id != 0 {
 		sync.mutex_lock(&app.run.mu)
 		consumed := false
 		if entry := entry_find(app, entry_id); entry != nil {
@@ -241,7 +241,7 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 		sync.mutex_unlock(&app.run.mu)
 		if consumed { return }
 	}
-	if mouse.y > app.rows - TUI_FOOTER_ROWS {
+	if mouse.y >= app.rows - TUI_FOOTER_ROWS {
 		return
 	}
 	#partial switch mouse.button {
@@ -261,13 +261,13 @@ Cell_Point :: struct {
 
 // selection_point converts a mouse report into a transcript cell, clamped to the
 // transcript so a drag that leaves the area still selects up to its edge. The
-// report is 1-based and in screen cells; the frame is 0-based and solved in the
-// transcript's own coordinates, which is the offset conversation_rect carries.
+// frame is solved in the transcript's own coordinates, which is the offset
+// conversation_rect carries.
 @(require_results)
 selection_point :: proc(app: ^App, mouse: input.Mouse_Event) -> (point: Cell_Point, inside: bool) {
-	x := mouse.x - 1 - app.conversation_rect.x
-	y := mouse.y - 1 - app.conversation_rect.y
-	inside = x >= 0 && y >= 0 && x < app.conversation_rect.width && y < app.conversation_rect.height
+	x := mouse.x - app.conversation_rect.x
+	y := mouse.y - app.conversation_rect.y
+	inside = tui.rect_contains(app.conversation_rect, mouse.x, mouse.y)
 	return {clamp(x, 0, max(app.conversation_rect.width - 1, 0)), clamp(y, 0, max(app.conversation_rect.height - 1, 0))}, inside
 }
 
@@ -360,7 +360,7 @@ tool_box_rect :: proc(app: ^App, id: u64) -> (rect: layout.Rect, found: bool) {
 
 // box_click toggles the tool box under a released click.
 box_click :: proc(app: ^App, mouse: input.Mouse_Event) {
-	id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1)
+	id := tool_box_entry_id(app, mouse.x, mouse.y)
 	if id == 0 { return }
 	sync.mutex_lock(&app.run.mu)
 	call: journal.Call_Id
@@ -374,12 +374,12 @@ box_click :: proc(app: ^App, mouse: input.Mouse_Event) {
 box_result_row :: proc(app: ^App, id: u64, mouse: input.Mouse_Event) -> (row: int, found: bool) {
 	rect, rect_found := tool_box_rect(app, id)
 	if !rect_found { return 0, false }
-	return mouse.y - 1 - app.conversation_rect.y - int(rect.position.y) - 1, true
+	return mouse.y - app.conversation_rect.y - int(rect.position.y) - 1, true
 }
 
 // box_drag_begin starts a drag on the result rows of an expanded box and reports whether it did.
 box_drag_begin :: proc(app: ^App, mouse: input.Mouse_Event) -> bool {
-	id := tool_box_entry_id(app, mouse.x - 1, mouse.y - 1)
+	id := tool_box_entry_id(app, mouse.x, mouse.y)
 	row, found := box_result_row(app, id, mouse)
 	if id == 0 || !found { return false }
 	sync.mutex_guard(&app.run.mu)

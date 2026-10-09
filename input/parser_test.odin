@@ -202,11 +202,11 @@ test_overlong_utf8_emits_unknown_and_resyncs :: proc(t: ^testing.T) {
 
 @(test)
 test_sgr_mouse_modifiers_motion_and_unknown_buttons :: proc(t: ^testing.T) {
-	_feed_events(t, "\e[<4;1;2M", []Event{Mouse_Event{button = .Left, x = 1, y = 2, modifiers = {.Shift}}})
-	_feed_events(t, "\e[<24;3;4m", []Event{Mouse_Event{button = .Left, x = 3, y = 4, modifiers = {.Alt, .Control}, release = true}})
-	_feed_events(t, "\e[<68;5;6M", []Event{Mouse_Event{button = .Wheel_Up, x = 5, y = 6, modifiers = {.Shift}}})
-	_feed_events(t, "\e[<35;7;8M", []Event{Mouse_Event{button = .None, x = 7, y = 8, motion = true}})
-	_feed_events(t, "\e[<34;7;8M", []Event{Mouse_Event{button = .Right, x = 7, y = 8, motion = true}})
+	_feed_events(t, "\e[<4;1;2M", []Event{Mouse_Event{button = .Left, x = 0, y = 1, modifiers = {.Shift}}})
+	_feed_events(t, "\e[<24;3;4m", []Event{Mouse_Event{button = .Left, x = 2, y = 3, modifiers = {.Alt, .Control}, release = true}})
+	_feed_events(t, "\e[<68;5;6M", []Event{Mouse_Event{button = .Wheel_Up, x = 4, y = 5, modifiers = {.Shift}}})
+	_feed_events(t, "\e[<35;7;8M", []Event{Mouse_Event{button = .None, x = 6, y = 7, motion = true}})
+	_feed_events(t, "\e[<34;7;8M", []Event{Mouse_Event{button = .Right, x = 6, y = 7, motion = true}})
 	_feed_events(t, "\e[<128;1;1M\e[<129;1;1M", []Event{Unknown_Input{}, Unknown_Input{}})
 }
 
@@ -224,11 +224,11 @@ test_bracketed_paste :: proc(t: ^testing.T) {
 test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
 	// Wheel up/down with extended coordinates, a button press, its release,
 	// and a drag (motion with the button held).
-	_feed_events(t, "\e[<64;10;5M", []Event{Mouse_Event{button = .Wheel_Up, x = 10, y = 5}})
-	_feed_events(t, "\e[<65;10;5M", []Event{Mouse_Event{button = .Wheel_Down, x = 10, y = 5}})
-	_feed_events(t, "\e[<0;12;9M", []Event{Mouse_Event{button = .Left, x = 12, y = 9}})
-	_feed_events(t, "\e[<0;12;9m", []Event{Mouse_Event{button = .Left, x = 12, y = 9, release = true}})
-	_feed_events(t, "\e[<32;7;7M", []Event{Mouse_Event{button = .Left, x = 7, y = 7, motion = true}})
+	_feed_events(t, "\e[<64;10;5M", []Event{Mouse_Event{button = .Wheel_Up, x = 9, y = 4}})
+	_feed_events(t, "\e[<65;10;5M", []Event{Mouse_Event{button = .Wheel_Down, x = 9, y = 4}})
+	_feed_events(t, "\e[<0;12;9M", []Event{Mouse_Event{button = .Left, x = 11, y = 8}})
+	_feed_events(t, "\e[<0;12;9m", []Event{Mouse_Event{button = .Left, x = 11, y = 8, release = true}})
+	_feed_events(t, "\e[<32;7;7M", []Event{Mouse_Event{button = .Left, x = 6, y = 6, motion = true}})
 
 	// Coordinates the size of a wide terminal still fit the parameter buffer,
 	// a report split across feeds waits for its final byte, and a malformed
@@ -244,7 +244,7 @@ test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
 	final := "M"
 	testing.expect(t, feed(&parser, transmute([]byte)final, &events) == nil, "final must not error")
 	testing.expect_value(t, len(events), 1)
-	testing.expect_value(t, events[0], Event(Mouse_Event{button = .Left, x = 1000, y = 900}))
+	testing.expect_value(t, events[0], Event(Mouse_Event{button = .Left, x = 999, y = 899}))
 	events_clear(&events)
 	malformed := []string{"\e[<0;;1M", "\e[<3;1;1M"}
 	for data in malformed {

@@ -714,17 +714,16 @@ test_wheel_scrolls_the_tool_box_under_the_pointer :: proc(t: ^testing.T) {
 	notice_row := conversation_row_with(app.storage, "notice")
 	if !testing.expect(t, box_row >= 0 && notice_row >= 0, "both entries must be drawn") { return }
 
-	// The terminal reports mouse cells one-based, so the frame's row and column
-	// each gain one.
+	// The pointer is on the second cell of the box's first content row.
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
-	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Down, x = box_column + 2, y = box_row + 2})
+	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Down, x = box_column + 1, y = box_row + 1})
 	testing.expect_value(t, widgets.scroll_offset(app.run.snap.entries[1].tool_scroll), MOUSE_WHEEL_LINES)
 	testing.expect_value(t, scrolled_back(app), 0)
 
-	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = box_column + 2, y = box_row + 2})
+	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = box_column + 1, y = box_row + 1})
 	testing.expect_value(t, widgets.scroll_offset(app.run.snap.entries[1].tool_scroll), 0)
 
-	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = box_column + 2, y = notice_row + 1})
+	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = box_column + 2, y = notice_row})
 	testing.expect_value(t, widgets.scroll_offset(app.run.snap.entries[1].tool_scroll), 0)
 	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
 }
@@ -757,8 +756,8 @@ test_wheel_ignores_a_stale_tool_box_ordinal :: proc(t: ^testing.T) {
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
 	report := input.Mouse_Event {
 		button = .Wheel_Up,
-		x      = box_column + 2,
-		y      = box_row + 2,
+		x      = box_column + 1,
+		y      = box_row + 1,
 	}
 
 	snapshot_clear(app)
@@ -801,8 +800,8 @@ test_wheel_falls_through_a_tool_box_at_its_boundary :: proc(t: ^testing.T) {
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
 	report := input.Mouse_Event {
 		button = .Wheel_Up,
-		x      = box_column + 2,
-		y      = box_row + 2,
+		x      = box_column + 1,
+		y      = box_row + 1,
 	}
 
 	// At the first row there is nothing above to show, so the transcript scrolls.
@@ -853,16 +852,15 @@ test_a_collapsed_tool_box_never_captures_the_wheel :: proc(t: ^testing.T) {
 	box_column := frame_glyph_column(app.storage, box_row, "╭")
 	for button in ([]input.Mouse_Button{.Wheel_Up, .Wheel_Down}) {
 		scroll_back(app, 10)
-		wheel_scroll(app, input.Mouse_Event{button = button, x = box_column + 2, y = box_row + 2})
+		wheel_scroll(app, input.Mouse_Event{button = button, x = box_column + 1, y = box_row + 1})
 		testing.expect_value(t, widgets.scroll_offset(app.run.snap.entries[0].tool_scroll), 0)
 		testing.expect_value(t, scrolled_back(app), 10 + MOUSE_WHEEL_LINES if button == .Wheel_Up else 10 - MOUSE_WHEEL_LINES)
 	}
 }
 
-// selection_report builds a mouse report for a screen cell. The terminal's
-// coordinates are one-based, so a cell gains one.
+// selection_report builds a mouse report for a screen cell.
 selection_report :: proc(button: input.Mouse_Button, column, row: int, motion := false, release := false) -> input.Mouse_Event {
-	return {button = button, x = column + 1, y = row + 1, motion = motion, release = release}
+	return {button = button, x = column, y = row, motion = motion, release = release}
 }
 
 // selection_app builds an app whose transcript holds two short entries and

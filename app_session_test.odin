@@ -1111,8 +1111,8 @@ app_click :: proc(app: ^App, storage: ^Frame_Storage, needle: string) {
 	row := app_row_with(storage, needle)
 	press := input.Mouse_Event {
 		button = .Left,
-		x      = 4,
-		y      = row + 1,
+		x      = 3,
+		y      = row,
 	}
 	handle_mouse(app, press)
 	press.release = true
