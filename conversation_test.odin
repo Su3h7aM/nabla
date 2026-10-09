@@ -23,8 +23,8 @@ import "nabla:tui/widgets"
 // stay legible in failure messages.
 conversation_glyph_row :: proc(storage: ^Frame_Storage, row: int, scratch: []byte) -> string {
 	count := 0
-	for column in 0 ..< storage.buffer.columns {
-		grapheme := storage.buffer.cells[row * storage.buffer.columns + column].grapheme
+	for column in 0 ..< storage.screen.buffer.columns {
+		grapheme := storage.screen.buffer.cells[row * storage.screen.buffer.columns + column].grapheme
 		if len(grapheme) > 0 {
 			scratch[count] = grapheme[0]
 		} else {
@@ -39,11 +39,7 @@ conversation_glyph_row :: proc(storage: ^Frame_Storage, row: int, scratch: []byt
 // conversation once. The storage owns its cells, so frame_storage_destroy
 // releases everything this allocates.
 conversation_render :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage, cols, rows: int) -> bool {
-	if storage.cells != nil {
-		delete(storage.cells, context.allocator)
-	}
-	storage.cells = make([]term.Cell, cols * rows, context.allocator)
-	if !tui.init(&storage.buffer, cols, rows, storage.cells) {
+	if _, err := tui.screen_begin(&storage.screen, cols, rows); err != nil {
 		testing.expect(t, false, "frame buffer must initialize")
 		return false
 	}
@@ -81,10 +77,10 @@ test_conversation_wraps_user_message_with_background :: proc(t: ^testing.T) {
 
 	// Every band row carries the message's background, and the separator row
 	// below the band does not.
-	testing.expect_value(t, storage.buffer.cells[0].style, USER_TEXT)
-	testing.expect_value(t, storage.buffer.cells[19].style, USER_TEXT)
-	testing.expect_value(t, storage.buffer.cells[3 * 20].style, USER_TEXT)
-	testing.expect_value(t, storage.buffer.cells[4 * 20].style, term.Style{})
+	testing.expect_value(t, storage.screen.buffer.cells[0].style, USER_TEXT)
+	testing.expect_value(t, storage.screen.buffer.cells[19].style, USER_TEXT)
+	testing.expect_value(t, storage.screen.buffer.cells[3 * 20].style, USER_TEXT)
+	testing.expect_value(t, storage.screen.buffer.cells[4 * 20].style, term.Style{})
 }
 
 // An empty line inside one user message is still one message: the band's
@@ -112,10 +108,10 @@ test_user_message_empty_line_keeps_the_background :: proc(t: ^testing.T) {
 	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "                    ")
 
 	for row in 0 ..< 5 {
-		testing.expect_value(t, storage.buffer.cells[row * 20].style, USER_TEXT)
-		testing.expect_value(t, storage.buffer.cells[row * 20 + 19].style, USER_TEXT)
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20].style, USER_TEXT)
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style, USER_TEXT)
 	}
-	testing.expect_value(t, storage.buffer.cells[5 * 20].style, term.Style{})
+	testing.expect_value(t, storage.screen.buffer.cells[5 * 20].style, term.Style{})
 }
 
 // A subagent message is a band like a user message: its heading is the first line
@@ -149,12 +145,12 @@ test_subagent_message_keeps_the_band_around_heading_and_body :: proc(t: ^testing
 	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "                    ")
 
 	for row in 0 ..< 5 {
-		testing.expect_value(t, storage.buffer.cells[row * 20].style.background, SUBAGENT_TEXT.background)
-		testing.expect_value(t, storage.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20].style.background, SUBAGENT_TEXT.background)
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
 	}
-	testing.expect_value(t, storage.buffer.cells[5 * 20].style, term.Style{})
+	testing.expect_value(t, storage.screen.buffer.cells[5 * 20].style, term.Style{})
 	for row in 6 ..< 9 {
-		testing.expect_value(t, storage.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
 	}
 }
 
@@ -345,8 +341,8 @@ test_conversation_wraps_after_a_long_unbreakable_token :: proc(t: ^testing.T) {
 // frame_glyph_column returns the first column of row whose grapheme is glyph,
 // or -1 when the row does not carry it.
 frame_glyph_column :: proc(storage: ^Frame_Storage, row: int, glyph: string) -> int {
-	for column in 0 ..< storage.buffer.columns {
-		if storage.buffer.cells[row * storage.buffer.columns + column].grapheme == glyph {
+	for column in 0 ..< storage.screen.buffer.columns {
+		if storage.screen.buffer.cells[row * storage.screen.buffer.columns + column].grapheme == glyph {
 			return column
 		}
 	}
@@ -366,10 +362,11 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	}
 	app.run.alloc = context.allocator
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	defer widgets.input_destroy(&app.input)
 	app.columns = 40
 	app.rows = 14
-	testing.expect(t, widgets.input_insert(&app.input, "prompt"))
+	testing.expect(t, widgets.input_insert(&app.input, "prompt") == nil)
 	snap_append(app, .Tool, "shell\nfirst line")
 	app.run.snap.entries[0].tool_outcome = .Success
 
@@ -389,7 +386,7 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	}
 	if !testing.expect(t, tool_row >= 0 && prompt_row > tool_row, "both boxes must be drawn") { return }
 
-	columns := storage.buffer.columns
+	columns := storage.screen.buffer.columns
 	tool_border := frame_glyph_column(storage, tool_row, "╭")
 	prompt_border := frame_glyph_column(storage, prompt_row, "╭")
 	testing.expect_value(t, tool_border, prompt_border)
@@ -399,15 +396,15 @@ test_tool_box_matches_the_prompt_box :: proc(t: ^testing.T) {
 	testing.expect_value(t, frame_glyph_column(storage, content_row, "f"), frame_glyph_column(storage, prompt_row + 1, "p"))
 
 	// The outline is green for a success and the text between the bars is not.
-	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_SUCCESS)
-	testing.expect_value(t, storage.buffer.cells[content_row * columns + frame_glyph_column(storage, content_row, "│")].style, TOOL_SUCCESS)
-	testing.expect_value(t, storage.buffer.cells[content_row * columns + frame_glyph_column(storage, content_row, "f")].style, TOOL_BODY)
+	testing.expect_value(t, storage.screen.buffer.cells[tool_row * columns + tool_border].style, TOOL_SUCCESS)
+	testing.expect_value(t, storage.screen.buffer.cells[content_row * columns + frame_glyph_column(storage, content_row, "│")].style, TOOL_SUCCESS)
+	testing.expect_value(t, storage.screen.buffer.cells[content_row * columns + frame_glyph_column(storage, content_row, "f")].style, TOOL_BODY)
 
 	// A failed call draws the same box in the failure color.
 	app.run.snap.entries[0].tool_outcome = .Tool_Failed
 	_, frame_error = render_frame(app, storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
-	testing.expect_value(t, storage.buffer.cells[tool_row * columns + tool_border].style, TOOL_FAILURE)
+	testing.expect_value(t, storage.screen.buffer.cells[tool_row * columns + tool_border].style, TOOL_FAILURE)
 }
 
 @(test)
@@ -421,6 +418,7 @@ test_display_allocation_failure_is_reported_in_the_footer_once :: proc(t: ^testi
 	app.columns = 60
 	app.rows = 8
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	defer widgets.input_destroy(&app.input)
 
 	conversation_test_report_dropped(app)
@@ -448,6 +446,7 @@ test_tool_box_with_tabs_keeps_the_right_border :: proc(t: ^testing.T) {
 	}
 	app.run.alloc = context.allocator
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	defer widgets.input_destroy(&app.input)
 	app.columns = 40
 	app.rows = 20
@@ -468,12 +467,12 @@ test_tool_box_with_tabs_keeps_the_right_border :: proc(t: ^testing.T) {
 	}
 	if !testing.expect(t, tool_row >= 0, "the tool box must be drawn") { return }
 
-	columns := storage.buffer.columns
+	columns := storage.screen.buffer.columns
 	right := -1
 	for row in tool_row ..< app.rows {
 		has_left := false
 		for column in 0 ..< columns {
-			grapheme := storage.buffer.cells[row * columns + column].grapheme
+			grapheme := storage.screen.buffer.cells[row * columns + column].grapheme
 			if grapheme == "╭" || grapheme == "│" || grapheme == "╰" {
 				has_left = true
 				break
@@ -482,7 +481,7 @@ test_tool_box_with_tabs_keeps_the_right_border :: proc(t: ^testing.T) {
 		if !has_left { break }
 		column := -1
 		for c in 0 ..< columns {
-			grapheme := storage.buffer.cells[row * columns + c].grapheme
+			grapheme := storage.screen.buffer.cells[row * columns + c].grapheme
 			if grapheme == "╮" || grapheme == "│" || grapheme == "╯" {
 				column = c
 			}
@@ -513,10 +512,10 @@ test_user_message_band_spans_the_terminal_width :: proc(t: ^testing.T) {
 	_, frame_error := render_frame(app, storage)
 	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
 
-	columns := storage.buffer.columns
+	columns := storage.screen.buffer.columns
 	text_row := -1
 	for row in 0 ..< app.rows {
-		if storage.buffer.cells[row * columns + 1].grapheme == "h" {
+		if storage.screen.buffer.cells[row * columns + 1].grapheme == "h" {
 			text_row = row
 			break
 		}
@@ -524,21 +523,21 @@ test_user_message_band_spans_the_terminal_width :: proc(t: ^testing.T) {
 	if !testing.expect(t, text_row > 0 && text_row + 1 < app.rows, "the user message must be drawn") { return }
 
 	for row in text_row - 1 ..= text_row + 1 {
-		testing.expect_value(t, storage.buffer.cells[row * columns].style, USER_TEXT)
-		testing.expect_value(t, storage.buffer.cells[row * columns + columns - 1].style, USER_TEXT)
+		testing.expect_value(t, storage.screen.buffer.cells[row * columns].style, USER_TEXT)
+		testing.expect_value(t, storage.screen.buffer.cells[row * columns + columns - 1].style, USER_TEXT)
 	}
-	testing.expect_value(t, storage.buffer.cells[text_row * columns].grapheme, " ")
-	testing.expect_value(t, storage.buffer.cells[text_row * columns + 1].grapheme, "h")
-	testing.expect_value(t, storage.buffer.cells[(text_row - 1) * columns].grapheme, " ")
-	testing.expect_value(t, storage.buffer.cells[(text_row + 1) * columns].grapheme, " ")
+	testing.expect_value(t, storage.screen.buffer.cells[text_row * columns].grapheme, " ")
+	testing.expect_value(t, storage.screen.buffer.cells[text_row * columns + 1].grapheme, "h")
+	testing.expect_value(t, storage.screen.buffer.cells[(text_row - 1) * columns].grapheme, " ")
+	testing.expect_value(t, storage.screen.buffer.cells[(text_row + 1) * columns].grapheme, " ")
 }
 
 // conversation_glyph_text reads one row of the grid keeping whole graphemes, so
 // a row that carries a multi-byte border glyph can still be searched.
 conversation_glyph_text :: proc(storage: ^Frame_Storage, row: int, scratch: []byte) -> string {
 	count := 0
-	for column in 0 ..< storage.buffer.columns {
-		grapheme := storage.buffer.cells[row * storage.buffer.columns + column].grapheme
+	for column in 0 ..< storage.screen.buffer.columns {
+		grapheme := storage.screen.buffer.cells[row * storage.screen.buffer.columns + column].grapheme
 		if len(grapheme) == 0 {
 			scratch[count] = ' '
 			count += 1
@@ -554,7 +553,7 @@ conversation_glyph_text :: proc(storage: ^Frame_Storage, row: int, scratch: []by
 // conversation_row_with returns the first row whose text contains needle, or -1.
 conversation_row_with :: proc(storage: ^Frame_Storage, needle: string) -> int {
 	scratch: [4096]byte
-	for row in 0 ..< storage.buffer.rows {
+	for row in 0 ..< storage.screen.buffer.rows {
 		if strings.contains(conversation_glyph_text(storage, row, scratch[:]), needle) { return row }
 	}
 	return -1
@@ -910,12 +909,12 @@ test_selection_marks_the_dragged_cells :: proc(t: ^testing.T) {
 
 	// "alpha" starts one cell in, because the transcript's inset is part of the
 	// band a selection covers.
-	columns := app.storage.buffer.columns
+	columns := app.storage.screen.buffer.columns
 	for column in 1 ..= 5 {
-		testing.expect_value(t, app.storage.buffer.cells[column].style.modifiers, term.Modifiers{.Reverse})
+		testing.expect_value(t, app.storage.screen.buffer.cells[column].style.modifiers, term.Modifiers{.Reverse})
 	}
-	testing.expect(t, .Reverse not_in app.storage.buffer.cells[6].style.modifiers, "a cell past the drag must stay unmarked")
-	testing.expect(t, .Reverse not_in app.storage.buffer.cells[columns + 1].style.modifiers, "the next row must stay unmarked")
+	testing.expect(t, .Reverse not_in app.storage.screen.buffer.cells[6].style.modifiers, "a cell past the drag must stay unmarked")
+	testing.expect(t, .Reverse not_in app.storage.screen.buffer.cells[columns + 1].style.modifiers, "the next row must stay unmarked")
 }
 
 // The copied text is the rows the drag covers, one line each, with the padding

@@ -57,7 +57,7 @@ image_test_frame :: proc(app: ^App, storage: ^Frame_Storage) -> Render_Status {
 }
 
 image_test_count_placeholders :: proc(storage: ^Frame_Storage) -> (count: int) {
-	for cell in storage.buffer.cells {
+	for cell in storage.screen.buffer.cells {
 		if strings.has_prefix(cell.grapheme, term.GRAPHICS_PLACEHOLDER) { count += 1 }
 	}
 	return
@@ -70,6 +70,7 @@ image_test_app :: proc(app: ^App, enabled: bool, columns, rows: int, width, heig
 	app.columns = columns
 	app.rows = rows
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	result := agent.Tool_Result {
 		content     = "ok\n\nread a.png",
 		outcome     = .Success,
@@ -107,8 +108,8 @@ test_tool_image_is_drawn_inside_the_box :: proc(t: ^testing.T) {
 	if !testing.expect_value(t, image_test_frame(app, storage), Render_Status.None) { return }
 	shown := image_test_count_placeholders(storage)
 	testing.expect(t, shown > 0 && shown < placement.columns * placement.rows, "only the rows inside the transcript are drawn")
-	prompt_top := (app.rows - 5) * storage.buffer.columns
-	testing.expect_value(t, storage.buffer.cells[prompt_top + 1].grapheme, "╭")
+	prompt_top := (app.rows - 5) * storage.screen.buffer.columns
+	testing.expect_value(t, storage.screen.buffer.cells[prompt_top + 1].grapheme, "╭")
 }
 
 // A large picture stays within the maximums, and a tiny one is enlarged to the minimum height.
@@ -131,7 +132,7 @@ test_tool_image_size_is_bounded :: proc(t: ^testing.T) {
 	testing.expect(t, placement.columns <= IMAGE_MAX_COLUMNS, "no wider than the maximum")
 	testing.expect(t, placement.rows <= storage.conversation_rows / 2, "no taller than half the conversation")
 	testing.expect_value(t, image_test_count_placeholders(storage), placement.columns * placement.rows)
-	for cell in storage.buffer.cells[(app.conversation_rect.y + app.conversation_rect.height) * storage.buffer.columns:] {
+	for cell in storage.screen.buffer.cells[(app.conversation_rect.y + app.conversation_rect.height) * storage.screen.buffer.columns:] {
 		if strings.has_prefix(cell.grapheme, term.GRAPHICS_PLACEHOLDER) {
 			testing.fail_now(t, "the prompt and footer rows hold no picture")
 		}
@@ -249,6 +250,7 @@ test_unreadable_jpeg_leaves_the_text_preview :: proc(t: ^testing.T) {
 	app.columns = 60
 	app.rows = 20
 	widgets.input_init(&app.input, context.allocator)
+	widgets.history_init(&app.history, context.allocator)
 	defer widgets.input_destroy(&app.input)
 	result := agent.Tool_Result {
 		content     = "ok\n\nread a.jpg",

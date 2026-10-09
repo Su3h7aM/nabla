@@ -78,6 +78,16 @@
 // term.graphics_place). The image is then ordinary cells that clip and scroll like text;
 // a rect clipped at its left edge draws nothing, since each row names column 0.
 //
+// Screen owns the frame lifecycle of one terminal so a program need not keep
+// its own buffers. screen_init binds an allocator; each frame calls
+// screen_begin for a blanked term.Frame_Buffer of the viewport's size, draws
+// into it, sets its links, and calls screen_present. screen_present writes only
+// the cells that changed since the last presented frame, grows its output
+// scratch when term.present asks, and remembers the frame on success. A failed
+// present, or screen_invalidate (after a resize or any outside write to the
+// terminal), makes the next frame a full one. The zero Screen is inert, and
+// screen_destroy releases everything.
+//
 // The widgets subpackage owns reusable UI behavior and caller-owned widget
 // state. Events remain in nabla:input. Terminal sessions, styles, colors,
 // buffers, cursors, and presentation remain in nabla:term. tui is not a facade

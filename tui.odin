@@ -173,22 +173,11 @@ Render_Status :: enum u8 {
 	Allocation_Failed,
 }
 
-// Frame_Storage is the caller-owned frame budget: the cell grid backing, the
-// Markdown presentation cache, the presentation scratch, and the layout
-// context, whose storage grows to the transcript it is given.
+// Frame_Storage is the caller-owned frame budget: the screen, the Markdown
+// presentation cache, and the layout context, whose storage grows to the
+// transcript it is given.
 Frame_Storage :: struct {
-	cells:             []term.Cell,
-	buffer:            term.Frame_Buffer,
-	output:            []byte,
-	// previous is a copy of the last frame that reached the terminal, which term.present
-	// diffs against; its strings live in previous_text, because the grid's own point into
-	// frame scratch that the next frame recycles. It is only meaningful while
-	// previous_known is set: a failed present, or a frame never presented, leaves it unset.
-	previous:          term.Frame_Buffer,
-	previous_known:    bool,
-	previous_cells:    []term.Cell,
-	previous_text:     []byte,
-	previous_links:    [dynamic]string,
+	screen:            tui.Screen,
 	alloc:             mem.Allocator,
 	markdown:          Markdown_Cache,
 	// links is this frame's hyperlink table (term.Frame_Buffer.links); the URIs are
@@ -220,8 +209,8 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage, storage_error := new(Frame_Storage, alloc)
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
+	tui.screen_init(&storage.screen, alloc)
 	storage.links = make([dynamic]string, alloc)
-	storage.previous_links = make([dynamic]string, alloc)
 	storage.paints = make(tui.Paints, alloc)
 	storage.shown = make([dynamic]tui.Image_Placement, alloc)
 	storage.placed = make([dynamic]tui.Image_Placement, alloc)
@@ -252,7 +241,6 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 
 frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 	delete(storage.links)
-	delete(storage.previous_links)
 	delete(storage.paints)
 	delete(storage.shown)
 	delete(storage.placed)
@@ -264,79 +252,11 @@ frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 frame_storage_destroy :: proc(storage: ^Frame_Storage) {
 	// A launch that could not allocate the budget has none to release.
 	if storage == nil { return }
-	if storage.cells != nil { delete(storage.cells, storage.alloc) }
-	if storage.output != nil { delete(storage.output, storage.alloc) }
-	if storage.previous_cells != nil { delete(storage.previous_cells, storage.alloc) }
-	if storage.previous_text != nil { delete(storage.previous_text, storage.alloc) }
+	tui.screen_destroy(&storage.screen)
 	markdown_cache_destroy(&storage.markdown)
 	frame_storage_tables_destroy(storage)
 	layout.destroy(&storage.layout_ctx)
 	free(storage, storage.alloc)
-}
-
-// frame_storage_remember copies the frame in storage.buffer into the previous frame, which
-// the next present diffs against. It returns false, and forgets the previous frame, when
-// the copy could not be allocated.
-@(require_results)
-frame_storage_remember :: proc(storage: ^Frame_Storage) -> bool {
-	storage.previous_known = false
-	buffer := storage.buffer
-	count := buffer.columns * buffer.rows
-	text_size := 0
-	for cell in buffer.cells[:count] { text_size += len(cell.grapheme) }
-	for uri in buffer.links { text_size += len(uri) }
-	if len(storage.previous_text) < text_size {
-		text, alloc_error := make([]byte, text_size, storage.alloc)
-		if alloc_error != nil { return false }
-		if storage.previous_text != nil { delete(storage.previous_text, storage.alloc) }
-		storage.previous_text = text
-	}
-	if len(storage.previous_cells) < count {
-		cells, alloc_error := make([]term.Cell, count, storage.alloc)
-		if alloc_error != nil { return false }
-		if storage.previous_cells != nil { delete(storage.previous_cells, storage.alloc) }
-		storage.previous_cells = cells
-	}
-	clear(&storage.previous_links)
-	used := 0
-	copy_text :: proc(text: []byte, used: ^int, value: string) -> string {
-		copy(text[used^:], value)
-		copied := string(text[used^:][:len(value)])
-		used^ += len(value)
-		return copied
-	}
-	for uri in buffer.links {
-		_, append_error := append(&storage.previous_links, copy_text(storage.previous_text, &used, uri))
-		if append_error != nil { return false }
-	}
-	for cell, i in buffer.cells[:count] {
-		storage.previous_cells[i] = cell
-		storage.previous_cells[i].grapheme = copy_text(storage.previous_text, &used, cell.grapheme)
-	}
-	storage.previous = {
-		columns = buffer.columns,
-		rows    = buffer.rows,
-		cells   = storage.previous_cells[:count],
-		links   = storage.previous_links[:],
-	}
-	storage.previous_known = true
-	return true
-}
-
-// ensure_frame grows the cell grid to the viewport: the grid holds one cell per terminal
-// cell, and a terminal that grew since the last frame buys the cells it needs. The
-// presentation scratch is sized from term.present's own required size in present_frame,
-// because no bytes-per-cell bound is valid for a grapheme.
-@(require_results)
-ensure_frame :: proc(storage: ^Frame_Storage, cols, rows: int) -> bool {
-	need := cols * rows
-	if len(storage.cells) < need {
-		cells, alloc_error := make([]term.Cell, need, storage.alloc)
-		if alloc_error != nil { return false }
-		if storage.cells != nil { delete(storage.cells, storage.alloc) }
-		storage.cells = cells
-	}
-	return true
 }
 
 // present_frame renders the runtime snapshot and writes the frame to the terminal. The
@@ -359,29 +279,8 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 		if !transcript_slide(app) { break }
 	}
 	images_sync(app, storage)
-	// Only a frame that is known to be on the terminal can be diffed against; a failed
-	// present or a changed size is answered with a full frame.
-	previous := &storage.previous if storage.previous_known else nil
-	_, required, present_err := term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output, previous)
-	if present_err == term.General_Error.Presentation_Workspace_Too_Small {
-		// The encoder reports the exact required count before writing anything,
-		// so the scratch can be grown once and the frame retried.
-		output, alloc_error := make([]byte, required, storage.alloc)
-		if alloc_error != nil {
-			fmt.eprintln("nabla: present: the frame scratch could not be allocated")
-			return
-		}
-		delete(storage.output, storage.alloc)
-		storage.output = output
-		_, _, present_err = term.present(app.terminal, storage.buffer, term.profile_default(), cursor, storage.output, previous)
-	}
-	if present_err != nil {
-		storage.previous_known = false
+	if present_err := tui.screen_present(&storage.screen, app.terminal, term.profile_default(), cursor); present_err != nil {
 		fmt.eprintln("nabla: present:", present_err)
-		return
-	}
-	if !frame_storage_remember(storage) {
-		fmt.eprintln("nabla: present: the previous frame could not be kept")
 	}
 }
 
@@ -398,10 +297,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	if rows < 6 {
 		return {}, .Too_Small
 	}
-	if !ensure_frame(storage, cols, rows) {
-		return {}, .Buffer_Too_Small
-	}
-	if !tui.init(&storage.buffer, cols, rows, storage.cells) {
+	if _, begin_err := tui.screen_begin(&storage.screen, cols, rows); begin_err != nil {
 		return {}, .Buffer_Too_Small
 	}
 	clear(&storage.shown)
@@ -451,7 +347,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	}
 	images_collect(app, storage)
 	draw_footer(app, storage, cwd_rect, status_rect)
-	storage.buffer.links = storage.links[:]
+	storage.screen.buffer.links = storage.links[:]
 	return cursor, .None
 }
 
@@ -486,7 +382,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			markdown_cache_sweep(&storage.markdown)
 			transcript_measure(app, order, frame_result, rect.height)
 			if !draw_bands(storage, frame_result, rect) { return false }
-			if tui.draw_commands(&storage.buffer, storage.paints[:], frame_result, rect, &storage.shown) != .None { return false }
+			if tui.draw_commands(&storage.screen.buffer, storage.paints[:], frame_result, rect, &storage.shown) != .None { return false }
 			selection_paint(app, storage, rect)
 			box_drag_paint(app, storage, frame_result, rect)
 			return true
@@ -643,7 +539,7 @@ draw_bands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, v
 		if !found || value.style.background == nil { continue }
 		line, project_err := tui.project_rect_integral(command.bounds)
 		if project_err != nil { return false }
-		tui.fill(&storage.buffer, {x = 0, y = viewport.y + line.y, width = storage.buffer.columns, height = 1}, " ", value.style)
+		tui.fill(&storage.screen.buffer, {x = 0, y = viewport.y + line.y, width = storage.screen.buffer.columns, height = 1}, " ", value.style)
 	}
 	return true
 }
@@ -652,12 +548,12 @@ draw_bands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, v
 // themed terminal stays themed. A cell outside the transcript's rect is not painted, so
 // the highlight stops where the content does.
 selection_paint :: proc(app: ^App, storage: ^Frame_Storage, viewport: tui.Cell_Rect) {
-	if !app.selecting || storage.buffer.cells == nil { return }
+	if !app.selecting || storage.screen.buffer.cells == nil { return }
 	start, end := selection_bounds(app)
 	for row in max(start.y, 0) ..= min(end.y, viewport.height - 1) {
 		first, last := selection_row_range(app, row, viewport.width)
 		for column in first ..= last {
-			cell := &storage.buffer.cells[(viewport.y + row) * storage.buffer.columns + viewport.x + column]
+			cell := &storage.screen.buffer.cells[(viewport.y + row) * storage.screen.buffer.columns + viewport.x + column]
 			cell.style.modifiers += {.Reverse}
 		}
 	}
@@ -677,7 +573,7 @@ box_drag_paint :: proc(app: ^App, storage: ^Frame_Storage, frame_result: layout.
 			if y < 0 || y >= viewport.height { continue }
 			for x in int(node.outer.position.x) + 1 ..< int(node.outer.position.x + node.outer.size.x) - 1 {
 				if x < 0 || x >= viewport.width { continue }
-				storage.buffer.cells[(viewport.y + y) * storage.buffer.columns + viewport.x + x].style.modifiers += {.Reverse}
+				storage.screen.buffer.cells[(viewport.y + y) * storage.screen.buffer.columns + viewport.x + x].style.modifiers += {.Reverse}
 			}
 		}
 		return
@@ -703,9 +599,9 @@ selection_row_range :: proc(app: ^App, row, columns: int) -> (first, last: int) 
 // text could not be built, which is distinct from an empty selection.
 @(require_results)
 selection_text :: proc(app: ^App, storage: ^Frame_Storage, allocator: mem.Allocator) -> (text: string, ok: bool) {
-	if storage == nil || storage.buffer.cells == nil { return "", true }
+	if storage == nil || storage.screen.buffer.cells == nil { return "", true }
 	start, end := selection_bounds(app)
-	buffer := storage.buffer
+	buffer := storage.screen.buffer
 	builder, builder_error := strings.builder_make(allocator)
 	if builder_error != nil { return "", false }
 	for row in max(start.y, 0) ..= min(end.y, buffer.rows - 1) {
@@ -1038,11 +934,11 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 		return
 	}
 	list_rect := rect
-	_, _ = tui.draw_text(&storage.buffer, {rect.x, list_rect.y, rect.width, 1}, app.menu.title, TITLE_STYLE)
+	_, _ = tui.draw_text(&storage.screen.buffer, {rect.x, list_rect.y, rect.width, 1}, app.menu.title, TITLE_STYLE)
 	list_rect.y += 1
 	list_rect.height -= 1
 	if setup_error := setup_error_text(app); setup_error != "" && list_rect.height > 0 {
-		_, _ = tui.draw_text(&storage.buffer, {rect.x, list_rect.y, rect.width, 1}, setup_error, ERROR_TEXT)
+		_, _ = tui.draw_text(&storage.screen.buffer, {rect.x, list_rect.y, rect.width, 1}, setup_error, ERROR_TEXT)
 		list_rect.y += 1
 		list_rect.height -= 1
 	}
@@ -1061,7 +957,7 @@ draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 			items[index] = fmt.tprintf("%s%s", marker, choice.label)
 		}
 	}
-	_ = widgets.draw_list(&storage.buffer, list_rect, {items = items, style = HINT_STYLE, selected_style = PICKED_STYLE}, &app.menu.list)
+	_ = widgets.draw_list(&storage.screen.buffer, list_rect, {items = items, style = HINT_STYLE, selected_style = PICKED_STYLE}, &app.menu.list)
 }
 
 // draw_input_hint replaces the prompt with the menu's keys while one is open.
@@ -1075,7 +971,7 @@ draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect)
 	if app.menu.required {
 		hint = "up/down move | enter select | esc quit"
 	}
-	_, _ = tui.draw_text(&storage.buffer, rect, hint, HINT_STYLE)
+	_, _ = tui.draw_text(&storage.screen.buffer, rect, hint, HINT_STYLE)
 }
 
 entry_style :: proc(kind: Entry_Kind) -> term.Style {
@@ -1151,10 +1047,10 @@ input_visible_rows :: proc(input: ^widgets.Input, width: int) -> (rows: int, err
 draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (cursor: term.Cursor, err: mem.Allocator_Error) {
 	if rect.height < 3 || rect.width <= 4 { return {}, nil }
 	border_style := RULE_STYLE
-	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = tui.BORDER_ROUNDED, style = border_style})
+	widgets.draw_block(&storage.screen.buffer, rect, widgets.Block{border = tui.BORDER_ROUNDED, style = border_style})
 	if app.transcript.focused {
 		_, _ = tui.draw_text(
-			&storage.buffer,
+			&storage.screen.buffer,
 			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(FOCUS_HINT), rect.width - 4), height = 1},
 			FOCUS_HINT,
 			HINT_STYLE,
@@ -1162,7 +1058,7 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (
 	} else if app.run.snap.status.running {
 		title := fmt.tprintf(" %s %s ", widgets.spinner_frame(widgets.SPINNER_BRAILLE, working_elapsed(app), SPINNER_INTERVAL), working_label(app))
 		_, _ = tui.draw_text(
-			&storage.buffer,
+			&storage.screen.buffer,
 			{x = rect.x + 2, y = rect.y, width = min(text.text_columns(title), rect.width - 4), height = 1},
 			title,
 			WORKING_BORDER_TEXT,
@@ -1176,10 +1072,10 @@ draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (
 	}
 	if content.width <= 0 || content.height <= 0 { return {}, nil }
 	if app.transcript.focused {
-		_, input_error := widgets.draw_input(&storage.buffer, content, &app.input, HINT_STYLE)
+		_, input_error := widgets.draw_input(&storage.screen.buffer, content, &app.input, HINT_STYLE)
 		return {}, input_error
 	}
-	return widgets.draw_input(&storage.buffer, content, &app.input, INPUT_TEXT)
+	return widgets.draw_input(&storage.screen.buffer, content, &app.input, INPUT_TEXT)
 }
 
 // draw_footer paints the two footer rows: the working directory, then the
@@ -1191,7 +1087,7 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		if clone_error != nil {
 			snap_report_dropped_locked(app)
 		} else {
-			_, _ = tui.draw_text(&storage.buffer, cwd_rect, shown, FOOTER_TEXT)
+			_, _ = tui.draw_text(&storage.screen.buffer, cwd_rect, shown, FOOTER_TEXT)
 		}
 	}
 	if status_rect.height <= 0 || status_rect.width <= 0 {
@@ -1239,7 +1135,7 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		return
 	}
 	left = text.truncate_text(left, usable)
-	_, _ = tui.draw_text(&storage.buffer, status_rect, left, FOOTER_MUTED)
+	_, _ = tui.draw_text(&storage.screen.buffer, status_rect, left, FOOTER_MUTED)
 	right_columns := text.text_columns(right)
 	if right_columns >= usable {
 		return
@@ -1250,7 +1146,7 @@ draw_footer :: proc(app: ^App, storage: ^Frame_Storage, cwd_rect, status_rect: t
 		width  = right_columns,
 		height = 1,
 	}
-	_, _ = tui.draw_text(&storage.buffer, right_rect, right, FOOTER_TEXT)
+	_, _ = tui.draw_text(&storage.screen.buffer, right_rect, right, FOOTER_TEXT)
 }
 
 // footer_token_count formats a token count for the footer: the nearest thousand below a
