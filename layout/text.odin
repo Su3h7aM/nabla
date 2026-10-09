@@ -49,6 +49,10 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 			style_diagnostics += 1
 		}
 	}
+	runs_valid := _text_runs_valid(desc.text, desc.runs)
+	if !runs_valid {
+		style_diagnostics += 1
+	}
 	node, declared := _declare_node(ctx, element_desc, false, loc, style_diagnostics)
 	if !declared {
 		return
@@ -59,6 +63,11 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 	input.text = desc.text
 	input.text_style = desc.style
 	input.text_paint = desc.paint
+	if runs_valid {
+		input.text_runs = desc.runs
+	} else {
+		_append_diagnostic(state, .Invalid_Text_Runs, node, loc = loc)
+	}
 	_normalize_nonnegative(state, &input.text_style.size, node, .Y, loc)
 	_normalize_nonnegative(state, &input.text_style.line_height, node, .Y, loc)
 	_normalize_nonnegative(state, &input.text_style.letter_spacing, node, .X, loc)
@@ -66,6 +75,21 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 	// reuses one hash of the string instead of rehashing a substring per lookup.
 	input.text_key = _text_identity_key(state, input^)
 	state._nodes[node].flags.is_text = true
+}
+
+/*
+Report whether runs are empty or have positive lengths summing to the text length.
+*/
+@(private, require_results)
+_text_runs_valid :: proc "contextless" (text: string, runs: []Text_Run) -> bool {
+	total := 0
+	for run in runs {
+		if run.length <= 0 || run.length > len(text) - total {
+			return false
+		}
+		total += run.length
+	}
+	return len(runs) == 0 || total == len(text)
 }
 
 /*

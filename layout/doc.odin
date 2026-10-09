@@ -204,6 +204,19 @@
 // on Y. Use `pad_all` or `pad_xy` for explicit padding; use `radius_all` for a
 // uniform paint radius.
 //
+// # Rich text runs
+//
+// One text node wraps as one paragraph with one `Text_Style`, but `Text_Desc.runs`
+// can paint consecutive byte ranges differently, for example Markdown bold, code,
+// and links. Wrapping is unchanged; each wrapped line emits one `Text_Cmd` per run
+// segment on that line, positioned at the segment's advance within the line. A run
+// with paint 0 emits nothing but still occupies space. Run lengths must be positive
+// and sum to `len(text)`; otherwise an `Invalid_Text_Runs` diagnostic is recorded
+// and the node uses `Text_Desc.paint`.
+//
+//     runs := []layout.Text_Run{{length = 6, paint = body}, {length = 4, paint = bold}}
+//     layout.text(&ctx, layout.Text_Desc{text = "plain bold", runs = runs, style = {wrap = .Words}})
+//
 // # Content zero value
 //
 // `Content{}` is the intentional zero value for an element with no content.
@@ -229,7 +242,7 @@
 // | Fixed context storage | Caller | `destroy` or reinitialization; keep it stable |
 // | `Options` and `Capacities` | Caller; copied by `init` | The call that supplied them |
 // | `Services` callbacks and `*_user_data` | Caller; borrowed by the active solve | End of that frame's deferred solve |
-// | Ordinary text and custom payloads | Caller; layout borrows them | Next `frame`, `destroy`, or `reserve` |
+// | Ordinary text, text runs, and custom payloads | Caller; layout borrows them | Next `frame`, `destroy`, or `reserve` |
 // | `Frame_Result` slices and query views | Layout context | Next `frame`, `destroy`, or `reserve` |
 // | `diagnostics` result | Layout context | Next `frame`, `destroy`, or `reserve` |
 //

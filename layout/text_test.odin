@@ -287,3 +287,79 @@ test_text_measurement_cache_and_missing_services :: proc(t: ^testing.T) {
 		testing.expect_value(t, len(frame_result.nodes), 0)
 	}
 }
+
+@(test)
+test_text_runs_wrap_mid_run :: proc(t: ^testing.T) {
+	ctx: Context
+	testing.expect_value(t, init(&ctx, _test_options()), nil)
+	defer destroy(&ctx)
+
+	// "aaa bbb ccc" wraps at 70 into "aaa bbb" and "ccc". The second run spans
+	// "a bbb", and the unpainted third run " c" crosses the line break.
+	runs := []Text_Run{{length = 2, paint = 1}, {length = 5, paint = 2}, {length = 2, paint = 0}, {length = 2, paint = 3}}
+	set_services(&ctx, _services())
+	if frame(&ctx, {400, 400}) {
+		text(&ctx, {text = "aaa bbb ccc", runs = runs, paint = 9, style = {wrap = .Words}, sizing = {fixed(70), fit()}})
+	}
+	frame_result, err := result(&ctx)
+	testing.expect_value(t, err, Frame_Error.None)
+	testing.expect_value(t, len(diagnostics(&ctx)), 0)
+
+	Segment :: struct {
+		text:  string,
+		paint: Paint,
+		x:     Scalar,
+		line:  u16,
+	}
+	expected := []Segment{{"aa", 1, 0, 0}, {"a bbb", 2, 20, 0}, {"cc", 3, 10, 1}}
+	index := 0
+	for command in frame_result.commands {
+		data, is_text := command.data.(Text_Cmd)
+		if !is_text {
+			continue
+		}
+		testing.expect(t, index < len(expected))
+		if index < len(expected) {
+			testing.expect_value(t, data.text, expected[index].text)
+			testing.expect_value(t, data.paint, expected[index].paint)
+			testing.expect_value(t, data.line, expected[index].line)
+			_expect_close(t, command.bounds.position.x, expected[index].x)
+			_expect_close(t, command.bounds.size.x, CHARACTER_WIDTH * Scalar(len(expected[index].text)))
+		}
+		index += 1
+	}
+	testing.expect_value(t, index, len(expected))
+}
+
+@(test)
+test_invalid_text_runs_fall_back_to_paint :: proc(t: ^testing.T) {
+	ctx: Context
+	testing.expect_value(t, init(&ctx, _test_options()), nil)
+	defer destroy(&ctx)
+
+	invalid := [][]Text_Run{{{length = 3, paint = 1}}, {{length = 0, paint = 1}, {length = 5, paint = 2}}, {{length = 9, paint = 1}}}
+	for runs in invalid {
+		set_services(&ctx, _services())
+		if frame(&ctx, {400, 400}) {
+			text(&ctx, {text = "hello", runs = runs, paint = 9})
+		}
+		frame_result, err := result(&ctx)
+		testing.expect_value(t, err, Frame_Error.None)
+		found := 0
+		for entry in diagnostics(&ctx) {
+			if entry.kind == .Invalid_Text_Runs {
+				found += 1
+			}
+		}
+		testing.expect_value(t, found, 1)
+		texts := 0
+		for command in frame_result.commands {
+			if data, is_text := command.data.(Text_Cmd); is_text {
+				texts += 1
+				testing.expect_value(t, data.text, "hello")
+				testing.expect_value(t, data.paint, Paint(9))
+			}
+		}
+		testing.expect_value(t, texts, 1)
+	}
+}

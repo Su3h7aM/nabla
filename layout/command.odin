@@ -170,7 +170,13 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	case:
 	}
 
-	if !input.is_text || input.text_paint == 0 {
+	if !input.is_text {
+		return true
+	}
+	if len(input.text_runs) > 0 {
+		return _emit_text_runs(state, node, clip)
+	}
+	if input.text_paint == 0 {
 		return true
 	}
 	for line_index in 0 ..< input.text_line_count {
@@ -188,6 +194,74 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 		}
 	}
 	return true
+}
+
+/*
+Emit one text command per run segment that intersects each wrapped line.
+
+A segment starts at the advance of the line prefix before it, measured through
+the same cached measurer that sized the line. Empty lines have no segment.
+*/
+@(private, require_results)
+_emit_text_runs :: proc(state: ^_Context_State, node: Node_Handle, clip: Clip_Handle) -> bool {
+	input := &state._node_inputs[node]
+	runs := input.text_runs
+	// Lines arrive in text order, so the first run of a line never precedes the previous line's.
+	first_run := 0
+	first_run_start := 0
+	for line_index in 0 ..< input.text_line_count {
+		record := state._text_lines[input.text_line_start + line_index]
+		line_start, within := _run_offset_in(input.text, record.text)
+		if !within || len(record.text) == 0 {
+			continue
+		}
+		line_end := line_start + len(record.text)
+		for first_run < len(runs) && first_run_start + runs[first_run].length <= line_start {
+			first_run_start += runs[first_run].length
+			first_run += 1
+		}
+		run_start := first_run_start
+		for run in runs[first_run:] {
+			if run_start >= line_end {
+				break
+			}
+			segment_start := max(run_start, line_start) - line_start
+			segment_end := min(run_start + run.length, line_end) - line_start
+			run_start += run.length
+			if run.paint == 0 {
+				continue
+			}
+			start_x := _line_prefix_width(state, node, record, segment_start)
+			end_x := _line_prefix_width(state, node, record, segment_end)
+			data := Text_Cmd {
+				text     = record.text[segment_start:segment_end],
+				style    = input.text_style,
+				paint    = run.paint,
+				user     = input.desc.user,
+				line     = record.line,
+				baseline = record.baseline,
+			}
+			bounds := Rect {
+				position = {record.position.x + start_x, record.position.y},
+				size     = {end_x - start_x, record.size.y},
+			}
+			if !_emit_command(state, node, bounds, clip, data) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+@(private)
+_line_prefix_width :: proc(state: ^_Context_State, node: Node_Handle, record: _Text_Line_Record, length: int) -> Scalar {
+	if length <= 0 {
+		return 0
+	}
+	if length >= len(record.text) {
+		return record.size.x
+	}
+	return _measure_text_run_cached(state, node, record.text[:length], _unbounded_request()).size.x
 }
 
 @(private, require_results)

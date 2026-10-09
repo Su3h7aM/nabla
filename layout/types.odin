@@ -174,9 +174,27 @@ Text_Break_Error :: enum u8 {
 Text_Break_Proc :: #type proc(user_data: rawptr, text: string, offset: int) -> (piece_end: int, next_offset: int, kind: Text_Break_Kind, err: Text_Break_Error)
 
 
+// Text_Run paints `length` bytes of a text node. Runs differ only in paint;
+// measurement and wrapping use the node's single `Text_Style`.
+Text_Run :: struct {
+	length: int,
+	paint:  Paint,
+}
+
+/*
+Text_Desc declares a text leaf.
+
+`runs` optionally paints consecutive byte ranges of `text` differently. When it
+is empty, the whole text uses `paint`. Otherwise the lengths must be positive
+and sum to `len(text)`; if they do not, the frame records an `Invalid_Text_Runs`
+diagnostic and the node uses `paint`. Like `text`, the `runs` slice is borrowed
+and must stay valid and unmodified until the frame result is released. A run
+with paint 0 emits no command but still occupies space.
+*/
 Text_Desc :: struct {
 	id:     Id,
 	text:   string,
+	runs:   []Text_Run,
 	style:  Text_Style,
 	paint:  Paint,
 	sizing: Sizing,
@@ -310,6 +328,9 @@ Diagnostic_Kind :: enum u8 {
 	// The break callback failed to advance past its offset, which would spin
 	// the wrapping loop. The frame is failed instead of looping forever.
 	Text_Break_Stalled,
+	// The runs of a text node have a non-positive length or do not sum to the
+	// text length; the node falls back to its single paint.
+	Invalid_Text_Runs,
 	Pool_Exhausted,
 }
 
