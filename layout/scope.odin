@@ -18,6 +18,7 @@ _reset_frame_state :: proc(state: ^_Context_State) {
 	clear(&state._root_nodes)
 	clear(&state._scopes)
 	clear(&state._solver_scratch)
+	clear(&state._tracks)
 	clear(&state._hit_order)
 	clear(&state._id_index)
 	clear(&state._diagnostics)
@@ -298,6 +299,10 @@ _declare_node :: proc(
 	}
 	if needs_child_link {
 		state._reserved_child_links += 1
+	}
+	if normalized_desc.layout.cell && in_flow && parent_input.table_kind == .Row {
+		parent_input.cell_count += 1
+		state._node_inputs[node].track_slot = parent_input.cell_count
 	}
 
 	if needs_identifier {

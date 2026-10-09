@@ -39,10 +39,9 @@ render :: proc(t: ^testing.T, rendered: ^Rendered, context_: ^layout.Context, so
 	if layout.frame(context_, {layout.Scalar(columns), layout.Scalar(rows)}) {
 		if layout.element(context_, layout.Element_Desc{layout = {sizing = {width = layout.grow(), height = layout.grow()}}}) {
 			target := Target {
-				ctx     = context_,
-				paints  = &rendered.paints,
-				links   = &rendered.links,
-				columns = columns,
+				ctx    = context_,
+				paints = &rendered.paints,
+				links  = &rendered.links,
 			}
 			testing.expect_value(t, declare(target, document, THEME), nil)
 		}
@@ -83,7 +82,9 @@ new_context :: proc(t: ^testing.T) -> (context_: layout.Context) {
 			id_table = 16,
 			depth = 32,
 			diagnostics = 32,
+			tracks = 16,
 		},
+		snap = 1,
 	}
 	testing.expect_value(t, layout.init(&context_, options), nil)
 	return context_

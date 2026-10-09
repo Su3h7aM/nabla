@@ -5,8 +5,28 @@ import "core:math"
 import "core:mem"
 
 @(private)
+_Table_Kind :: enum u8 {
+	None,
+	Table,
+	Row,
+}
+
+@(private)
+_Track :: struct {
+	preferred, floor, width: Scalar,
+}
+
+@(private)
 _Node_Input :: struct {
 	desc:              Element_Desc,
+	table_kind:        _Table_Kind,
+	columns:           []Column_Desc,
+	track_start:       int,
+	track_count:       int,
+	track_overhead:    Scalar,
+	cell_count:        int,
+	// One more than the column index of a cell; zero for a node that is not a cell.
+	track_slot:        int,
 	loc:               runtime.Source_Code_Location,
 	private_id:        Id,
 	child_start:       int,
@@ -176,6 +196,7 @@ _Context_State :: struct {
 	_id_table:             []_Id_Table_Entry,
 	_scopes:               [dynamic]_Scope_Record,
 	_solver_scratch:       [dynamic]Node_Handle,
+	_tracks:               [dynamic]_Track,
 	_root_nodes:           [dynamic]Node_Handle,
 	_root_order:           [dynamic]i32,
 	_root_paint:           [dynamic]u64,
@@ -239,6 +260,7 @@ STORAGE_ALIGNMENT :: max(
 	align_of(_Measure_Cache_Entry),
 	align_of(_Id_Table_Entry),
 	align_of(_Scope_Record),
+	align_of(_Track),
 	align_of(Id_Index_Entry),
 	align_of(Diagnostic),
 	align_of(byte),
@@ -399,6 +421,11 @@ _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partitio
 	if !ok {
 		return false
 	}
+	tracks: []_Track
+	tracks, ok = _partition_take_slice(partition, _Track, capacities.tracks)
+	if !ok {
+		return false
+	}
 	hit_order: []Node_Handle
 	hit_order, ok = _partition_take_slice(partition, Node_Handle, capacities.nodes)
 	if !ok {
@@ -448,6 +475,7 @@ _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partitio
 		state._id_table = id_table
 		state._scopes = mem.buffer_from_slice(scopes)
 		state._solver_scratch = mem.buffer_from_slice(solver_scratch)
+		state._tracks = mem.buffer_from_slice(tracks)
 		state._hit_order = mem.buffer_from_slice(hit_order)
 		state._id_index = mem.buffer_from_slice(id_index)
 		state._diagnostics = mem.buffer_from_slice(diagnostics)
@@ -494,6 +522,7 @@ _config_is_valid :: proc(config: Options) -> bool {
 	   capacities.commands < 0 ||
 	   capacities.text_lines < 0 ||
 	   capacities.measured_words < 0 ||
+	   capacities.tracks < 0 ||
 	   capacities.overlays < 0 ||
 	   capacities.measure_cache < 0 ||
 	   capacities.id_table < 0 ||
@@ -719,6 +748,7 @@ _capacities_are_nonnegative :: proc "contextless" (capacities: Capacities) -> bo
 		capacities.commands >= 0 &&
 		capacities.text_lines >= 0 &&
 		capacities.measured_words >= 0 &&
+		capacities.tracks >= 0 &&
 		capacities.overlays >= 0 &&
 		capacities.measure_cache >= 0 &&
 		capacities.id_table >= 0 &&
@@ -737,6 +767,7 @@ _capacities_union :: proc "contextless" (current, requested: Capacities) -> Capa
 		commands = max(current.commands, requested.commands),
 		text_lines = max(current.text_lines, requested.text_lines),
 		measured_words = max(current.measured_words, requested.measured_words),
+		tracks = max(current.tracks, requested.tracks),
 		overlays = max(current.overlays, requested.overlays),
 		measure_cache = max(current.measure_cache, requested.measure_cache),
 		id_table = max(current.id_table, requested.id_table),

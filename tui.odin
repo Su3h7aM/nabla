@@ -137,6 +137,7 @@ CONVERSATION_CAPACITIES :: layout.Capacities {
 	commands       = 512,
 	text_lines     = 1024,
 	measured_words = 4096,
+	tracks         = 64,
 	measure_cache  = 512,
 	id_table       = 8,
 	depth          = 8,
@@ -513,6 +514,8 @@ conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.P
 		next.text_lines = max(current.text_lines * 2, 256)
 	case .Measured_Words:
 		next.measured_words = max(current.measured_words * 2, 1024)
+	case .Tracks:
+		next.tracks = max(current.tracks * 2, 64)
 	case .Overlays:
 		next.overlays = max(current.overlays * 2, 4)
 	case .Measure_Cache:
@@ -643,7 +646,7 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 	}
 	if entry.kind == .Assistant {
 		if document, parse_error := markdown_cache_document(&storage.markdown, entry); parse_error == nil {
-			declare_markdown_entry(ctx, storage, document, width)
+			declare_markdown_entry(ctx, storage, document)
 			return
 		}
 	}
@@ -724,9 +727,9 @@ markdown_theme :: proc() -> markdown_view.Theme {
 }
 
 // declare_markdown_entry adds an assistant message rendered from Markdown. Layout
-// wraps it; width is only what table columns are fitted to. An allocation failure
+// wraps it and sizes its tables. An allocation failure
 // leaves the entry partial for this frame, and the next frame declares it again.
-declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, document: markdown.Document, width: int) {
+declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, document: markdown.Document) {
 	entry_layout := layout.Layout_Style {
 		flow = .Column,
 		sizing = layout.Sizing{width = layout.grow(), height = layout.fit()},
@@ -734,10 +737,9 @@ declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, do
 	}
 	if layout.element(ctx, layout.Element_Desc{layout = entry_layout}) {
 		target := markdown_view.Target {
-			ctx     = ctx,
-			paints  = &storage.paints,
-			links   = &storage.links,
-			columns = width,
+			ctx    = ctx,
+			paints = &storage.paints,
+			links  = &storage.links,
 		}
 		_ = markdown_view.declare(target, document, markdown_theme(), context.temp_allocator)
 	}

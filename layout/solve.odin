@@ -94,6 +94,9 @@ _recompute_intrinsic_sizes :: proc(state: ^_Context_State) {
 	for node_index := len(state._node_inputs) - 1; node_index >= 1; node_index -= 1 {
 		node := Node_Handle(node_index)
 		input := &state._node_inputs[node]
+		if input.table_kind == .Table {
+			_fit_table(state, node)
+		}
 		main_axis := _flow_main_axis(input.desc.layout.flow)
 		cross_axis := _other_axis(main_axis)
 		main_extent: f64
@@ -520,6 +523,9 @@ _correct_distribution :: proc(state: ^_Context_State, parent: Node_Handle, axis:
 
 @(private)
 _resolve_children_axis :: proc(state: ^_Context_State, parent: Node_Handle, axis: Axis) {
+	if axis == .X && state._node_inputs[parent].table_kind == .Table {
+		_solve_tracks(state, parent)
+	}
 	parent_input := &state._node_inputs[parent]
 	parent_inner := _parent_inner_size(state, parent)
 	main_axis := _flow_main_axis(_parent_flow(state, parent))
@@ -985,6 +991,7 @@ _solve_frame :: proc(state: ^_Context_State) {
 		return
 	}
 	_diagnose_unresolved_constraints(state)
+	_diagnose_table_rows(state)
 	_place_local_flow(state)
 	_place_text_lines(state)
 	_place_paint_roots(state)

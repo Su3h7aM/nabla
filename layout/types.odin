@@ -79,6 +79,16 @@ Layout_Style :: struct {
 	justify: Justify,
 	align:   Align,
 	aspect:  Scalar,
+	// cell makes this element a cell of its parent table_row: it takes the width of
+	// the table column at its position and ignores its own width sizing.
+	cell:    bool,
+}
+
+// Column_Desc declares one table column. Its width is fit (the widest cell),
+// fixed, grow (takes remaining table width by weight) or percent of the table's
+// width, with the usual min and max.
+Column_Desc :: struct {
+	width: Axis_Size,
 }
 
 Border_Style :: struct {
@@ -317,6 +327,7 @@ Pool_Id :: enum u8 {
 	Solver_Scratch,
 	Hit_Order,
 	Id_Index,
+	Tracks,
 }
 
 Diagnostic_Kind :: enum u8 {
@@ -345,6 +356,10 @@ Diagnostic_Kind :: enum u8 {
 	// The runs of a text node have a non-positive length or do not sum to the
 	// text length; the node falls back to its single paint.
 	Invalid_Text_Runs,
+	// A table_row has a different number of cells than the table has columns.
+	// `amount` is the row's cell count. Extra cells keep their own sizing and
+	// missing cells leave their columns empty.
+	Table_Cell_Count,
 	Pool_Exhausted,
 }
 
@@ -379,6 +394,8 @@ Capacities :: struct {
 	// each word again. Budget one entry per whitespace-separated word across
 	// every text node declared in a frame.
 	measured_words:                                            int,
+	// Table columns declared in a frame, summed over all tables.
+	tracks:                                                    int,
 }
 
 Cull_Policy :: enum u8 {

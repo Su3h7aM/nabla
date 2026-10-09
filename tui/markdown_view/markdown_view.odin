@@ -30,13 +30,11 @@ Theme :: struct {
 
 // Target is the open layout frame a document is declared into.
 Target :: struct {
-	ctx:     ^layout.Context,
-	paints:  ^tui.Paints,
+	ctx:    ^layout.Context,
+	paints: ^tui.Paints,
 	// links is the frame's hyperlink table (term.Frame_Buffer.links). The
 	// destinations are views into the document's source.
-	links:   ^[dynamic]string,
-	// columns is the width available to the document, used only to fit tables.
-	columns: int,
+	links:  ^[dynamic]string,
 }
 
 CODE_INSET :: 2
@@ -69,7 +67,7 @@ declare :: proc(target: Target, document: markdown.Document, theme: Theme, alloc
 		theme     = theme,
 		allocator = allocator,
 	}
-	return declare_blocks(&declarer, document.blocks, target.columns, false)
+	return declare_blocks(&declarer, document.blocks, false)
 }
 
 @(private)
@@ -86,18 +84,18 @@ column_style :: proc(gap: f32 = 0) -> layout.Layout_Style {
 }
 
 @(private, require_results)
-declare_blocks :: proc(declarer: ^Declarer, blocks: []markdown.Block, columns: int, tight: bool) -> mem.Allocator_Error {
+declare_blocks :: proc(declarer: ^Declarer, blocks: []markdown.Block, tight: bool) -> mem.Allocator_Error {
 	gap: f32 = 0 if tight else 1
 	if layout.element(declarer.target.ctx, layout.Element_Desc{layout = column_style(gap)}) {
 		for block in blocks {
-			declare_block(declarer, block, columns) or_return
+			declare_block(declarer, block) or_return
 		}
 	}
 	return nil
 }
 
 @(private, require_results)
-declare_block :: proc(declarer: ^Declarer, block: markdown.Block, columns: int) -> mem.Allocator_Error {
+declare_block :: proc(declarer: ^Declarer, block: markdown.Block) -> mem.Allocator_Error {
 	switch value in block {
 	case markdown.Paragraph:
 		declare_inline(declarer, value.spans, {}, .Start) or_return
@@ -106,11 +104,11 @@ declare_block :: proc(declarer: ^Declarer, block: markdown.Block, columns: int) 
 	case markdown.Code_Block:
 		declare_code_block(declarer, value) or_return
 	case markdown.Quote:
-		declare_quote(declarer, value, columns) or_return
+		declare_quote(declarer, value) or_return
 	case markdown.List:
-		declare_list(declarer, value, columns) or_return
+		declare_list(declarer, value) or_return
 	case markdown.Table:
-		declare_table(declarer, value, columns) or_return
+		declare_table(declarer, value) or_return
 	case markdown.Thematic_Break:
 		rule := tui.Paint {
 			style = declarer.theme.dim,
@@ -313,7 +311,7 @@ declare_code_block :: proc(declarer: ^Declarer, block: markdown.Code_Block) -> m
 }
 
 @(private, require_results)
-declare_quote :: proc(declarer: ^Declarer, quote: markdown.Quote, columns: int) -> mem.Allocator_Error {
+declare_quote :: proc(declarer: ^Declarer, quote: markdown.Quote) -> mem.Allocator_Error {
 	bar := tui.Paint {
 		style = declarer.theme.dim,
 		border = tui.Border{vertical = "│"},
@@ -326,13 +324,13 @@ declare_quote :: proc(declarer: ^Declarer, quote: markdown.Quote, columns: int) 
 		paint = {border = {paint = id, width = layout.Edges{left = 1}}},
 	}
 	if layout.element(declarer.target.ctx, element) {
-		declare_blocks(declarer, quote.blocks, max(columns - QUOTE_INSET, 1), false) or_return
+		declare_blocks(declarer, quote.blocks, false) or_return
 	}
 	return nil
 }
 
 @(private, require_results)
-declare_list :: proc(declarer: ^Declarer, list: markdown.List, columns: int) -> mem.Allocator_Error {
+declare_list :: proc(declarer: ^Declarer, list: markdown.List) -> mem.Allocator_Error {
 	number_width := 0
 	if list.ordered {
 		buffer: [ORDERED_NUMBER_DIGITS]byte
@@ -360,7 +358,7 @@ declare_list :: proc(declarer: ^Declarer, list: markdown.List, columns: int) -> 
 						sizing = {width = layout.fixed(layout.Scalar(marker_columns)), height = layout.fit()},
 					},
 				)
-				declare_blocks(declarer, item, max(columns - marker_columns, 1), list.tight) or_return
+				declare_blocks(declarer, item, list.tight) or_return
 			}
 		}
 	}
@@ -379,120 +377,80 @@ ordered_marker :: proc(value, width: int, allocator: mem.Allocator) -> (string, 
 }
 
 @(private, require_results)
-declare_table :: proc(declarer: ^Declarer, table: markdown.Table, columns: int) -> mem.Allocator_Error {
+declare_table :: proc(declarer: ^Declarer, table: markdown.Table) -> mem.Allocator_Error {
 	if len(table.alignments) == 0 {
 		return nil
 	}
-	widths := table_column_widths(table, columns, declarer.allocator) or_return
-	defer delete(widths, declarer.allocator)
+	// A column is as wide as its widest cell and its two paddings, and shrinks
+	// to one content column.
+	columns := make([]layout.Column_Desc, len(table.alignments), declarer.allocator) or_return
+	for &column in columns {
+		column.width = layout.fit(2 * TABLE_CELL_PADDING + 1)
+	}
 	ctx := declarer.target.ctx
-	dim := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim}) or_return
-	if layout.element(ctx, layout.Element_Desc{layout = {flow = .Column, sizing = {width = layout.fit(), height = layout.fit()}}}) {
-		declare_table_border(declarer, widths, dim, "┌", "┬", "┐") or_return
+	if layout.table(ctx, layout.Element_Desc{layout = {sizing = {width = layout.fit(), height = layout.fit()}}}, columns) {
+		declare_table_rule(declarer, len(columns), "┌", "┬", "┐") or_return
 		for row_index := 0; row_index <= len(table.rows); row_index += 1 {
 			is_header := row_index == 0
 			cells := table.header if is_header else table.rows[row_index - 1]
-			declare_table_row(declarer, cells, table.alignments, widths, is_header) or_return
+			declare_table_row(declarer, cells, table.alignments, is_header) or_return
 			if row_index < len(table.rows) {
-				declare_table_border(declarer, widths, dim, "├", "┼", "┤") or_return
+				declare_table_rule(declarer, len(columns), "├", "┼", "┤") or_return
 			}
 		}
-		declare_table_border(declarer, widths, dim, "└", "┴", "┘") or_return
+		declare_table_rule(declarer, len(columns), "└", "┴", "┘") or_return
 	}
 	return nil
 }
 
-// table_column_widths returns the content columns of each table column: the widest
-// cell, then shrunk one column at a time from the widest until the table fits in
-// columns or every column is down to one.
+// declare_table_rule declares a border line: a rule filling each column and a
+// junction between and around them.
 @(private, require_results)
-table_column_widths :: proc(table: markdown.Table, columns: int, allocator: mem.Allocator) -> (widths: []int, err: mem.Allocator_Error) {
-	count := len(table.alignments)
-	widths = make([]int, count, allocator) or_return
-	for column in 0 ..< count {
-		widths[column] = cell_columns(table.header[column])
-		for row in table.rows {
-			widths[column] = max(widths[column], cell_columns(row[column]))
-		}
-		widths[column] = max(widths[column], 1)
-	}
-	for table_columns(widths) > columns {
-		widest := -1
-		for column in 0 ..< count {
-			if widths[column] > 1 && (widest < 0 || widths[column] > widths[widest]) {
-				widest = column
-			}
-		}
-		if widest < 0 {
-			break
-		}
-		widths[widest] -= 1
-	}
-	return widths, nil
-}
-
-@(private)
-table_columns :: proc(widths: []int) -> int {
-	total := 1 + len(widths) * (2 * TABLE_CELL_PADDING + 1)
-	for width in widths {
-		total += width
-	}
-	return total
-}
-
-@(private)
-cell_columns :: proc(spans: []markdown.Span) -> int {
-	column := 0
-	widest := 0
-	for span in spans {
-		if span.text == "\n" {
-			widest = max(widest, column)
-			column = 0
-			continue
-		}
-		column += text.text_columns_at(span.text, column)
-	}
-	return max(widest, column)
-}
-
-@(private, require_results)
-declare_table_border :: proc(declarer: ^Declarer, widths: []int, paint: layout.Paint, left, middle, right: string) -> mem.Allocator_Error {
-	pieces := make([dynamic]string, declarer.allocator)
-	defer delete(pieces)
-	append(&pieces, left) or_return
-	for width, column in widths {
-		rule := strings.repeat("─", width + 2 * TABLE_CELL_PADDING, declarer.allocator) or_return
-		append(&pieces, rule) or_return
-		append(&pieces, right if column + 1 == len(widths) else middle) or_return
-	}
-	line := strings.concatenate(pieces[:], declarer.allocator) or_return
-	layout.text(declarer.target.ctx, layout.Text_Desc{text = line, style = {size = 1, wrap = .None}, paint = paint})
-	return nil
-}
-
-@(private, require_results)
-declare_table_row :: proc(declarer: ^Declarer, cells: []markdown.Cell, alignments: []markdown.Alignment, widths: []int, header: bool) -> mem.Allocator_Error {
+declare_table_rule :: proc(declarer: ^Declarer, columns: int, left, middle, right: string) -> mem.Allocator_Error {
 	ctx := declarer.target.ctx
-	bar := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim, fill = "│"}) or_return
-	bar_element := layout.Element_Desc {
-		layout = {sizing = {width = layout.fixed(1), height = layout.fit()}},
-		paint = {background = bar},
+	rule := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim, fill = "─"}) or_return
+	if layout.table_row(ctx, layout.Element_Desc{layout = {align = .Stretch, sizing = {width = layout.fit(), height = layout.fixed(1)}}}) {
+		for column in 0 ..< columns {
+			declare_table_junction(declarer, left if column == 0 else middle) or_return
+			layout.content(
+				ctx,
+				layout.Element_Desc{layout = {cell = true, sizing = {width = layout.fit(), height = layout.fixed(1)}}, paint = {background = rule}},
+			)
+		}
+		declare_table_junction(declarer, right) or_return
 	}
+	return nil
+}
+
+@(private, require_results)
+declare_table_junction :: proc(declarer: ^Declarer, glyph: string) -> mem.Allocator_Error {
+	paint := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim, fill = glyph}) or_return
+	layout.content(
+		declarer.target.ctx,
+		layout.Element_Desc{layout = {sizing = {width = layout.fixed(1), height = layout.fit()}}, paint = {background = paint}},
+	)
+	return nil
+}
+
+@(private, require_results)
+declare_table_row :: proc(declarer: ^Declarer, cells: []markdown.Cell, alignments: []markdown.Alignment, header: bool) -> mem.Allocator_Error {
+	ctx := declarer.target.ctx
 	base := declarer.theme.table_header if header else term.Style{}
-	if layout.element(ctx, layout.Element_Desc{layout = {flow = .Row, align = .Stretch, sizing = {width = layout.fit(), height = layout.fit()}}}) {
-		layout.content(ctx, bar_element)
+	if layout.table_row(ctx, layout.Element_Desc{layout = {align = .Stretch, sizing = {width = layout.fit(), height = layout.fit()}}}) {
 		for cell, column in cells {
+			declare_table_junction(declarer, "│") or_return
 			content := layout.Layout_Style {
+				cell = true,
 				flow = .Column,
 				align = .Stretch,
-				sizing = {width = layout.fixed(layout.Scalar(widths[column] + 2 * TABLE_CELL_PADDING)), height = layout.fit(1)},
+				sizing = {width = layout.fit(), height = layout.fit(1)},
 				padding = {left = TABLE_CELL_PADDING, right = TABLE_CELL_PADDING},
 			}
 			if layout.element(ctx, layout.Element_Desc{layout = content}) {
 				declare_inline(declarer, cell, base, text_align(alignments[column])) or_return
 			}
-			layout.content(ctx, bar_element)
 		}
+		declare_table_junction(declarer, "│") or_return
 	}
 	return nil
 }

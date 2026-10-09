@@ -22,6 +22,7 @@ _test_options :: proc() -> Options {
 			depth = 16,
 			diagnostics = 16,
 			debug_labels = 128,
+			tracks = 8,
 		},
 	}
 }

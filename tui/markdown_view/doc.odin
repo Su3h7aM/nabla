@@ -6,13 +6,9 @@
 // layout. A paragraph or heading is one wrapped text node whose runs carry the
 // bold, italic, code, and link paints. A list item is a row of its marker and a
 // column of its blocks, a quote is a column with a left border, a code block is
-// an inset column, a thematic break is a one-row fill, and a table is a column
-// of rows whose cells have fixed widths and wrap in layout.
-//
-// The one place width enters is the table: declare fits the integer column
-// widths of a table to Target.columns, the columns available to the document,
-// and tracks the insets of the quotes and lists around it. Everything else is
-// independent of the width.
+// an inset column, a thematic break is a one-row fill, and a table is a
+// layout.table whose rows, border lines included, share column widths that
+// layout solves and wraps cells into. No width enters the package.
 //
 // The caller owns the frame. Paints are added to Target.paints and hyperlink
 // destinations to Target.links, both of which must outlive the draw of the

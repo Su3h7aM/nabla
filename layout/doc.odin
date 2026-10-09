@@ -215,6 +215,33 @@
 // `scroll_range`, and `scroll_offset` are rounded to the same grid. Measurement
 // is not changed: callbacks should already return multiples of the pitch.
 //
+// # Tables
+//
+// Rows of a `table` share column widths, so cells align without the caller
+// computing them. `table` is a stretching Column and `table_row` a Row; the
+// children of a row with `Layout_Style.cell` set are its cells, taking the
+// columns of `columns` in order. A cell's own width sizing is ignored. Other
+// children, such as one-cell separators, keep their sizing and should be fixed
+// so every row loses the same width to them.
+//
+//     columns := []layout.Column_Desc{{width = layout.fit()}, {width = layout.grow()}}
+//     if layout.table(&ctx, layout.Element_Desc{layout = {sizing = {width = layout.grow(), height = layout.fit()}}}, columns) {
+//         if layout.table_row(&ctx, layout.Element_Desc{}) {
+//             if layout.element(&ctx, layout.Element_Desc{layout = {cell = true}}) { ... }
+//             if layout.element(&ctx, layout.Element_Desc{layout = {cell = true}}) { ... }
+//         }
+//     }
+//
+// A fit column is as wide as its widest cell, a fixed column is exact, a
+// percent column is a fraction of the table's width, and a grow column takes
+// the width left over, by weight and up to its max. When the columns together
+// are wider than the table, fit, grow and indefinite percent columns give up
+// width in proportion to how much each can give: its widest cell minus the
+// narrowest it can wrap to. Wrapping cells reach their height once their
+// column width is known, and a row is as tall as its tallest cell. Capacities
+// `tracks` holds one entry per column per table in a frame. A row whose cell
+// count differs from the column count is reported as `Table_Cell_Count`.
+//
 // # Rich text runs
 //
 // One text node wraps as one paragraph with one `Text_Style`, but `Text_Desc.runs`
