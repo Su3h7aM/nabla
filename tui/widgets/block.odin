@@ -3,35 +3,12 @@ package widgets
 import "nabla:term"
 import "nabla:tui"
 
-Border :: struct {
-	top_left, top_right, bottom_left, bottom_right: string,
-	horizontal, vertical:                           string,
-}
-
-BORDER_SINGLE :: Border {
-	top_left     = "┌",
-	top_right    = "┐",
-	bottom_left  = "└",
-	bottom_right = "┘",
-	horizontal   = "─",
-	vertical     = "│",
-}
-
-BORDER_ROUNDED :: Border {
-	top_left     = "╭",
-	top_right    = "╮",
-	bottom_left  = "╰",
-	bottom_right = "╯",
-	horizontal   = "─",
-	vertical     = "│",
-}
-
 // Block draws a border, a title on the top edge, and a footer on the bottom
 // edge. Both labels start one cell inside the corner and are truncated to the
 // room the edge has; the caller supplies any spacing around them. Layout
 // padding, not the widget, reserves the content inset.
 Block :: struct {
-	border: Border,
+	border: tui.Border,
 	style:  term.Style,
 	title:  string,
 	footer: string,

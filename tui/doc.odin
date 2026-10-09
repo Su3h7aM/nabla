@@ -7,6 +7,9 @@
 // declare and solve the layout tree, then render the same hierarchy through
 // frame and element:
 //
+//     paints: tui.Paints
+//     defer delete(paints)
+//     body_paint, _ := tui.paint(&paints, {style = {foreground = term.Indexed_Color(7)}})
 //     layout.set_services(&layout_ctx, tui.layout_services(&measure_context))
 //     if layout.frame(&layout_ctx, viewport) {
 //         if layout.element(&layout_ctx, layout.Element_Desc{
@@ -19,7 +22,8 @@
 //             layout.text(&layout_ctx, layout.Text_Desc{
 //                 id = body_id,
 //                 text = body,
-//                 style = {size = 1, color = layout.rgba(255, 255, 255, 255), wrap = .Words},
+//                 style = {size = 1, wrap = .Words},
+//                 paint = body_paint,
 //                 sizing = {layout.grow(), layout.fit()},
 //             })
 //         }
@@ -30,11 +34,11 @@
 //     }
 //
 //     ui: tui.Context
-//     if tui.frame(&ui, solved, cells) {
+//     if tui.frame(&ui, solved, cells, paints = paints[:]) {
 //         if tui.element(&ui, {id = panel_id}) {
 //             widgets.draw_block(&ui, panel)
 //             if tui.element(&ui, {id = body_id}) {
-//                 tui.text(&ui, body_style)
+//                 tui.text(&ui)
 //             }
 //         }
 //     }
@@ -53,6 +57,15 @@
 //
 // text draws the resolved lines emitted by layout.text, so layout owns wrapping
 // and line placement while nabla:text supplies width measurement.
+//
+// Layout carries a layout.Paint id on every command it emits and never reads it.
+// tui resolves the id in a Paints table the caller fills while declaring the
+// frame: paint appends a Paint (terminal style, fill grapheme, border glyphs,
+// hyperlink) and returns the id to put in a Text_Desc, Paint_Style, or
+// Image_Content. Id 0 is never returned and makes layout emit no command. The
+// table is cleared each frame and must outlive the draw of that frame's
+// commands. draw_commands paints every command of a solved frame into a cell
+// rectangle without the scoped API.
 //
 // put, fill, and draw_text are overloaded. Their Frame_Buffer forms are the
 // explicit-rectangle escape hatch for small renderers and existing code. Their

@@ -228,7 +228,7 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	ctx: tui.Context
 	if tui.frame(&ctx, layout_result, cells[:]) {
 		if tui.element(&ctx, {id = block_id}) {
-			draw_block(&ctx, Block{border = BORDER_SINGLE})
+			draw_block(&ctx, Block{border = tui.BORDER_SINGLE})
 			if tui.element(&ctx, {id = input_id}) {
 				_, draw_error := draw_input(&ctx, &input, {})
 				testing.expect(t, draw_error == nil)
@@ -313,7 +313,7 @@ test_list_select_first_last_page :: proc(t: ^testing.T) {
 test_block_draws_footer_on_bottom_edge_and_truncates_it :: proc(t: ^testing.T) {
 	cells: [48]term.Cell
 	frame := _frame(cells[:], 12, 4)
-	draw_block(&frame, {x = 0, y = 0, width = 12, height = 4}, Block{border = BORDER_ROUNDED, title = "top", footer = "─ 3 more lines ─────"})
+	draw_block(&frame, {x = 0, y = 0, width = 12, height = 4}, Block{border = tui.BORDER_ROUNDED, title = "top", footer = "─ 3 more lines ─────"})
 	testing.expect_value(t, frame.cells[1].grapheme, "t")
 	testing.expect_value(t, frame.cells[3 * 12].grapheme, "╰")
 	testing.expect_value(t, frame.cells[3 * 12 + 1].grapheme, "─")

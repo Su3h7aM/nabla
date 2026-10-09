@@ -86,15 +86,7 @@ test_frame_end_to_end :: proc(t: ^testing.T) {
 		if layout.element(&ctx, {layout = {flow = .Column, sizing = {layout.grow(), layout.grow()}, padding = layout.pad_all(8), gap = 4}}) {
 			layout.content(&ctx, {id = layout.id("header"), layout = {sizing = {layout.grow(), layout.fixed(24)}}})
 			if layout.element(&ctx, {id = layout.id("body"), layout = {sizing = {layout.grow(), layout.grow()}}, clip = {axes = {.Y}}}) {
-				layout.text(
-					&ctx,
-					{
-						id = layout.id("title"),
-						text = "hello world",
-						style = {size = 10, color = layout.rgb(255, 255, 255)},
-						sizing = {layout.grow(), layout.fit()},
-					},
-				)
+				layout.text(&ctx, {id = layout.id("title"), text = "hello world", paint = 1, style = {size = 10}, sizing = {layout.grow(), layout.fit()}})
 			}
 		}
 	}
@@ -133,8 +125,8 @@ test_fixed_storage_frame_allocates_nothing :: proc(t: ^testing.T) {
 	layout.set_services(&ctx, _test_services())
 	if layout.frame(&ctx, {300, 200}) {
 		if layout.element(&ctx, {layout = {sizing = {layout.grow(), layout.grow()}, padding = layout.pad_all(4)}, clip = {axes = {.Y}}}) {
-			layout.content(&ctx, {id = layout.id("box"), layout = {sizing = {layout.fixed(40), layout.fixed(40)}}, paint = {background = layout.rgb(1, 2, 3)}})
-			layout.text(&ctx, {text = "aaa bbb ccc", style = {size = 10, color = layout.rgb(255, 255, 255)}, sizing = {layout.grow(), layout.fit()}})
+			layout.content(&ctx, {id = layout.id("box"), layout = {sizing = {layout.fixed(40), layout.fixed(40)}}, paint = {background = 1}})
+			layout.text(&ctx, {text = "aaa bbb ccc", paint = 1, style = {size = 10}, sizing = {layout.grow(), layout.fit()}})
 			layout.content(&ctx, {id = layout.id("overlay"), layout = {sizing = {layout.fixed(20), layout.fixed(20)}}, overlay = {attach = .Root}})
 		}
 	}
@@ -151,13 +143,13 @@ test_overlay_hit_stack_and_visible_commands :: proc(t: ^testing.T) {
 
 	layout.set_services(&ctx, _test_services())
 	if layout.frame(&ctx, {200, 200}) {
-		layout.content(&ctx, {id = layout.id("background"), layout = {sizing = {layout.grow(), layout.grow()}}, paint = {background = layout.rgb(1, 1, 1)}})
+		layout.content(&ctx, {id = layout.id("background"), layout = {sizing = {layout.grow(), layout.grow()}}, paint = {background = 1}})
 		layout.content(
 			&ctx,
 			{
 				id = layout.id("modal"),
 				layout = {sizing = {layout.fixed(150), layout.fixed(150)}},
-				paint = {background = layout.rgb(2, 2, 2)},
+				paint = {background = 2},
 				overlay = {attach = .Root, layer = 1},
 				hit = .Opaque,
 			},

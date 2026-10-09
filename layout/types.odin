@@ -13,7 +13,10 @@ Edges :: struct {
 Radius :: struct {
 	tl, tr, br, bl: Scalar,
 }
-Color :: distinct [4]u8
+
+// Paint is an opaque id the caller resolves when it draws. Layout never
+// interprets it; 0 means nothing is drawn for it, so the command is not emitted.
+Paint :: distinct u64
 
 Axis :: enum u8 {
 	X,
@@ -79,13 +82,13 @@ Layout_Style :: struct {
 }
 
 Border_Style :: struct {
-	color:            Color,
+	paint:            Paint,
 	width:            Edges,
 	between_children: Scalar,
 }
 
 Paint_Style :: struct {
-	background: Color,
+	background: Paint,
 	radius:     Radius,
 	border:     Border_Style,
 }
@@ -133,7 +136,6 @@ Text_Align :: enum u8 {
 Text_Style :: struct {
 	font:           Font,
 	size:           Scalar,
-	color:          Color,
 	line_height:    Scalar,
 	letter_spacing: Scalar,
 	wrap:           Wrap,
@@ -176,6 +178,7 @@ Text_Desc :: struct {
 	id:     Id,
 	text:   string,
 	style:  Text_Style,
+	paint:  Paint,
 	sizing: Sizing,
 	user:   User_Tag,
 }
@@ -190,16 +193,11 @@ Image_Source :: struct {
 	uv:   Rect,
 }
 
-Image_Tint :: struct {
-	enabled: bool,
-	color:   Color,
-}
-
 Image_Content :: struct {
 	handle:         Image_Handle,
 	intrinsic_size: Vec2,
 	source:         Image_Source,
-	tint:           Image_Tint,
+	paint:          Paint,
 }
 
 Custom_Content :: struct {

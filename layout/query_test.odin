@@ -174,7 +174,7 @@ test_result_lifecycle_and_visible_commands :: proc(t: ^testing.T) {
 		if element(&ctx, {layout = {flow = .Column, sizing = {fixed(100), fit()}}}) {
 			for index in 0 ..< 4 {
 				row := _panel(100, 100)
-				row.paint.background = {255, 255, 255, 255}
+				row.paint.background = 1
 				content(&ctx, row)
 			}
 		}

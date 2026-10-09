@@ -27,33 +27,3 @@ pad_xy :: proc "contextless" (horizontal, vertical: Scalar) -> Edges {
 radius_all :: proc "contextless" (value: Scalar) -> Radius {
 	return Radius{tl = value, tr = value, br = value, bl = value}
 }
-
-rgb :: proc "contextless" (red, green, blue: u8) -> Color {
-	return Color{red, green, blue, 255}
-}
-
-rgba :: proc "contextless" (red, green, blue, alpha: u8) -> Color {
-	return Color{red, green, blue, alpha}
-}
-
-gray :: proc "contextless" (value: u8, alpha: u8 = 255) -> Color {
-	return Color{value, value, value, alpha}
-}
-
-opaque :: proc "contextless" (color: Color) -> Color {
-	return Color{color.r, color.g, color.b, 255}
-}
-
-with_alpha :: proc "contextless" (color: Color, alpha: u8) -> Color {
-	return Color{color.r, color.g, color.b, alpha}
-}
-
-// mix linearly interpolates between two colors. An amount outside [0, 1]
-// extrapolates rather than clamping, matching math.lerp.
-mix :: proc(from, to: Color, amount: Scalar) -> Color {
-	blend := proc(from, to: u8, amount: Scalar) -> u8 {
-		value := f32(from) + (f32(to) - f32(from)) * f32(amount)
-		return u8(clamp(value, 0, 255))
-	}
-	return Color{blend(from.r, to.r, amount), blend(from.g, to.g, amount), blend(from.b, to.b, amount), blend(from.a, to.a, amount)}
-}

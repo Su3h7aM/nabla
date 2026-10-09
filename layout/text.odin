@@ -58,6 +58,7 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 	input.is_text = true
 	input.text = desc.text
 	input.text_style = desc.style
+	input.text_paint = desc.paint
 	_normalize_nonnegative(state, &input.text_style.size, node, .Y, loc)
 	_normalize_nonnegative(state, &input.text_style.line_height, node, .Y, loc)
 	_normalize_nonnegative(state, &input.text_style.letter_spacing, node, .X, loc)

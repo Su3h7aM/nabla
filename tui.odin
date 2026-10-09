@@ -194,6 +194,8 @@ Frame_Storage :: struct {
 	// links is this frame's hyperlink table (term.Frame_Buffer.links); the URIs are
 	// views into markdown's records, which live through the frame's present.
 	links:             [dynamic]string,
+	// paints resolves the ids this frame's declarations carry; cleared with links.
+	paints:            tui.Paints,
 	layout_ctx:        layout.Context,
 	// capacities is what layout_ctx is currently sized for. The context owns its
 	// storage, so the budget is raised through layout.reserve as the transcript
@@ -205,8 +207,8 @@ Frame_Storage :: struct {
 	// cell_pixels is the size of a terminal cell in pixels, zero when unknown.
 	cell_pixels:       [2]int,
 	// shown is the images this frame draws; placed is what the terminal holds; uploads and stale are the work images_collect found between them.
-	shown:             [dynamic]Image_Placement,
-	placed:            [dynamic]Image_Placement,
+	shown:             [dynamic]tui.Image_Placement,
+	placed:            [dynamic]tui.Image_Placement,
 	uploads:           [dynamic]Image_Upload,
 	stale:             [dynamic]term.Image_Id,
 	// graphics_failed latches the one warning a failing image write produces.
@@ -227,9 +229,10 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	if storage_error != nil { return nil }
 	storage.alloc = alloc
 	storage.links = make([dynamic]string, alloc)
+	storage.paints = make(tui.Paints, alloc)
 	storage.tool_blocks = make([dynamic]Tool_Block, alloc)
-	storage.shown = make([dynamic]Image_Placement, alloc)
-	storage.placed = make([dynamic]Image_Placement, alloc)
+	storage.shown = make([dynamic]tui.Image_Placement, alloc)
+	storage.placed = make([dynamic]tui.Image_Placement, alloc)
 	storage.uploads = make([dynamic]Image_Upload, alloc)
 	storage.stale = make([dynamic]term.Image_Id, alloc)
 	markdown_cache_init(&storage.markdown, alloc)
@@ -257,6 +260,7 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 
 frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 	delete(storage.links)
+	delete(storage.paints)
 	delete(storage.tool_blocks)
 	delete(storage.shown)
 	delete(storage.placed)
@@ -430,7 +434,8 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			// Markdown it did not ask for belongs to entries that are gone.
 			markdown_cache_sweep(&storage.markdown)
 			transcript_measure(app, order, frame_result, rect.height)
-			if !draw_conversation_commands(storage, frame_result, rect) { return false }
+			if !draw_bands(storage, frame_result, rect) { return false }
+			if tui.draw_commands(&storage.buffer, storage.paints[:], frame_result, rect, &storage.shown) != .None { return false }
 			if !draw_tool_blocks(storage, frame_result, rect) { return false }
 			selection_paint(app, storage, rect)
 			box_drag_paint(app, storage, frame_result, rect)
@@ -480,6 +485,7 @@ conversation_solve :: proc(
 // the frame's own `if` block, because that block is what layout closes the frame on.
 declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int, order: []^Entry) {
 	clear(&storage.links)
+	clear(&storage.paints)
 	clear(&storage.tool_blocks)
 	// Services bind for one frame only, so every solve re-binds them.
 	layout.set_services(
@@ -501,8 +507,14 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 		) {
 			if len(order) == 0 {
 				if layout.element(&storage.layout_ctx, layout.Element_Desc{layout = {flow = .Column}}) {
-					layout.text(&storage.layout_ctx, layout.Text_Desc{text = "nabla", style = tui.text_style(TITLE_STYLE)})
-					layout.text(&storage.layout_ctx, layout.Text_Desc{text = STARTUP_HINT, style = tui.text_style(HINT_STYLE)})
+					layout.text(
+						&storage.layout_ctx,
+						layout.Text_Desc{text = "nabla", style = {size = 1, wrap = .None}, paint = storage_paint(storage, {style = TITLE_STYLE})},
+					)
+					layout.text(
+						&storage.layout_ctx,
+						layout.Text_Desc{text = STARTUP_HINT, style = {size = 1, wrap = .None}, paint = storage_paint(storage, {style = HINT_STYLE})},
+					)
 				}
 			} else {
 				for entry in order {
@@ -572,34 +584,17 @@ conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.P
 	return next
 }
 
-// draw_conversation_commands projects the solved frame's text commands into
-// the cell grid. Culling already dropped every line outside the clip.
+// draw_bands fills the whole terminal row behind each text line whose paint has a background; a layout element would only span the conversation's width.
 @(require_results)
-draw_conversation_commands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
+draw_bands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
 	for command in frame_result.commands {
-		if image, is_image := command.data.(layout.Image_Cmd); is_image {
-			if !draw_conversation_image(storage, command.bounds, term.Image_Id(image.handle), viewport) { return false }
-			continue
-		}
 		text_data, is_text := command.data.(layout.Text_Cmd)
-		if !is_text {
-			continue
-		}
+		if !is_text { continue }
+		value, found := tui.paint_of(storage.paints[:], text_data.paint)
+		if !found || value.style.background == nil { continue }
 		line, project_err := tui.project_rect_integral(command.bounds)
-		if project_err != nil {
-			return false
-		}
-		line.x += viewport.x
-		line.y += viewport.y
-		style := tui.term_style(text_data.style)
-		// Only a user message has a background.
-		if style.background != nil {
-			// A user message is a band across the whole terminal, not a block inside
-			// the conversation's indent: the text keeps that indent as its padding.
-			tui.fill(&storage.buffer, {x = 0, y = line.y, width = storage.buffer.columns, height = 1}, " ", style)
-		}
-		// A text node's user tag is its link id; zero draws plain cells.
-		_, _ = tui.draw_text_linked_rect(&storage.buffer, line, text_data.text, style, term.Link_Id(text_data.user))
+		if project_err != nil { return false }
+		tui.fill(&storage.buffer, {x = 0, y = viewport.y + line.y, width = storage.buffer.columns, height = 1}, " ", value.style)
 	}
 	return true
 }
@@ -619,22 +614,6 @@ draw_tool_blocks :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Res
 			widgets.draw_block(&clipped, rect, tool.block)
 			break
 		}
-	}
-	return true
-}
-
-// draw_conversation_image draws a picture's placeholder cells into a view of the grid that ends at the transcript's last row,
-// so the part below it is clipped, and records it as shown.
-@(require_results)
-draw_conversation_image :: proc(storage: ^Frame_Storage, bounds: layout.Rect, id: term.Image_Id, viewport: tui.Cell_Rect) -> bool {
-	rect, project_err := tui.project_rect_integral(bounds)
-	if project_err != nil { return false }
-	rect.x += viewport.x
-	rect.y += viewport.y
-	clipped := storage.buffer
-	clipped.rows = viewport.y + viewport.height
-	if tui.draw_image(&clipped, rect, id) > 0 {
-		_, _ = append(&storage.shown, Image_Placement{id = id, columns = rect.width, rows = rect.height})
 	}
 	return true
 }
@@ -743,21 +722,17 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 		}
 	}
 	if entry.kind == .Subagent {
-		declare_subagent_entry(ctx, entry)
+		declare_subagent_entry(ctx, storage, entry)
 		return
 	}
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
-	body_style := tui.text_style(entry_style(entry.kind))
-	// A user message is a band, and the band's padding rows are painted too, so
-	// they keep the band's style rather than the body's wrapping one.
-	band_style := body_style
-	body_style.wrap = .Words
+	body_paint := storage_paint(storage, {style = entry_style(entry.kind)})
 	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
-		if entry.kind == .User { declare_band_pad(ctx, band_style) }
+		if entry.kind == .User { declare_band_pad(ctx, body_paint) }
 		if len(cleaned) > 0 {
-			layout.text(ctx, layout.Text_Desc{text = cleaned, style = body_style})
+			layout.text(ctx, layout.Text_Desc{text = cleaned, style = {size = 1, wrap = .Words}, paint = body_paint})
 		}
-		if entry.kind == .User { declare_band_pad(ctx, band_style) }
+		if entry.kind == .User { declare_band_pad(ctx, body_paint) }
 	}
 }
 
@@ -770,15 +745,15 @@ text_entry_layout :: proc() -> layout.Layout_Style {
 // declare_band_pad reserves one row of a band's background. The row is a single cell
 // wide: the renderer paints a band row across the whole terminal, so the row only has
 // to exist, and `Wrap.None` is what keeps one cell one line.
-declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Text_Style) {
-	layout.text(ctx, layout.Text_Desc{text = " ", style = band})
+declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Paint) {
+	layout.text(ctx, layout.Text_Desc{text = " ", style = {size = 1, wrap = .None}, paint = band})
 }
 
 // declare_subagent_entry adds one message from another agent on the subagent band: the
 // first line as a bold heading naming the sender and the kind, the rest as the body
 // below it. The heading is the first line by the sender's contract, so the split
 // reads no wording.
-declare_subagent_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
+declare_subagent_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry) {
 	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
 	heading := cleaned
 	rest := ""
@@ -786,20 +761,17 @@ declare_subagent_entry :: proc(ctx: ^layout.Context, entry: ^Entry) {
 		heading = cleaned[:split]
 		rest = cleaned[split + 1:]
 	}
-	heading_style := tui.text_style(SUBAGENT_LABEL)
-	heading_style.wrap = .Words
-	band_style := tui.text_style(SUBAGENT_TEXT)
-	body_style := band_style
-	body_style.wrap = .Words
+	heading_paint := storage_paint(storage, {style = SUBAGENT_LABEL})
+	band_paint := storage_paint(storage, {style = SUBAGENT_TEXT})
 	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
-		declare_band_pad(ctx, band_style)
+		declare_band_pad(ctx, band_paint)
 		if len(heading) > 0 {
-			layout.text(ctx, layout.Text_Desc{text = heading, style = heading_style})
+			layout.text(ctx, layout.Text_Desc{text = heading, style = {size = 1, wrap = .Words}, paint = heading_paint})
 		}
 		if len(rest) > 0 {
-			layout.text(ctx, layout.Text_Desc{text = rest, style = body_style})
+			layout.text(ctx, layout.Text_Desc{text = rest, style = {size = 1, wrap = .Words}, paint = band_paint})
 		}
-		declare_band_pad(ctx, band_style)
+		declare_band_pad(ctx, band_paint)
 	}
 }
 
@@ -816,17 +788,23 @@ declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, li
 		for line_index in 0 ..< len(lines.line_ends) {
 			line := markdown_line(lines, line_index)
 			if len(line) == 0 {
-				layout.text(ctx, layout.Text_Desc{text = " ", style = tui.text_style({})})
+				layout.text(ctx, layout.Text_Desc{text = " ", style = {size = 1, wrap = .None}, paint = storage_paint(storage, {})})
 				continue
 			}
 			if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Row}}) {
 				for segment in line {
-					link := frame_link_id(storage, segment.link)
-					layout.text(ctx, layout.Text_Desc{text = segment.text, style = tui.text_style(segment.style), user = layout.User_Tag(link)})
+					paint := storage_paint(storage, {style = segment.style, link = frame_link_id(storage, segment.link)})
+					layout.text(ctx, layout.Text_Desc{text = segment.text, style = {size = 1, wrap = .None}, paint = paint})
 				}
 			}
 		}
 	}
+}
+
+// storage_paint returns the id of value in the frame's paint table, or zero when the table cannot grow.
+storage_paint :: proc(storage: ^Frame_Storage, value: tui.Paint) -> layout.Paint {
+	id, _ := tui.paint(&storage.paints, value)
+	return id
 }
 
 // frame_link_id returns the frame's link id for uri, adding it to the table the first
@@ -849,7 +827,7 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // Only the border carries the outcome color. Code Mode calls draw here too, in blue on success.
 // A running call draws the spinner frame before its name and the working border color.
 declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
-	outline := widgets.BORDER_ROUNDED
+	outline := tui.BORDER_ROUNDED
 	box_width := max(width, 4)
 	border_inner_width := max(box_width - 2, 1)
 	content_width := max(box_width - 4, 1)
@@ -919,14 +897,14 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 			padding = layout.pad_all(1),
 		}
 		if layout.element(ctx, layout.Element_Desc{layout = box, user = layout.User_Tag(entry.id)}) {
-			body := tui.text_style(TOOL_BODY)
+			body := storage_paint(storage, {style = TOOL_BODY})
 			remaining := preview
 			row_index := 0
 			drawn := 0
 			for len(remaining) > 0 {
 				piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
 				if row_index >= first_row && drawn < visible_rows {
-					layout.text(ctx, layout.Text_Desc{text = fmt.tprintf(" %s", piece), style = body})
+					layout.text(ctx, layout.Text_Desc{text = fmt.tprintf(" %s", piece), style = {size = 1, wrap = .None}, paint = body})
 					drawn += 1
 				}
 				row_index += 1
@@ -934,11 +912,11 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 				if drawn >= visible_rows { break }
 			}
 			if content_rows == 0 {
-				layout.text(ctx, layout.Text_Desc{text = " ", style = body})
+				layout.text(ctx, layout.Text_Desc{text = " ", style = {size = 1, wrap = .None}, paint = body})
 			}
 			if entry.image.id != 0 {
 				columns, rows := image_cells(entry.image, content_width, storage.conversation_rows, storage.cell_pixels)
-				declare_tool_image(ctx, entry.image.id, columns, rows)
+				declare_tool_image(ctx, storage, entry.image.id, columns, rows)
 			}
 		}
 	}
@@ -952,7 +930,7 @@ tool_border_bright :: proc(style: term.Style) -> term.Style {
 }
 
 // declare_tool_image reserves a box's picture rows below its text, inside the border.
-declare_tool_image :: proc(ctx: ^layout.Context, id: term.Image_Id, columns, rows: int) {
+declare_tool_image :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, id: term.Image_Id, columns, rows: int) {
 	picture_box := layout.Layout_Style {
 		sizing = layout.Sizing{width = layout.fixed(layout.Scalar(columns + 1)), height = layout.fixed(layout.Scalar(rows))},
 		padding = layout.Edges{left = 1},
@@ -965,7 +943,11 @@ declare_tool_image :: proc(ctx: ^layout.Context, id: term.Image_Id, columns, row
 			ctx,
 			layout.Element_Desc {
 				layout = picture,
-				content = layout.Image_Content{handle = layout.Image_Handle(id), intrinsic_size = {layout.Scalar(columns), layout.Scalar(rows)}},
+				content = layout.Image_Content {
+					handle = layout.Image_Handle(id),
+					intrinsic_size = {layout.Scalar(columns), layout.Scalar(rows)},
+					paint = storage_paint(storage, {}),
+				},
 			},
 		)
 	}
@@ -1165,7 +1147,7 @@ input_visible_rows :: proc(input: ^widgets.Input, width: int) -> (rows: int, err
 draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (cursor: term.Cursor, err: mem.Allocator_Error) {
 	if rect.height < 3 || rect.width <= 4 { return {}, nil }
 	border_style := RULE_STYLE
-	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = widgets.BORDER_ROUNDED, style = border_style})
+	widgets.draw_block(&storage.buffer, rect, widgets.Block{border = tui.BORDER_ROUNDED, style = border_style})
 	if app.transcript.focused {
 		_, _ = tui.draw_text(
 			&storage.buffer,

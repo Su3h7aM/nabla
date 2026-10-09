@@ -39,12 +39,12 @@ Resolved_Clip :: struct {
 }
 
 Fill_Cmd :: struct {
-	color:  Color,
+	paint:  Paint,
 	radius: Radius,
 }
 
 Border_Cmd :: struct {
-	color:  Color,
+	paint:  Paint,
 	radius: Radius,
 	width:  Edges,
 }
@@ -52,6 +52,7 @@ Border_Cmd :: struct {
 Text_Cmd :: struct {
 	text:     string,
 	style:    Text_Style,
+	paint:    Paint,
 	// user travels with each wrapped line emitted from its text node.
 	user:     User_Tag,
 	line:     u16,
@@ -60,7 +61,7 @@ Text_Cmd :: struct {
 
 Image_Cmd :: struct {
 	handle: Image_Handle,
-	tint:   Color,
+	paint:  Paint,
 	radius: Radius,
 	source: Image_Source,
 }

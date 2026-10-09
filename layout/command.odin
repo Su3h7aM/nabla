@@ -137,8 +137,8 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	clip := resolved.clip
 	radius := _normalize_radius(input.desc.paint.radius, resolved.outer.size)
 
-	if input.desc.paint.background.a > 0 {
-		if !_emit_command(state, node, resolved.outer, clip, Fill_Cmd{color = input.desc.paint.background, radius = radius}) {
+	if input.desc.paint.background != 0 {
+		if !_emit_command(state, node, resolved.outer, clip, Fill_Cmd{paint = input.desc.paint.background, radius = radius}) {
 			return false
 		}
 	}
@@ -146,15 +146,11 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	switch content in input.desc.content {
 	case Image_Content:
 		source, usable := _normalize_image_source(content.source)
-		tint := Color{255, 255, 255, 255}
-		if content.tint.enabled {
-			tint = content.tint.color
-		}
-		emit := content.handle != 0 && usable && tint.a > 0 && resolved.inner.size.x > 0 && resolved.inner.size.y > 0
+		emit := content.handle != 0 && usable && content.paint != 0 && resolved.inner.size.x > 0 && resolved.inner.size.y > 0
 		if emit {
 			data := Image_Cmd {
 				handle = content.handle,
-				tint   = tint,
+				paint  = content.paint,
 				radius = _normalize_radius(input.desc.paint.radius, resolved.inner.size),
 				source = source,
 			}
@@ -174,7 +170,7 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	case:
 	}
 
-	if !input.is_text || input.text_style.color.a == 0 {
+	if !input.is_text || input.text_paint == 0 {
 		return true
 	}
 	for line_index in 0 ..< input.text_line_count {
@@ -182,6 +178,7 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 		data := Text_Cmd {
 			text     = record.text,
 			style    = input.text_style,
+			paint    = input.text_paint,
 			user     = input.desc.user,
 			line     = record.line,
 			baseline = record.baseline,
@@ -197,7 +194,7 @@ _emit_node_enter :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 _emit_between_children :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	input := &state._node_inputs[node]
 	thickness := input.desc.paint.border.between_children
-	if !_scalar_is_finite(thickness) || thickness <= 0 || input.desc.paint.border.color.a == 0 {
+	if !_scalar_is_finite(thickness) || thickness <= 0 || input.desc.paint.border.paint == 0 {
 		return true
 	}
 	main_axis := _flow_main_axis(input.desc.layout.flow)
@@ -231,7 +228,7 @@ _emit_between_children :: proc(state: ^_Context_State, node: Node_Handle) -> boo
 		bounds.size[main] = Scalar(width)
 		bounds.position[cross] = Scalar(cross_origin)
 		bounds.size[cross] = inner.size[cross]
-		if !_emit_command(state, node, bounds, clip, Fill_Cmd{color = input.desc.paint.border.color}) {
+		if !_emit_command(state, node, bounds, clip, Fill_Cmd{paint = input.desc.paint.border.paint}) {
 			return false
 		}
 	}
@@ -246,7 +243,7 @@ _emit_node_exit :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	}
 	input := &state._node_inputs[node]
 	border := input.desc.paint.border
-	if border.color.a == 0 {
+	if border.paint == 0 {
 		return true
 	}
 	resolved := state._nodes[node]
@@ -255,7 +252,7 @@ _emit_node_exit :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 		return true
 	}
 	data := Border_Cmd {
-		color  = border.color,
+		paint  = border.paint,
 		radius = _normalize_radius(input.desc.paint.radius, resolved.outer.size),
 		width  = width,
 	}

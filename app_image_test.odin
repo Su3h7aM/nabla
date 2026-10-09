@@ -9,6 +9,7 @@ import "core:testing"
 import "nabla:agent"
 import "nabla:ai"
 import "nabla:term"
+import "nabla:tui"
 import "nabla:tui/widgets"
 
 // image_test_png is a black 8-bit RGB PNG of the given size, with stored deflate blocks.
@@ -354,7 +355,7 @@ test_released_picture_is_deleted_from_the_terminal :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(storage.uploads), 0)
 	testing.expect_value(t, app.run.snap.image_bytes, 0)
 
-	append(&storage.placed, Image_Placement{id = id, columns = 1, rows = 1})
+	append(&storage.placed, tui.Image_Placement{id = id, columns = 1, rows = 1})
 	{
 		sync.mutex_guard(&app.run.mu)
 		images_collect(app, storage)

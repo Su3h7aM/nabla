@@ -2,6 +2,13 @@ package tui
 
 import "nabla:term"
 
+// Image_Placement is an image at a size in cells.
+Image_Placement :: struct {
+	id:      term.Image_Id,
+	columns: int,
+	rows:    int,
+}
+
 // draw_image_rect fills rect with the placeholder cells of the image id, in the shape
 // term.graphics_place gave it, and returns the cells written. The first cell of each row
 // names column 0, so a rect whose left edge is clipped draws nothing; rows past

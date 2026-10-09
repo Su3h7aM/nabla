@@ -71,15 +71,15 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 		parent := _panel(120, 120)
 		parent.id = id("parent")
 		parent.paint = {
-			background = {10, 10, 10, 255},
-			border = {color = {200, 200, 200, 255}, width = pad_all(2)},
+			background = 1,
+			border = {paint = 2, width = pad_all(2)},
 		}
 		parent.content = Custom_Content {
 			kind = Custom_Kind(7),
 		}
 		if element(&ctx, parent) {
 			child := _panel(40, 40)
-			child.paint.background = {80, 80, 80, 255}
+			child.paint.background = 8
 			content(&ctx, child)
 		}
 	}
@@ -100,7 +100,7 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 		box.layout.sizing.height = fit()
 		box.id = id("box")
 		if element(&ctx, box) {
-			text(&ctx, {text = "aaa bbb ccc", user = User_Tag(37), style = {size = 10, color = {255, 255, 255, 255}, wrap = .Words}})
+			text(&ctx, {text = "aaa bbb ccc", user = User_Tag(37), paint = 3, style = {size = 10, wrap = .Words}})
 		}
 	}
 	frame_result, err = result(&ctx)
@@ -125,14 +125,14 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 	if frame(&ctx, {300, 300}) {
 		parent := _panel(200, 200)
 		parent.id = id("parent")
-		parent.paint.background = {1, 1, 1, 255}
+		parent.paint.background = 1
 		if element(&ctx, parent) {
 			first := _panel(20, 20)
-			first.paint.background = {2, 2, 2, 255}
+			first.paint.background = 2
 			content(&ctx, first)
 
 			floating := _panel(20, 20)
-			floating.paint.background = {3, 3, 3, 255}
+			floating.paint.background = 3
 			floating.overlay = {
 				attach = .Parent,
 				layer  = 5,
@@ -140,7 +140,7 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 			content(&ctx, floating)
 
 			last := _panel(20, 20)
-			last.paint.background = {4, 4, 4, 255}
+			last.paint.background = 4
 			content(&ctx, last)
 		}
 	}
@@ -175,7 +175,7 @@ test_command_order_and_culling :: proc(t: ^testing.T) {
 				if element(ctx, {layout = {flow = .Column, sizing = {fixed(100), fit()}}}) {
 					for index in 0 ..< 6 {
 						row := _panel(100, 40)
-						row.paint.background = {u8(index), 0, 0, 255}
+						row.paint.background = Paint(index + 1)
 						content(ctx, row)
 					}
 				}
@@ -205,19 +205,19 @@ test_command_normalization :: proc(t: ^testing.T) {
 	if frame(&ctx, {200, 200}) {
 		transparent := _panel(50, 50)
 		transparent.paint = {
-			background = {255, 255, 255, 0},
-			border = {color = {255, 0, 0, 255}},
+			background = 0,
+			border = {paint = 0, width = pad_all(4)},
 		}
 		content(&ctx, transparent)
 
 		invisible_border := _panel(50, 50)
 		invisible_border.paint.border = {
-			color = {255, 0, 0, 0},
+			paint = 0,
 			width = pad_all(4),
 		}
 		content(&ctx, invisible_border)
 
-		text(&ctx, {text = "hidden", style = {size = 10, color = {255, 255, 255, 0}}})
+		text(&ctx, {text = "hidden", style = {size = 10}})
 
 		custom := _panel(40, 30)
 		custom.content = Custom_Content {
@@ -231,11 +231,12 @@ test_command_normalization :: proc(t: ^testing.T) {
 	testing.expect_value(t, frame_result.commands[0].data.(Custom_Cmd).kind, Custom_Kind(0))
 
 	// A flipped, out-of-range UV rectangle becomes the region it overlaps, and
-	// a disabled tint is republished as the identity multiplier.
+	// an image without a paint id is not emitted.
 	if frame(&ctx, {200, 200}) {
 		box := _panel(100, 100)
 		box.content = Image_Content {
 			handle = Image_Handle(3),
+			paint = 7,
 			source = {mode = .Normalized, uv = {position = {0.75, 1.5}, size = {-0.5, -2}}},
 		}
 		content(&ctx, box)
@@ -246,18 +247,17 @@ test_command_normalization :: proc(t: ^testing.T) {
 		}
 		content(&ctx, no_handle)
 
-		clear_tint := _panel(50, 50)
-		clear_tint.content = Image_Content {
+		no_paint := _panel(50, 50)
+		no_paint.content = Image_Content {
 			handle = Image_Handle(1),
-			tint = {enabled = true, color = {255, 255, 255, 0}},
 		}
-		content(&ctx, clear_tint)
+		content(&ctx, no_paint)
 	}
 	frame_result, err = result(&ctx)
 	testing.expect_value(t, err, Frame_Error.None)
 	testing.expect_value(t, len(frame_result.commands), 1)
 	image := frame_result.commands[0].data.(Image_Cmd)
-	testing.expect_value(t, image.tint, Color{255, 255, 255, 255})
+	testing.expect_value(t, image.paint, Paint(7))
 	_expect_close(t, image.source.uv.position.x, 0.25)
 	_expect_close(t, image.source.uv.size.x, 0.5)
 	_expect_close(t, image.source.uv.position.y, 0)
@@ -268,9 +268,9 @@ test_command_normalization :: proc(t: ^testing.T) {
 	if frame(&ctx, {200, 200}) {
 		box := _panel(100, 100)
 		box.paint = {
-			background = {255, 255, 255, 255},
+			background = 1,
 			radius = {tl = 150, tr = 50, br = 150, bl = 50},
-			border = {color = {255, 0, 0, 255}, width = {left = 90, right = 30, top = 12, bottom = 12}},
+			border = {paint = 4, width = {left = 90, right = 30, top = 12, bottom = 12}},
 		}
 		content(&ctx, box)
 	}
@@ -290,7 +290,7 @@ test_command_normalization :: proc(t: ^testing.T) {
 		row := Element_Desc {
 			id = id("row"),
 			layout = {flow = .Row, sizing = {fixed(300), fixed(100)}, gap = 8},
-			paint = {border = {color = {255, 255, 255, 255}, between_children = 2}},
+			paint = {border = {paint = 5, between_children = 2}},
 		}
 		if element(&ctx, row) {
 			for _ in 0 ..< 3 {
@@ -338,7 +338,7 @@ test_empty_text_line_survives_visible_culling :: proc(t: ^testing.T) {
 	}
 	set_services(&ctx, Services{measure_text = measure_text, break_text = break_text})
 	if frame(&ctx, {100, 100}) {
-		text(&ctx, {text = "ab\n\ncd", style = {color = {255, 255, 255, 255}, wrap = .Words}})
+		text(&ctx, {text = "ab\n\ncd", paint = 3, style = {wrap = .Words}})
 	}
 	frame_result, err := result(&ctx)
 	testing.expect_value(t, err, Frame_Error.None)

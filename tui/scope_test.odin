@@ -107,6 +107,10 @@ test_text_draws_layout_wrapped_lines :: proc(t: ^testing.T) {
 	layout.set_services(&layout_ctx, layout_services(&measure_context))
 	parent_id := layout.Id(10)
 	text_id := layout.Id(11)
+	paints: Paints
+	defer delete(paints)
+	text_paint, paint_error := paint(&paints, {})
+	testing.expect_value(t, paint_error, nil)
 	if layout.frame(&layout_ctx, {5, 2}) {
 		if layout.element(&layout_ctx, layout.Element_Desc{id = parent_id, layout = {flow = .Column, sizing = {layout.grow(), layout.grow()}}}) {
 			layout.text(
@@ -114,7 +118,8 @@ test_text_draws_layout_wrapped_lines :: proc(t: ^testing.T) {
 				layout.Text_Desc {
 					id = text_id,
 					text = "hello world",
-					style = {size = 1, color = {255, 255, 255, 255}, line_height = 1, wrap = .Words},
+					style = {size = 1, line_height = 1, wrap = .Words},
+					paint = text_paint,
 					sizing = {layout.grow(), layout.fit()},
 				},
 			)
@@ -125,10 +130,10 @@ test_text_draws_layout_wrapped_lines :: proc(t: ^testing.T) {
 
 	cells: [10]term.Cell
 	ctx: Context
-	if frame(&ctx, layout_result, cells[:]) {
+	if frame(&ctx, layout_result, cells[:], paints = paints[:]) {
 		if element(&ctx, {id = parent_id}) {
 			if element(&ctx, {id = text_id}) {
-				written, ok := text(&ctx, {})
+				written, ok := text(&ctx)
 				testing.expect(t, ok)
 				testing.expect_value(t, written, 10)
 			}

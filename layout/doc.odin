@@ -10,6 +10,14 @@
 // belong to the caller or the TUI integration. Layout publishes geometry and
 // renderer-neutral commands, not terminal I/O or retained widgets.
 //
+// Layout holds no colors. Drawn things carry a `Paint`, an opaque id the caller
+// resolves when it draws. The caller keeps its own paint table (colors, styles,
+// theme lookups) and passes ids in `Paint_Style.background`,
+// `Border_Style.paint`, `Text_Desc.paint`, and `Image_Content.paint`. Layout
+// computes geometry and carries each id through to the matching command
+// unchanged. Paint 0 means nothing is drawn, so layout emits no command for it.
+// Paint never affects measurement, and the measure cache ignores it.
+//
 // Read this package comment as the canonical composition guide. In particular,
 // `frame` and `element` use Odin's deferred lexical scopes: the declaration
 // block is the tree, and leaving that block is the solve/publication point.
@@ -64,6 +72,7 @@
 //                 layout.text(&ctx, layout.Text_Desc{
 //                     id = layout.id("title"),
 //                     text = title,
+//                     paint = layout.Paint(theme_title),
 //                     style = layout.Text_Style{
 //                         size = 18,
 //                         wrap = .None,

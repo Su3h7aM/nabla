@@ -69,6 +69,7 @@ Context :: struct {
 	// selected its inner box: the one fact the tree cannot give back.
 	_inner:        [layout.MAX_DEPTH / 8]u8,
 	_profile:      width_text.Width_Profile,
+	_paints:       []Paint,
 	_error:        Frame_Error,
 	_frame_open:   bool,
 	_result_ready: bool,
@@ -76,7 +77,9 @@ Context :: struct {
 
 // frame opens a terminal render scope over a completed layout frame. The
 // viewport initializes the cell grid, and the block closes with a complete
-// Frame available from result.
+// Frame available from result. paints is the table the frame's layout.Paint ids
+// index; text resolves each line's paint in it, and it must stay valid until
+// the block closes.
 @(deferred_in_out = _frame_leave, require_results)
 frame :: proc(
 	ctx: ^Context,
@@ -84,6 +87,7 @@ frame :: proc(
 	storage: []term.Cell,
 	base: term.Style = {},
 	profile: width_text.Width_Profile = width_text.DEFAULT_WIDTH_PROFILE,
+	paints: []Paint = nil,
 	loc := #caller_location,
 ) -> bool {
 	if ctx == nil {
@@ -118,6 +122,7 @@ frame :: proc(
 	ctx._result = frame_result
 	ctx._cursor = {}
 	ctx._profile = profile
+	ctx._paints = paints
 	ctx._frame = _Scope {
 		outer  = viewport,
 		inner  = viewport,
@@ -136,6 +141,7 @@ _frame_leave :: proc(
 	storage: []term.Cell,
 	base: term.Style,
 	profile: width_text.Width_Profile,
+	paints: []Paint,
 	loc: runtime.Source_Code_Location,
 	entered: bool,
 ) {
@@ -404,9 +410,10 @@ draw_text_context :: proc(ctx: ^Context, value: string, style: term.Style) -> (i
 }
 
 // text draws the active layout text node's resolved lines. Wrapping and line
-// positions come from layout; style supplies the terminal-specific paint.
+// positions come from layout; each line takes its style and link from the
+// paint its command carries, looked up in the table given to frame.
 @(require_results)
-text :: proc(ctx: ^Context, style: term.Style) -> (written: int, ok: bool) {
+text :: proc(ctx: ^Context) -> (written: int, ok: bool) {
 	if ctx == nil || !ctx._frame_open || ctx._error != .None || ctx._depth == 0 {
 		return 0, false
 	}
@@ -420,13 +427,25 @@ text :: proc(ctx: ^Context, style: term.Style) -> (written: int, ok: bool) {
 		if !is_text {
 			continue
 		}
+		value, found := paint_of(ctx._paints, text_command.paint)
+		if !found {
+			continue
+		}
 		rect, rect_error := project_rect_integral(command.bounds)
 		clip, clip_error := project_rect_integral(layout.clip_of(ctx._result, command.clip).rect)
 		if rect_error != .None || clip_error != .None {
 			ctx._error = .Non_Integral_Geometry
 			return written, false
 		}
-		line_written, line_ok := _draw_text_clipped(&ctx._buffer, rect, _intersect_rect(scope.bounds, clip), text_command.text, style, ctx._profile)
+		line_written, line_ok := _draw_text_clipped(
+			&ctx._buffer,
+			rect,
+			_intersect_rect(scope.bounds, clip),
+			text_command.text,
+			value.style,
+			ctx._profile,
+			value.link,
+		)
 		if !line_ok {
 			ctx._error = .Invalid_Text
 			return written, false

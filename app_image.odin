@@ -13,6 +13,7 @@ import "core:sync"
 
 import "nabla:ai"
 import "nabla:term"
+import "nabla:tui"
 
 // IMAGE_MAX_ROWS is the tallest a picture is drawn; half the conversation's rows is the tallest on a short terminal.
 IMAGE_MAX_ROWS :: 24
@@ -44,20 +45,13 @@ Entry_Image :: struct {
 	height: int,
 }
 
-// Image_Placement is an image at a size in cells.
-Image_Placement :: struct {
-	id:      term.Image_Id,
-	columns: int,
-	rows:    int,
-}
-
 // Image_Upload is an image the terminal does not have yet; it owns the pixels images_collect moved out of the entry.
 Image_Upload :: struct {
 	pixels:    [dynamic]u8, // owned,
 	format:    term.Image_Format,
 	width:     int,
 	height:    int,
-	placement: Image_Placement,
+	placement: tui.Image_Placement,
 }
 
 // entry_destroy releases everything an entry owns.
@@ -240,7 +234,7 @@ images_collect :: proc(app: ^App, storage: ^Frame_Storage) {
 }
 
 // image_placement_find returns the index of id in placements, or -1.
-image_placement_find :: proc(placements: []Image_Placement, id: term.Image_Id) -> int {
+image_placement_find :: proc(placements: []tui.Image_Placement, id: term.Image_Id) -> int {
 	for placement, index in placements {
 		if placement.id == id { return index }
 	}
