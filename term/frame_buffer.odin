@@ -24,10 +24,24 @@ Frame_Buffer :: struct {
 // caret.
 Cursor :: struct {
 	visible:  bool,
+	// shape is the DECSCUSR cursor style; .Default leaves the terminal's own
+	// style untouched.
+	shape:    Cursor_Shape,
 	position: Position,
 	// placed moves the cursor to position; when false the cursor stays where
 	// the last written cell left it.
 	placed:   bool,
+}
+
+// Cursor_Shape is a DECSCUSR style. The values are the sequence parameters.
+Cursor_Shape :: enum u8 {
+	Default,
+	Block_Blink,
+	Block,
+	Underline_Blink,
+	Underline,
+	Beam_Blink,
+	Beam,
 }
 
 // Position is a zero-based cell coordinate, origin at the top-left. The

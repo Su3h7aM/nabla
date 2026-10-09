@@ -67,6 +67,12 @@
 // - Viewport also carries the cell area's size in pixels (zero when the
 //   terminal does not report it), for scaling an image to a cell placement.
 //
+// Frame output contract:
+// - Every frame is bracketed by synchronized output (DECSET 2026) so a
+//   terminal that supports it shows the frame atomically; others ignore it.
+// - Cursor.shape selects a DECSCUSR cursor style. The zero value, .Default,
+//   emits nothing. close restores the terminal's default style.
+//
 // Terminal mode contract:
 // - The session assumes a documented entry baseline and restores it on close
 //   rather than querying and preserving whatever it found. Named state

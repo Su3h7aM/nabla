@@ -47,7 +47,7 @@ test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
 	out, ok := _encode_frame(buffer, profile, {}, scratch[:])
 	testing.expect(t, ok, "a valid frame must encode")
 
-	expected := "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[2;1H\x1b[mcd\x1b[?25l\x1b[m"
+	expected := "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[2;1H\x1b[mcd\x1b[?25l\x1b[m\x1b[?2026l"
 	testing.expect_value(t, out, expected)
 
 	// The stream carries real ESC bytes and never a literal backslash-e.
@@ -82,7 +82,7 @@ test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
 	padded_scratch: [4096]byte
 	padded_out, padded_ok := _encode_frame(padded, profile_default(), {}, padded_scratch[:])
 	testing.expect(t, padded_ok, "unused trailing cells must not veto the frame")
-	testing.expect_value(t, padded_out, "\x1b[H\x1b[m\x1b[1;1Habc\x1b[?25l\x1b[m")
+	testing.expect_value(t, padded_out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Habc\x1b[?25l\x1b[m\x1b[?2026l")
 }
 
 @(test)
@@ -105,7 +105,7 @@ test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
 	}
 	out, ok := _encode_frame(buffer, profile, placed, scratch[:])
 	testing.expect(t, ok, "an in-bounds position must encode")
-	testing.expect_value(t, out, "\x1b[H\x1b[m\x1b[1;1Hxyz\x1b[1;2H\x1b[?25h\x1b[m")
+	testing.expect_value(t, out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hxyz\x1b[1;2H\x1b[?25h\x1b[m\x1b[?2026l")
 
 	// Visibility and position are independent: a frame with no position still
 	// sets visibility, and an unplaced cursor keeps the frame's end position.
@@ -121,7 +121,7 @@ test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
 		hide_scratch: [4096]byte
 		hide_out, hide_ok := _encode_frame(buffer, profile, intent, hide_scratch[:])
 		testing.expect(t, hide_ok, "hide/show must encode")
-		expected := strings.concatenate({"\x1b[H\x1b[m\x1b[1;1Hxyz", sequence, "\x1b[m"})
+		expected := strings.concatenate({"\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hxyz", sequence, "\x1b[m\x1b[?2026l"})
 		defer delete(expected)
 		testing.expect_value(t, hide_out, expected)
 	}
@@ -144,10 +144,10 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 		depth:    Color_Depth,
 		expected: string,
 	} {
-		{.True_Color, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[mc\x1b[?25l\x1b[m"},
-		{.Eight_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;5;196mb\x1b[mc\x1b[?25l\x1b[m"},
-		{.Four_Bit, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m"},
-		{.None, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[mc\x1b[?25l\x1b[m"},
+		{.True_Color, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.Eight_Bit, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;5;196mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.Four_Bit, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.None, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
 	}
 	for fixture in cases {
 		scratch: [4096]byte
@@ -178,7 +178,7 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 	indexed_scratch: [4096]byte
 	indexed_out, indexed_ok := _encode_frame(Frame_Buffer{columns = 3, rows = 1, cells = indexed}, {color_depth = .Four_Bit}, {}, indexed_scratch[:])
 	testing.expect(t, indexed_ok, "an indexed frame must encode")
-	testing.expect_value(t, indexed_out, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m")
+	testing.expect_value(t, indexed_out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l")
 }
 
 @(test)
@@ -198,7 +198,7 @@ test_encode_emits_style_once_per_run :: proc(t: ^testing.T) {
 	scratch: [4096]byte
 	out, ok := _encode_frame(buffer, {color_depth = .True_Color}, {}, scratch[:])
 	testing.expect(t, ok, "a valid frame must encode")
-	testing.expect_value(t, out, "\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mbcd\x1b[?25l\x1b[m")
+	testing.expect_value(t, out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mbcd\x1b[?25l\x1b[m\x1b[?2026l")
 }
 
 @(test)
@@ -216,7 +216,7 @@ test_encode_validates_frame_and_cells :: proc(t: ^testing.T) {
 	}
 	wide_out, wide_ok := _encode_frame(wide, {color_depth = .True_Color}, {}, scratch[:])
 	testing.expect(t, wide_ok, "a well-formed wide frame must encode")
-	testing.expect_value(t, wide_out, "\x1b[H\x1b[m\x1b[1;1H界\x1b[?25l\x1b[m")
+	testing.expect_value(t, wide_out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1H界\x1b[?25l\x1b[m\x1b[?2026l")
 
 	// Malformed wide grids are rejected before any byte is written.
 	width_three := Frame_Buffer {
@@ -425,4 +425,52 @@ test_encode_invalid_hyperlink_uri_without_osc8 :: proc(t: ^testing.T) {
 	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
 	if !testing.expect(t, ok) { return }
 	testing.expect(t, strings.index(out, "\x1b]8;") < 0)
+}
+
+@(test)
+test_encode_wraps_the_frame_in_synchronized_output :: proc(t: ^testing.T) {
+	buffer := Frame_Buffer {
+		columns = 1,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "x", width = 1}},
+	}
+	scratch: [4096]byte
+	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
+	if !testing.expect(t, ok) { return }
+	testing.expect(t, strings.has_prefix(out, "\x1b[?2026h"))
+	testing.expect(t, strings.has_suffix(out, "\x1b[?2026l"))
+	testing.expect_value(t, strings.count(out, "\x1b[?2026"), 2)
+}
+
+@(test)
+test_encode_emits_the_cursor_shape :: proc(t: ^testing.T) {
+	buffer := Frame_Buffer {
+		columns = 1,
+		rows    = 1,
+		cells   = []Cell{{grapheme = "x", width = 1}},
+	}
+	expected := [Cursor_Shape]string {
+		.Default         = "",
+		.Block_Blink     = "\x1b[1 q",
+		.Block           = "\x1b[2 q",
+		.Underline_Blink = "\x1b[3 q",
+		.Underline       = "\x1b[4 q",
+		.Beam_Blink      = "\x1b[5 q",
+		.Beam            = "\x1b[6 q",
+	}
+	for shape in Cursor_Shape {
+		scratch: [4096]byte
+		out, ok := _encode_frame(buffer, {}, {shape = shape}, scratch[:])
+		if !testing.expect(t, ok) { return }
+		want := strings.concatenate({"\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hx", expected[shape], "\x1b[?25l\x1b[m\x1b[?2026l"})
+		defer delete(want)
+		testing.expect_value(t, out, want)
+	}
+}
+
+@(test)
+test_encode_maps_rgb_to_the_nearest_xterm_256_entry :: proc(t: ^testing.T) {
+	testing.expect_value(t, _rgb_to_256({135, 0, 0}), 88)
+	testing.expect_value(t, _rgb_to_256({95, 175, 215}), 16 + 36 * 1 + 6 * 3 + 4)
+	testing.expect_value(t, _rgb_to_256({128, 128, 128}), 244)
 }

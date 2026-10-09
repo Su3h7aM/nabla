@@ -5,7 +5,7 @@ package term
 import "core:sys/linux"
 
 // Termios mirrors the kernel's struct termios (asm-generic/termbits.h), the
-// layout TCGETS and TCSETSF transfer. core:sys/linux has no termios type.
+// layout TCGETS, TCSETS, and TCSETSF transfer. core:sys/linux has no termios type.
 Termios :: struct {
 	c_iflag: u32,
 	c_oflag: u32,
@@ -17,11 +17,19 @@ Termios :: struct {
 
 TERMIOS_NCCS :: 19
 
-// Request numbers from asm-generic/ioctls.h. TCSETSF is tcsetattr's
-// TCSAFLUSH: apply after output drains and discard pending input.
+// Request numbers from asm-generic/ioctls.h. TCSETS is tcsetattr's TCSANOW:
+// apply immediately. TCSETSF is TCSAFLUSH: apply after output drains and
+// discard pending input.
 TCGETS :: 0x5401
+TCSETS :: 0x5402
 TCSETSF :: 0x5404
+TCSANOW :: TCSETS
 TCSAFLUSH :: TCSETSF
+
+// c_cflag bits.
+CSIZE :: 0o60
+CS8 :: 0o60
+PARENB :: 0o400
 
 // c_lflag bits.
 ISIG :: 0o1

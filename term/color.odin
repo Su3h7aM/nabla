@@ -22,13 +22,36 @@ ANSI_16 :: [16][3]u8 {
 	{255, 255, 255},
 }
 
-// _rgb_to_256 maps an RGB triple to the nearest xterm-256 cube entry (the
-// 6x6x6 color cube; the grayscale ramp is not approximated).
+// CUBE_LEVELS are the channel values of the xterm 6x6x6 color cube.
+CUBE_LEVELS :: [6]u8{0, 95, 135, 175, 215, 255}
+
+// _rgb_to_256 maps an RGB triple to the nearest xterm-256 entry by squared
+// distance: the closest color cube entry or, when nearer, a grayscale ramp step.
 _rgb_to_256 :: proc(color: RGB_Color) -> u8 {
-	step :: proc(channel: u8) -> int {
-		return (int(channel) * 5 + 127) / 255
+	levels := CUBE_LEVELS
+	nearest_level :: proc(levels: [6]u8, channel: u8) -> int {
+		best := 0
+		for level, i in levels {
+			if abs(int(level) - int(channel)) < abs(int(levels[best]) - int(channel)) {
+				best = i
+			}
+		}
+		return best
 	}
-	return u8(16 + 36 * step(color[0]) + 6 * step(color[1]) + step(color[2]))
+	cube := u8(16 + 36 * nearest_level(levels, color[0]) + 6 * nearest_level(levels, color[1]) + nearest_level(levels, color[2]))
+	average := (int(color[0]) + int(color[1]) + int(color[2])) / 3
+	ramp := u8(232 + clamp((average - 3) / 10, 0, 23))
+	if _rgb_distance(color, _xterm_256_to_rgb(ramp)) < _rgb_distance(color, _xterm_256_to_rgb(cube)) {
+		return ramp
+	}
+	return cube
+}
+
+_rgb_distance :: proc(a, b: RGB_Color) -> int {
+	red := int(a[0]) - int(b[0])
+	green := int(a[1]) - int(b[1])
+	blue := int(a[2]) - int(b[2])
+	return red * red + green * green + blue * blue
 }
 
 // _xterm_256_to_rgb decodes an xterm-256 palette index to its RGB triple:
@@ -41,13 +64,8 @@ _xterm_256_to_rgb :: proc(index: u8) -> RGB_Color {
 		return RGB_Color(palette[index])
 	case index < 232:
 		cube := int(index) - 16
-		level :: proc(cube_index: int) -> u8 {
-			if cube_index == 0 {
-				return 0
-			}
-			return u8(55 + cube_index * 40)
-		}
-		return RGB_Color{level(cube / 36), level((cube % 36) / 6), level(cube % 6)}
+		levels := CUBE_LEVELS
+		return RGB_Color{levels[cube / 36], levels[(cube % 36) / 6], levels[cube % 6]}
 	case:
 		gray := u8(8 + (int(index) - 232) * 10)
 		return RGB_Color{gray, gray, gray}

@@ -132,7 +132,7 @@ _validate_frame :: proc(buffer: Frame_Buffer, cursor: Cursor) -> Error {
 				return General_Error.Invalid_Cell
 			}
 		case 1:
-			if len(cell.grapheme) > 0 && !_grapheme_safe(cell.grapheme) {
+			if len(cell.grapheme) == 0 || !_grapheme_safe(cell.grapheme) {
 				return General_Error.Invalid_Cell
 			}
 		case 2:
@@ -231,6 +231,11 @@ _encoder_write_uint :: proc(encoder: ^_Encoder, value: u64) {
 	}
 }
 
+// Synchronized output (DECSET 2026) brackets a frame so the terminal shows it
+// atomically; a terminal without the mode ignores both sequences.
+SYNC_BEGIN :: ansi.CSI + "?2026h"
+SYNC_END :: ansi.CSI + "?2026l"
+
 // _serialize renders the (validated) frame to the ANSI byte stream. The fixed
 // sequences come from core:terminal/ansi; the numeric ones (SGR parameters,
 // CUP coordinates) are composed here because the encoder owns their exact
@@ -239,7 +244,7 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 	// Baseline: cursor origin + explicit base style. The frame overwrites the
 	// viewport without a preliminary clear (framework contract); the
 	// unconditional SGR reset prevents stale attributes from a previous frame.
-	_encoder_write_text(encoder, ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
+	_encoder_write_text(encoder, SYNC_BEGIN + ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
 	previous_style: Style
 	// previous_link is the last cell's id; link_open says a hyperlink for it is open,
 	// which is false for an id with no usable URI.
@@ -275,6 +280,11 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 
 	// Position first, then visibility: showing after the move keeps a
 	// terminal from rendering a frame at the stale position.
+	if cursor.shape != .Default {
+		_encoder_write_text(encoder, ansi.CSI)
+		_encoder_write_uint(encoder, u64(cursor.shape))
+		_encoder_write_text(encoder, " q")
+	}
 	if cursor.placed {
 		_encoder_write_text(encoder, ansi.CSI)
 		_encoder_write_uint(encoder, u64(cursor.position.y) + 1)
@@ -289,7 +299,7 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 	}
 
 	// Restore the base style at the end of the frame (baseline contract).
-	_encoder_write_text(encoder, ansi.CSI + ansi.SGR)
+	_encoder_write_text(encoder, ansi.CSI + ansi.SGR + SYNC_END)
 }
 
 _hyperlink_uri :: proc(buffer: Frame_Buffer, id: Link_Id) -> (string, bool) {

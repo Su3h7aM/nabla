@@ -40,6 +40,7 @@ ALT_SCREEN_ENTER :: ansi.CSI + ansi.DECASB_ENTER + ansi.CSI + ansi.CUP
 ALT_SCREEN_LEAVE :: ansi.CSI + ansi.DECASB_EXIT
 CURSOR_HIDE :: ansi.CSI + ansi.DECTCEM_HIDE
 CURSOR_SHOW :: ansi.CSI + ansi.DECTCEM_SHOW
+CURSOR_SHAPE_DEFAULT :: ansi.CSI + "0 q"
 SGR_RESET :: ansi.CSI + "0" + ansi.SGR
 // The session disables autowrap (DECAWM) for its lifetime: the frame path may
 // write the bottom-right cell, and with autowrap on that write can scroll the
@@ -161,6 +162,8 @@ _session_open :: proc(session: ^Session, options: Options) -> (err: Error) {
 		// output postprocessing; retain all unrelated bits; VMIN=1 VTIME=0.
 		raw := impl.original_termios
 		raw.c_lflag &~= ECHO | ECHONL | ICANON | IEXTEN | ISIG
+		raw.c_cflag &~= CSIZE | PARENB
+		raw.c_cflag |= CS8
 		raw.c_iflag &~= ICRNL | INLCR | IGNCR | IXON
 		raw.c_oflag &~= OPOST
 		raw.c_cc[VMIN] = 1
@@ -302,7 +305,7 @@ _session_restore :: proc(impl: ^Session_Impl, write: proc(file: ^os.File, text: 
 	_keep_first_error(&first_error, _session_undo(&impl.autowrap_disabled, impl.file, AUTOWRAP_ON, write))
 	_keep_first_error(&first_error, _session_undo(&impl.alt_screen_entered, impl.file, ALT_SCREEN_LEAVE, write))
 	if impl.mode_applied {
-		if errno := _tcsetattr(linux.Fd(os.fd(impl.file)), TCSAFLUSH, &impl.original_termios); errno != .NONE {
+		if errno := _tcsetattr(linux.Fd(os.fd(impl.file)), TCSANOW, &impl.original_termios); errno != .NONE {
 			_keep_first_error(&first_error, Platform_Error(errno))
 		} else {
 			impl.mode_applied = false
@@ -349,7 +352,7 @@ _session_close :: proc(session: ^Session) -> Error {
 	// intent. The descriptor guard keeps a retry after the one-shot descriptor
 	// close from writing to a file the session no longer owns.
 	if impl.file != nil {
-		if err := _session_close_write(impl.file, CURSOR_SHOW + SGR_RESET); err != nil {
+		if err := _session_close_write(impl.file, CURSOR_SHAPE_DEFAULT + CURSOR_SHOW + SGR_RESET); err != nil {
 			_keep_first_error(&first_error, err)
 		} else {
 			impl.cursor_hidden = false
@@ -505,7 +508,7 @@ _session_close_write :: proc(file: ^os.File, text: string) -> Error {
 @(fini, private = "file")
 _session_restore_at_fini :: proc "contextless" () {
 	if atexit_active {
-		_ = _tcsetattr(atexit_fd, TCSAFLUSH, &atexit_termios)
+		_ = _tcsetattr(atexit_fd, TCSANOW, &atexit_termios)
 	}
 }
 
@@ -527,6 +530,7 @@ _session_install_sigwinch :: proc(impl: ^Session_Impl) {
 	// rt_sigaction supplies the x86_64 restorer (SA_RESTORER + rt_sigreturn).
 	action := linux.Sig_Action {
 		handler = _session_sigwinch_handler,
+		flags   = {.RESTART},
 	}
 	if linux.rt_sigaction(.SIGWINCH, &action, &impl.previous_sigaction) == .NONE {
 		impl.sigwinch_installed = true
