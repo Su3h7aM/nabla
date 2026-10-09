@@ -6,6 +6,7 @@ package widgets
 import "core:testing"
 import "nabla:layout"
 import "nabla:term"
+import "nabla:text"
 import "nabla:tui"
 
 _frame :: proc(storage: []term.Cell, columns, rows: int) -> term.Frame_Buffer {
@@ -85,15 +86,24 @@ test_input_edits_by_cluster :: proc(t: ^testing.T) {
 
 	testing.expect(t, input_move_end(&input))
 	testing.expect(t, input_insert(&input, "a\nb\tc"))
-	// The line break is kept and the tab is dropped, so the text keeps the shape
-	// it was pasted in.
-	testing.expect_value(t, input_text(&input), "xa\nbc")
-	testing.expect(t, !input_insert(&input, "\xff"))
-	testing.expect_value(t, input_text(&input), "xa\nbc")
+	testing.expect_value(t, input_text(&input), "xa\nb\tc")
 
 	testing.expect(t, input_move_home(&input))
 	testing.expect(t, input_delete(&input))
-	testing.expect_value(t, input_text(&input), "a\nbc")
+	testing.expect_value(t, input_text(&input), "a\nb\tc")
+}
+
+@(test)
+test_input_insert_sanitizes_untrusted_text :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	testing.expect(t, input_insert(&input, "ad"))
+	testing.expect(t, input_move_left(&input))
+	testing.expect(t, input_insert(&input, "b\r\nc\re\x1b[31m\u0085\x07\xff\x1b[2"))
+	testing.expect_value(t, input_text(&input), "ab\nc\ne\uFFFDd")
+	testing.expect_value(t, input_cursor(&input), len("ab\nc\ne\uFFFD"))
 }
 
 @(test)
@@ -228,7 +238,6 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	ctx: tui.Context
 	if tui.frame(&ctx, layout_result, cells[:]) {
 		if tui.element(&ctx, {id = block_id}) {
-			draw_block(&ctx, Block{border = tui.BORDER_SINGLE})
 			if tui.element(&ctx, {id = input_id}) {
 				_, draw_error := draw_input(&ctx, &input, {})
 				testing.expect(t, draw_error == nil)
@@ -237,7 +246,6 @@ test_widgets_draw_through_scoped_layout_boxes :: proc(t: ^testing.T) {
 	}
 	frame, render_error := tui.result(&ctx)
 	testing.expect_value(t, render_error, tui.Frame_Error.None)
-	testing.expect_value(t, frame.buffer.cells[0].grapheme, "┌")
 	testing.expect_value(t, frame.buffer.cells[11].grapheme, "o")
 	testing.expect(t, frame.cursor.visible && frame.cursor.placed)
 	testing.expect_value(t, frame.cursor.position, term.Position{3, 1})
@@ -310,7 +318,7 @@ test_list_select_first_last_page :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_block_draws_footer_on_bottom_edge_and_truncates_it :: proc(t: ^testing.T) {
+test_draw_block_draws_footer_on_bottom_edge_and_truncates_it :: proc(t: ^testing.T) {
 	cells: [48]term.Cell
 	frame := _frame(cells[:], 12, 4)
 	draw_block(&frame, {x = 0, y = 0, width = 12, height = 4}, Block{border = tui.BORDER_ROUNDED, title = "top", footer = "─ 3 more lines ─────"})
@@ -318,5 +326,61 @@ test_block_draws_footer_on_bottom_edge_and_truncates_it :: proc(t: ^testing.T) {
 	testing.expect_value(t, frame.cells[3 * 12].grapheme, "╰")
 	testing.expect_value(t, frame.cells[3 * 12 + 1].grapheme, "─")
 	testing.expect_value(t, frame.cells[3 * 12 + 5].grapheme, "m")
+	testing.expect_value(t, frame.cells[3 * 12 + 11].grapheme, "╯")
+}
+
+@(test)
+test_block_declares_border_title_and_footer_cut_to_the_box :: proc(t: ^testing.T) {
+	options := layout.Options {
+		capacities = {
+			nodes = 16,
+			children = 16,
+			clips = 8,
+			commands = 16,
+			text_lines = 8,
+			measured_words = 16,
+			overlays = 4,
+			measure_cache = 8,
+			id_table = 8,
+			depth = 8,
+			diagnostics = 16,
+		},
+	}
+	layout_ctx: layout.Context
+	testing.expect_value(t, layout.init(&layout_ctx, options), nil)
+	defer layout.destroy(&layout_ctx)
+	measure_context := tui.Measure_Context {
+		profile = text.DEFAULT_WIDTH_PROFILE,
+	}
+	layout.set_services(&layout_ctx, tui.layout_services(&measure_context))
+
+	paints: tui.Paints
+	defer delete(paints)
+	desc := Block_Desc {
+		id     = layout.id("box"),
+		sizing = {layout.fixed(12), layout.fixed(4)},
+		border = tui.BORDER_ROUNDED,
+		title  = "─ top ",
+		footer = "─ 3 more lines ─────",
+	}
+	if layout.frame(&layout_ctx, {12, 4}) {
+		if block(&layout_ctx, &paints, desc) {
+		}
+	}
+	frame_result, frame_error := layout.result(&layout_ctx)
+	testing.expect_value(t, frame_error, layout.Frame_Error.None)
+
+	cells: [48]term.Cell
+	frame := _frame(cells[:], 12, 4)
+	testing.expect_value(t, tui.draw_commands(&frame, paints[:], frame_result, {width = 12, height = 4}), tui.Draw_Error.None)
+	testing.expect_value(t, frame.cells[0].grapheme, "╭")
+	testing.expect_value(t, frame.cells[1].grapheme, "─")
+	testing.expect_value(t, frame.cells[3].grapheme, "t")
+	testing.expect_value(t, frame.cells[11].grapheme, "╮")
+	testing.expect_value(t, frame.cells[12].grapheme, "│")
+	testing.expect_value(t, frame.cells[2 * 12 + 11].grapheme, "│")
+	testing.expect_value(t, frame.cells[3 * 12].grapheme, "╰")
+	testing.expect_value(t, frame.cells[3 * 12 + 5].grapheme, "m")
+	testing.expect_value(t, frame.cells[3 * 12 + 10].grapheme, "l")
 	testing.expect_value(t, frame.cells[3 * 12 + 11].grapheme, "╯")
 }

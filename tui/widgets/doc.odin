@@ -1,12 +1,16 @@
 // Package widgets provides reusable terminal components over nabla:tui.
 //
-// Block and Input have scoped forms that draw in the active tui element. Their
-// geometry comes from layout: Block uses the resolved outer box and expects
-// layout padding to reserve its border and labels its top and bottom edges with
-// Block.title and Block.footer, while Input uses the selected box and
-// only computes which rows the box shows and where the caret sits in them. The
-// caret's rows come from input_lines, so the box a caller draws and the rows the
-// caret moves through are the same wrap.
+// block declares a bordered box inside a layout frame: `if block(&ctx, &paints,
+// {...}) { children }`. The box is a layout element whose border tui.draw_commands
+// draws and whose padding reserves the inset; its title and footer are overlay
+// elements on the top and bottom border rows. draw_block draws the same look
+// straight into a frame buffer for callers that have no layout.
+//
+// Input has a scoped form that draws in the active tui element. Its geometry
+// comes from layout: it uses the selected box and only computes which rows the
+// box shows and where the caret sits in them. The caret's rows come from
+// input_lines, so the box a caller draws and the rows the caret moves through
+// are the same wrap.
 //
 // Paragraph and List retain explicit Cell_Rect forms for callers using tui's
 // low-level frame-buffer API. They perform local row iteration inside that

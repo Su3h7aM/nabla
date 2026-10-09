@@ -213,14 +213,6 @@ Frame_Storage :: struct {
 	stale:             [dynamic]term.Image_Id,
 	// graphics_failed latches the one warning a failing image write produces.
 	graphics_failed:   bool,
-	// tool_blocks is the border of each tool box the frame declared, drawn once the frame is solved.
-	tool_blocks:       [dynamic]Tool_Block,
-}
-
-// Tool_Block is one tool box's border: the entry id its layout element carries and the block to draw around that element's rect.
-Tool_Block :: struct {
-	id:    u64,
-	block: widgets.Block,
 }
 
 @(require_results)
@@ -230,7 +222,6 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 	storage.alloc = alloc
 	storage.links = make([dynamic]string, alloc)
 	storage.paints = make(tui.Paints, alloc)
-	storage.tool_blocks = make([dynamic]Tool_Block, alloc)
 	storage.shown = make([dynamic]tui.Image_Placement, alloc)
 	storage.placed = make([dynamic]tui.Image_Placement, alloc)
 	storage.uploads = make([dynamic]Image_Upload, alloc)
@@ -261,7 +252,6 @@ frame_storage_new :: proc(alloc := context.allocator) -> ^Frame_Storage {
 frame_storage_tables_destroy :: proc(storage: ^Frame_Storage) {
 	delete(storage.links)
 	delete(storage.paints)
-	delete(storage.tool_blocks)
 	delete(storage.shown)
 	delete(storage.placed)
 	for &upload in storage.uploads { delete(upload.pixels) }
@@ -436,7 +426,6 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 			transcript_measure(app, order, frame_result, rect.height)
 			if !draw_bands(storage, frame_result, rect) { return false }
 			if tui.draw_commands(&storage.buffer, storage.paints[:], frame_result, rect, &storage.shown) != .None { return false }
-			if !draw_tool_blocks(storage, frame_result, rect) { return false }
 			selection_paint(app, storage, rect)
 			box_drag_paint(app, storage, frame_result, rect)
 			return true
@@ -486,7 +475,6 @@ conversation_solve :: proc(
 declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layout.Vec2, width: int, offset: int, order: []^Entry) {
 	clear(&storage.links)
 	clear(&storage.paints)
-	clear(&storage.tool_blocks)
 	// Services bind for one frame only, so every solve re-binds them.
 	layout.set_services(
 		&storage.layout_ctx,
@@ -599,25 +587,6 @@ draw_bands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, v
 	return true
 }
 
-// draw_tool_blocks draws each declared tool box's border around the rect its layout element solved to, clipped to the transcript's last row.
-@(require_results)
-draw_tool_blocks :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
-	clipped := storage.buffer
-	clipped.rows = viewport.y + viewport.height
-	for tool in storage.tool_blocks {
-		for node in frame_result.nodes {
-			if u64(node.user) != tool.id || node.flags.is_text { continue }
-			rect, project_err := tui.project_rect_integral(node.outer)
-			if project_err != nil { return false }
-			rect.x += viewport.x
-			rect.y += viewport.y
-			widgets.draw_block(&clipped, rect, tool.block)
-			break
-		}
-	}
-	return true
-}
-
 // selection_paint marks the cells a drag covers, reversing each cell's own style so a
 // themed terminal stays themed. A cell outside the transcript's rect is not painted, so
 // the highlight stops where the content does.
@@ -725,7 +694,7 @@ declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Ent
 		declare_subagent_entry(ctx, storage, entry)
 		return
 	}
-	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
+	cleaned := text.sanitize_text(string(entry.text[:]), context.temp_allocator) or_else ""
 	body_paint := storage_paint(storage, {style = entry_style(entry.kind)})
 	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
 		if entry.kind == .User { declare_band_pad(ctx, body_paint) }
@@ -754,7 +723,7 @@ declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Paint) {
 // below it. The heading is the first line by the sender's contract, so the split
 // reads no wording.
 declare_subagent_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry) {
-	cleaned := display_clean(string(entry.text[:]), context.temp_allocator)
+	cleaned := text.sanitize_text(string(entry.text[:]), context.temp_allocator) or_else ""
 	heading := cleaned
 	rest := ""
 	if split := strings.index_byte(cleaned, '\n'); split >= 0 {
@@ -822,8 +791,8 @@ frame_link_id :: proc(storage: ^Frame_Storage, uri: string) -> term.Link_Id {
 // border, then a window of its result. A collapsed box shows the first rows its entry kept and
 // the bottom border counts the lines hidden. An expanded box (entry.full) scrolls its whole
 // text in the window (see `entry.tool_scroll`) and draws its border in the bright color.
-// The box is one layout element whose padding reserves the border; the border itself is a
-// widgets.Block recorded in storage.tool_blocks and drawn by draw_tool_blocks once solved.
+// The box is a widgets.block, whose padding reserves the border and whose title and footer
+// are overlays on the border rows.
 // Only the border carries the outcome color. Code Mode calls draw here too, in blue on success.
 // A running call draws the spinner frame before its name and the working border color.
 declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, spin_frame: int) {
@@ -846,7 +815,7 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	// The corner, the leading rule, and the space after the name leave the name
 	// this much room; the rest of the top border is rule.
 	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
-	preview = display_clean(preview, context.temp_allocator)
+	preview = text.sanitize_text(preview, context.temp_allocator) or_else ""
 	title := fmt.tprintf("%s %s ", outline.horizontal, name)
 	// The window is the part of the result the box shows. Its range is set
 	// here because this is where the row count and the box's width are both known:
@@ -884,19 +853,18 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	}
 	if expanded { border_style = tool_border_bright(border_style) }
 	if entry.selected { border_style.modifiers += {.Bold} }
-	// A failed append leaves this box without a border for the frame; the next frame retries.
-	_, _ = append(
-		&storage.tool_blocks,
-		Tool_Block{id = entry.id, block = widgets.Block{border = outline, style = border_style, title = title, footer = footer}},
-	)
 	// The outer element holds the blank row that separates boxes, so the box's own rect is exactly its border.
 	if layout.element(ctx, layout.Element_Desc{layout = layout.Layout_Style{flow = .Column, padding = layout.Edges{bottom = 1}}}) {
-		box := layout.Layout_Style {
-			flow = .Column,
+		box := widgets.Block_Desc {
+			id = layout.id_index("tool-box", u64(entry.id)),
+			user = layout.User_Tag(entry.id),
 			sizing = layout.Sizing{width = layout.fixed(layout.Scalar(box_width)), height = layout.fit()},
-			padding = layout.pad_all(1),
+			border = outline,
+			style = border_style,
+			title = title,
+			footer = footer,
 		}
-		if layout.element(ctx, layout.Element_Desc{layout = box, user = layout.User_Tag(entry.id)}) {
+		if widgets.block(ctx, &storage.paints, box) {
 			body := storage_paint(storage, {style = TOOL_BODY})
 			remaining := preview
 			row_index := 0

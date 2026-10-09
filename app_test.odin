@@ -368,8 +368,8 @@ test_unapplied_steering_returns_to_the_prompt :: proc(t: ^testing.T) {
 }
 
 // A pasted block keeps its line breaks, so a multi-line paste stays the block it
-// was. CR and CRLF are read as the one break they mean and the other controls are
-// still dropped.
+// was. CR and CRLF are read as the one break they mean, a tab is kept and the other
+// controls are dropped.
 @(test)
 test_paste_keeps_line_breaks :: proc(t: ^testing.T) {
 	app := new(App)
@@ -379,7 +379,7 @@ test_paste_keeps_line_breaks :: proc(t: ^testing.T) {
 	defer widgets.input_destroy(&app.input)
 
 	paste_insert(app, "first\r\nsecond\nthird\tend\x07")
-	testing.expect_value(t, widgets.input_text(&app.input), "first\nsecond\nthirdend")
+	testing.expect_value(t, widgets.input_text(&app.input), "first\nsecond\nthird\tend")
 }
 
 // The arrow keys move the caret between the prompt's rows, so a multi-line prompt

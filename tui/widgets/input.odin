@@ -1,6 +1,7 @@
 package widgets
 
 import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:unicode/utf8"
 
@@ -49,32 +50,20 @@ input_destroy :: proc(input: ^Input) {
 	input^ = {}
 }
 
-// input_insert inserts value at the cursor. Line breaks are kept, so a pasted
-// block stays a block; every other C0/DEL control is dropped, which reads a CRLF
-// pair as the one break it is. Invalid UTF-8 is refused.
+// input_insert inserts value at the cursor after text.sanitizer_write's rule: line breaks
+// and tabs are kept, CR and CRLF become one line break, escape sequences and other control
+// characters are removed, and invalid UTF-8 becomes U+FFFD. It returns false on an
+// allocation failure and leaves the text unchanged.
 @(require_results)
 input_insert :: proc(input: ^Input, value: string) -> bool {
-	if !utf8.valid_string(value) {
-		return false
-	}
-	kept := _input_byte_count(value)
-	if kept == 0 {
-		return true
-	}
 	previous_length := len(input.text)
-	if err := resize(&input.text, previous_length + kept); err != nil {
+	sanitizer: text.Sanitizer
+	if text.sanitizer_write(&sanitizer, &input.text, value) != nil || text.sanitizer_flush(&sanitizer, &input.text) != nil {
+		resize(&input.text, previous_length)
 		return false
 	}
-	copy(input.text[input.cursor + kept:], input.text[input.cursor:previous_length])
-	written := 0
-	for byte in transmute([]byte)value {
-		if _input_skip(byte) {
-			continue
-		}
-		input.text[input.cursor + written] = byte
-		written += 1
-	}
-	input.cursor += kept
+	slice.rotate_left(input.text[input.cursor:], previous_length - input.cursor)
+	input.cursor += len(input.text) - previous_length
 	return true
 }
 
@@ -335,21 +324,6 @@ _input_window :: proc(input: ^Input, lines: []Input_Line, rect: tui.Cell_Rect, p
 draw_input :: proc {
 	draw_input_rect,
 	draw_input_context,
-}
-
-@(require_results)
-_input_skip :: proc(byte: u8) -> bool {
-	return byte == '\r' || (byte < 0x20 && byte != '\n') || byte == 0x7f
-}
-
-_input_byte_count :: proc(value: string) -> int {
-	count := 0
-	for byte in transmute([]byte)value {
-		if !_input_skip(byte) {
-			count += 1
-		}
-	}
-	return count
 }
 
 // _input_remove deletes [start, end) and reports whether the buffer holds the

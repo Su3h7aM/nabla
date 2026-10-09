@@ -4,6 +4,8 @@ import "base:runtime"
 import "core:mem"
 import "core:mem/virtual"
 
+import "nabla:text"
+
 // Markdown_Cache keeps the rendered Markdown of assistant entries between frames. The
 // transcript is still declared from scratch every frame; the cache only spares parsing
 // and wrapping text that has not changed. It is a memo, not a model of the screen: a
@@ -65,8 +67,10 @@ markdown_cache_lines :: proc(cache: ^Markdown_Cache, entry: ^Entry, width: int) 
 		virtual.arena_free_all(&record.arena)
 	}
 	allocator := virtual.arena_allocator(&record.arena)
-	cleaned := display_clean(string(entry.text[:]), allocator)
-	record.lines, err = markdown_lines(cleaned, width, allocator)
+	cleaned: string
+	if cleaned, err = text.sanitize_text(string(entry.text[:]), allocator); err == nil {
+		record.lines, err = markdown_lines(cleaned, width, allocator)
+	}
 	if err != nil {
 		virtual.arena_destroy(&record.arena)
 		delete_key(&cache.records, entry.id)

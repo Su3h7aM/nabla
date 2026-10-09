@@ -338,11 +338,20 @@ _declare_node :: proc(
 	return node, true
 }
 
-@(deferred_in_out = _element_leave, require_results)
 // element declares an element node and, when it returns true, opens a scope
 // that its children are declared into. Pair each call with the closing `}` of
 // the conditional so the scope closes at the right point.
+@(deferred_in_out = _element_leave, require_results)
 element :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_location) -> bool {
+	return element_begin(ctx, desc, loc)
+}
+
+// element_begin declares an element node and, when it returns true, opens a
+// scope that its children are declared into. Each true result must be paired
+// with one element_end after the children, in reverse order of opening. Use
+// `element` unless a wrapper must keep the scope open across its own return.
+@(require_results)
+element_begin :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_location) -> bool {
 	_, entered := _declare_node(ctx, desc, true, loc)
 	return entered
 }
@@ -361,7 +370,11 @@ _element_leave :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc: runtime.S
 	}
 	_ = desc
 	_ = loc
+	element_end(ctx)
+}
 
+// element_end closes the scope the matching element_begin opened.
+element_end :: proc(ctx: ^Context) {
 	state := _context_state(ctx)
 	balanced := ctx != nil && state._frame_open && len(state._scopes) > 1 && state._scopes[len(state._scopes) - 1].kind == .Element
 	if !balanced {
