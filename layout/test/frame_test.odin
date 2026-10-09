@@ -106,7 +106,6 @@ test_frame_end_to_end :: proc(t: ^testing.T) {
 
 	hit, hit_found := layout.hit_test(frame_result, {10, 40})
 	testing.expect(t, hit_found)
-	testing.expect_value(t, hit.id, layout.id("title"))
 	testing.expect_value(t, layout.node(frame_result, hit).id, layout.id("title"))
 }
 
