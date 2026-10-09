@@ -1,6 +1,7 @@
 package layout
 
 import "base:runtime"
+import "core:math"
 import "core:mem"
 
 @(private)
@@ -482,6 +483,9 @@ storage_size :: proc(capacities: Capacities) -> int {
 
 @(private, require_results)
 _config_is_valid :: proc(config: Options) -> bool {
+	if !(config.snap >= 0) || math.is_inf(config.snap) {
+		return false
+	}
 	capacities := config.capacities
 	if capacities.nodes < 1 || capacities.clips < 1 || capacities.depth < 1 || capacities.diagnostics < 1 {
 		return false

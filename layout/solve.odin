@@ -988,6 +988,7 @@ _solve_frame :: proc(state: ^_Context_State) {
 	_place_local_flow(state)
 	_place_text_lines(state)
 	_place_paint_roots(state)
+	_snap_geometry(state)
 	_resolve_clips(state)
 	if state._frame_error != .None {
 		return

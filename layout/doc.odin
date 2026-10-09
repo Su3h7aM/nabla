@@ -204,6 +204,17 @@
 // on Y. Use `pad_all` or `pad_xy` for explicit padding; use `radius_all` for a
 // uniform paint radius.
 //
+// # Snapping
+//
+// Solving is floating point, so grow and percent shares are fractional. Set
+// `Options.snap` to the grid pitch to round after solving: 1 for whole units
+// (a terminal), 1/scale for a renderer at device scale, 0 (the default) for
+// none. Every absolute edge of a node's outer and inner box, text line, clip,
+// and command is rounded, not its size, so neighbours stay adjacent and a
+// parent's inner extent equals the sum of its children. `content_size`,
+// `scroll_range`, and `scroll_offset` are rounded to the same grid. Measurement
+// is not changed: callbacks should already return multiples of the pitch.
+//
 // # Rich text runs
 //
 // One text node wraps as one paragraph with one `Text_Style`, but `Text_Desc.runs`

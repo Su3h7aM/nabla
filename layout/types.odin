@@ -376,6 +376,10 @@ Options :: struct {
 	capacities:   Capacities,
 	cull:         Cull_Policy,
 	debug_labels: bool,
+	// snap is the grid pitch every resolved edge is rounded to after solving.
+	// Zero leaves geometry fractional; 1 gives whole units (a terminal); a
+	// renderer drawing at scale S passes 1/S. It must be finite and not negative.
+	snap:         Scalar,
 }
 
 Services :: struct {

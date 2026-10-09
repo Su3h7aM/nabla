@@ -111,7 +111,8 @@ _command_visible :: proc(state: ^_Context_State, bounds: Rect, clip: Clip_Handle
 }
 
 @(private, require_results)
-_emit_command :: proc(state: ^_Context_State, node: Node_Handle, bounds: Rect, clip: Clip_Handle, data: Command_Data) -> bool {
+_emit_command :: proc(state: ^_Context_State, node: Node_Handle, unsnapped_bounds: Rect, clip: Clip_Handle, data: Command_Data) -> bool {
+	bounds := _snap_rect(state._options.snap, unsnapped_bounds)
 	if !_command_visible(state, bounds, clip) {
 		return true
 	}
