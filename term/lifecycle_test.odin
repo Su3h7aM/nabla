@@ -152,41 +152,52 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		return linux.Errno(-ret)
 	}
 
+	// Lifecycle_Exit is the exit status of the forked child. Checks_Failed
+	// means the child wrote the failed checks to the report pipe.
+	Lifecycle_Exit :: enum u8 {
+		Passed,
+		Checks_Failed,
+		Setsid_Failed,
+		Slave_Path_Too_Long,
+		Slave_Open_Failed,
+		Controlling_Terminal_Failed,
+		Resize_Ready_Write_Failed,
+		Resize_Go_Missing,
+	}
+
 	lifecycle_failures: int
+	lifecycle_report_fd: linux.Fd
 
 	lifecycle_check :: proc(cond: bool, message: string, args: ..any) {
 		if !cond {
-			fmt.eprintln("FAIL:", fmt.tprintf(message, ..args))
+			line := fmt.tprintfln(message, ..args)
+			_, _ = linux.write(lifecycle_report_fd, transmute([]byte)line)
 			lifecycle_failures += 1
 		}
 	}
 
-	lifecycle_run_child :: proc(slave_path: string, sync_out_w: linux.Fd, sync_in_r: linux.Fd) -> int {
+	lifecycle_run_child :: proc(slave_path: string, sync_out_w: linux.Fd, sync_in_r: linux.Fd) -> Lifecycle_Exit {
 		tracking: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&tracking, context.allocator)
 		context.allocator = mem.tracking_allocator(&tracking)
 
 		// Acquire a controlling terminal from the PTY.
 		if _, setsid_errno := linux.setsid(); setsid_errno != .NONE {
-			fmt.eprintln("child: setsid failed")
-			return 1
+			return .Setsid_Failed
 		}
 		path_buf: [256]byte
 		if len(slave_path) >= len(path_buf) {
-			fmt.eprintln("child: slave path too long")
-			return 1
+			return .Slave_Path_Too_Long
 		}
 		copy(path_buf[:], slave_path)
 		slave_path_c := cstring(raw_data(path_buf[:]))
 		slave, slave_errno := linux.open(slave_path_c, {.RDWR, .NOCTTY})
 		if slave_errno != .NONE {
-			fmt.eprintln("child: slave open failed, errno", slave_errno)
-			return 1
+			return .Slave_Open_Failed
 		}
 		defer linux.close(slave)
 		if errno := _ioctl(slave, LIFECYCLE_TIOCSCTTY, nil); errno != .NONE {
-			fmt.eprintln("child: TIOCSCTTY failed, errno", errno)
-			return 1
+			return .Controlling_Terminal_Failed
 		}
 
 		// A: ownership — open allocates with the caller's allocator; a
@@ -218,12 +229,10 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		lifecycle_check(open_err == nil, "open must succeed")
 		ready_byte := [1]byte{'R'}
 		if written, _ := linux.write(sync_out_w, ready_byte[:]); written != 1 {
-			fmt.eprintln("child: resize-ready write failed")
-			return 1
+			return .Resize_Ready_Write_Failed
 		}
 		if !lifecycle_wait_for_byte(sync_in_r, 'G') {
-			fmt.eprintln("child: resize-go signal missing")
-			return 1
+			return .Resize_Go_Missing
 		}
 		vp, vp_err := viewport(session)
 		lifecycle_check(vp_err == nil, "viewport must succeed after a resize")
@@ -351,7 +360,7 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		close_err := close(session)
 		lifecycle_check(close_err == nil, "close must tolerate a terminal write that fails with EIO")
 
-		return lifecycle_failures == 0 ? 0 : 1
+		return lifecycle_failures == 0 ? .Passed : .Checks_Failed
 	}
 
 	// --- parent ---------------------------------------------------------------
@@ -368,6 +377,12 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 			testing.fail_now(t, "sync pipes must open")
 		}
 
+		report: [2]linux.Fd
+		if linux.pipe2(&report, {}) != .NONE {
+			testing.fail_now(t, "report pipe must open")
+		}
+		defer linux.close(report[0])
+
 		pid, fork_errno := linux.fork()
 		if fork_errno != .NONE {
 			testing.fail_now(t, "fork must succeed")
@@ -376,11 +391,14 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 			_ = linux.close(master)
 			_ = linux.close(child_out[0])
 			_ = linux.close(parent_out[1])
-			os.exit(lifecycle_run_child(slave_path, child_out[1], parent_out[0]))
+			_ = linux.close(report[0])
+			lifecycle_report_fd = report[1]
+			os.exit(int(lifecycle_run_child(slave_path, child_out[1], parent_out[0])))
 		}
 
 		_ = linux.close(child_out[1])
 		_ = linux.close(parent_out[0])
+		_ = linux.close(report[1])
 
 		// Scenario C: resize the master once the child's session is open.
 		if !lifecycle_wait_for_byte(child_out[0], 'R') {
@@ -408,8 +426,14 @@ when #config(NABLA_TERM_TEST_HOOKS, false) {
 		waited, _ := linux.wait4(pid, &status, {}, nil)
 		testing.expect(t, waited == pid, "waitpid must return the child pid")
 		exited := (status & 0x7f) == 0
-		code := (status >> 8) & 0xff
-		testing.expect(t, exited && code == 0, "child must exit 0")
+		exit := Lifecycle_Exit((status >> 8) & 0xff)
+		testing.expectf(t, exited && exit == .Passed, "child must exit Passed, got status %#x (%v)", status, exit)
+
+		failures: [4096]byte
+		count, _ := linux.read(report[0], failures[:])
+		if count > 0 {
+			testing.expectf(t, false, "child checks failed:\n%s", string(failures[:count]))
+		}
 	}
 
 } // when #config(NABLA_TERM_TEST_HOOKS, false)

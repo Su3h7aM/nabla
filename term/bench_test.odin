@@ -13,19 +13,19 @@
 //	odin test ./term -collection:nabla=$PWD -define:BENCH=true -o:speed -thread-count:1
 package term
 
-import "core:fmt"
+import "core:log"
 import "core:testing"
 import "core:time"
 
 // Anchors keep the imports referenced when the benchmark block is compiled
 // out (BENCH unset).
-_ :: fmt
+_ :: log
 _ :: testing
 _ :: time
 
 when #config(BENCH, false) {
 
-	_bench_encode :: proc(label: string, buffer: Frame_Buffer, profile: Target_Profile, frames: int) {
+	_bench_encode :: proc(t: ^testing.T, label: string, buffer: Frame_Buffer, profile: Target_Profile, frames: int) {
 		scratch := make([]byte, 4 << 20)
 		defer delete(scratch)
 
@@ -33,7 +33,7 @@ when #config(BENCH, false) {
 		for _ in 0 ..< 24 {
 			_, required_size, err := encode(buffer, profile, {}, scratch)
 			if err != nil {
-				fmt.eprintln("bench: encode failed:", err)
+				testing.expectf(t, false, "encode failed: %v", err)
 				return
 			}
 			required = required_size
@@ -43,13 +43,13 @@ when #config(BENCH, false) {
 		for _ in 0 ..< frames {
 			_, _, err := encode(buffer, profile, {}, scratch)
 			if err != nil {
-				fmt.eprintln("bench: encode failed:", err)
+				testing.expectf(t, false, "encode failed: %v", err)
 				return
 			}
 		}
 		elapsed_us := time.duration_microseconds(time.tick_diff(start, time.tick_now()))
 		us_per_frame := f64(elapsed_us) / f64(frames)
-		fmt.printf("%-16s %6d cells  %9.2f us/frame  %7d bytes/frame\n", label, len(buffer.cells), us_per_frame, required)
+		log.infof("%-16s %6d cells  %9.2f us/frame  %7d bytes/frame", label, len(buffer.cells), us_per_frame, required)
 	}
 
 	// _bench_frame builds a frame of the given size; styled frames force a
@@ -74,8 +74,7 @@ when #config(BENCH, false) {
 
 	@(test)
 	bench_full_frame_encode :: proc(t: ^testing.T) {
-		_ = t
-		fmt.println("== terminal full-frame encode (BENCH=true, -o:speed) ==")
+		log.info("== terminal full-frame encode (BENCH=true, -o:speed) ==")
 		profile := Target_Profile {
 			color_depth = .True_Color,
 		}
@@ -94,9 +93,9 @@ when #config(BENCH, false) {
 		for workload in workloads {
 			buffer := _bench_frame(workload.columns, workload.rows, workload.styled)
 			defer delete(buffer.cells)
-			_bench_encode(workload.label, buffer, profile, workload.frames)
+			_bench_encode(t, workload.label, buffer, profile, workload.frames)
 		}
-		fmt.println("\n== done ==")
+		log.info("\n== done ==")
 	}
 
 } // when #config(BENCH, false)

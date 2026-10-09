@@ -31,18 +31,18 @@
 // same maxes) predicts; it was cross-checked against the real loop in a
 // temporary instrumented copy.
 //
-// Results are printed as a table by the `bench_c6b_baseline` test.
+// Results are logged as a table by the `bench_c6b_baseline` test.
 
 package layout
 
-import "core:fmt"
+import "core:log"
 import "core:math"
 import "core:testing"
 import "core:time"
 
 // Anchor: keeps the imports referenced when the benchmark block below is
 // compiled out (BENCH unset) so the unused-import check stays green.
-_ :: fmt
+_ :: log
 _ :: math
 _ :: testing
 _ :: time
@@ -140,7 +140,7 @@ when #config(BENCH, false) {
 	// Times `frames` consecutive frames of `build` in a fresh context, repeated
 	// `repeats` times, and aggregates per-frame microseconds.
 	@(private)
-	_measure :: proc(label: string, node_count: int, viewport: Vec2, frames: int, repeats: int, build: proc(ctx: ^Context)) -> Bench_Point {
+	_measure :: proc(t: ^testing.T, label: string, node_count: int, viewport: Vec2, frames: int, repeats: int, build: proc(ctx: ^Context)) -> Bench_Point {
 		ctx: Context
 		init_err := init(&ctx, _bench_config(node_count))
 		defer destroy(&ctx)
@@ -154,7 +154,7 @@ when #config(BENCH, false) {
 		}
 		_, frame_error := result(&ctx)
 		if frame_error != .None {
-			fmt.printfln("  WARN %s (node_count=%d): frame error %v", label, node_count, frame_error)
+			testing.expectf(t, false, "%s (node_count=%d): frame error %v", label, node_count, frame_error)
 		}
 
 		run_means := make([]f64, repeats)
@@ -282,12 +282,12 @@ when #config(BENCH, false) {
 
 	@(private)
 	_print_header :: proc() {
-		fmt.println("workload\tn\tframes\tsim_passes\tmean_us/frame\tmin_us\tmax_us\tstddev_us")
+		log.info("workload\tn\tframes\tsim_passes\tmean_us/frame\tmin_us\tmax_us\tstddev_us")
 	}
 
 	@(private)
 	_print_point :: proc(point: Bench_Point) {
-		fmt.printfln(
+		log.infof(
 			"%s\t%d\t%d\t%d\t%.2f\t%.2f\t%.2f\t%.2f",
 			point.label,
 			point.node_count,
@@ -301,8 +301,8 @@ when #config(BENCH, false) {
 	}
 
 	@(private)
-	_bench_ordinary :: proc() {
-		fmt.println("\n== ordinary (representative tree) ==")
+	_bench_ordinary :: proc(t: ^testing.T) {
+		log.info("\n== ordinary (representative tree) ==")
 		_print_header()
 		rows := []int{128, 256, 512, 1024, 2048}
 		frames := []int{5000, 3000, 1500, 800, 400}
@@ -310,18 +310,18 @@ when #config(BENCH, false) {
 			_bench_rows = rows[i]
 			_bench_sim_passes = 0
 			viewport := Vec2{1200, Scalar(f64(rows[i]) * 28.0 + 64.0)}
-			point := _measure("ordinary", rows[i] + 30, viewport, frames[i], 5, _build_ordinary)
+			point := _measure(t, "ordinary", rows[i] + 30, viewport, frames[i], 5, _build_ordinary)
 			_print_point(point)
 		}
 	}
 
 	@(private)
-	_bench_grow :: proc(saturating: bool) {
+	_bench_grow :: proc(t: ^testing.T, saturating: bool) {
 		name := "grow-linear"
 		if saturating {
 			name = "grow-saturating"
 		}
-		fmt.printfln("\n== %s ==", name)
+		log.infof("\n== %s ==", name)
 		_print_header()
 		sizes := []int{125, 250, 500, 1000, 2000, 4000, 8000}
 		frames := []int{3000, 1500, 800, 400, 400, 300, 200}
@@ -338,14 +338,14 @@ when #config(BENCH, false) {
 				_bench_sim_passes = _sim_grow_passes(f64(4 * node_count), _bench_maxes)
 			}
 			viewport := Vec2{Scalar(4 * node_count), 64}
-			point := _measure(name, node_count, viewport, frames[i], 7, _build_grow_row)
+			point := _measure(t, name, node_count, viewport, frames[i], 7, _build_grow_row)
 			_print_point(point)
 		}
 	}
 
 	@(private)
-	_bench_adversarial :: proc() {
-		fmt.println("\n== grow-adversarial (review construction: cap 3.5, then proposal - 1e-5) ==")
+	_bench_adversarial :: proc(t: ^testing.T) {
+		log.info("\n== grow-adversarial (review construction: cap 3.5, then proposal - 1e-5) ==")
 		_print_header()
 		sizes := []int{125, 250, 500, 1000, 2000, 4000, 8000}
 		frames := []int{3000, 1500, 800, 400, 400, 300, 200}
@@ -358,19 +358,19 @@ when #config(BENCH, false) {
 			defer delete(_bench_maxes)
 			_bench_sim_passes = _sim_grow_passes(f64(4 * node_count), _bench_maxes)
 			viewport := Vec2{Scalar(4 * node_count), 64}
-			point := _measure("grow-adversarial", node_count, viewport, frames[i], 7, _build_grow_row)
+			point := _measure(t, "grow-adversarial", node_count, viewport, frames[i], 7, _build_grow_row)
 			_print_point(point)
 		}
 	}
 
 	@(test)
 	bench_c6b_baseline :: proc(t: ^testing.T) {
-		fmt.println("== C6b layout baseline (BENCH=true, -o:speed) ==")
-		_bench_ordinary()
-		_bench_grow(false)
-		_bench_grow(true)
-		_bench_adversarial()
-		fmt.println("\n== done ==")
+		log.info("== C6b layout baseline (BENCH=true, -o:speed) ==")
+		_bench_ordinary(t)
+		_bench_grow(t, false)
+		_bench_grow(t, true)
+		_bench_adversarial(t)
+		log.info("\n== done ==")
 	}
 
 } // when #config(BENCH, false)
