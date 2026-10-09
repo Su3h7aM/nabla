@@ -12,7 +12,17 @@ import "core:unicode/utf8"
 // share one serialization body, so a too-small scratch is observable through
 // the exact required return before anything is written.
 //
-// Serialization establishes the Presentation Baseline (cursor origin +
+// Each procedure takes an optional previous frame. The package keeps no state:
+// the caller owns the frame it last presented and passes it back. With a nil
+// previous, or one whose dimensions differ from the buffer, the whole frame is
+// encoded. Otherwise only the cells that differ are encoded (grapheme, style,
+// width, and link URI, since link ids are frame-local), each after a cursor
+// move unless it continues the previous write. A diff frame leaves the cursor
+// after its last write unless the cursor intent places it. The caller passes
+// nil after a failed present, at startup, and after a resize, because the
+// terminal then no longer shows the previous frame.
+//
+// A full frame establishes the Presentation Baseline (cursor origin +
 // explicit base style) before any cell output, overwrites the viewport
 // without a preliminary clear, reduces authored colors deterministically to
 // the profile's color depth (TrueColor as authored, 256 via the xterm cube,
@@ -30,8 +40,8 @@ import "core:unicode/utf8"
 // encoded_size returns the exact byte count encode needs for the frame, without
 // writing anything. It returns the same validation errors as encode.
 @(require_results)
-encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) -> (required: int, err: Error) {
-	_, required, err = encode(buffer, profile, cursor, nil)
+encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, previous: ^Frame_Buffer = nil) -> (required: int, err: Error) {
+	_, required, err = encode(buffer, profile, cursor, nil, previous)
 	if err == General_Error.Presentation_Workspace_Too_Small {
 		err = nil
 	}
@@ -44,17 +54,28 @@ encoded_size :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Curs
 // written == 0 and nothing usable written; the caller resizes and retries,
 // never guessing.
 @(require_results)
-encode :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, output: []byte) -> (written: int, required: int, err: Error) {
+encode :: proc(
+	buffer: Frame_Buffer,
+	profile: Target_Profile,
+	cursor: Cursor,
+	output: []byte,
+	previous: ^Frame_Buffer = nil,
+) -> (
+	written: int,
+	required: int,
+	err: Error,
+) {
 	if validation_error := _validate_frame(buffer, cursor); validation_error != nil {
 		return 0, 0, validation_error
 	}
 	if buffer.columns == 0 || buffer.rows == 0 {
 		return 0, 0, nil
 	}
+	base := _diff_base(buffer, previous)
 	encoder := _Encoder {
 		count_only = true,
 	}
-	_serialize(&encoder, buffer, profile, cursor)
+	_serialize(&encoder, buffer, base, profile, cursor)
 	required = encoder.pos
 	if required > len(output) {
 		return 0, required, General_Error.Presentation_Workspace_Too_Small
@@ -62,7 +83,7 @@ encode :: proc(buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor, ou
 	writer := _Encoder {
 		out = output,
 	}
-	_serialize(&writer, buffer, profile, cursor)
+	_serialize(&writer, buffer, base, profile, cursor)
 	if writer.overflowed {
 		// Unreachable: the count pass just produced the exact size.
 		return 0, required, General_Error.Presentation_Workspace_Too_Small
@@ -81,6 +102,7 @@ present :: proc(
 	profile: Target_Profile,
 	cursor: Cursor,
 	output: []byte,
+	previous: ^Frame_Buffer = nil,
 ) -> (
 	committed: int,
 	required: int,
@@ -90,7 +112,7 @@ present :: proc(
 		return 0, 0, General_Error.Not_Open
 	}
 	written: int
-	written, required, err = encode(buffer, profile, cursor, output)
+	written, required, err = encode(buffer, profile, cursor, output, previous)
 	if err != nil || written == 0 {
 		return 0, required, err
 	}
@@ -236,47 +258,50 @@ _encoder_write_uint :: proc(encoder: ^_Encoder, value: u64) {
 SYNC_BEGIN :: ansi.CSI + "?2026h"
 SYNC_END :: ansi.CSI + "?2026l"
 
-// _serialize renders the (validated) frame to the ANSI byte stream. The fixed
-// sequences come from core:terminal/ansi; the numeric ones (SGR parameters,
-// CUP coordinates) are composed here because the encoder owns their exact
-// byte layout.
-_serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Profile, cursor: Cursor) {
-	// Baseline: cursor origin + explicit base style. The frame overwrites the
-	// viewport without a preliminary clear (framework contract); the
-	// unconditional SGR reset prevents stale attributes from a previous frame.
-	_encoder_write_text(encoder, SYNC_BEGIN + ansi.CSI + ansi.CUP + ansi.CSI + ansi.SGR)
-	previous_style: Style
-	// previous_link is the last cell's id; link_open says a hyperlink for it is open,
-	// which is false for an id with no usable URI.
-	previous_link: Link_Id
-	link_open: bool
-
-	for y in 0 ..< buffer.rows {
-		// Per-row cursor positioning. CUP does not reset SGR attributes, so
-		// the diff carries the previous row's last style into the next row —
-		// a default cell after a styled row end emits its own reset.
-		_encoder_write_text(encoder, ansi.CSI)
-		_encoder_write_uint(encoder, u64(y) + 1)
-		_encoder_write_text(encoder, ";1" + ansi.CUP)
-
-		for x in 0 ..< buffer.columns {
-			index := y * buffer.columns + x
-			cell := buffer.cells[index]
-			if cell.link != previous_link {
-				if link_open { _encoder_hyperlink_close(encoder) }
-				uri: string
-				uri, link_open = _hyperlink_uri(buffer, cell.link)
-				if link_open { _encoder_hyperlink_open(encoder, cell.link, uri) }
-				previous_link = cell.link
-			}
-			_encoder_write_cell(encoder, cell, &previous_style, profile.color_depth)
-		}
-		// A hyperlink never spans the next row's cursor move; the same id reopens
-		// it there, which is what joins the pieces of a wrapped link.
-		if link_open { _encoder_hyperlink_close(encoder) }
-		link_open = false
-		previous_link = 0
+// _diff_base returns previous when it describes a grid the buffer can be
+// diffed against, and nil when the whole frame must be encoded.
+@(require_results)
+_diff_base :: proc(buffer: Frame_Buffer, previous: ^Frame_Buffer) -> ^Frame_Buffer {
+	if previous == nil || previous.columns != buffer.columns || previous.rows != buffer.rows {
+		return nil
 	}
+	if len(previous.cells) < buffer.columns * buffer.rows {
+		return nil
+	}
+	return previous
+}
+
+// _Pen is the terminal's drawing state while a frame is written: the active
+// style and the hyperlink currently open. link_open is false for an id with no
+// usable URI.
+_Pen :: struct {
+	style:     Style,
+	link:      Link_Id,
+	link_open: bool,
+}
+
+// _serialize renders the (validated) frame to the ANSI byte stream: all of it
+// when previous is nil, otherwise only the cells that differ from previous. The
+// fixed sequences come from core:terminal/ansi; the numeric ones (SGR
+// parameters, CUP coordinates) are composed here because the encoder owns their
+// exact byte layout.
+_serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, previous: ^Frame_Buffer, profile: Target_Profile, cursor: Cursor) {
+	// Baseline: explicit base style, and for a full frame the cursor origin.
+	// The frame overwrites the viewport without a preliminary clear (framework
+	// contract); the unconditional SGR reset prevents stale attributes from a
+	// previous frame.
+	_encoder_write_text(encoder, SYNC_BEGIN)
+	if previous == nil {
+		_encoder_write_text(encoder, ansi.CSI + ansi.CUP)
+	}
+	_encoder_write_text(encoder, ansi.CSI + ansi.SGR)
+	pen: _Pen
+	if previous == nil {
+		_serialize_full(encoder, buffer, &pen, profile)
+	} else {
+		_serialize_changes(encoder, buffer, previous^, &pen, profile)
+	}
+	_encoder_pen_release(encoder, &pen)
 
 	// Position first, then visibility: showing after the move keeps a
 	// terminal from rendering a frame at the stale position.
@@ -286,11 +311,7 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 		_encoder_write_text(encoder, " q")
 	}
 	if cursor.placed {
-		_encoder_write_text(encoder, ansi.CSI)
-		_encoder_write_uint(encoder, u64(cursor.position.y) + 1)
-		_encoder_write_text(encoder, ";")
-		_encoder_write_uint(encoder, u64(cursor.position.x) + 1)
-		_encoder_write_text(encoder, ansi.CUP)
+		_encoder_write_cursor_position(encoder, cursor.position)
 	}
 	if cursor.visible {
 		_encoder_write_text(encoder, ansi.CSI + ansi.DECTCEM_SHOW)
@@ -300,6 +321,82 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, profile: Target_Pro
 
 	// Restore the base style at the end of the frame (baseline contract).
 	_encoder_write_text(encoder, ansi.CSI + ansi.SGR + SYNC_END)
+}
+
+_serialize_full :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, pen: ^_Pen, profile: Target_Profile) {
+	for y in 0 ..< buffer.rows {
+		// Per-row cursor positioning. CUP does not reset SGR attributes, so
+		// the diff carries the previous row's last style into the next row —
+		// a default cell after a styled row end emits its own reset.
+		_encoder_write_cursor_position(encoder, {0, y})
+		for x in 0 ..< buffer.columns {
+			_encoder_write_cell(encoder, buffer, buffer.cells[y * buffer.columns + x], pen, profile.color_depth)
+		}
+		// A hyperlink never spans the next row's cursor move; the same id reopens
+		// it there, which is what joins the pieces of a wrapped link.
+		_encoder_pen_release(encoder, pen)
+	}
+}
+
+// _serialize_changes writes the cells of buffer that differ from previous. A
+// wide cell is written together with its placeholder. Writing in the last
+// column leaves the cursor column unspecified, so the next write moves.
+_serialize_changes :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, previous: Frame_Buffer, pen: ^_Pen, profile: Target_Profile) {
+	cursor := Position{-1, -1}
+	for y in 0 ..< buffer.rows {
+		for x := 0; x < buffer.columns; x += 1 {
+			index := y * buffer.columns + x
+			width := int(buffer.cells[index].width)
+			if width == 0 || !_cell_changed(buffer, previous, index, width) {
+				continue
+			}
+			if cursor != (Position{x, y}) {
+				_encoder_pen_release(encoder, pen)
+				_encoder_write_cursor_position(encoder, {x, y})
+			}
+			for offset in 0 ..< width {
+				_encoder_write_cell(encoder, buffer, buffer.cells[index + offset], pen, profile.color_depth)
+			}
+			x += width - 1
+			cursor = {x + 1, y}
+			if cursor.x >= buffer.columns {
+				cursor = {-1, -1}
+			}
+		}
+	}
+}
+
+// _cell_changed reports whether any of the count cells at index differ from
+// the same cells of previous. Links compare by URI because ids are frame-local.
+@(require_results)
+_cell_changed :: proc(buffer, previous: Frame_Buffer, index, count: int) -> bool {
+	for i in index ..< index + count {
+		cell, before := buffer.cells[i], previous.cells[i]
+		if cell.grapheme != before.grapheme || cell.style != before.style || cell.width != before.width {
+			return true
+		}
+		uri, _ := _hyperlink_uri(buffer, cell.link)
+		before_uri, _ := _hyperlink_uri(previous, before.link)
+		if uri != before_uri {
+			return true
+		}
+	}
+	return false
+}
+
+_encoder_write_cursor_position :: proc(encoder: ^_Encoder, position: Position) {
+	_encoder_write_text(encoder, ansi.CSI)
+	_encoder_write_uint(encoder, u64(position.y) + 1)
+	_encoder_write_text(encoder, ";")
+	_encoder_write_uint(encoder, u64(position.x) + 1)
+	_encoder_write_text(encoder, ansi.CUP)
+}
+
+// _encoder_pen_release closes the open hyperlink, which must not outlive a cursor move.
+_encoder_pen_release :: proc(encoder: ^_Encoder, pen: ^_Pen) {
+	if pen.link_open { _encoder_hyperlink_close(encoder) }
+	pen.link = 0
+	pen.link_open = false
 }
 
 _hyperlink_uri :: proc(buffer: Frame_Buffer, id: Link_Id) -> (string, bool) {
@@ -329,9 +426,16 @@ _encoder_hyperlink_close :: proc(encoder: ^_Encoder) {
 	_encoder_write_text(encoder, "\x1b]8;;\x1b\\")
 }
 
-_encoder_write_cell :: proc(encoder: ^_Encoder, cell: Cell, previous: ^Style, depth: Color_Depth) {
-	_encoder_style_diff(encoder, previous^, cell.style, depth)
-	previous^ = cell.style
+_encoder_write_cell :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, cell: Cell, pen: ^_Pen, depth: Color_Depth) {
+	if cell.link != pen.link {
+		if pen.link_open { _encoder_hyperlink_close(encoder) }
+		uri: string
+		uri, pen.link_open = _hyperlink_uri(buffer, cell.link)
+		if pen.link_open { _encoder_hyperlink_open(encoder, cell.link, uri) }
+		pen.link = cell.link
+	}
+	_encoder_style_diff(encoder, pen.style, cell.style, depth)
+	pen.style = cell.style
 	_encoder_write_text(encoder, cell.grapheme)
 }
 

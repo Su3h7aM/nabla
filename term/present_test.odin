@@ -3,6 +3,7 @@
 #+private file
 package term
 
+import "core:slice"
 import "core:strings"
 import "core:terminal"
 import "core:testing"
@@ -473,4 +474,116 @@ test_encode_maps_rgb_to_the_nearest_xterm_256_entry :: proc(t: ^testing.T) {
 	testing.expect_value(t, _rgb_to_256({135, 0, 0}), 88)
 	testing.expect_value(t, _rgb_to_256({95, 175, 215}), 16 + 36 * 1 + 6 * 3 + 4)
 	testing.expect_value(t, _rgb_to_256({128, 128, 128}), 244)
+}
+
+// _encode_diff encodes next against previous through the public contract.
+_encode_diff :: proc(t: ^testing.T, next: Frame_Buffer, previous: ^Frame_Buffer, cursor: Cursor, scratch: []byte) -> string {
+	written, required, err := encode(next, {}, cursor, scratch, previous)
+	testing.expect_value(t, err, nil)
+	size, size_err := encoded_size(next, {}, cursor, previous)
+	testing.expect_value(t, size_err, nil)
+	testing.expect_value(t, size, required)
+	return string(scratch[:written])
+}
+
+@(test)
+test_encode_diff_unchanged_frame_emits_only_the_wrap_and_cursor :: proc(t: ^testing.T) {
+	cells := []Cell{{grapheme = "a", width = 1}, {grapheme = "b", width = 1}, {grapheme = "c", width = 1}, {grapheme = "d", width = 1}}
+	next := Frame_Buffer {
+		columns = 2,
+		rows    = 2,
+		cells   = cells,
+	}
+	previous := Frame_Buffer {
+		columns = 2,
+		rows    = 2,
+		cells   = slice.clone(cells),
+	}
+	defer delete(previous.cells)
+	scratch: [256]byte
+	testing.expect_value(t, _encode_diff(t, next, &previous, {}, scratch[:]), "\x1b[?2026h\x1b[m\x1b[?25l\x1b[m\x1b[?2026l")
+	placed := Cursor {
+		visible  = true,
+		placed   = true,
+		position = {1, 0},
+	}
+	testing.expect_value(t, _encode_diff(t, next, &previous, placed, scratch[:]), "\x1b[?2026h\x1b[m\x1b[1;2H\x1b[?25h\x1b[m\x1b[?2026l")
+}
+
+@(test)
+test_encode_diff_changed_cell_emits_one_positioned_write :: proc(t: ^testing.T) {
+	cells := []Cell{{grapheme = "a", width = 1}, {grapheme = "b", width = 1}, {grapheme = "c", width = 1}, {grapheme = "d", width = 1}}
+	previous := Frame_Buffer {
+		columns = 2,
+		rows    = 2,
+		cells   = slice.clone(cells),
+	}
+	defer delete(previous.cells)
+	cells[3].grapheme = "x"
+	next := Frame_Buffer {
+		columns = 2,
+		rows    = 2,
+		cells   = cells,
+	}
+	scratch: [256]byte
+	testing.expect_value(t, _encode_diff(t, next, &previous, {}, scratch[:]), "\x1b[?2026h\x1b[m\x1b[2;2Hx\x1b[?25l\x1b[m\x1b[?2026l")
+
+	// Adjacent changes share one move; the link table is compared by URI, so a
+	// different frame-local id for the same URI is not a change.
+	cells[0].grapheme = "y"
+	cells[1].grapheme = "z"
+	links := []string{"https://a.example"}
+	cells[2].link = 1
+	previous.cells[2].link = 2
+	previous.links = []string{"https://other.example", "https://a.example"}
+	next.links = links
+	testing.expect_value(t, _encode_diff(t, next, &previous, {}, scratch[:]), "\x1b[?2026h\x1b[m\x1b[1;1Hyz\x1b[2;2Hx\x1b[?25l\x1b[m\x1b[?2026l")
+}
+
+@(test)
+test_encode_diff_wide_cell_is_written_with_its_placeholder :: proc(t: ^testing.T) {
+	previous_cells := []Cell{{grapheme = "x", width = 1}, {grapheme = "y", width = 1}, {grapheme = "a", width = 1}, {grapheme = "b", width = 1}}
+	next_cells := []Cell{{grapheme = "界", width = 2}, {width = 0}, {grapheme = "a", width = 1}, {grapheme = "b", width = 1}}
+	previous := Frame_Buffer {
+		columns = 4,
+		rows    = 1,
+		cells   = previous_cells,
+	}
+	next := Frame_Buffer {
+		columns = 4,
+		rows    = 1,
+		cells   = next_cells,
+	}
+	scratch: [256]byte
+	testing.expect_value(t, _encode_diff(t, next, &previous, {}, scratch[:]), "\x1b[?2026h\x1b[m\x1b[1;1H界\x1b[?25l\x1b[m\x1b[?2026l")
+
+	// The wide cell replaced by two narrow cells rewrites both columns.
+	testing.expect_value(t, _encode_diff(t, previous, &next, {}, scratch[:]), "\x1b[?2026h\x1b[m\x1b[1;1Hxy\x1b[?25l\x1b[m\x1b[?2026l")
+
+	// A wide cell whose neighbour changes is not rewritten.
+	changed := []Cell{{grapheme = "界", width = 2}, {width = 0}, {grapheme = "a", width = 1}, {grapheme = "c", width = 1}}
+	testing.expect_value(
+		t,
+		_encode_diff(t, Frame_Buffer{columns = 4, rows = 1, cells = changed}, &next, {}, scratch[:]),
+		"\x1b[?2026h\x1b[m\x1b[1;4Hc\x1b[?25l\x1b[m\x1b[?2026l",
+	)
+}
+
+@(test)
+test_encode_diff_falls_back_to_the_full_frame :: proc(t: ^testing.T) {
+	cells := []Cell{{grapheme = "a", width = 1}, {grapheme = "b", width = 1}}
+	next := Frame_Buffer {
+		columns = 2,
+		rows    = 1,
+		cells   = cells,
+	}
+	other := Frame_Buffer {
+		columns = 1,
+		rows    = 2,
+		cells   = cells,
+	}
+	full := "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hab\x1b[?25l\x1b[m\x1b[?2026l"
+	scratch: [256]byte
+	testing.expect_value(t, _encode_diff(t, next, nil, {}, scratch[:]), full)
+	testing.expect_value(t, _encode_diff(t, next, &other, {}, scratch[:]), full)
 }
