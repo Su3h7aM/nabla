@@ -301,6 +301,8 @@ Diagnostic_Kind :: enum u8 {
 	Min_Exceeds_Max,
 	Aspect_Undetermined,
 	Overflow,
+	// A caller's clip offset lies outside [0, scroll_range] on the axis.
+	Scroll_Out_Of_Range,
 	Missing_Overlay_Target,
 	Overlay_Dependency_Cycle,
 	Measure_Failed,

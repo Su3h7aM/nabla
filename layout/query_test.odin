@@ -54,15 +54,15 @@ test_hit_ancestor_and_child_queries :: proc(t: ^testing.T) {
 	// stops the overlap stack beneath it.
 	front, hit := hit_test(frame_result, {10, 10})
 	testing.expect(t, hit)
-	testing.expect_value(t, front.id, id("floating"))
+	testing.expect_value(t, node(frame_result, front).id, id("floating"))
 
 	inner, inner_hit := hit_test(frame_result, {80, 80})
 	testing.expect(t, inner_hit)
-	testing.expect_value(t, inner.id, id("child"))
+	testing.expect_value(t, node(frame_result, inner).id, id("child"))
 
 	outer, outer_hit := hit_test(frame_result, {150, 150})
 	testing.expect(t, outer_hit)
-	testing.expect_value(t, outer.id, id("background"))
+	testing.expect_value(t, node(frame_result, outer).id, id("background"))
 
 	_, missed := hit_test(frame_result, {400, 400})
 	testing.expect(t, !missed)
@@ -129,7 +129,7 @@ test_hit_ancestor_and_child_queries :: proc(t: ^testing.T) {
 	testing.expect(t, !frame_result.nodes[clipper].flags.hit_testable)
 	second, second_hit := hit_test(frame_result, {50, 20})
 	testing.expect(t, second_hit)
-	testing.expect_value(t, second.id, id("second"))
+	testing.expect_value(t, node(frame_result, second).id, id("second"))
 
 	// A handle wider than the table is rejected without signed wrap.
 	nodes := make([]Resolved_Node, 2)
@@ -143,6 +143,46 @@ test_hit_ancestor_and_child_queries :: proc(t: ^testing.T) {
 	_, valid := node(manual, Node_Handle(max(u32)))
 	testing.expect(t, !valid)
 	_, found := lookup(manual, Id(1))
+	testing.expect(t, !found)
+}
+
+@(test)
+test_scroll_target_skips_clips_without_range :: proc(t: ^testing.T) {
+	// scroll_target picks the innermost scrollable ancestor of the front-most
+	// hit on the asked axis, skipping clips with no range on that axis.
+	ctx: Context
+	testing.expect_value(t, init(&ctx, _test_options()), nil)
+	defer destroy(&ctx)
+
+	if frame(&ctx, {300, 300}) {
+		outer := _panel(200, 100)
+		outer.id = id("outer")
+		outer.layout.flow = .Column
+		outer.clip = {
+			axes = {.X, .Y},
+		}
+		if element(&ctx, outer) {
+			fitting := _panel(200, 50)
+			fitting.id = id("fitting")
+			fitting.clip = {
+				axes = {.Y},
+			}
+			if element(&ctx, fitting) {
+				content(&ctx, {id = id("short"), layout = {sizing = {fixed(200), fixed(20)}}})
+			}
+			content(&ctx, {id = id("wide"), layout = {sizing = {fixed(400), fixed(150)}}})
+		}
+	}
+	frame_result, err := result(&ctx)
+	testing.expect_value(t, err, Frame_Error.None)
+
+	handle, found := scroll_target(frame_result, {10, 10}, .Y)
+	testing.expect(t, found)
+	testing.expect_value(t, node(frame_result, handle).id, id("outer"))
+	handle, found = scroll_target(frame_result, {10, 10}, .X)
+	testing.expect(t, found)
+	testing.expect_value(t, node(frame_result, handle).id, id("outer"))
+	_, found = scroll_target(frame_result, {250, 250}, .Y)
 	testing.expect(t, !found)
 }
 

@@ -105,14 +105,37 @@ Front-most node under a point.
 `hit_order` is already front-to-back, so the first eligible entry is the
 answer and the scan exits there.
 */
-hit_test :: proc(frame_result: Frame_Result, point: Vec2) -> (Resolved_Node, bool) #optional_ok {
+hit_test :: proc(frame_result: Frame_Result, point: Vec2) -> (Node_Handle, bool) #optional_ok {
 	for handle in frame_result.hit_order {
-		candidate, eligible := _hit_eligible_node(frame_result, handle, point)
-		if eligible {
-			return candidate, true
+		if _hit_eligible(frame_result, handle, point) {
+			return handle, true
 		}
 	}
-	return {}, false
+	return 0, false
+}
+
+/*
+Innermost scrollable node under a point on one axis.
+
+Walks parents from the front-most hit and returns the first node that clips on
+`axis` and has `scroll_range` above zero on it. Offsets are positive, in
+[0, scroll_range]. Allocates nothing.
+*/
+scroll_target :: proc(frame_result: Frame_Result, point: Vec2, axis: Axis) -> (Node_Handle, bool) {
+	current, hit := hit_test(frame_result, point)
+	if !hit {
+		return 0, false
+	}
+	for {
+		candidate, found := node(frame_result, current)
+		if !found {
+			return 0, false
+		}
+		if axis in candidate.clip_axes && candidate.scroll_range[int(axis)] > 0 {
+			return current, true
+		}
+		current = candidate.parent
+	}
 }
 
 /*

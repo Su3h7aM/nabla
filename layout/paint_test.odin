@@ -127,13 +127,21 @@ test_clip_intersection_and_scroll_displacement :: proc(t: ^testing.T) {
 			offset = {0, 500},
 		}
 		if element(&ctx, scroller) {
-			content(&ctx, {id = id("child"), layout = {sizing = {fixed(100), fixed(120)}}})
+			content(&ctx, {id = id("child"), layout = {sizing = {fixed(100), fixed(80)}}})
 		}
 	}
 	frame_result, err = result(&ctx)
 	testing.expect_value(t, err, Frame_Error.None)
 	testing.expect_value(t, lookup(frame_result, id("child")).outer.position, Vec2{0, -500})
-	testing.expect(t, .Overflow in _diagnostic_kinds(&ctx))
+	// The caller's bad offset is its own diagnostic and does not set the
+	// content-overflow flags; the child fits the viewport.
+	testing.expect(t, .Scroll_Out_Of_Range in _diagnostic_kinds(&ctx))
+	testing.expect(t, .Overflow not_in _diagnostic_kinds(&ctx))
+	testing.expect(t, !lookup(frame_result, id("scroller")).flags.overflow_y)
+
+	// A node reports the axes of the clip it owns, not the clip it sits in.
+	testing.expect_value(t, lookup(frame_result, id("scroller")).clip_axes, Axis_Set{.Y})
+	testing.expect_value(t, lookup(frame_result, id("child")).clip_axes, Axis_Set{})
 }
 
 @(test)

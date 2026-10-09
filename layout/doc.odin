@@ -261,4 +261,10 @@
 // their `complete` value reports whether the supplied output was large enough.
 // Query views and iterators borrow the result until the next frame, destroy, or
 // reserve.
+//
+// `Resolved_Node.clip` is the clip a node sits inside and `clip_axes` the axes of
+// the clip it owns. `scroll_target` finds the innermost scrollable node under a
+// point for a wheel axis. Scroll offsets are positive, in [0, scroll_range]; the
+// core applies an offset outside that range as given and reports it as
+// `Scroll_Out_Of_Range`, while `overflow_x` and `overflow_y` mean content overflow only.
 package layout

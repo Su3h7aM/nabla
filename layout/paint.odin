@@ -265,7 +265,7 @@ Displacement a clipping node imposes on its descendants.
 
 The core clamps nothing and stores nothing: it applies the offset it is given
 and reports the legal range, so an out-of-range offset produces the
-geometrically correct over-scrolled result plus an `Overflow` diagnostic.
+geometrically correct over-scrolled result plus a `Scroll_Out_Of_Range` diagnostic.
 */
 @(private)
 _scroll_displacement :: proc(state: ^_Context_State, node: Node_Handle) -> Vec2 {
@@ -290,9 +290,14 @@ _scroll_displacement :: proc(state: ^_Context_State, node: Node_Handle) -> Vec2 
 		// only an offset outside the legal range is worth reporting.
 		over_scroll := math.max(-f64(offset), f64(offset) - f64(resolved.scroll_range[index]))
 		if over_scroll > f64(SCALAR_TOLERANCE) {
-			resolved.flags.overflow_x = axis == .X || resolved.flags.overflow_x
-			resolved.flags.overflow_y = axis == .Y || resolved.flags.overflow_y
-			_append_diagnostic(state, .Overflow, node, axis = axis, amount = Scalar(math.min(over_scroll, f64(Scalar(math.F32_MAX)))), loc = input.loc)
+			_append_diagnostic(
+				state,
+				.Scroll_Out_Of_Range,
+				node,
+				axis = axis,
+				amount = Scalar(math.min(over_scroll, f64(Scalar(math.F32_MAX)))),
+				loc = input.loc,
+			)
 		}
 	}
 	resolved.scroll_offset = applied
@@ -405,6 +410,7 @@ _resolve_clips :: proc(state: ^_Context_State) {
 			resolved.flags.clipped = resolved.flags.visible && !_rect_contains(clip_rect, resolved.outer)
 
 			axes := state._node_inputs[node].desc.clip.axes
+			resolved.clip_axes = axes
 			if axes == {} {
 				state._node_inputs[node].child_clip = effective
 				continue

@@ -25,6 +25,9 @@ Resolved_Node :: struct {
 	scroll_range:  Vec2,
 	scroll_offset: Vec2,
 	clip:          Clip_Handle,
+	// clip_axes is the Clip_Style.axes this node owns; {} when it does not clip.
+	// `clip` is the clip the node sits inside, not the one it establishes.
+	clip_axes:     Axis_Set,
 	user:          User_Tag,
 	layer:         i16,
 	child_count:   u16,
