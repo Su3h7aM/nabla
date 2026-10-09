@@ -2882,3 +2882,187 @@ test_agent_origin_text_shows_as_a_subagent_entry_live_and_replayed :: proc(t: ^t
 test_steering_origin_text_shows_as_a_user_entry_live_and_replayed :: proc(t: ^testing.T) {
 	app_expect_delivered_origin_kind(t, .Steering, "steer left", .User)
 }
+
+// Batched Page Up stays pinned and moves monotonically through oversized Markdown and grouped tool results.
+@(test)
+test_batched_page_up_through_mixed_history :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	large_markdown_body := strings.repeat("lorem ipsum ", 3_750, context.allocator)
+	defer delete(large_markdown_body, context.allocator)
+	large_markdown, concatenate_error := strings.concatenate({"# large response\n\n", large_markdown_body}, context.allocator)
+	if concatenate_error != nil { testing.fail_now(t, "the oversized Markdown fixture could not be allocated") }
+	defer delete(large_markdown, context.allocator)
+	large_tool_output := strings.repeat("tool output line\n", 1_024, context.allocator)
+	defer delete(large_tool_output, context.allocator)
+	head := journal.Node_Id(0)
+	large_tool_call: journal.Call_Id
+	for turn in 1 ..= 40 {
+		head = app_history_node(&app, head, .User, fmt.tprintf("history question %d", turn))
+		answer := fmt.tprintf("history answer %d", turn)
+		if turn == 15 || turn == 25 || turn == 35 { answer = large_markdown }
+		assistant := app_history_node(&app, head, .Assistant, answer)
+		if turn % 10 == 0 {
+			calls: [3]journal.Call_Id
+			for index in 0 ..< len(calls) {
+				call := journal.next_call(app.setup.store)
+				calls[index] = call
+				journal.append_record(
+					app.setup.store,
+					{
+						kind = .Tool_Proposed,
+						session = app.setup.session.session,
+						branch = app.setup.session.branch,
+						node = assistant,
+						turn = app.setup.session.turn,
+						call = call,
+					},
+					journal.Tool_Proposed{provider_id = fmt.tprintf("tool_%d", index), name = "shell"},
+					transmute([]u8)string(`{"command":"ls"}`),
+				)
+				output := "small tool output\n"
+				if turn == 40 && index == 0 {
+					output = large_tool_output
+					large_tool_call = call
+				}
+				journal.append_record(
+					app.setup.store,
+					{kind = .Tool_Completed, session = app.setup.session.session, branch = app.setup.session.branch, node = assistant, call = call},
+					journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
+					transmute([]u8)output,
+				)
+			}
+			head = journal.append_node(
+				app.setup.store,
+				{session = app.setup.session.session, branch = app.setup.session.branch, parent = assistant, turn = app.setup.session.turn, kind = .Results},
+				journal.Results{calls = calls[:]},
+			)
+		} else {
+			head = assistant
+		}
+	}
+	if _, commit_error := journal.commit(app.setup.store);
+	   commit_error != nil { testing.fail_now(t, "the history could not be committed") }; storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	app_settle(&app, storage, SCROLL_ROWS)
+	box_toggle(&app, large_tool_call)
+	app_settle(&app, storage, SCROLL_ROWS)
+	for _ in 0 ..< 100 {
+		if app.transcript.first == 0 { break }
+		before, _ := app_visible_entry(&app)
+		for _ in 0 ..< 20 { handle_key(&app, input.Key_Event{code = .Page_Up}) }
+		app_render_settle(t, &app, storage)
+		after, _ := app_visible_entry(&app)
+		testing.expect(t, after <= before, "Page Up never moves the visible entry toward newer history")
+		testing.expect(t, app.conversation_scroll.top != nil, "Page Up keeps the view pinned")
+		for entry in app.transcript.entries {
+			if entry.kind != .Tool { continue }
+			siblings := 0
+			for other in app.transcript.entries {
+				if other.node == entry.node && other.kind == .Tool { siblings += 1 }
+			}
+			testing.expect(t, siblings == 3, "a window never splits a node's sibling calls")
+		}
+	}
+	testing.expect(t, app.transcript.first == 0, "batched paging reaches the first history page")
+}
+
+// A single slide trims every distant whole node at both edges without moving the view.
+@(test)
+test_transcript_slide_batches_distant_nodes :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	_ = app_history_turns(t, &app, 0, 1, 80)
+	storage := app_frame_storage(SCROLL_ROWS)
+	defer frame_storage_destroy(storage)
+	app_settle(&app, storage, SCROLL_ROWS)
+	transcript := &app.transcript
+	entries_destroy(&transcript.entries)
+	entries, read_error := transcript_read(&app, 0, len(transcript.path))
+	if read_error != nil { testing.fail_now(t, "the history could not be read") }
+	transcript.entries = entries
+	transcript.first, transcript.end = 0, len(transcript.path)
+	testing.expect(t, draw_conversation(&app, storage, app.conversation_rect), "the whole history lays out")
+	widgets.scroll_to(&app.conversation_scroll, app.conversation_scroll.range / 2)
+	testing.expect(t, draw_conversation(&app, storage, app.conversation_rect), "the pinned view lays out")
+	anchor, row := app_visible_entry(&app)
+	testing.expect(t, transcript_slide(&app), "distant nodes are trimmed")
+	testing.expect(t, transcript.first > 1 && transcript.end < len(transcript.path) - 1, "both edges trim multiple nodes in one slide")
+	testing.expect(t, draw_conversation(&app, storage, app.conversation_rect), "the trimmed view lays out")
+	kept, kept_row := app_visible_entry(&app)
+	testing.expect_value(t, kept, anchor)
+	testing.expect_value(t, kept_row, row)
+	testing.expect(t, !transcript_slide(&app), "one slide removed every eligible node")
+}
+
+app_visible_entry :: proc(app: ^App) -> (id: u64, row: int) {
+	row = widgets.scroll_offset(app.conversation_scroll)
+	for entry in transcript_order(app) {
+		if row < entry.rows { return entry.id, row }
+		row -= entry.rows
+	}
+	return
+}
+
+// One Page Down from the first prompt must not follow a partial window to the session's tail.
+@(test)
+test_page_down_from_the_first_prompt_keeps_the_local_anchor :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	widgets.input_init(&app.input, app.run.alloc)
+	defer widgets.input_destroy(&app.input)
+	_ = app_history_turns(t, &app, 0, 1, 240)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	app.storage = storage
+	app.columns, app.rows = 80, SCROLL_ROWS + 5
+	head_publish(&app)
+	app_render_settle(t, &app, storage)
+	for _ in 0 ..< len(app.transcript.path) {
+		if app.transcript.first == 0 && widgets.scroll_offset(app.conversation_scroll) == 0 { break }
+		handle_key(&app, input.Key_Event{code = .Page_Up})
+		app_render_settle(t, &app, storage)
+	}
+	if !testing.expect(t, app.transcript.first == 0 && widgets.scroll_offset(app.conversation_scroll) == 0, "the viewport reaches the first prompt") { return }
+	testing.expect_value(t, string(app.transcript.entries[0].text[:]), "question 1")
+	app.rows = 60 + 5
+	app_render_settle(t, &app, storage)
+	if !testing.expect_value(t, app.conversation_scroll.range, app.conversation_rect.height) { return }
+	end := app.transcript.end
+	if !testing.expect(t, end < len(app.transcript.path), "newer history is still unloaded") { return }
+	app.transcript.focused = true
+	handle_key(&app, input.Key_Event{code = .Page_Down})
+	testing.expect(t, app.conversation_scroll.top != nil, "reaching the loaded bottom keeps an explicit pin")
+	anchor, row := app_visible_entry(&app)
+	app_render_settle(t, &app, storage)
+	visible, visible_row := app_visible_entry(&app)
+	testing.expect_value(t, visible, anchor)
+	testing.expect_value(t, visible_row, row)
+	testing.expect(t, app.conversation_scroll.top != nil, "layout and page loading keep the pin")
+	testing.expect(t, app.transcript.end <= end + 2 * TRANSCRIPT_PAGE_NODES, "only the pages near the requested viewport are loaded")
+	testing.expect(t, app.transcript.end < len(app.transcript.path), "the viewport has not jumped to the global tail")
+	transcript_jump_bottom(&app)
+	app_render_settle(t, &app, storage)
+	testing.expect(t, app.conversation_scroll.top == nil, "an explicit jump still follows the tail")
+	testing.expect_value(t, app.transcript.end, len(app.transcript.path))
+	testing.expect(t, app_has_text(app.transcript.entries[:], "answer 240"), "the explicit jump shows the latest answer")
+}
+
+// app_render_settle runs the production frame lifetime without writing to a terminal.
+app_render_settle :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage) {
+	free_all(context.temp_allocator)
+	transcript_sync(app)
+	for {
+		_, status := render_frame(app, storage)
+		if status != .None { testing.fail_now(t, "the transcript could not be rendered") }
+		if !transcript_slide(app) { return }
+		free_all(context.temp_allocator)
+	}
+}

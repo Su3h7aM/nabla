@@ -246,9 +246,9 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	}
 	#partial switch mouse.button {
 	case .Wheel_Up:
-		_ = widgets.scroll_by(&app.conversation_scroll, -MOUSE_WHEEL_LINES)
+		transcript_scroll_by(app, -MOUSE_WHEEL_LINES)
 	case .Wheel_Down:
-		_ = widgets.scroll_by(&app.conversation_scroll, MOUSE_WHEEL_LINES)
+		transcript_scroll_by(app, MOUSE_WHEEL_LINES)
 	case:
 	}
 }
@@ -509,7 +509,7 @@ interrupt :: proc(app: ^App) {
 // scroll_page scrolls the transcript by the height of its viewport.
 scroll_page :: proc(app: ^App, up: bool) {
 	page := app.conversation_rect.height
-	_ = widgets.scroll_by(&app.conversation_scroll, -page if up else page)
+	transcript_scroll_by(app, -page if up else page)
 }
 
 // handle_key sends a key to the prompt, or to the transcript while it has the keyboard.

@@ -152,6 +152,30 @@ transcript_page_tail :: proc(app: ^App) {
 	transcript.first, transcript.end = first, end
 }
 
+// transcript_scroll_to follows only at the history's bottom, not a loaded window's bottom.
+transcript_scroll_to :: proc(app: ^App, row: int) {
+	scroll := &app.conversation_scroll
+	widgets.scroll_to(scroll, row)
+	if app.transcript.end < len(app.transcript.path) {
+		scroll.top = clamp(row, 0, scroll.range)
+	}
+}
+
+transcript_scroll_by :: proc(app: ^App, delta: int) {
+	scroll := &app.conversation_scroll
+	transcript_scroll_to(app, clamp(widgets.scroll_offset(scroll^) + delta, 0, scroll.range))
+}
+
+// transcript_scroll_set_range keeps a pin at a partial window's bottom while layout settles.
+transcript_scroll_set_range :: proc(app: ^App, range: int) {
+	scroll := &app.conversation_scroll
+	top := scroll.top
+	widgets.scroll_set_range(scroll, range)
+	if row, pinned := top.?; pinned && app.transcript.end < len(app.transcript.path) {
+		transcript_scroll_to(app, row)
+	}
+}
+
 // transcript_jump_bottom follows the newest content, reattaching a window that was paged away from the tail.
 transcript_jump_bottom :: proc(app: ^App) {
 	transcript := &app.transcript
@@ -442,7 +466,7 @@ transcript_slide_step :: proc(app: ^App) -> bool {
 	transcript.measured = false
 	if anchor, pending := transcript.anchor.?; pending {
 		transcript.anchor = nil
-		if scroll.top != nil { widgets.scroll_to(scroll, scroll.range - anchor) }
+		if scroll.top != nil { transcript_scroll_to(app, scroll.range - anchor) }
 		return true
 	}
 	height := transcript.viewport_rows
@@ -460,24 +484,32 @@ transcript_slide_step :: proc(app: ^App) -> bool {
 		transcript_page_newer(app)
 		return !transcript.failed
 	}
-	if transcript.end - transcript.first <= 1 { return false }
-	last := transcript.path[transcript.end - 1]
-	if rows := transcript_node_rows(transcript, last); below - rows >= far {
+	moved := false
+	for transcript.end - transcript.first > 1 {
+		last := transcript.path[transcript.end - 1]
+		rows := transcript_node_rows(transcript, last)
+		if below - rows < far { break }
 		transcript_pop_node(app, last)
 		transcript.end -= 1
-		return true
+		below -= rows
+		moved = true
 	}
-	first := transcript.path[transcript.first]
-	if rows := transcript_node_rows(transcript, first); above - rows >= far {
-		count := 0
+	removed_rows, count := 0, 0
+	for transcript.end - transcript.first > 1 {
+		first := transcript.path[transcript.first]
+		rows := transcript_node_rows(transcript, first)
+		if above - removed_rows - rows < far { break }
 		for count < len(transcript.entries) && transcript.entries[count].node == first { count += 1 }
+		transcript.first += 1
+		removed_rows += rows
+		moved = true
+	}
+	if count > 0 {
 		for &entry in transcript.entries[:count] { entry_destroy(&entry) }
 		remove_range(&transcript.entries, 0, count)
-		transcript.first += 1
-		if scroll.top != nil { widgets.scroll_to(scroll, above - rows) }
-		return true
 	}
-	return false
+	if removed_rows > 0 && scroll.top != nil { transcript_scroll_to(app, above - removed_rows) }
+	return moved
 }
 
 transcript_node_rows :: proc(transcript: ^Transcript, node: journal.Node_Id) -> (rows: int) {
@@ -685,5 +717,5 @@ transcript_select_move :: proc(app: ^App, delta: int) {
 	box := boxes[next]
 	transcript.selected = box.call
 	view_top := widgets.scroll_offset(app.conversation_scroll)
-	widgets.scroll_to(&app.conversation_scroll, widgets.scroll_reveal(view_top, transcript.viewport_rows, box.top, box.rows))
+	transcript_scroll_to(app, widgets.scroll_reveal(view_top, transcript.viewport_rows, box.top, box.rows))
 }

@@ -281,6 +281,9 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 		}
 		if err != .None { return }
 		if !transcript_slide(app) { break }
+		// This grid will be replaced, not presented. Its scratch-backed cells and
+		// links are no longer read; the final grid keeps them through screen_present.
+		free_all(context.temp_allocator)
 	}
 	images_sync(app, storage)
 	if present_err := tui.screen_present(&storage.screen, app.terminal, term.profile_default(), cursor); present_err != nil {
@@ -378,7 +381,7 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 		if !found {
 			return false
 		}
-		widgets.scroll_set_range(&app.conversation_scroll, int(node.scroll_range.y))
+		transcript_scroll_set_range(app, int(node.scroll_range.y))
 		corrected := widgets.scroll_offset(app.conversation_scroll)
 		if corrected == offset || pass == 1 {
 			// The last solve declared every entry this frame draws, so the
