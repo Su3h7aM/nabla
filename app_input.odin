@@ -4,13 +4,13 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:sync"
-import "core:unicode/utf8"
 
 import "nabla:agent"
 import "nabla:agent/journal"
 import input "nabla:input"
 import "nabla:layout"
 import "nabla:term"
+import "nabla:text"
 import "nabla:tui/widgets"
 
 // --- input handling -------------------------------------------------------
@@ -433,7 +433,7 @@ box_drag_end :: proc(app: ^App) {
 box_rows_text :: proc(full: string, content_width, first, last: int) -> string {
 	split := strings.index_byte(full, '\n')
 	if split < 0 { return "" }
-	remaining := display_clean(full[split + 1:], context.temp_allocator)
+	remaining := text.sanitize_text(full[split + 1:], context.temp_allocator) or_else ""
 	builder := strings.builder_make(context.temp_allocator)
 	for index := 0; len(remaining) > 0 && index <= last; index += 1 {
 		piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
@@ -593,9 +593,9 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 	case .Character:
 		if .Control in key.modifiers {
 			switch key.character {
-			case '\x03':
+			case 'c':
 				interrupt(app)
-			case '\x04':
+			case 'd':
 				cancel_or_quit(app)
 			}
 		} else if key.character >= 0x20 && key.character != 0x7f {
@@ -604,7 +604,7 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 				snap_append(app, .Warning, "the prompt could not hold that character")
 			}
 		}
-	case .Insert, .F1, .F2, .F3, .F4, .F5:
+	case .Insert, .F1, .F2, .F3, .F4, .F5, .F6, .F7, .F8, .F9, .F10, .F11, .F12:
 	}
 }
 
@@ -757,37 +757,10 @@ enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {
 
 // --- prompt line editing --------------------------------------------------
 
-// paste_insert inserts a bracketed paste at the caret. Line breaks are kept, so a
-// pasted block stays the block it was; CR and CRLF are read as the one break they
-// mean, and every other control byte is dropped.
+// paste_insert inserts a bracketed paste at the caret. The prompt applies its text rule, so
+// line breaks are kept and CR and CRLF read as the one break they mean.
 paste_insert :: proc(app: ^App, text_value: string) {
-	if text_value == "" {
-		return
-	}
-	run, run_error := strings.builder_make(0, 0, context.temp_allocator)
-	if run_error != nil {
-		snap_append(app, .Warning, "the pasted text could not be prepared")
-		return
-	}
-	for index := 0; index < len(text_value); {
-		r, width := utf8.decode_rune(text_value[index:])
-		index += max(width, 1)
-		switch {
-		case r == '\n':
-			strings.write_byte(&run, '\n')
-		case r == '\r':
-			strings.write_byte(&run, '\n')
-			if index < len(text_value) && text_value[index] == '\n' { index += 1 }
-		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
-		// A control code point has no place in the prompt.
-		case:
-			if _, write_error := strings.write_rune(&run, r); write_error != nil {
-				snap_append(app, .Warning, "the pasted text could not be prepared")
-				return
-			}
-		}
-	}
-	if !widgets.input_insert(&app.input, strings.to_string(run)) {
+	if !widgets.input_insert(&app.input, text_value) {
 		snap_append(app, .Warning, "the prompt could not hold the pasted text")
 	}
 }

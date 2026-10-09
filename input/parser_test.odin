@@ -51,7 +51,11 @@ test_utf8_split_across_feeds :: proc(t: ^testing.T) {
 @(test)
 test_escape_sequences :: proc(t: ^testing.T) {
 	// CSI arrows and tilde keys, a CSI modifier, and the SS3 function-key form.
-	_feed_events(t, "\e[A\e[3~\e[1;5D\eOP", []Event{Key_Event{code = .Up}, Key_Event{code = .Delete}, Key_Event{code = .Left}, Key_Event{code = .F1}})
+	_feed_events(
+		t,
+		"\e[A\e[3~\e[1;5D\eOP",
+		[]Event{Key_Event{code = .Up}, Key_Event{code = .Delete}, Key_Event{code = .Left, modifiers = {.Control}}, Key_Event{code = .F1}},
+	)
 }
 
 @(test)
@@ -75,9 +79,103 @@ test_lone_escape_resolves_on_deadline :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_escape_then_printable_emits_escape_then_key :: proc(t: ^testing.T) {
-	// Alt+x arrives as ESC x; the policy is an Escape event followed by the key.
-	_feed_events(t, "\eX", []Event{Key_Event{code = .Escape}, Key_Event{code = .Character, character = 'X'}})
+test_escape_then_key_is_alt_key :: proc(t: ^testing.T) {
+	_feed_events(
+		t,
+		"\eX\e]\e\t\e\r\e\x7f\e ",
+		[]Event {
+			Key_Event{code = .Character, character = 'X', modifiers = {.Alt}},
+			Key_Event{code = .Character, character = ']', modifiers = {.Alt}},
+			Key_Event{code = .Tab, modifiers = {.Alt}},
+			Key_Event{code = .Enter, modifiers = {.Alt}},
+			Key_Event{code = .Backspace, modifiers = {.Alt}},
+			Key_Event{code = .Character, character = ' ', modifiers = {.Alt}},
+		},
+	)
+	// ESC before a control byte is still Escape, then the key.
+	_feed_events(t, "\e\x01", []Event{Key_Event{code = .Escape}, Key_Event{code = .Character, character = 'a', modifiers = {.Control}}})
+}
+
+@(test)
+test_control_bytes_normalize_to_letters :: proc(t: ^testing.T) {
+	_feed_events(
+		t,
+		"\x01\x03\x1a\x00\x1c\x1f",
+		[]Event {
+			Key_Event{code = .Character, character = 'a', modifiers = {.Control}},
+			Key_Event{code = .Character, character = 'c', modifiers = {.Control}},
+			Key_Event{code = .Character, character = 'z', modifiers = {.Control}},
+			Key_Event{code = .Character, character = ' ', modifiers = {.Control}},
+			Key_Event{code = .Character, character = '4', modifiers = {.Control}},
+			Key_Event{code = .Character, character = '7', modifiers = {.Control}},
+		},
+	)
+}
+
+@(test)
+test_modified_csi_and_ss3_keys :: proc(t: ^testing.T) {
+	_feed_events(
+		t,
+		"\e[1;5D\e[3;3~\e[5;2~\e[1;2H\e[1;6F\e[1;5P\e[1;3S\e[1;2R\eO5Q\e[Z",
+		[]Event {
+			Key_Event{code = .Left, modifiers = {.Control}},
+			Key_Event{code = .Delete, modifiers = {.Alt}},
+			Key_Event{code = .Page_Up, modifiers = {.Shift}},
+			Key_Event{code = .Home, modifiers = {.Shift}},
+			Key_Event{code = .End, modifiers = {.Shift, .Control}},
+			Key_Event{code = .F1, modifiers = {.Control}},
+			Key_Event{code = .F4, modifiers = {.Alt}},
+			Key_Event{code = .F3, modifiers = {.Shift}},
+			Key_Event{code = .F2, modifiers = {.Control}},
+			Key_Event{code = .Tab, modifiers = {.Shift}},
+		},
+	)
+}
+
+@(test)
+test_function_keys_f6_to_f12 :: proc(t: ^testing.T) {
+	_feed_events(
+		t,
+		"\e[17~\e[18~\e[19~\e[20~\e[21~\e[23~\e[24~",
+		[]Event {
+			Key_Event{code = .F6},
+			Key_Event{code = .F7},
+			Key_Event{code = .F8},
+			Key_Event{code = .F9},
+			Key_Event{code = .F10},
+			Key_Event{code = .F11},
+			Key_Event{code = .F12},
+		},
+	)
+}
+
+@(test)
+test_kitty_keys :: proc(t: ^testing.T) {
+	_feed_events(
+		t,
+		"\e[97;5u\e[97:65;2u\e[97;1:3u\e[98;3:2u\e[27u\e[9;2u\e[127u\e[57441u\e[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18A",
+		[]Event {
+			Key_Event{code = .Character, character = 'a', modifiers = {.Control}},
+			Key_Event{code = .Character, character = 'A'},
+			Key_Event{code = .Character, character = 'a', kind = .Release},
+			Key_Event{code = .Character, character = 'b', modifiers = {.Alt}, kind = .Repeat},
+			Key_Event{code = .Escape},
+			Key_Event{code = .Tab, modifiers = {.Shift}},
+			Key_Event{code = .Backspace},
+			Unknown_Input{},
+			Unknown_Input{},
+		},
+	)
+}
+
+@(test)
+test_extra_parameters_are_rejected :: proc(t: ^testing.T) {
+	// More parameter bytes than the buffer holds must not decode as the key the first bytes spell.
+	_feed_events(
+		t,
+		"\e[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1A\e[1$~q",
+		[]Event{Unknown_Input{}, Unknown_Input{}, Key_Event{code = .Character, character = 'q'}},
+	)
 }
 
 @(test)
@@ -103,8 +201,13 @@ test_overlong_utf8_emits_unknown_and_resyncs :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_osc_string_terminator_is_consumed :: proc(t: ^testing.T) {
-	_feed_events(t, "\e]0;title\e\\q", []Event{Key_Event{code = .Character, character = 'q'}})
+test_sgr_mouse_modifiers_motion_and_unknown_buttons :: proc(t: ^testing.T) {
+	_feed_events(t, "\e[<4;1;2M", []Event{Mouse_Event{button = .Left, x = 1, y = 2, modifiers = {.Shift}}})
+	_feed_events(t, "\e[<24;3;4m", []Event{Mouse_Event{button = .Left, x = 3, y = 4, modifiers = {.Alt, .Control}, release = true}})
+	_feed_events(t, "\e[<68;5;6M", []Event{Mouse_Event{button = .Wheel_Up, x = 5, y = 6, modifiers = {.Shift}}})
+	_feed_events(t, "\e[<35;7;8M", []Event{Mouse_Event{button = .None, x = 7, y = 8, motion = true}})
+	_feed_events(t, "\e[<34;7;8M", []Event{Mouse_Event{button = .Right, x = 7, y = 8, motion = true}})
+	_feed_events(t, "\e[<128;1;1M\e[<129;1;1M", []Event{Unknown_Input{}, Unknown_Input{}})
 }
 
 @(test)
@@ -129,8 +232,7 @@ test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
 
 	// Coordinates the size of a wide terminal still fit the parameter buffer,
 	// a report split across feeds waits for its final byte, and a malformed
-	// report (an empty field, a hover report from a mode this parser never
-	// enables) becomes Unknown_Input and resynchronizes.
+	// report (an empty field, a release with no button) becomes Unknown_Input and resynchronizes.
 	parser: Parser
 	parser_init(&parser)
 	defer parser_destroy(&parser)
@@ -144,7 +246,7 @@ test_sgr_mouse_reports_decode :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(events), 1)
 	testing.expect_value(t, events[0], Event(Mouse_Event{button = .Left, x = 1000, y = 900}))
 	events_clear(&events)
-	malformed := []string{"\e[<0;;1M", "\e[<35;1;1M"}
+	malformed := []string{"\e[<0;;1M", "\e[<3;1;1M"}
 	for data in malformed {
 		testing.expect(t, feed(&parser, transmute([]byte)data, &events) == nil, "malformed report must not error")
 		testing.expect_value(t, len(events), 1)

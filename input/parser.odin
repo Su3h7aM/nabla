@@ -10,7 +10,6 @@ Parser_State :: enum u8 {
 	Escape,
 	Csi,
 	Ss3,
-	Osc,
 	Paste,
 }
 
@@ -18,27 +17,34 @@ Parser_State :: enum u8 {
 // tail of the paste buffer so a partial marker stays content.
 PASTE_END :: "\e[201~"
 
+// PARAMS_CAPACITY fits the longest sequence decoded: a kitty key with alternates, modifiers and
+// event kind, or an SGR mouse report with wide coordinates.
+PARAMS_CAPACITY :: 32
+
+// PARAM_LIMIT saturates a decimal parameter so a long digit run cannot overflow int.
+PARAM_LIMIT :: 1 << 24
+
 // Parser is a caller-owned, pure byte-to-event state machine. It retains
 // state across feed calls (a key sequence may span reads) and performs no
 // I/O: acquisition feeds byte slices and drains the emitted events. Malformed
 // input normalizes to Unknown_Input events and resynchronizes; only resource
 // failures are errors.
 Parser :: struct {
-	state:         Parser_State,
-	utf8_expected: int, // remaining UTF-8 continuation bytes
-	utf8_bytes:    [4]u8,
-	utf8_length:   int,
-	// params holds the raw parameter bytes of one CSI/SS3 sequence. An SGR
-	// mouse report needs up to 14 bytes ('<' plus three decimal fields with
-	// separators), so the buffer is sized for that, not for key sequences.
-	params:        [16]u8,
-	param_count:   int,
-	intermediate:  u8,
-	osc_escape:    bool,
+	state:           Parser_State,
+	utf8_expected:   int, // remaining UTF-8 continuation bytes
+	utf8_bytes:      [4]u8,
+	utf8_length:     int,
+	// params holds the raw parameter bytes of one CSI/SS3 sequence. A byte
+	// that does not fit sets params_overflow and the sequence becomes
+	// Unknown_Input, so a truncated parameter list is never decoded.
+	params:          [PARAMS_CAPACITY]u8,
+	param_count:     int,
+	params_overflow: bool,
+	intermediate:    u8,
 	// paste is the scratch for a bracketed paste's raw bytes, allocated with
 	// the feed allocator and owned by the parser until parser_destroy. It grows
 	// with the paste it is collecting, however large that paste is.
-	paste:         [dynamic]u8,
+	paste:           [dynamic]u8,
 }
 
 parser_init :: proc(parser: ^Parser) {
@@ -70,8 +76,6 @@ feed :: proc(parser: ^Parser, data: []byte, events: ^[dynamic]Event, allocator :
 			consumed, err = parser_sequence(parser, data[i], events, allocator)
 		case .Paste:
 			consumed, err = parser_paste(parser, data[i], events, allocator)
-		case .Osc:
-			consumed, err = parser_osc(parser, data[i])
 		}
 		if err != nil {
 			return err
@@ -104,8 +108,8 @@ parser_reset :: proc(parser: ^Parser) {
 	parser.utf8_expected = 0
 	parser.utf8_length = 0
 	parser.param_count = 0
+	parser.params_overflow = false
 	parser.intermediate = 0
-	parser.osc_escape = false
 }
 
 @(require_results)
@@ -120,14 +124,6 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 	switch {
 	case input_byte == 0x1b:
 		parser.state = .Escape
-	case input_byte == 0x09:
-		err = parser_emit(events, Key_Event{code = .Tab}, allocator)
-	case input_byte == 0x0d:
-		err = parser_emit(events, Key_Event{code = .Enter}, allocator)
-	case input_byte == 0x7f:
-		err = parser_emit(events, Key_Event{code = .Backspace}, allocator)
-	case input_byte >= 0x01 && input_byte <= 0x1a:
-		err = parser_emit(events, Key_Event{code = .Character, character = rune(input_byte), modifiers = {.Control}}, allocator)
 	case input_byte >= 0x80:
 		expected := 0
 		switch {
@@ -146,10 +142,31 @@ parser_ground :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 			parser.state = .Utf8
 			parser.utf8_expected = expected
 		}
-	case input_byte < 0x80:
-		err = parser_emit(events, Key_Event{code = .Character, character = rune(input_byte)}, allocator)
+	case:
+		err = parser_emit(events, parser_key_from_byte(input_byte), allocator)
 	}
 	return 1, err
+}
+
+// parser_key_from_byte maps a single input byte below 0x80, other than ESC, to its key. Tab, Enter
+// and Backspace keep their own codes; the other control bytes are the letter or digit they are typed
+// with, plus Control.
+parser_key_from_byte :: proc(input_byte: u8) -> Key_Event {
+	switch {
+	case input_byte == 0x09:
+		return {code = .Tab}
+	case input_byte == 0x0d:
+		return {code = .Enter}
+	case input_byte == 0x7f:
+		return {code = .Backspace}
+	case input_byte == 0x00:
+		return {code = .Character, character = ' ', modifiers = {.Control}}
+	case input_byte <= 0x1a:
+		return {code = .Character, character = 'a' + rune(input_byte - 1), modifiers = {.Control}}
+	case input_byte >= 0x1c && input_byte <= 0x1f:
+		return {code = .Character, character = '4' + rune(input_byte - 0x1c), modifiers = {.Control}}
+	}
+	return {code = .Character, character = rune(input_byte)}
 }
 
 @(require_results)
@@ -186,21 +203,19 @@ parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 		// ESC ESC: restart the escape sequence.
 		return 1, nil
 	case '[':
-		parser.state = .Csi
-		parser.param_count = 0
-		parser.intermediate = 0
+		parser_begin_sequence(parser, .Csi)
 		return 1, nil
 	case 'O':
-		parser.state = .Ss3
-		parser.param_count = 0
-		parser.intermediate = 0
+		parser_begin_sequence(parser, .Ss3)
 		return 1, nil
-	case ']':
-		parser.state = .Osc
-		return 1, nil
+	case 0x20 ..= 0x7f, 0x09, 0x0d:
+		key := parser_key_from_byte(input_byte)
+		key.modifiers += {.Alt}
+		parser.state = .Ground
+		return 1, parser_emit(events, key, allocator)
 	case:
-		// A lone ESC followed by an ordinary byte: emit Escape, then
-		// reprocess the byte in Ground (ESC + printable = Escape then key).
+		// ESC before a control or non-ASCII byte: emit Escape, then
+		// reprocess the byte in Ground.
 		parser.state = .Ground
 		if esc_err := parser_emit(events, Key_Event{code = .Escape}, allocator); esc_err != nil {
 			return 0, esc_err
@@ -209,12 +224,19 @@ parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 	}
 }
 
+parser_begin_sequence :: proc(parser: ^Parser, state: Parser_State) {
+	parser_reset(parser)
+	parser.state = state
+}
+
 @(require_results)
 parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	if input_byte >= 0x30 && input_byte <= 0x3f {
 		if parser.param_count < len(parser.params) {
 			parser.params[parser.param_count] = input_byte
 			parser.param_count += 1
+		} else {
+			parser.params_overflow = true
 		}
 		return 1, nil
 	}
@@ -223,7 +245,7 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 		return 1, nil
 	}
 	if input_byte >= 0x40 && input_byte <= 0x7e {
-		if parser.state == .Csi && input_byte == '~' && parser_first_param(parser) == 200 {
+		if parser.state == .Csi && input_byte == '~' && parser_param(parser, 0) == 200 {
 			if parser.paste == nil {
 				parser.paste = make([dynamic]u8, 0, 64, allocator)
 			} else {
@@ -249,116 +271,195 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 
 @(require_results)
 parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
+	if parser.params_overflow || parser.intermediate != 0 {
+		return parser_emit(events, Unknown_Input{}, allocator)
+	}
+	// A leading '<', '=', '>' or '?' marks a private sequence (mouse, replies), never a key.
+	private := parser.param_count > 0 && parser.params[0] >= '<' && parser.params[0] <= '?'
 	if state == .Csi && parser.param_count > 0 && parser.params[0] == '<' && (final == 'M' || final == 'm') {
 		return parser_mouse_event(parser, final, events, allocator)
 	}
-	code: Key_Code
-	found := true
+	key: Key_Event
+	found: bool
+	if !private {
+		if state == .Csi {
+			key, found = parser_csi_key(parser, final)
+		} else {
+			key, found = parser_ss3_key(parser, final)
+		}
+	}
+	if !found {
+		return parser_emit(events, Unknown_Input{}, allocator)
+	}
+	return parser_emit(events, key, allocator)
+}
+
+// parser_letter_key maps the final bytes that name a key without a number, shared by CSI and SS3.
+parser_letter_key :: proc(final: u8) -> (code: Key_Code, ok: bool) {
 	switch final {
 	case 'A':
-		code = .Up
+		return .Up, true
 	case 'B':
-		code = .Down
+		return .Down, true
 	case 'C':
-		code = .Right
+		return .Right, true
 	case 'D':
-		code = .Left
+		return .Left, true
 	case 'H':
-		code = .Home
+		return .Home, true
 	case 'F':
-		code = .End
+		return .End, true
+	case 'P':
+		return .F1, true
+	case 'Q':
+		return .F2, true
+	case 'R':
+		return .F3, true
+	case 'S':
+		return .F4, true
+	}
+	return {}, false
+}
+
+// parser_tilde_key maps the number of a `CSI number ~` key.
+parser_tilde_key :: proc(number: int) -> (code: Key_Code, ok: bool) {
+	switch number {
+	case 1, 7:
+		return .Home, true
+	case 2:
+		return .Insert, true
+	case 3:
+		return .Delete, true
+	case 4, 8:
+		return .End, true
+	case 5:
+		return .Page_Up, true
+	case 6:
+		return .Page_Down, true
+	case 11:
+		return .F1, true
+	case 12:
+		return .F2, true
+	case 13:
+		return .F3, true
+	case 14:
+		return .F4, true
+	case 15:
+		return .F5, true
+	case 17:
+		return .F6, true
+	case 18:
+		return .F7, true
+	case 19:
+		return .F8, true
+	case 20:
+		return .F9, true
+	case 21:
+		return .F10, true
+	case 23:
+		return .F11, true
+	case 24:
+		return .F12, true
+	}
+	return {}, false
+}
+
+// parser_ss3_key decodes ESC O [modifiers] final; xterm puts the modifier before the final byte.
+parser_ss3_key :: proc(parser: ^Parser, final: u8) -> (key: Key_Event, ok: bool) {
+	key.code = parser_letter_key(final) or_return
+	key.modifiers = parser_key_modifiers(parser, 0)
+	key.kind = parser_key_kind(parser, 0)
+	return key, true
+}
+
+// parser_csi_key decodes a CSI key: `CSI [1;modifiers[:kind]] final`, `CSI number[;modifiers[:kind]] ~`,
+// `CSI Z`, and the kitty form handled by parser_kitty_key.
+parser_csi_key :: proc(parser: ^Parser, final: u8) -> (key: Key_Event, ok: bool) {
+	number := parser_param(parser, 0)
+	switch final {
+	case 'Z':
+		return {code = .Tab, modifiers = {.Shift}}, true
+	case 'u':
+		return parser_kitty_key(parser)
+	case '~':
+		if number == 27 && parser_param(parser, 2) == 13 {
+			// xterm modifyOtherKeys: CSI 27 ; modifiers ; 13 ~.
+			return {code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, true
+		}
+		key.code = parser_tilde_key(number) or_return
 	case:
-		found = false
+		key.code = parser_letter_key(final) or_return
 	}
-	if found {
-		return parser_emit(events, Key_Event{code = code}, allocator)
-	}
-	if state == .Ss3 {
-		switch final {
-		case 'P':
-			code, found = .F1, true
-		case 'Q':
-			code, found = .F2, true
-		case 'R':
-			code, found = .F3, true
-		case 'S':
-			code, found = .F4, true
-		}
-	} else {
-		param := parser_first_param(parser)
-		// Kitty's keyboard protocol reports Enter as CSI 13 ; modifier u.
-		// xterm's modifyOtherKeys mode uses CSI 27 ; modifier ; 13 ~.
-		if final == 'u' && param == 13 {
-			return parser_emit(events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, allocator)
-		}
-		if final == '~' && param == 27 && parser_param(parser, 2) == 13 {
-			return parser_emit(events, Key_Event{code = .Enter, modifiers = parser_key_modifiers(parser, 1)}, allocator)
-		}
-		switch final {
-		case '~':
-			switch param {
-			case 1, 7:
-				code, found = .Home, true
-			case 2:
-				code, found = .Insert, true
-			case 3:
-				code, found = .Delete, true
-			case 4, 8:
-				code, found = .End, true
-			case 5:
-				code, found = .Page_Up, true
-			case 6:
-				code, found = .Page_Down, true
-			case 11:
-				code, found = .F1, true
-			case 12:
-				code, found = .F2, true
-			case 13:
-				code, found = .F3, true
-			case 14:
-				code, found = .F4, true
-			case 15:
-				code, found = .F5, true
-			}
-		}
-	}
-	if found {
-		return parser_emit(events, Key_Event{code = code}, allocator)
-	}
-	return parser_emit(events, Unknown_Input{}, allocator)
+	key.modifiers = parser_key_modifiers(parser, 1)
+	key.kind = parser_key_kind(parser, 1)
+	return key, true
 }
 
-parser_first_param :: proc(parser: ^Parser) -> int {
-	value := parser_param(parser, 0)
-	if value == 0 {
-		return 1
+// parser_kitty_key decodes the kitty keyboard protocol form
+// `CSI code[:shifted[:base]] ; modifiers[:kind] [; text] u`. With Shift held, the shifted alternate
+// is the character and Shift is dropped, matching how a legacy terminal reports typed text. The text
+// field and the base alternate are ignored.
+parser_kitty_key :: proc(parser: ^Parser) -> (key: Key_Event, ok: bool) {
+	code := parser_param(parser, 0)
+	key.modifiers = parser_key_modifiers(parser, 1)
+	key.kind = parser_key_kind(parser, 1)
+	switch code {
+	case 9:
+		key.code = .Tab
+	case 13:
+		key.code = .Enter
+	case 27:
+		key.code = .Escape
+	case 127:
+		key.code = .Backspace
+	case:
+		key.code = .Character
+		key.character = parser_kitty_character(code) or_return
+		if shifted := parser_param(parser, 0, 1); .Shift in key.modifiers && shifted != 0 {
+			key.character = parser_kitty_character(shifted) or_return
+			key.modifiers -= {.Shift}
+		}
 	}
-	return value
+	return key, true
 }
 
-parser_param :: proc(parser: ^Parser, wanted: int) -> int {
-	field := 0
-	value := 0
-	for i in 0 ..< parser.param_count {
-		parameter_byte := parser.params[i]
-		if parameter_byte == ';' {
-			if field == wanted {
+// parser_kitty_character accepts a printable code point and rejects the private-use block kitty
+// uses for keys that have no character, such as modifier and media keys.
+parser_kitty_character :: proc(code: int) -> (character: rune, ok: bool) {
+	if code < 0x20 || code == 0x7f || code >= 0xe000 && code <= 0xf8ff || utf8.rune_size(rune(code)) < 0 {
+		return 0, false
+	}
+	return rune(code), true
+}
+
+// parser_param returns the decimal value of one parameter: `field` counts ';' separators and `sub`
+// counts ':' separators within the field. A missing or empty parameter is 0.
+parser_param :: proc(parser: ^Parser, field: int, sub := 0) -> int {
+	field_index, sub_index, value := 0, 0, 0
+	for parameter_byte in parser.params[:parser.param_count] {
+		switch {
+		case parameter_byte == ';' || parameter_byte == ':':
+			if field_index == field && sub_index == sub {
 				return value
 			}
-			field += 1
+			if parameter_byte == ';' {
+				field_index += 1
+				sub_index = 0
+			} else {
+				sub_index += 1
+			}
 			value = 0
-			continue
-		}
-		if parameter_byte >= '0' && parameter_byte <= '9' && field == wanted {
-			value = value * 10 + int(parameter_byte - '0')
+		case parameter_byte >= '0' && parameter_byte <= '9':
+			value = min(value * 10 + int(parameter_byte - '0'), PARAM_LIMIT)
 		}
 	}
-	if field == wanted {
+	if field_index == field && sub_index == sub {
 		return value
 	}
 	return 0
 }
 
+// parser_key_modifiers decodes the xterm modifier parameter, which is 1 plus the modifier bits.
 parser_key_modifiers :: proc(parser: ^Parser, field: int) -> Key_Modifiers {
 	encoded_modifiers := parser_param(parser, field)
 	if encoded_modifiers <= 1 {
@@ -381,6 +482,16 @@ parser_key_modifiers :: proc(parser: ^Parser, field: int) -> Key_Modifiers {
 	return result
 }
 
+parser_key_kind :: proc(parser: ^Parser, field: int) -> Key_Kind {
+	switch parser_param(parser, field, 1) {
+	case 2:
+		return .Repeat
+	case 3:
+		return .Release
+	}
+	return .Press
+}
+
 // parser_mouse_fields splits an SGR mouse report into its three decimal fields.
 @(require_results)
 parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bool) {
@@ -391,7 +502,7 @@ parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bo
 		parameter_byte := parser.params[i]
 		switch {
 		case parameter_byte >= '0' && parameter_byte <= '9':
-			value = value * 10 + int(parameter_byte - '0')
+			value = min(value * 10 + int(parameter_byte - '0'), PARAM_LIMIT)
 			digits = true
 		case parameter_byte == ';':
 			if !digits {
@@ -419,48 +530,46 @@ parser_mouse_fields :: proc(parser: ^Parser) -> (control_byte, x, y: int, ok: bo
 	return control_byte, x, y, true
 }
 
-// parser_mouse_event decodes an SGR mouse report into a Mouse_Event.
+// parser_mouse_event decodes an SGR mouse report into a Mouse_Event. Bits 4, 8 and 16 are the
+// modifiers, 32 marks motion, and 64 the wheel block; any other bit (buttons 8 and above) is
+// Unknown_Input.
 @(require_results)
 parser_mouse_event :: proc(parser: ^Parser, final: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> Error {
+	MOUSE_KNOWN_BITS :: 3 | 4 | 8 | 16 | 32 | 64
 	control_byte, x, y, ok := parser_mouse_fields(parser)
-	if !ok || x <= 0 || y <= 0 {
+	if !ok || x <= 0 || y <= 0 || control_byte & ~int(MOUSE_KNOWN_BITS) != 0 {
 		return parser_emit(events, Unknown_Input{}, allocator)
 	}
+	mouse := Mouse_Event {
+		x = x,
+		y = y,
+	}
+	if control_byte & 4 != 0 {
+		mouse.modifiers += {.Shift}
+	}
+	if control_byte & 8 != 0 {
+		mouse.modifiers += {.Alt}
+	}
+	if control_byte & 16 != 0 {
+		mouse.modifiers += {.Control}
+	}
+	low_bits := control_byte & 3
 	switch {
 	case control_byte & 64 != 0:
-		// The wheel block starts at Mouse_Button.Wheel_Up: 64..67 map to 3..6.
-		return parser_emit(events, Mouse_Event{button = Mouse_Button((control_byte & 3) + 3), x = x, y = y}, allocator)
+		// The wheel block follows Mouse_Button.Right: 64..67 map to Wheel_Up..Wheel_Right.
+		mouse.button = Mouse_Button(low_bits + int(Mouse_Button.Wheel_Up))
 	case control_byte & 32 != 0:
-		if control_byte & 3 == 3 {
-			return parser_emit(events, Unknown_Input{}, allocator)
+		mouse.motion = true
+		if low_bits != 3 {
+			mouse.button = Mouse_Button(low_bits + int(Mouse_Button.Left))
 		}
-		return parser_emit(events, Mouse_Event{button = Mouse_Button(control_byte & 3), x = x, y = y, motion = true}, allocator)
+	case low_bits == 3:
+		return parser_emit(events, Unknown_Input{}, allocator)
 	case:
-		if control_byte & 3 == 3 {
-			return parser_emit(events, Unknown_Input{}, allocator)
-		}
-		return parser_emit(events, Mouse_Event{button = Mouse_Button(control_byte & 3), x = x, y = y, release = final == 'm'}, allocator)
+		mouse.button = Mouse_Button(low_bits + int(Mouse_Button.Left))
+		mouse.release = final == 'm'
 	}
-}
-
-// parser_osc discards string content (OSC/DCS/APC/PM/SOS) until BEL or an
-// ESC terminator; the content is intentionally dropped, not surfaced.
-@(require_results)
-parser_osc :: proc(parser: ^Parser, input_byte: u8) -> (consumed: int, err: Error) {
-	if parser.osc_escape {
-		if input_byte == '\\' {
-			parser_reset(parser)
-			return 1, nil
-		}
-		parser_reset(parser)
-		return 0, nil
-	}
-	if input_byte == 0x07 {
-		parser_reset(parser)
-	} else if input_byte == 0x1b {
-		parser.osc_escape = true
-	}
-	return 1, nil
+	return parser_emit(events, mouse, allocator)
 }
 
 // parser_paste collects a bracketed paste and emits one Paste event at the closing marker.

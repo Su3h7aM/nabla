@@ -24,6 +24,13 @@ Key_Code :: enum u8 {
 	F3,
 	F4,
 	F5,
+	F6,
+	F7,
+	F8,
+	F9,
+	F10,
+	F11,
+	F12,
 }
 
 Key_Modifier :: enum u8 {
@@ -35,11 +42,22 @@ Key_Modifier :: enum u8 {
 
 Key_Modifiers :: distinct bit_set[Key_Modifier;u8]
 
+// Key_Kind is the event type of the kitty keyboard protocol. Terminals that do not report it
+// send only presses.
+Key_Kind :: enum u8 {
+	Press,
+	Repeat,
+	Release,
+}
+
+// Key_Event is one key. A control byte is normalized to its letter with Control (0x01 is 'a', 0x00
+// is ' ', 0x1c..0x1f are '4'..'7'), except Tab, Enter and Backspace, which keep their codes. ESC
+// before a printable byte, Tab, Enter or Delete adds Alt.
 Key_Event :: struct {
 	code:      Key_Code,
 	character: rune, // set when code is .Character
 	modifiers: Key_Modifiers,
-	repeat:    bool,
+	kind:      Key_Kind,
 }
 
 Resize_Event :: struct {
@@ -47,10 +65,11 @@ Resize_Event :: struct {
 	rows:    int,
 }
 
-// Mouse_Button names which control produced a mouse report: the three
-// physical buttons button-event tracking reports, plus the four wheel
+// Mouse_Button names which control produced a mouse report: None for motion
+// with no button held, the three physical buttons, plus the four wheel
 // directions of the SGR protocol's 64..67 block.
 Mouse_Button :: enum u8 {
+	None,
 	Left,
 	Middle,
 	Right,
@@ -62,12 +81,14 @@ Mouse_Button :: enum u8 {
 
 // Mouse_Event is one SGR mouse report (DECSET 1002 + 1006). x and y are the
 // cell coordinates as the protocol sends them, 1-based. release marks a
-// button release and motion a drag report; wheel reports carry neither.
+// button release and motion a movement report (a drag, or button None for a
+// hover); wheel reports carry neither.
 Mouse_Event :: struct {
-	button:  Mouse_Button,
-	x, y:    int,
-	release: bool,
-	motion:  bool,
+	button:    Mouse_Button,
+	x, y:      int,
+	modifiers: Key_Modifiers,
+	release:   bool,
+	motion:    bool,
 }
 
 // Paste is one bracketed paste (DECSET 2004), emitted when the parser sees

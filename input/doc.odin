@@ -19,6 +19,12 @@
 // dynamic array. read_events takes the byte source (the Session's os.File,
 // handed over by the application); no terminal type crosses the boundary.
 //
+// Keys: legacy bytes, CSI and SS3 sequences keep their xterm modifier parameter, and the kitty
+// `CSI code;modifiers:kind u` form is decoded with its event kind. ESC followed by a printable
+// byte, Tab, Enter or Delete is one Alt key event; a lone ESC resolves to Escape after the deadline.
+// Mouse reports are SGR (DECSET 1006) and carry modifiers. A sequence whose parameters do not fit
+// the parser's buffer, or that this package does not decode, is Unknown_Input.
+//
 // Bracketed paste (DECSET 2004) is a parser-level event: the parser collects
 // the bytes between CSI 200 ~ and CSI 201 ~ and emits one Paste event carrying
 // them, so a multi-line paste is never decoded into keystrokes. The terminal
