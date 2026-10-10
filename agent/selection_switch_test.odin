@@ -112,16 +112,16 @@ test_selection_check_records_nothing_before_the_first_prompt :: proc(test: ^test
 		_ = os.remove_all(directory)
 		delete(directory, context.allocator)
 	}
-	store: journal.Journal
-	if open_error := journal.open(&store, directory, directory, journal.run_id_create(), .Read_Write, context.allocator); open_error != nil {
+	store, store_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
+	if store_open_error != nil {
 		testing.fail_now(test, "the journal could not be opened")
 	}
-	defer _ = journal.close(&store)
+	defer _ = journal.close(store)
 
 	// The session is named but never claimed, which is what an opened ACP session looks like
 	// before its first prompt.
 	session := journal.session_id_create()
-	chat, tool_error := chat_session_init(&store, session, journal.INITIAL_BRANCH, 0, tool_loop_workspace(test), context.allocator)
+	chat, tool_error := chat_session_init(store, session, journal.INITIAL_BRANCH, 0, tool_loop_workspace(test), context.allocator)
 	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
 	defer chat_session_destroy(&chat)
 	chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""

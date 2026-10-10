@@ -33,9 +33,9 @@ test_retry_policy :: proc() -> Chat_Retry_Policy {
 }
 
 // Chat_Test binds a running session to a journal in a temporary directory. The
-// journal lives in the fixture so its address is stable while the session points at it.
+// fixture owns the journal until chat_test_end or chat_test_reopen releases it.
 Chat_Test :: struct {
-	store:     journal.Journal,
+	store:     ^journal.Journal,
 	directory: string,
 	chat:      Chat_Session,
 }
@@ -90,13 +90,15 @@ chat_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string
 	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
 	fixture.directory = directory
 
-	if open_error := journal.open(&fixture.store, directory, directory, journal.run_id_create(), .Read_Write); open_error != nil {
+	store_open_error: journal.Error
+	fixture.store, store_open_error = journal.open(directory, directory, journal.run_id_create(), .Read_Write)
+	if store_open_error != nil {
 		testing.fail_now(
 			test,
-			strings.concatenate({"the journal could not be opened: ", journal.error_text(open_error, context.temp_allocator)}, context.temp_allocator),
+			strings.concatenate({"the journal could not be opened: ", journal.error_text(store_open_error, context.temp_allocator)}, context.temp_allocator),
 		)
 	}
-	session, create_error := journal.create_session(&fixture.store, {workspace = workspace, role = .Main})
+	session, create_error := journal.create_session(fixture.store, {workspace = workspace, role = .Main})
 	if create_error != nil { testing.fail_now(test, "the session could not be created") }
 
 	chat_test_attach(test, fixture, session, journal.INITIAL_BRANCH, 0, workspace)
@@ -112,7 +114,7 @@ chat_test_attach :: proc(
 	workspace: string,
 ) {
 	tool_error: Tool_Registry_Error
-	fixture.chat, tool_error = chat_session_init(&fixture.store, session, branch, head, workspace, context.allocator)
+	fixture.chat, tool_error = chat_session_init(fixture.store, session, branch, head, workspace, context.allocator)
 	if tool_error.kind != .None { testing.fail_now(test, "the tool registry could not be created") }
 	fixture.chat.provider_id = chat_clone_string("test-provider", context.allocator) or_else ""
 	fixture.chat.model_id = chat_clone_string("test-model", context.allocator) or_else ""
@@ -134,18 +136,20 @@ chat_test_attach :: proc(
 chat_test_reopen :: proc(test: ^testing.T, fixture, reopened: ^Chat_Test, workspace: string) -> journal.Recovery {
 	session := fixture.chat.session
 	chat_session_destroy(&fixture.chat)
-	if close_error := journal.close(&fixture.store); close_error != nil { testing.fail_now(test, "the first journal did not close") }
+	if close_error := journal.close(fixture.store); close_error != nil { testing.fail_now(test, "the first journal did not close") }
 	reopened.directory = fixture.directory
 	fixture^ = {}
 
-	if open_error := journal.open(&reopened.store, reopened.directory, reopened.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+	store_open_error: journal.Error
+	reopened.store, store_open_error = journal.open(reopened.directory, reopened.directory, journal.run_id_create(), .Read_Write)
+	if store_open_error != nil {
 		testing.fail_now(test, "the journal could not be opened again")
 	}
-	if _, claim_error := journal.claim(&reopened.store, session); claim_error != nil { testing.fail_now(test, "the session could not be claimed again") }
+	if _, claim_error := journal.claim(reopened.store, session); claim_error != nil { testing.fail_now(test, "the session could not be claimed again") }
 	kept_directory := os.join_path({reopened.directory, "tool-output"}, context.temp_allocator) or_else ""
-	recovery, recover_error := journal.recover(&reopened.store, kept_directory)
+	recovery, recover_error := journal.recover(reopened.store, kept_directory)
 	if recover_error != nil { testing.fail_now(test, "the session could not be recovered") }
-	branch, head, head_error := journal.session_head(&reopened.store, session)
+	branch, head, head_error := journal.session_head(reopened.store, session)
 	if head_error != nil { testing.fail_now(test, "the session head could not be read") }
 	chat_test_attach(test, reopened, session, branch, head, workspace)
 	return recovery
@@ -170,7 +174,7 @@ chat_test_end :: proc(test: ^testing.T, fixture: ^Chat_Test) {
 	}
 	testing.expect(test, chat.compact.state != .Retiring, "the summary's worker did not stop when the test ended")
 	chat_session_destroy(chat)
-	if close_error := journal.close(&fixture.store); close_error != nil {
+	if close_error := journal.close(fixture.store); close_error != nil {
 		testing.expectf(test, false, "the journal did not close: %s", journal.error_text(close_error, context.temp_allocator))
 	}
 	// The fixture's directory is abandoned; a removal that fails changes nothing in a test.

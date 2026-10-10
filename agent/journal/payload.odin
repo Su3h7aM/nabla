@@ -12,6 +12,7 @@ PAYLOAD_VERSION :: 1
 // payload_decode reads one supported record or node payload, with strings and slices in
 // allocator. Malformed JSON or a missing or unsupported version returns .Corrupt. A failed
 // decode may leave partial allocations behind, so allocator is a temp or arena allocator.
+// Allocation failures return an allocator error without marking corruption.
 // When corruption_journal is given, a corrupt payload also records its session and seq there.
 @(require_results)
 payload_decode :: proc(
@@ -23,7 +24,12 @@ payload_decode :: proc(
 	seq: Journal_Seq = 0,
 ) -> Error {
 	payload.version = 0
-	if json.unmarshal_string(data, payload, allocator = allocator) != nil || payload.version != PAYLOAD_VERSION {
+	decode_error := json.unmarshal_string(data, payload, allocator = allocator)
+	if json_error, is_json := decode_error.(json.Error); is_json {
+		if json_error == .Out_Of_Memory { return mem.Allocator_Error.Out_Of_Memory }
+		if json_error == .Invalid_Allocator { return mem.Allocator_Error.Invalid_Argument }
+	}
+	if decode_error != nil || payload.version != PAYLOAD_VERSION {
 		if corruption_journal != nil {
 			return corrupt(corruption_journal, Journal_Error.Corrupt, session, seq)
 		}

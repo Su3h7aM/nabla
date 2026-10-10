@@ -142,14 +142,14 @@ acp_connection_open :: proc(conn: ^ACP_Server, sources: []agent.Catalog_Provider
 	_, commit_error := journal.commit(store)
 	if commit_error != nil {
 		fmt.eprintln("nabla: cannot record the run:", journal.error_text(commit_error, context.temp_allocator))
-		_ = session_store_close(store, setup.alloc)
+		_ = session_store_close(store)
 		return false
 	}
 	// run.finished is owed from here, and no session's journal carries it.
 	setup.run_open = true
 	selection, found, load_error := selection_latest(store, setup.alloc)
 	defer selection_destroy(&selection, setup.alloc)
-	if close_error := session_store_close(store, setup.alloc); close_error != nil {
+	if close_error := session_store_close(store); close_error != nil {
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", journal.error_text(close_error, context.temp_allocator))
 	}
 	acp_default_selection(conn, selection, found && load_error == nil)
@@ -466,7 +466,7 @@ acp_session_release :: proc(session: ^ACP_Session) {
 	if setup.workers_abandoned { return }
 	// A release failure is recorded rather than answered: the session is already
 	// destroyed, so the close stands either way.
-	if close_error := session_store_close(setup.store, setup.alloc); close_error != nil {
+	if close_error := session_store_close(setup.store); close_error != nil {
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", journal.error_text(close_error, context.temp_allocator))
 	}
 	setup.store = nil

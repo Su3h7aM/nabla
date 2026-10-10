@@ -94,11 +94,9 @@ Corruption :: struct {
 	seq:     Journal_Seq,
 }
 
-// Journal is one connection and at most one claimed session. One thread uses it
-// at a time; ownership passes to another thread only while no result set or
-// transaction is open, and the thread that hands it off stops using it. It must
-// not move while open: the connection and arena keep their address. The zero
-// value is closed.
+// Journal owns one connection and at most one session claim. Never copy it: its
+// connection, statements, and arena keep its address. One thread uses it at a time;
+// ownership may pass between threads only with no result set or transaction open.
 Journal :: struct {
 	connection:  db.Conn,
 	allocator:   mem.Allocator,
@@ -132,22 +130,23 @@ Journal :: struct {
 	corrupt:     Corruption,
 }
 
-// open opens the journal in directory, creating it private to the user and
-// migrating its schema when writable. A writable journal takes its claims on lock
-// files in locks, created private to the user when a claim needs it. A read-only
-// journal ignores locks, creates, migrates, and writes nothing, and refuses a
-// database at another version.
+// open allocates a journal with allocator. The caller releases it with close.
+// Writable opens create private storage in directory, migrate its schema, and use
+// locks for session claims. Read-only opens ignore locks and refuse another schema
+// version without creating or writing anything. Failure returns nil and the
+// allocation, filesystem, schema, or database error. If failed-open cleanup cannot
+// close the database, its allocation is abandoned to preserve live references.
 @(require_results)
-open :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> (error: Error) {
+open :: proc(directory, locks: string, run: Run_Id, mode: Open_Mode, allocator := context.allocator) -> (journal: ^Journal, error: Error) {
+	journal = new(Journal, allocator) or_return
 	error = open_database(journal, directory, locks, run, mode, allocator)
 	if error != nil {
-		// The error borrows the connection's text, which the teardown frees. A
-		// failure of the teardown itself changes nothing, because the open
-		// error is what the caller needs.
+		// The open error wins; failed cleanup leaves its allocation abandoned.
 		error = error_detach(error)
 		_ = close(journal)
+		return nil, error
 	}
-	return error
+	return journal, nil
 }
 
 @(private)
@@ -156,11 +155,9 @@ open_database :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, 
 	assert(!journal.open, "the journal is already open")
 	assert(run != {}, "a journal writes for a run")
 	assert(mode == .Read_Only || locks != "", "a writable journal claims sessions on lock files")
-	journal^ = {
-		allocator = allocator,
-		run       = run,
-		read_only = mode == .Read_Only,
-	}
+	journal.allocator = allocator
+	journal.run = run
+	journal.read_only = mode == .Read_Only
 	journal.pending.allocator = allocator
 
 	virtual.arena_init_growing(&journal.batch) or_return
@@ -195,14 +192,14 @@ open_database :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, 
 	return nil
 }
 
-// close records `session.released` for a held claim and commits it with every
-// pending item, then releases the claim, the statements, and the connection.
-// The first failure wins and cleanup continues: a commit failure is returned
-// only when releasing the claim and closing the connection succeed. A journal
-// that is read-only, not open, holds no claim, or has latched a failure writes
-// nothing, and its pending items are dropped. Closing a zero journal does nothing.
+// close commits session.released and pending items for a held claim, then releases
+// the claim and database. Nil does nothing. A statement or database close refusal
+// returns its error and retains ownership; only a close retry or abandonment is
+// valid afterwards. Once the database closes, close frees the journal with its
+// allocator, even when returning a claim-release or commit error, in that order.
 @(require_results)
 close :: proc(journal: ^Journal) -> Error {
+	if journal == nil { return nil }
 	commit_error: Error
 	if journal.open && !journal.read_only && journal.claimed != {} && journal.failure == nil {
 		append_record(journal, Record{kind = .Session_Released, session = journal.claimed}, Session_Released{})
@@ -212,22 +209,18 @@ close :: proc(journal: ^Journal) -> Error {
 		commit_error = error_detach(commit_error)
 	}
 	release_error := error_detach(release(journal))
-	// A statement that refuses to close stays on the connection's list, and the
-	// connection close below is what reports it.
-	for &statement in journal.inserts { _ = db.statement_close(&statement) }
-	close_error := error_detach(db.close(&journal.connection))
+	for &statement in journal.inserts {
+		if statement_error := db.statement_close(&statement); statement_error != nil { return error_detach(statement_error) }
+	}
+	if close_error := db.close(&journal.connection); close_error != nil { return error_detach(close_error) }
 	result := commit_error
-	if close_error != nil { result = close_error }
 	if release_error != nil { result = release_error }
-	// The latched failure belongs to the journal, and callers that got it from
-	// an earlier call hold views valid until here. When close itself returns it,
-	// it passes to the caller as the copy in the temp allocator made above.
 	error_release(&journal.failure)
 	delete(journal.pending)
 	virtual.arena_destroy(&journal.batch)
 	delete(journal.directory, journal.allocator)
 	delete(journal.locks, journal.allocator)
-	journal^ = {}
+	free(journal, journal.allocator)
 	return result
 }
 

@@ -48,11 +48,12 @@ app_session_begin :: proc(t: ^testing.T, app: ^App) -> string {
 	app.setup.alloc = context.allocator
 	app.run.snap.entries = make([dynamic]Entry, 0, 4, app.run.alloc)
 
-	app.setup.store = new(journal.Journal)
 	app.setup.journal_directory = strings.clone(directory, app.setup.alloc)
 	app.setup.lock_directory = strings.clone(directory, app.setup.alloc)
 	app.setup.run = journal.run_id_create()
-	if open_error := journal.open(app.setup.store, directory, directory, app.setup.run, .Read_Write, app.setup.alloc); open_error != nil {
+	store_open_error: journal.Error
+	app.setup.store, store_open_error = journal.open(directory, directory, app.setup.run, .Read_Write, app.setup.alloc)
+	if store_open_error != nil {
 		testing.fail_now(t, "journal.open failed")
 	}
 	id, create_error := journal.create_session(app.setup.store, {workspace = workspace, role = .Main})
@@ -70,7 +71,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
 	agent.chat_session_destroy(&app.setup.session)
 	agent.session_watch_stop(&app.setup.watch)
-	_ = session_store_close(app.setup.store, app.setup.alloc)
+	_ = session_store_close(app.setup.store)
 	app.setup.store = nil
 	transcript_destroy(app)
 	for &entry in app.run.snap.entries {
@@ -292,12 +293,11 @@ App_Test_Session_Options :: struct {
 }
 
 app_session_add :: proc(test: ^testing.T, setup: ^Run_Setup, options: App_Test_Session_Options, _: i64) -> journal.Session_Id {
-	store := new(journal.Journal, setup.alloc)
-	if open_error := journal.open(store, setup.journal_directory, setup.lock_directory, journal.run_id_create(), .Read_Write, setup.alloc); open_error != nil {
-		free(store, setup.alloc)
+	store, store_open_error := journal.open(setup.journal_directory, setup.lock_directory, journal.run_id_create(), .Read_Write, setup.alloc)
+	if store_open_error != nil {
 		testing.fail_now(test, "could not open a session journal")
 	}
-	defer _ = session_store_close(store, setup.alloc)
+	defer _ = session_store_close(store)
 	id, create_error := journal.create_session(store, {workspace = options.workspace, role = .Main})
 	if create_error != nil { testing.fail_now(test, "could not create a session") }
 	if options.provider != "" {
@@ -632,11 +632,10 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 
 	// A second store claiming the target is what a second process running it
 	// looks like from here.
-	other: journal.Journal
-	if open_error := journal.open(&other, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   open_error != nil { testing.fail_now(t, "second journal could not open") }
-	defer _ = journal.close(&other)
-	if _, claim_error := journal.claim(&other, id); claim_error != nil { testing.fail_now(t, "the second journal could not claim the target") }
+	other, other_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if other_open_error != nil { testing.fail_now(t, "second journal could not open") }
+	defer _ = journal.close(other)
+	if _, claim_error := journal.claim(other, id); claim_error != nil { testing.fail_now(t, "the second journal could not claim the target") }
 
 	testing.expect(t, !session_switch(&app, Start_Resume_Id(app_session_id_text(id))))
 	testing.expect_value(t, app.setup.session.session, running)
@@ -649,11 +648,10 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	// The running session was never released during the attempt, so another
 	// process still cannot take it. A third store holds no claim of its own, so
 	// its refusal can only come from the running session being locked.
-	prober: journal.Journal
-	if open_error := journal.open(&prober, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   open_error != nil { testing.fail_now(t, "third journal could not open") }
-	defer _ = journal.close(&prober)
-	_, running_claim_error := journal.claim(&prober, running)
+	prober, prober_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if prober_open_error != nil { testing.fail_now(t, "third journal could not open") }
+	defer _ = journal.close(prober)
+	_, running_claim_error := journal.claim(prober, running)
 	testing.expect_value(t, running_claim_error, journal.Journal_Error.Claimed)
 }
 
@@ -671,12 +669,12 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 	defer agent.catalog_destroy(&app.setup.catalog)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if open_error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
+	runner, runner_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_open_error != nil {
 		testing.fail_now(t, "the runner's journal could not open")
 	}
-	defer _ = journal.close(&runner)
-	if _, claim_error := journal.claim(&runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
+	defer _ = journal.close(runner)
+	if _, claim_error := journal.claim(runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
 
 	testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id))))
 	testing.expect_value(t, app.setup.session.session, id)
@@ -688,7 +686,7 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 
 	observer := run_observer(&app)
 	app_follow_submit(&app, "from the follower", observer)
-	lines, lines_error := journal.read_inbox(&runner, id, 0, context.temp_allocator)
+	lines, lines_error := journal.read_inbox(runner, id, 0, context.temp_allocator)
 	testing.expect(t, lines_error == nil, "the runner could not read its inbox")
 	if !testing.expect_value(t, len(lines), 1) { return }
 	testing.expect_value(t, string(lines[0].body), "from the follower")
@@ -741,21 +739,21 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 	defer agent.steer_queue_destroy(&app.run.steer)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if open_error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
+	runner, runner_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_open_error != nil {
 		testing.fail_now(t, "the runner's journal could not open")
 	}
-	defer _ = journal.close(&runner)
-	if _, claim_error := journal.claim(&runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
-	turn := journal.next_turn(&runner)
-	journal.append_record(&runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
+	defer _ = journal.close(runner)
+	if _, claim_error := journal.claim(runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
+	turn := journal.next_turn(runner)
+	journal.append_record(runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
 	question := journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
 		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt]},
 		transmute([]u8)string("the first question"),
 	)
-	if _, commit_error := journal.commit(&runner); commit_error != nil { testing.fail_now(t, "the runner could not commit") }
+	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit") }
 
 	testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id))))
 	testing.expect(t, app_following(&app), "the session runs in the other journal")
@@ -764,12 +762,12 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 
 	// What the runner commits after the follow began is shown without a restart.
 	_ = journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, parent = question, kind = .Assistant, turn = turn},
 		journal.Assistant{request = 1},
 		transmute([]u8)string("an answer"),
 	)
-	if _, commit_error := journal.commit(&runner); commit_error != nil { testing.fail_now(t, "the runner could not commit") }
+	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit") }
 	testing.expect(t, app_follow_service(&app, observer), "the runner's answer is new")
 	testing.expect(t, app_following(&app), "a claim that fails leaves the process a follower")
 	app_follow_submit(&app, "queued line", observer)
@@ -790,7 +788,8 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 		testing.expect(t, serve.served, "the delivered line's turn never made its request")
 	}
 
-	if close_error := journal.close(&runner); close_error != nil { testing.fail_now(t, "the runner's journal did not close") }
+	if close_error := journal.close(runner); close_error != nil { testing.fail_now(t, "the runner's journal did not close") }
+	runner = nil
 	testing.expect(t, app_follow_service(&app, observer), "the claim dropped")
 	testing.expect(t, !app_following(&app), "the follower is the runner now")
 	testing.expect_value(t, app.setup.store.claimed, id)
@@ -2261,13 +2260,13 @@ test_a_launch_records_its_run_and_the_claims_of_its_sessions :: proc(t: ^testing
 	attach_setup_destroy(&second_setup)
 	testing.expect(t, first_run != second_run, "each launch is a run of its own")
 
-	reader: journal.Journal
-	if open_error := journal.open(&reader, directory, "", journal.run_id_create(), .Read_Only, context.allocator); open_error != nil {
+	reader, reader_open_error := journal.open(directory, "", journal.run_id_create(), .Read_Only, context.allocator)
+	if reader_open_error != nil {
 		testing.fail_now(t, "the journal could not be opened for reading")
 	}
-	defer _ = journal.close(&reader)
+	defer _ = journal.close(reader)
 	records, _, read_error := journal.read_records(
-		&reader,
+		reader,
 		{kinds = {.Run_Started, .Session_Claimed, .Run_Finished, .Session_Released}},
 		0,
 		0,
@@ -2476,13 +2475,13 @@ test_a_headless_follower_returns_the_answer_of_the_turn_that_delivered_its_line 
 	defer agent.catalog_destroy(&app.setup.catalog)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner_store: journal.Journal
-	if open_error := journal.open(&runner_store, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
+	runner_store, runner_store_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_store_open_error != nil {
 		testing.fail_now(t, "the runner's journal could not open")
 	}
-	defer _ = journal.close(&runner_store)
-	if _, claim_error := journal.claim(&runner_store, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
-	chat, tool_error := agent.chat_session_init(&runner_store, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	defer _ = journal.close(runner_store)
+	if _, claim_error := journal.claim(runner_store, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
+	chat, tool_error := agent.chat_session_init(runner_store, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
 	if tool_error.kind != .None { testing.fail_now(t, "the runner's tool registry could not be created") }
 	defer agent.chat_session_destroy(&chat)
 	chat.skill_instructions = agent.test_skill_instructions(&chat)
@@ -2540,32 +2539,30 @@ test_follower_attachment_replays_captured_pending_input_once :: proc(t: ^testing
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   error != nil { testing.fail_now(t, "runner open failed") }
-	defer _ = journal.close(&runner)
-	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
-	sender: journal.Journal
-	if error := journal.open(&sender, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   error != nil { testing.fail_now(t, "sender open failed") }
-	defer _ = journal.close(&sender)
-	if error := journal.follow(&sender, id); error != nil { testing.fail_now(t, "sender follow failed") }
-	if error := journal.append_input(&sender, "captured pending line", .Prompt); error != nil { testing.fail_now(t, "input failed") }
-	waiting, error := journal.read_inbox(&runner, id, 0, context.temp_allocator)
+	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(runner)
+	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	sender, sender_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if sender_error != nil { testing.fail_now(t, "sender open failed") }
+	defer _ = journal.close(sender)
+	if error := journal.follow(sender, id); error != nil { testing.fail_now(t, "sender follow failed") }
+	if error := journal.append_input(sender, "captured pending line", .Prompt); error != nil { testing.fail_now(t, "input failed") }
+	waiting, error := journal.read_inbox(runner, id, 0, context.temp_allocator)
 	if !testing.expect(t, error == nil && len(waiting) == 1) { return }
 	opened, message, ok := session_open(&app.setup, Start_Resume_Id(app_session_id_text(id)), app.setup.workspace)
 	defer delete(message, app.setup.alloc)
 	defer opened_session_destroy(&opened, app.setup.alloc)
 	if !testing.expect(t, ok) { return }
-	_, head, head_error := journal.session_head(&runner, id)
+	_, head, head_error := journal.session_head(runner, id)
 	if !testing.expect(t, head_error == nil) { return }
 	_ = journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, parent = head, kind = .User},
 		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt], message = waiting[0].seq},
 		transmute([]u8)string("captured pending line"),
 	)
-	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "delivery failed") }
+	if _, error := journal.commit(runner); error != nil { testing.fail_now(t, "delivery failed") }
 	if !testing.expect(t, session_install(&app.setup, &opened) == "") { return }
 	session_opened_show(&app)
 	_ = app_follow_poll(&app, run_observer(&app))
@@ -2629,33 +2626,33 @@ test_a_follower_shows_the_calls_running_when_it_attached :: proc(t: ^testing.T) 
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); error != nil {
+	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_error != nil {
 		testing.fail_now(t, "runner open failed")
 	}
-	defer _ = journal.close(&runner)
-	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
-	turn := journal.next_turn(&runner)
-	journal.append_record(&runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
+	defer _ = journal.close(runner)
+	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	turn := journal.next_turn(runner)
+	journal.append_record(runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
 	prompt := journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
 		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt]},
 		transmute([]u8)string("list files"),
 	)
 	assistant := journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, parent = prompt, kind = .Assistant, turn = turn},
 		journal.Assistant{request = 1},
 	)
-	call := journal.next_call(&runner)
+	call := journal.next_call(runner)
 	journal.append_record(
-		&runner,
+		runner,
 		{kind = .Tool_Proposed, session = id, branch = journal.INITIAL_BRANCH, node = assistant, turn = turn, call = call},
 		journal.Tool_Proposed{provider_id = "first", name = "shell"},
 		transmute([]u8)string(`{"command":"ls"}`),
 	)
-	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "commit failed") }
+	if _, error := journal.commit(runner); error != nil { testing.fail_now(t, "commit failed") }
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
 	session_opened_show(&app)
 	running := 0
@@ -2665,18 +2662,18 @@ test_a_follower_shows_the_calls_running_when_it_attached :: proc(t: ^testing.T) 
 	testing.expect_value(t, running, 1)
 
 	journal.append_record(
-		&runner,
+		runner,
 		{kind = .Tool_Completed, session = id, branch = journal.INITIAL_BRANCH, node = assistant, turn = turn, call = call},
 		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
 		transmute([]u8)string("ok\nexit_code: 0\n\nstdout:\nfile\n"),
 	)
 	_ = journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, parent = assistant, kind = .Notice, turn = turn},
 		journal.Notice{},
 		transmute([]u8)string("a harness note"),
 	)
-	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "completion commit failed") }
+	if _, error := journal.commit(runner); error != nil { testing.fail_now(t, "completion commit failed") }
 	_ = app_follow_poll(&app, run_observer(&app))
 	testing.expect_value(t, app_entries_count(&app, "a harness note"), 1)
 	boxes := 0
@@ -2696,35 +2693,34 @@ test_a_follower_does_not_repeat_a_result_the_replay_showed :: proc(t: ^testing.T
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   error != nil { testing.fail_now(t, "runner open failed") }
-	defer _ = journal.close(&runner)
-	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
-	chat, tool_error := agent.chat_session_init(&runner, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
+	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(runner)
+	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	chat, tool_error := agent.chat_session_init(runner, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
 	if tool_error.kind != .None { testing.fail_now(t, "runner initialization failed") }
 	defer agent.chat_session_destroy(&chat)
 	chat.skill_instructions = agent.test_skill_instructions(&chat)
 	if agent.chat_session_accept_user(&chat, "list files") != .Accepted { testing.fail_now(t, "runner prompt failed") }
 	assistant := journal.append_node(
-		&runner,
+		runner,
 		{session = id, branch = chat.branch, parent = chat.head, turn = chat.turn, kind = .Assistant},
 		journal.Assistant{request = 1},
 	)
-	call := journal.next_call(&runner)
+	call := journal.next_call(runner)
 	journal.append_record(
-		&runner,
+		runner,
 		{kind = .Tool_Proposed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
 		journal.Tool_Proposed{provider_id = "first", name = "shell"},
 		transmute([]u8)string(`{"command":"ls"}`),
 	)
 	journal.append_record(
-		&runner,
+		runner,
 		{kind = .Tool_Completed, session = id, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
 		journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]},
 		transmute([]u8)string("ok\nexit_code: 0\n\nstdout:\nfile\n"),
 	)
-	if _, error := journal.commit(&runner); error != nil { testing.fail_now(t, "commit failed") }
+	if _, error := journal.commit(runner); error != nil { testing.fail_now(t, "commit failed") }
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
 	session_opened_show(&app)
 
@@ -2750,11 +2746,10 @@ test_busy_follower_input_retries_once_and_keeps_order :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   error != nil { testing.fail_now(t, "runner open failed") }
-	defer _ = journal.close(&runner)
-	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(runner)
+	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
 	if error := db.exec(&app.setup.store.connection, "PRAGMA busy_timeout=0"); error != nil { testing.fail_now(t, "busy timeout failed") }
 	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
@@ -2771,7 +2766,7 @@ test_busy_follower_input_retries_once_and_keeps_order :: proc(t: ^testing.T) {
 	_ = app_follow_service(&app, observer)
 	testing.expect_value(t, app_entries_count(&app, "first pending line"), 1)
 	testing.expect_value(t, app_entries_count(&app, "second pending line"), 1)
-	waiting, error := journal.read_inbox(&runner, id, 0, context.temp_allocator)
+	waiting, error := journal.read_inbox(runner, id, 0, context.temp_allocator)
 	testing.expect(t, error == nil)
 	if !testing.expect_value(t, len(waiting), 2) { return }
 	testing.expect_value(t, string(waiting[0].body), "first pending line")
@@ -2785,18 +2780,17 @@ test_busy_takeover_retries_only_on_new_submit :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   error != nil { testing.fail_now(t, "runner open failed") }
-	defer _ = journal.close(&runner)
-	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(runner)
+	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
 	if error := db.exec(&app.setup.store.connection, "PRAGMA busy_timeout=0"); error != nil { testing.fail_now(t, "busy timeout failed") }
 	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
 	defer _ = db.rollback(&runner.connection)
 	observer := run_observer(&app)
 	app_follow_submit(&app, "retained during takeover", observer)
-	if error := journal.release(&runner); error != nil { testing.fail_now(t, "runner release failed") }
+	if error := journal.release(runner); error != nil { testing.fail_now(t, "runner release failed") }
 	_ = app_follow_service(&app, observer)
 	testing.expect(t, app.setup.takeover_failed && app.setup.takeover_retryable && app_following(&app))
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
@@ -2816,11 +2810,10 @@ test_takeover_shows_input_first_committed_by_recovery :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner: journal.Journal
-	if error := journal.open(&runner, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc);
-	   error != nil { testing.fail_now(t, "runner open failed") }
-	defer _ = journal.close(&runner)
-	if _, error := journal.claim(&runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
+	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_error != nil { testing.fail_now(t, "runner open failed") }
+	defer _ = journal.close(runner)
+	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
 	if error := db.exec(&app.setup.store.connection, "PRAGMA busy_timeout=0"); error != nil { testing.fail_now(t, "busy timeout failed") }
 	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
@@ -2828,7 +2821,7 @@ test_takeover_shows_input_first_committed_by_recovery :: proc(t: ^testing.T) {
 	observer := run_observer(&app)
 	app_follow_submit(&app, "first committed in recovery", observer)
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
-	if error := journal.release(&runner); error != nil { testing.fail_now(t, "runner release failed") }
+	if error := journal.release(runner); error != nil { testing.fail_now(t, "runner release failed") }
 	if _, error := journal.try_claim(app.setup.store); error != nil { testing.fail_now(t, "takeover claim failed") }
 	app_takeover(&app, observer)
 	testing.expect(t, !app_following(&app))
@@ -2852,17 +2845,17 @@ test_opening_a_child_session_installs_the_subagent_role :: proc(t: ^testing.T) {
 		transmute([]u8)string("Review the parser."),
 	)
 	if _, commit_error := journal.commit(app.setup.store); commit_error != nil { testing.fail_now(t, "the delegation could not be committed") }
-	child_store: journal.Journal
-	if open_error := journal.open(&child_store, directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc); open_error != nil {
+	child_store, child_store_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if child_store_open_error != nil {
 		testing.fail_now(t, "the child's journal could not be opened")
 	}
 	_, create_error := journal.create_session(
-		&child_store,
+		child_store,
 		{id = child, workspace = app.setup.workspace, role = .Subagent, parent_session = parent, parent_call = 1},
 	)
 	if create_error != nil { testing.fail_now(t, "the child's session could not be created") }
-	if _, commit_error := journal.commit(&child_store); commit_error != nil { testing.fail_now(t, "the child's session could not be committed") }
-	_ = journal.close(&child_store)
+	if _, commit_error := journal.commit(child_store); commit_error != nil { testing.fail_now(t, "the child's session could not be committed") }
+	_ = journal.close(child_store)
 
 	snapshot_clear(&app)
 	session_refresh_rows(&app)
@@ -2918,13 +2911,13 @@ app_expect_delivered_origin_kind :: proc(t: ^testing.T, origin: journal.User_Ori
 
 	// Another process's line is what a subagent's report or a steering line looks like
 	// on the wire; accepting it delivers a User node of that origin.
-	sender: journal.Journal
-	if error := journal.open(&sender, directory, directory, journal.run_id_create(), .Read_Write); error != nil {
+	sender, sender_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write)
+	if sender_error != nil {
 		testing.fail_now(t, "the sender journal did not open")
 	}
-	defer _ = journal.close(&sender)
-	if error := journal.follow(&sender, app.setup.session.session); error != nil { testing.fail_now(t, "the sender could not follow") }
-	if error := journal.append_input(&sender, text, origin); error != nil { testing.fail_now(t, "the line was not accepted") }
+	defer _ = journal.close(sender)
+	if error := journal.follow(sender, app.setup.session.session); error != nil { testing.fail_now(t, "the sender could not follow") }
+	if error := journal.append_input(sender, text, origin); error != nil { testing.fail_now(t, "the line was not accepted") }
 	accepted := agent.chat_session_accept_message(&app.setup.session, "", origin, run_observer(&app))
 	if !testing.expect_value(t, accepted, agent.Chat_Accept.Accepted) { return }
 	kind, found = app_entry_kind(&app, text)

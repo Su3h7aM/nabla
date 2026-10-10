@@ -13,7 +13,7 @@ test_projection_keeps_only_children_of_projected_parents_in_a_long_history :: pr
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
 	branch := fixture.chat.branch
 	excluded := journal.append_node(store, {session = session, branch = branch, kind = .Assistant}, journal.Assistant{request = 1})
@@ -74,7 +74,7 @@ test_projection_lists_unanswered_calls_and_unsettled_children :: proc(test: ^tes
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
 	head := journal.append_node(store, {session = session, branch = fixture.chat.branch, kind = .Assistant}, journal.Assistant{request = 1})
 	answered := journal.next_call(store)
@@ -137,7 +137,7 @@ test_projection_load_nodes_loads_only_the_children_of_its_window :: proc(test: ^
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
 	branch := fixture.chat.branch
 	scripts: [2]journal.Call_Id
@@ -191,7 +191,7 @@ test_projection_load_nodes_accepts_a_window_cut_through_tool_exchanges :: proc(t
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
 	branch := fixture.chat.branch
 	exchange_calls: [2]journal.Call_Id

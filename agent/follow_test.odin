@@ -72,13 +72,14 @@ follow_body :: proc(text: string) -> []u8 {
 	return transmute([]u8)text
 }
 
-// follow_open opens a second journal on the fixture's directory and follows the fixture's
-// session with it, as another process does.
-follow_open :: proc(test: ^testing.T, fixture: ^Chat_Test, follower: ^journal.Journal) {
-	if open_error := journal.open(follower, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+// follow_open returns a journal following fixture's session. The caller closes it.
+follow_open :: proc(test: ^testing.T, fixture: ^Chat_Test) -> ^journal.Journal {
+	follower, follower_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
+	if follower_open_error != nil {
 		testing.fail_now(test, "the follower journal could not be opened")
 	}
 	if follow_error := journal.follow(follower, fixture.chat.session); follow_error != nil { testing.fail_now(test, "the session could not be followed") }
+	return follower
 }
 
 follow_commit :: proc(test: ^testing.T, store: ^journal.Journal) {
@@ -96,13 +97,12 @@ test_a_follower_shows_a_delivered_agent_report_as_user_text :: proc(test: ^testi
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
 
-	follower: journal.Journal
-	follow_open(test, &fixture, &follower)
-	defer _ = journal.close(&follower)
-	follow, start_error := follow_start(&follower, session)
+	follower := follow_open(test, &fixture)
+	defer _ = journal.close(follower)
+	follow, start_error := follow_start(follower, session)
 	if !testing.expect(test, start_error == nil, "the follow could not start") { return }
 
 	log: Follow_Log
@@ -116,7 +116,7 @@ test_a_follower_shows_a_delivered_agent_report_as_user_text :: proc(test: ^testi
 		follow_body("agent-1 answered\nforty-two"),
 	)
 	follow_commit(test, store)
-	if !testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the poll failed") { return }
+	if !testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the poll failed") { return }
 	if !testing.expect_value(test, len(log.events), 1) { return }
 	testing.expect_value(test, log.events[0], "user:agent-1 answered\nforty-two:agent")
 }
@@ -130,26 +130,25 @@ test_a_follower_shows_a_delivered_agent_input_once :: proc(test: ^testing.T) {
 	defer chat_test_end(test, &fixture)
 	session := fixture.chat.session
 
-	follower: journal.Journal
-	follow_open(test, &fixture, &follower)
-	defer _ = journal.close(&follower)
-	follow, start_error := follow_start(&follower, session)
+	follower := follow_open(test, &fixture)
+	defer _ = journal.close(follower)
+	follow, start_error := follow_start(follower, session)
 	if !testing.expect(test, start_error == nil, "the follow could not start") { return }
 
 	log: Follow_Log
 	defer follow_log_destroy(&log)
 	observer := follow_log_observer(&log)
 
-	if input_error := journal.append_input(&follower, "agent-1 asks\nwhat next", .Agent); input_error != nil {
+	if input_error := journal.append_input(follower, "agent-1 asks\nwhat next", .Agent); input_error != nil {
 		testing.fail_now(test, "the agent line was not accepted")
 	}
-	if !testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the first poll failed") { return }
+	if !testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the first poll failed") { return }
 	if !testing.expect_value(test, len(log.events), 1) { return }
 	testing.expect_value(test, log.events[0], "user:agent-1 asks\nwhat next:agent")
 
 	accepted := chat_session_accept_message(&fixture.chat, "", .Agent, {})
 	if !testing.expect_value(test, accepted, Chat_Accept.Accepted) { return }
-	if !testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the second poll failed") { return }
+	if !testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the second poll failed") { return }
 	testing.expect_value(test, len(log.events), 1)
 }
 
@@ -161,13 +160,12 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
 
-	follower: journal.Journal
-	follow_open(test, &fixture, &follower)
-	defer _ = journal.close(&follower)
-	follow, start_error := follow_start(&follower, session)
+	follower := follow_open(test, &fixture)
+	defer _ = journal.close(follower)
+	follow, start_error := follow_start(follower, session)
 	testing.expect(test, start_error == nil, "the follow could not start")
 	testing.expect(test, !follow.working, "no turn runs yet")
 
@@ -217,7 +215,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	)
 	follow_commit(test, store)
 
-	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the first poll failed")
+	testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the first poll failed")
 	testing.expect(test, follow.working, "a turn started and has not completed")
 	testing.expect_value(test, follow.estimate, 1234)
 	testing.expect_value(test, follow.window, 8000)
@@ -236,7 +234,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	journal.append_record(store, child, journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]}, follow_body("child result"))
 	journal.append_record(store, completed, journal.Tool_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Success]}, follow_body("ok\nvalue: 1"))
 	follow_commit(test, store)
-	follow_send(test, &follower, "from the follower")
+	follow_send(test, follower, "from the follower")
 	ended := header
 	ended.kind = .Turn_Completed
 	journal.append_record(store, ended, journal.Turn_Completed{outcome = journal.TURN_OUTCOME_NAMES[.Completed]})
@@ -255,7 +253,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	)
 	follow_commit(test, store)
 
-	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the second poll failed")
+	testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the second poll failed")
 	testing.expect(test, !follow.working, "the turn completed")
 	expected := [?]string {
 		"user:question:prompt",
@@ -271,7 +269,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	for event, index in expected { testing.expect_value(test, log.events[index], event) }
 
 	// Nothing is shown twice: a poll with nothing new shows nothing.
-	testing.expect(test, follow_poll(&follower, session, &follow, observer) == nil, "the third poll failed")
+	testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the third poll failed")
 	testing.expect_value(test, len(log.events), len(expected))
 }
 
@@ -286,16 +284,16 @@ test_the_runner_starts_a_turn_for_lines_other_processes_sent_while_idle :: proc(
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 
-	first, second: journal.Journal
-	follow_open(test, &fixture, &first)
-	defer _ = journal.close(&first)
-	follow_open(test, &fixture, &second)
-	defer _ = journal.close(&second)
+	first, second: ^journal.Journal
+	first = follow_open(test, &fixture)
+	defer _ = journal.close(first)
+	second = follow_open(test, &fixture)
+	defer _ = journal.close(second)
 	testing.expect(test, !chat_inbox_reports_pending(chat), "an idle session with an empty inbox starts nothing")
 
-	follow_send(test, &first, "line one")
-	follow_send(test, &second, "line two")
-	follow_send(test, &first, "line three")
+	follow_send(test, first, "line one")
+	follow_send(test, second, "line two")
+	follow_send(test, first, "line three")
 	testing.expect(test, chat_inbox_reports_pending(chat), "lines other processes sent start a turn")
 
 	provider: Agent_Provider
@@ -330,16 +328,15 @@ test_the_runner_starts_a_turn_for_lines_other_processes_sent_while_idle :: proc(
 test_a_line_older_than_the_claim_waits_for_the_next_prompt :: proc(test: ^testing.T) {
 	first: Chat_Test
 	chat_test_begin(test, &first, tool_loop_workspace(test))
-	follower: journal.Journal
-	follow_open(test, &first, &follower)
-	defer _ = journal.close(&follower)
-	follow_send(test, &follower, "sent before the claim")
+	follower := follow_open(test, &first)
+	defer _ = journal.close(follower)
+	follow_send(test, follower, "sent before the claim")
 
 	reopened: Chat_Test
 	_ = chat_test_reopen(test, &first, &reopened, tool_loop_workspace(test))
 	defer chat_test_end(test, &reopened)
 	testing.expect(test, !chat_inbox_reports_pending(&reopened.chat), "a line older than the claim starts no turn")
-	follow_send(test, &follower, "sent after the claim")
+	follow_send(test, follower, "sent after the claim")
 	testing.expect(test, chat_inbox_reports_pending(&reopened.chat), "a line committed after the claim starts one")
 }
 
@@ -365,9 +362,8 @@ test_a_line_committed_during_a_turn_is_delivered_at_the_next_boundary :: proc(te
 	chat := &fixture.chat
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 
-	follower: journal.Journal
-	follow_open(test, &fixture, &follower)
-	defer _ = journal.close(&follower)
+	follower := follow_open(test, &fixture)
+	defer _ = journal.close(follower)
 
 	provider: Agent_Provider
 	if !agent_provider_start(test, &provider, {agent_provider_reply("first answer"), agent_provider_reply("second answer")}) { return }
@@ -379,7 +375,7 @@ test_a_line_committed_during_a_turn_is_delivered_at_the_next_boundary :: proc(te
 	defer delete(connection.Endpoint, chat.allocator)
 
 	probe := Follow_Midturn_Probe {
-		follower = &follower,
+		follower = follower,
 	}
 	observer := Chat_Observer {
 		user_data        = &probe,
@@ -403,30 +399,30 @@ test_two_followers_race_for_a_dropped_claim :: proc(test: ^testing.T) {
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	session := fixture.chat.session
-	first, second: journal.Journal
-	follow_open(test, &fixture, &first)
-	defer _ = journal.close(&first)
-	follow_open(test, &fixture, &second)
-	defer _ = journal.close(&second)
-	follow_commit(test, &fixture.store)
+	first, second: ^journal.Journal
+	first = follow_open(test, &fixture)
+	defer _ = journal.close(first)
+	second = follow_open(test, &fixture)
+	defer _ = journal.close(second)
+	follow_commit(test, fixture.store)
 
-	claims_before := len(_claim_records(test, &first, session))
+	claims_before := len(_claim_records(test, first, session))
 	chat_session_destroy(&fixture.chat)
-	if close_error := journal.close(&fixture.store); close_error != nil { testing.fail_now(test, "the runner's journal did not close") }
+	if close_error := journal.close(fixture.store); close_error != nil { testing.fail_now(test, "the runner's journal did not close") }
 	defer {
 		// The directory is abandoned; a removal that fails changes nothing in a test.
 		_ = os.remove_all(fixture.directory)
 		delete(fixture.directory, context.allocator)
 	}
 
-	_, first_error := journal.try_claim(&first)
-	_, second_error := journal.try_claim(&second)
+	_, first_error := journal.try_claim(first)
+	_, second_error := journal.try_claim(second)
 	winner_count := 0
 	if first_error == nil { winner_count += 1 }
 	if second_error == nil { winner_count += 1 }
 	testing.expect_value(test, winner_count, 1)
-	loser := &second if first_error == nil else &first
-	winner := &first if first_error == nil else &second
+	loser := second if first_error == nil else first
+	winner := first if first_error == nil else second
 	testing.expect_value(test, loser.followed, session)
 	testing.expect_value(test, loser.claimed, journal.Session_Id{})
 	testing.expect_value(test, winner.claimed, session)
@@ -445,20 +441,19 @@ test_follow_attachment_snapshot_keeps_delivery_between_reads_once :: proc(test: 
 	fixture: Chat_Test
 	chat_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
-	store := &fixture.store
+	store := fixture.store
 	session := fixture.chat.session
-	follower: journal.Journal
-	follow_open(test, &fixture, &follower)
-	defer _ = journal.close(&follower)
-	follow_send(test, &follower, "queued at attachment")
+	follower := follow_open(test, &fixture)
+	defer _ = journal.close(follower)
+	follow_send(test, follower, "queued at attachment")
 	pending, pending_error := journal.read_inbox(store, session, 0, context.temp_allocator)
 	if !testing.expect(test, pending_error == nil && len(pending) == 1) { return }
-	if error := journal.begin_read_snapshot(&follower); error != nil { testing.fail_now(test, "snapshot begin failed") }
+	if error := journal.begin_read_snapshot(follower); error != nil { testing.fail_now(test, "snapshot begin failed") }
 	snapshot_open := true
-	defer if snapshot_open { _ = journal.end_read_snapshot(&follower) }
-	follow, start_error := follow_start(&follower, session)
+	defer if snapshot_open { _ = journal.end_read_snapshot(follower) }
+	follow, start_error := follow_start(follower, session)
 	if !testing.expect(test, start_error == nil) { return }
-	_, captured_head, head_error := journal.session_head(&follower, session)
+	_, captured_head, head_error := journal.session_head(follower, session)
 	if !testing.expect(test, head_error == nil) { return }
 	_ = journal.append_node(
 		store,
@@ -467,15 +462,15 @@ test_follow_attachment_snapshot_keeps_delivery_between_reads_once :: proc(test: 
 		follow_body("queued at attachment"),
 	)
 	follow_commit(test, store)
-	delivered, delivered_error := journal.last_delivered_message(&follower, session)
+	delivered, delivered_error := journal.last_delivered_message(follower, session)
 	if !testing.expect(test, delivered_error == nil) { return }
-	captured_pending, inbox_error := journal.read_inbox(&follower, session, delivered, context.allocator)
+	captured_pending, inbox_error := journal.read_inbox(follower, session, delivered, context.allocator)
 	defer journal.records_destroy(captured_pending, context.allocator)
 	if !testing.expect(test, inbox_error == nil && len(captured_pending) == 1) { return }
-	_, still_captured_head, captured_error := journal.session_head(&follower, session)
+	_, still_captured_head, captured_error := journal.session_head(follower, session)
 	testing.expect(test, captured_error == nil)
 	testing.expect_value(test, still_captured_head, captured_head)
-	if error := journal.end_read_snapshot(&follower); error != nil { testing.fail_now(test, "snapshot end failed") }
+	if error := journal.end_read_snapshot(follower); error != nil { testing.fail_now(test, "snapshot end failed") }
 	snapshot_open = false
 	log: Follow_Log
 	defer follow_log_destroy(&log)
@@ -485,7 +480,7 @@ test_follow_attachment_snapshot_keeps_delivery_between_reads_once :: proc(test: 
 			observer.user_text(observer.user_data, string(record.body), user_input_origin(record))
 		}
 	}
-	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)
-	testing.expect_value(test, follow_poll(&follower, session, &follow, observer), nil)
+	testing.expect_value(test, follow_poll(follower, session, &follow, observer), nil)
+	testing.expect_value(test, follow_poll(follower, session, &follow, observer), nil)
 	testing.expect_value(test, follow_log_count(&log, "user:queued at attachment"), 1)
 }

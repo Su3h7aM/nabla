@@ -32,7 +32,7 @@ CHECKPOINT_NOTICE :: "(earlier turns are summarized)"
 
 // Transcript is the window onto the shown session's node path. Main thread only.
 Transcript :: struct {
-	store:          journal.Journal, // read-only, opened by the first read
+	store:          ^journal.Journal, // read-only, opened by the first read
 	session:        journal.Session_Id,
 	path:           []journal.Node_Id, // owned by the run's allocator; the active branch, oldest first, as of head
 	head:           journal.Node_Id,
@@ -56,7 +56,7 @@ transcript_destroy :: proc(app: ^App) {
 	delete(transcript.path, app.run.alloc)
 	boxes_collapse_all(app)
 	delete(transcript.expanded)
-	_ = journal.close(&transcript.store)
+	_ = journal.close(transcript.store)
 	transcript^ = {}
 }
 
@@ -103,7 +103,7 @@ transcript_follow :: proc(app: ^App, head: journal.Node_Id) {
 	path: []journal.Node_Id
 	if head != 0 {
 		read_error: journal.Error
-		path, read_error = journal.read_path(&transcript.store, transcript.session, head, app.run.alloc)
+		path, read_error = journal.read_path(transcript.store, transcript.session, head, app.run.alloc)
 		if read_error != nil {
 			transcript_fail(app, read_error)
 			return
@@ -131,9 +131,11 @@ transcript_follow :: proc(app: ^App, head: journal.Node_Id) {
 @(require_results)
 transcript_open :: proc(app: ^App) -> bool {
 	transcript := &app.transcript
-	if transcript.store.open { return true }
-	if open_error := journal.open(&transcript.store, app.setup.journal_directory, "", app.setup.run, .Read_Only, app.run.alloc); open_error != nil {
-		transcript_fail(app, open_error)
+	if transcript.store != nil && transcript.store.open { return true }
+	store_open_error: journal.Error
+	transcript.store, store_open_error = journal.open(app.setup.journal_directory, "", app.setup.run, .Read_Only, app.run.alloc)
+	if store_open_error != nil {
+		transcript_fail(app, store_open_error)
 		return false
 	}
 	return true
@@ -243,8 +245,8 @@ transcript_read :: proc(app: ^App, first, end: int) -> (entries: [dynamic]Entry,
 	virtual.arena_init_growing(&arena) or_return
 	defer virtual.arena_destroy(&arena)
 	allocator := virtual.arena_allocator(&arena)
-	nodes := journal.read_nodes(&transcript.store, transcript.session, transcript.path[first:end], allocator) or_return
-	projection := agent.projection_load_nodes(&transcript.store, transcript.session, nodes, allocator) or_return
+	nodes := journal.read_nodes(transcript.store, transcript.session, transcript.path[first:end], allocator) or_return
+	projection := agent.projection_load_nodes(transcript.store, transcript.session, nodes, allocator) or_return
 	entries.allocator = app.run.alloc
 	defer if error != nil { entries_destroy(&entries) }
 	window_entries(app, projection, &entries) or_return
@@ -689,7 +691,7 @@ box_toggle :: proc(app: ^App, call: journal.Call_Id) {
 	prefix, found := box_prefix(app, call)
 	if !found || !transcript_open(app) { return }
 	records, _, read_error := journal.read_records(
-		&transcript.store,
+		transcript.store,
 		{session = transcript.session, kinds = {.Tool_Completed}, call = call},
 		0,
 		1,

@@ -337,7 +337,7 @@ Opened_Session :: struct {
 opened_session_destroy :: proc(opened: ^Opened_Session, allocator: mem.Allocator) {
 	journal.records_destroy(opened.pending, allocator)
 	// The opened session is being released; its close failure changes nothing here.
-	_ = session_store_close(opened.store, allocator)
+	_ = session_store_close(opened.store)
 	delete(opened.workspace, allocator)
 	delete(opened.provider, allocator)
 	delete(opened.model, allocator)
@@ -597,7 +597,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem:
 		setup.workers_abandoned = setup.workers_abandoned || setup.session.workers_retained
 	}
 	// The session being replaced is released; its close failure changes nothing here.
-	if setup.store != opened.store { _ = session_store_close(setup.store, setup.alloc) }
+	if setup.store != opened.store { _ = session_store_close(setup.store) }
 	delete(setup.workspace, setup.alloc)
 	delete(setup.resumed_provider, setup.alloc)
 	delete(setup.resumed_model, setup.alloc)
@@ -666,28 +666,19 @@ app_watch_sync :: proc(setup: ^Run_Setup) -> os.Error {
 // owned by setup.alloc.
 @(require_results)
 session_store_open :: proc(setup: ^Run_Setup) -> (store: ^journal.Journal, error: journal.Error) {
-	store = new(journal.Journal, setup.alloc) or_return
-	if open_error := journal.open(store, setup.journal_directory, setup.lock_directory, setup.run, .Read_Write, setup.alloc); open_error != nil {
-		free(store, setup.alloc)
-		return nil, open_error
-	}
-	return store, nil
+	return journal.open(setup.journal_directory, setup.lock_directory, setup.run, .Read_Write, setup.alloc)
 }
 
-// session_store_close records the launch's end when finish_run says the store carries the
-// last of it, commits it, and closes the store, which records the release of the store's
-// session. A commit that fails changes nothing here: the store is closing either way.
-// Owner thread only.
+// session_store_close writes run.finished when requested and closes the store on
+// its owner thread. A commit failure is abandoned during teardown.
 @(require_results)
-session_store_close :: proc(store: ^journal.Journal, allocator: mem.Allocator, finish_run := false) -> journal.Error {
+session_store_close :: proc(store: ^journal.Journal, finish_run := false) -> journal.Error {
 	if store == nil { return nil }
 	if finish_run {
 		journal.append_record(store, {kind = .Run_Finished}, journal.Run_Finished{})
 		_, _ = journal.commit(store)
 	}
-	close_error := journal.close(store)
-	free(store, allocator)
-	return close_error
+	return journal.close(store)
 }
 
 // run_store_close ends the launch's use of the journal: the launch's run.finished when it
@@ -705,7 +696,7 @@ run_store_close :: proc(setup: ^Run_Setup) -> journal.Error {
 		store, open_error = session_store_open(setup)
 		if open_error != nil { return open_error }
 	}
-	return session_store_close(store, setup.alloc, finish)
+	return session_store_close(store, finish)
 }
 
 // session_error_message is what for a person, followed by the journal's reason,

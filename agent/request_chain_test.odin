@@ -436,7 +436,7 @@ test_a_prepared_request_records_its_admission :: proc(test: ^testing.T) {
 
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the request completed")
 	records, _, read_error := journal.read_records(
-		&fixture.store,
+		fixture.store,
 		{session = chat.session, kinds = {.Request_Prepared, .Request_Admitted}},
 		0,
 		0,
@@ -506,7 +506,7 @@ test_a_retry_records_its_schedule_and_completion :: proc(test: ^testing.T) {
 	testing.expect(test, chat_run_turn(chat, connection, test_retry_policy(), {}), "the turn completed after a retry")
 
 	records, _, read_error := journal.read_records(
-		&fixture.store,
+		fixture.store,
 		{session = chat.session, kinds = {.Retry_Scheduled, .Retry_Completed}},
 		0,
 		0,
@@ -550,7 +550,7 @@ test_a_runtime_message_is_recorded_with_its_level_and_text :: proc(test: ^testin
 	chat_runtime_message(chat, .Warning, "something odd")
 	testing.expect(test, chat_commit(chat, "the runtime message"))
 
-	records, _, read_error := journal.read_records(&fixture.store, {session = chat.session, kinds = {.Runtime_Message}}, 0, 0, context.allocator)
+	records, _, read_error := journal.read_records(fixture.store, {session = chat.session, kinds = {.Runtime_Message}}, 0, 0, context.allocator)
 	if read_error != nil { testing.fail_now(test, "the runtime messages could not be read") }
 	defer journal.records_destroy(records, context.allocator)
 	if !testing.expect_value(test, len(records), 1) { return }

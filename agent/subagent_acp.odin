@@ -231,13 +231,17 @@ subagent_acp_run :: proc(member: ^Subagent) {
 
 	// The program has no Nabla session, so what the orchestrator sends it is read from the
 	// orchestrator's journal records, through a connection of its own.
-	store: journal.Journal
-	if open_error := journal.open(&store, member.store_directory, member.lock_directory, member.run, .Read_Only, allocator); open_error != nil {
-		subagent_fail(member, .Failed, fmt.tprintf("the subagent's inbox could not be opened: %s", journal.error_text(open_error, context.temp_allocator)))
+	store, store_open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Only, allocator)
+	if store_open_error != nil {
+		subagent_fail(
+			member,
+			.Failed,
+			fmt.tprintf("the subagent's inbox could not be opened: %s", journal.error_text(store_open_error, context.temp_allocator)),
+		)
 		return
 	}
 	// Nothing is written through it, so a close that fails changes nothing.
-	defer _ = journal.close(&store)
+	defer _ = journal.close(store)
 
 	text := member.prompt
 	if !member.resumed && member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
@@ -245,7 +249,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	owned := false
 	after := member.acp_after
 	if member.resumed {
-		records, read_error := journal.read_inbox(&store, member.session, after, context.temp_allocator)
+		records, read_error := journal.read_inbox(store, member.session, after, context.temp_allocator)
 		if read_error != nil { subagent_fail(member, .Failed, "the subagent's inbox could not be read"); return }
 		if len(records) > 0 {
 			after = records[len(records) - 1].seq
@@ -283,7 +287,7 @@ subagent_acp_run :: proc(member: ^Subagent) {
 			subagent_fail(member, .Failed, problem)
 			return
 		}
-		records, read_error := journal.read_inbox(&store, member.session, after, context.temp_allocator)
+		records, read_error := journal.read_inbox(store, member.session, after, context.temp_allocator)
 		if read_error != nil {
 			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
 			return
@@ -567,12 +571,11 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	if refused := acp_session_configure(connection, connection.opened, control.acp_model, control.effort, false); refused != "" {
 		text := fmt.tprintf("%s asks\nYour request to switch model or effort was not applied: %s", member.name, refused)
 		// The ACP child owns no journal session. Feedback enters the parent's inbox as agent input.
-		sender: journal.Journal
-		if open_error := journal.open(&sender, member.store_directory, member.lock_directory, member.run, .Read_Write, member.allocator);
-		   open_error != nil { return "the refusal of a model switch could not be recorded" }
-		defer _ = journal.close(&sender)
-		if follow_error := journal.follow(&sender, member.parent_session); follow_error != nil { return "the refusal of a model switch could not be recorded" }
-		if append_error := journal.append_input(&sender, text, .Agent); append_error != nil { return "the refusal of a model switch could not be recorded" }
+		sender, sender_open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Write, member.allocator)
+		if sender_open_error != nil { return "the refusal of a model switch could not be recorded" }
+		defer _ = journal.close(sender)
+		if follow_error := journal.follow(sender, member.parent_session); follow_error != nil { return "the refusal of a model switch could not be recorded" }
+		if append_error := journal.append_input(sender, text, .Agent); append_error != nil { return "the refusal of a model switch could not be recorded" }
 
 		owner_wake_signal()
 		return ""

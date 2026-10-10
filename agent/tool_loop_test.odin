@@ -43,8 +43,9 @@ tool_loop_workspace :: proc(test: ^testing.T) -> string {
 }
 
 @(private)
-tool_loop_busy_lock :: proc(test: ^testing.T, fixture: ^Chat_Test, holder: ^journal.Journal) {
-	if open_error := journal.open(holder, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+tool_loop_busy_lock :: proc(test: ^testing.T, fixture: ^Chat_Test) -> ^journal.Journal {
+	holder, holder_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
+	if holder_open_error != nil {
 		testing.fail_now(test, "the busy-lock journal could not be opened")
 	}
 	if timeout_error := db.exec(&fixture.store.connection, "PRAGMA busy_timeout = 0"); timeout_error != nil {
@@ -53,6 +54,7 @@ tool_loop_busy_lock :: proc(test: ^testing.T, fixture: ^Chat_Test, holder: ^jour
 	if lock_error := db.exec(&holder.connection, "BEGIN IMMEDIATE"); lock_error != nil {
 		testing.fail_now(test, "the busy lock could not be acquired")
 	}
+	return holder
 }
 
 @(test)
@@ -549,9 +551,8 @@ test_busy_prompt_is_finalized_and_the_next_prompt_is_accepted :: proc(test: ^tes
 	chat := &fixture.chat
 	_test_commit(test, chat)
 
-	holder: journal.Journal
-	defer _ = journal.close(&holder)
-	tool_loop_busy_lock(test, &fixture, &holder)
+	holder := tool_loop_busy_lock(test, &fixture)
+	defer _ = journal.close(holder)
 
 	accepted := chat_session_accept_user(chat, "first prompt")
 	testing.expect_value(test, accepted, Chat_Accept.Storage_Failed)
@@ -600,9 +601,8 @@ test_live_recovery_answers_calls_before_the_next_prompt :: proc(test: ^testing.T
 	usages: [dynamic]Chat_Request_Usage
 	usages.allocator = chat.allocator
 	defer delete(usages)
-	holder: journal.Journal
-	defer _ = journal.close(&holder)
-	tool_loop_busy_lock(test, &fixture, &holder)
+	holder := tool_loop_busy_lock(test, &fixture)
+	defer _ = journal.close(holder)
 	testing.expect(test, !chat_commit_response_nodes(chat, request, 1, .Tool_Call, &usages), "the response commit should hit the writer lock")
 	testing.expect(test, chat.recovery_pending, "a busy response commit schedules live recovery")
 	testing.expect(test, !chat.storage_failed, "a busy response commit does not latch the session")

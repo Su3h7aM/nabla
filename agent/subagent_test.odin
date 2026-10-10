@@ -223,23 +223,23 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	// The child's own journal carries its message to the orchestrator.
 	chat_record(chat, {kind = .Subagent_Started, subagent = member.session}, journal.Subagent_Started{background = true})
 	_test_commit(test, chat)
-	child_store: journal.Journal
-	if open_error := journal.open(&child_store, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+	child_store, child_store_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
+	if child_store_open_error != nil {
 		testing.fail_now(test, "the child's journal could not be opened")
 	}
-	defer _ = journal.close(&child_store)
+	defer _ = journal.close(child_store)
 	_, create_error := journal.create_session(
-		&child_store,
+		child_store,
 		{id = member.session, workspace = tool_loop_workspace(test), role = .Subagent, parent_session = chat.session},
 	)
 	if create_error != nil { testing.fail_now(test, "the child's session could not be created") }
 	journal.append_record(
-		&child_store,
+		child_store,
 		{kind = .Subagent_Message, session = member.session, subagent = member.session},
 		journal.Subagent_Message{name = member.name},
 		transmute([]u8)string("The parser has a race."),
 	)
-	if _, commit_error := journal.commit(&child_store); commit_error != nil { testing.fail_now(test, "the child's message could not be committed") }
+	if _, commit_error := journal.commit(child_store); commit_error != nil { testing.fail_now(test, "the child's message could not be committed") }
 	// The child's message is not the orchestrator's own message to read back.
 	own, _ := journal.read_inbox(chat.store, member.session, 0, context.temp_allocator)
 	testing.expect_value(test, len(own), 1)
@@ -1104,11 +1104,11 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 	child := children[0].id
 
 	// A session another process runs is refused by the claim, and the child's failure says so.
-	holder: journal.Journal
-	if open_error := journal.open(&holder, fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write); open_error != nil {
+	holder, holder_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
+	if holder_open_error != nil {
 		testing.fail_now(test, "the second journal could not be opened")
 	}
-	if _, claim_error := journal.claim(&holder, child); claim_error != nil { testing.fail_now(test, "the second journal could not claim the child") }
+	if _, claim_error := journal.claim(holder, child); claim_error != nil { testing.fail_now(test, "the second journal could not claim the child") }
 	testing.expect_value(
 		test,
 		subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Try this."}`),
@@ -1116,7 +1116,7 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 	)
 	refused := subagent_test_report(test, chat)
 	testing.expect(test, strings.contains(refused, "agent-1 failed") && strings.contains(refused, "another process holds the session"), refused)
-	holder_error := journal.close(&holder)
+	holder_error := journal.close(holder)
 	testing.expect(test, holder_error == nil, "the second journal closed")
 
 	testing.expect_value(

@@ -296,7 +296,10 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 		bytes_or_null(row.body),
 	}
 	rows: db.Rows
-	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
+	defer {
+		close_error := db.rows_close(&rows)
+		if error == nil { error = close_error }
+	}
 	db.statement_query(&journal.inserts[.Record], &rows, arguments[:]) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return 0, Journal_Error.Corrupt }

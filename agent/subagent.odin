@@ -913,30 +913,30 @@ subagent_run :: proc(member: ^Subagent) {
 		subagent_acp_run(member)
 		return
 	}
-	store: journal.Journal
-	if open_error := journal.open(&store, member.store_directory, member.lock_directory, member.run, .Read_Write, allocator); open_error != nil {
+	store, store_open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Write, allocator)
+	if store_open_error != nil {
 		subagent_fail(
 			member,
 			.Failed,
-			fmt.tprintf("the subagent's session store could not be opened: %s", journal.error_text(open_error, context.temp_allocator)),
+			fmt.tprintf("the subagent's session store could not be opened: %s", journal.error_text(store_open_error, context.temp_allocator)),
 		)
 		return
 	}
 	// The subagent's session is over when this returns, so the claim the journal
 	// holds with it is never released by anyone else, and a close that fails
 	// changes nothing about that.
-	defer _ = journal.close(&store)
+	defer _ = journal.close(store)
 
-	branch, head, problem := subagent_session_open(member, &store)
+	branch, head, problem := subagent_session_open(member, store)
 	if problem != "" {
 		subagent_fail(member, .Failed, problem)
 		return
 	}
 	// The answer is read after the session is destroyed and before the store closes, whatever
 	// the outcome.
-	defer subagent_keep_answer(member, &store)
+	defer subagent_keep_answer(member, store)
 
-	chat, init_error := chat_session_init(&store, member.session, branch, head, member.workspace, allocator)
+	chat, init_error := chat_session_init(store, member.session, branch, head, member.workspace, allocator)
 	if init_error.kind != .None {
 		subagent_fail(member, .Failed, "the subagent's session could not be initialized")
 		return
@@ -1020,7 +1020,7 @@ subagent_run :: proc(member: ^Subagent) {
 		// Steering answers every message taken before the turn settled. One that arrived
 		// after its last check starts the next turn, which delivers it. One that arrives
 		// after this read is found when the orchestrator reaps the child, which runs it again.
-		waiting, read_error := journal.read_inbox(&store, member.session, chat.delivered, context.temp_allocator)
+		waiting, read_error := journal.read_inbox(store, member.session, chat.delivered, context.temp_allocator)
 		if read_error != nil {
 			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
 			return

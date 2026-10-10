@@ -34,19 +34,19 @@ test_an_old_instruction_snapshot_is_a_corruption_on_restore :: proc(t: ^testing.
 		`"roots":[{"kind":"project","path":"/tmp/.agents/skills","authority":"/tmp"}],` +
 		`"agents":[],"skills":[],"diagnostics":[],"omitted_diagnostics":0,` +
 		`"inline_catalog_truncated":false}`
-	instructions_digest := journal.put_artifact(&fixture.store, INSTRUCTIONS_ARTIFACT, transmute([]u8)instructions)
-	manifest_digest := journal.put_artifact(&fixture.store, INSTRUCTION_MANIFEST_ARTIFACT, transmute([]u8)manifest)
+	instructions_digest := journal.put_artifact(fixture.store, INSTRUCTIONS_ARTIFACT, transmute([]u8)instructions)
+	manifest_digest := journal.put_artifact(fixture.store, INSTRUCTION_MANIFEST_ARTIFACT, transmute([]u8)manifest)
 	instructions_hex_buffer: [journal.DIGEST_HEX_LENGTH]u8
 	manifest_hex_buffer: [journal.DIGEST_HEX_LENGTH]u8
 	journal.append_record(
-		&fixture.store,
+		fixture.store,
 		journal.Record{session = fixture.chat.session, turn = 1, kind = .Turn_Started},
 		journal.Turn_Started {
 			instructions = journal.digest_to_hex(instructions_digest, instructions_hex_buffer[:]),
 			manifest = journal.digest_to_hex(manifest_digest, manifest_hex_buffer[:]),
 		},
 	)
-	turn_seq, commit_error := journal.commit(&fixture.store)
+	turn_seq, commit_error := journal.commit(fixture.store)
 	if !testing.expect_value(t, commit_error, nil) { return }
 
 	delete(fixture.chat.skill_instructions, fixture.chat.allocator)

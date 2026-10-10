@@ -91,8 +91,10 @@ _remove_directory :: proc(directory: string) {
 	delete(directory, context.allocator)
 }
 
-_open_journal :: proc(test: ^testing.T, journal: ^Journal, directory: string, mode := Open_Mode.Read_Write) {
-	_expect_ok(test, open(journal, directory, directory, _test_run_id(), mode))
+_open_journal :: proc(test: ^testing.T, directory: string, mode := Open_Mode.Read_Write) -> ^Journal {
+	journal, error := open(directory, directory, _test_run_id(), mode)
+	_expect_ok(test, error)
+	return journal
 }
 
 _close_journal :: proc(test: ^testing.T, journal: ^Journal) {

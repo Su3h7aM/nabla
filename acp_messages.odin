@@ -472,19 +472,18 @@ acp_request_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 // that have been opened on this connection but have not committed their first record.
 // Session strings copied from the table use temp memory so no table lock spans the writer.
 acp_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, cwd: string, before: journal.Journal_Seq) {
-	store: journal.Journal
-	if open_error := journal.open(&store, server.app.setup.journal_directory, "", server.app.setup.run, .Read_Only, context.temp_allocator);
-	   open_error != nil {
+	store, store_open_error := journal.open(server.app.setup.journal_directory, "", server.app.setup.run, .Read_Only, context.temp_allocator)
+	if store_open_error != nil {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session database could not be opened")
 		return
 	}
-	defer _ = journal.close(&store)
+	defer _ = journal.close(store)
 	filter := journal.Session_Filter {
 		workspace = cwd,
 		limit     = ACP_SESSION_LIST_PAGE_SIZE + 1,
 		before    = before,
 	}
-	stored, list_error := journal.list_sessions(&store, filter, context.temp_allocator)
+	stored, list_error := journal.list_sessions(store, filter, context.temp_allocator)
 	if list_error != nil {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be read")
 		return
@@ -548,7 +547,7 @@ acp_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, cwd: stri
 	for info in live_infos[:live_count] {
 		parsed_id, valid := journal.session_id_parse(info.session_id)
 		if !valid { continue }
-		matching, matching_error := journal.list_sessions(&store, journal.Session_Filter{session = parsed_id, limit = 1}, context.temp_allocator)
+		matching, matching_error := journal.list_sessions(store, journal.Session_Filter{session = parsed_id, limit = 1}, context.temp_allocator)
 		if matching_error != nil {
 			acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the session list could not be read")
 			return
@@ -719,10 +718,9 @@ acp_stored_session :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, session
 		return nil, false
 	}
 	// The worker owns the running journal, so the reader asks through a read-only one of its own.
-	store: journal.Journal
-	if open_error := journal.open(&store, server.app.setup.journal_directory, "", server.app.setup.run, .Read_Only, context.temp_allocator);
-	   open_error != nil {
-		if journal.error_is(open_error, .Not_Found) {
+	store, store_open_error := journal.open(server.app.setup.journal_directory, "", server.app.setup.run, .Read_Only, context.temp_allocator)
+	if store_open_error != nil {
+		if journal.error_is(store_open_error, .Not_Found) {
 			acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("no session named %s", session_id))
 			return nil, false
 		}
@@ -731,8 +729,8 @@ acp_stored_session :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, session
 	}
 	// The lookup's own store is being abandoned; a close failure changes nothing
 	// the caller can act on.
-	defer _ = journal.close(&store)
-	loaded, load_error := journal.list_sessions(&store, {session = parsed_id, limit = 1}, context.temp_allocator)
+	defer _ = journal.close(store)
+	loaded, load_error := journal.list_sessions(store, {session = parsed_id, limit = 1}, context.temp_allocator)
 	if load_error != nil {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, fmt.tprintf("the session %s could not be read", session_id))
 		return nil, false

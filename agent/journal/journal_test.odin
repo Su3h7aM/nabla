@@ -10,6 +10,37 @@ import "core:time"
 import "nabla:db"
 import "nabla:db/sqlite"
 
+@(test)
+test_close_retains_the_journal_until_live_handles_close :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+	_expect_ok(test, close(nil))
+	live_rows := [2]bool{false, true}
+	for with_rows in live_rows {
+		journal := _open_journal(test, directory)
+		defer _close_journal(test, journal)
+		if with_rows {
+			append_record(journal, {kind = .Run_Started}, Run_Started{})
+			_commit_ok(test, journal)
+		}
+		statement: db.Statement
+		_expect_db_ok(test, db.prepare(&journal.connection, &statement, "SELECT 1"))
+		defer _expect_db_ok(test, db.statement_close(&statement))
+		rows: db.Rows
+		defer _expect_db_ok(test, db.rows_close(&rows))
+		if with_rows { _expect_db_ok(test, db.statement_query(&statement, &rows)) }
+
+		close_error := close(journal)
+		database_error, is_database := close_error.(db.Error)
+		if !testing.expect(test, is_database, "close refuses while a database handle remains live") { return }
+		testing.expect_value(test, db.error_kind(database_error), db.Error_Kind.Invalid_State)
+		_expect_db_ok(test, db.rows_close(&rows))
+		_expect_db_ok(test, db.statement_close(&statement))
+		_expect_ok(test, close(journal))
+		journal = nil
+	}
+}
+
 // Another writer holding the database is not a storage failure: the commit reports
 // it, keeps its records pending, and the next commit writes them.
 @(test)
@@ -17,25 +48,25 @@ test_a_busy_commit_keeps_its_records_for_the_next_one :: proc(test: ^testing.T) 
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	holder, writer: Journal
-	_open_journal(test, &holder, directory)
-	defer _close_journal(test, &holder)
-	_open_journal(test, &writer, directory)
-	defer _close_journal(test, &writer)
-	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
-	_commit_ok(test, &writer)
+	holder, writer: ^Journal
+	holder = _open_journal(test, directory)
+	defer _close_journal(test, holder)
+	writer = _open_journal(test, directory)
+	defer _close_journal(test, writer)
+	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(test, writer)
 	// The writer gives up at once instead of waiting out the busy timeout.
 	_expect_db_ok(test, db.exec(&writer.connection, "PRAGMA busy_timeout = 0"))
 
 	_expect_db_ok(test, db.exec(&holder.connection, "BEGIN IMMEDIATE"))
-	append_record(&writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
-	_, busy_error := commit(&writer)
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	_, busy_error := commit(writer)
 	testing.expect(test, error_is_busy(busy_error), "the commit reports the other writer")
 	testing.expect(test, writer.failure == nil, "a busy database latches nothing")
 	_expect_db_ok(test, db.rollback(&holder.connection))
 
-	_commit_ok(test, &writer)
-	records := _records_of_session(test, &writer, session)
+	_commit_ok(test, writer)
+	records := _records_of_session(test, writer, session)
 	defer records_destroy(records, context.allocator)
 	testing.expect(test, _record_seq_of_kind(records, .Turn_Started) != 0, "the pending record was written by the next commit")
 }
@@ -45,8 +76,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	writer: Journal
-	_open_journal(test, &writer, directory)
+	writer := _open_journal(test, directory)
 
 	// The directory and the database admit the owner alone.
 	directory_info, directory_error := os.stat(directory, context.temp_allocator)
@@ -57,27 +87,26 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	if database_error != nil { testing.fail_now(test, "the database was not created") }
 	testing.expect(test, database_info.mode & OTHERS_ACCESS == {}, "the database should be owner-only")
 
-	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
-	append_record(&writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
 	// A process-scope record names no session, so both session columns are
 	// absent rather than sixteen zero bytes.
-	append_record(&writer, Record{kind = .Run_Started}, _Test_Payload{detail = "run"})
+	append_record(writer, Record{kind = .Run_Started}, _Test_Payload{detail = "run"})
 	node_id := append_node(
-		&writer,
+		writer,
 		Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1},
 		_Test_Payload{detail = "prompt"},
 		_body("hello there"),
 	)
 	testing.expect_value(test, node_id, Node_Id(1))
-	last := _commit_ok(test, &writer)
+	last := _commit_ok(test, writer)
 	testing.expect(test, last > 0, "a commit should report the seq it wrote")
-	_expect_ok(test, close(&writer))
+	_expect_ok(test, close(writer))
 
-	reader: Journal
-	_open_journal(test, &reader, directory, .Read_Only)
-	defer _close_journal(test, &reader)
+	reader := _open_journal(test, directory, .Read_Only)
+	defer _close_journal(test, reader)
 
-	records := _records_of_session(test, &reader, session)
+	records := _records_of_session(test, reader, session)
 	defer records_destroy(records, context.allocator)
 
 	// The global order is the order the items were appended in, and a node's
@@ -97,7 +126,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 
 	// The process-scope record reads back with the absent session id, so the
 	// NULL round-trips as the zero id.
-	scoped, _, scoped_error := read_records(&reader, Filter{kinds = {.Run_Started}}, 0, 0, context.allocator)
+	scoped, _, scoped_error := read_records(reader, Filter{kinds = {.Run_Started}}, 0, 0, context.allocator)
 	_expect_ok(test, scoped_error)
 	defer records_destroy(scoped, context.allocator)
 	testing.expect_value(test, len(scoped), 1)
@@ -107,7 +136,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	committed := _record_seq_of_kind(records, .Node_Committed)
 	testing.expect(test, committed > 0, "the node's record should be there")
 
-	ancestry, ancestry_error := read_ancestry(&reader, session, node_id, context.allocator)
+	ancestry, ancestry_error := read_ancestry(reader, session, node_id, context.allocator)
 	_expect_ok(test, ancestry_error)
 	defer nodes_destroy(ancestry, context.allocator)
 
@@ -145,9 +174,8 @@ test_a_writable_open_narrows_wide_permissions :: proc(test: ^testing.T) {
 	_expect_ok(test, os.chmod(database, WIDE_FILE_PERMISSIONS))
 	_expect_ok(test, os.close(created))
 
-	journal: Journal
-	_open_journal(test, &journal, journal_directory)
-	_close_journal(test, &journal)
+	journal := _open_journal(test, journal_directory)
+	_close_journal(test, journal)
 
 	directory_info, directory_error := os.stat(journal_directory, context.allocator)
 	if directory_error != nil { testing.fail_now(test, "the journal directory was not found") }
@@ -165,18 +193,16 @@ test_buffered_records_are_invisible_until_a_commit :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	writer: Journal
-	_open_journal(test, &writer, directory)
-	defer _close_journal(test, &writer)
+	writer := _open_journal(test, directory)
+	defer _close_journal(test, writer)
 
-	session := _create_session(test, &writer, {workspace = "/tmp/project", role = .Main})
+	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
 	for _ in 0 ..< 3 {
-		append_record(&writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "buffered"})
+		append_record(writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "buffered"})
 	}
 
-	reader: Journal
-	_open_journal(test, &reader, directory, .Read_Only)
-	defer _close_journal(test, &reader)
+	reader := _open_journal(test, directory, .Read_Only)
+	defer _close_journal(test, reader)
 
 	expect_records :: proc(test: ^testing.T, journal: ^Journal, session: Session_Id, want: int, what: string) {
 		records, _, error := read_records(journal, Filter{session = session}, 0, 0, context.allocator)
@@ -189,26 +215,26 @@ test_buffered_records_are_invisible_until_a_commit :: proc(test: ^testing.T) {
 	// observation is buffered.
 	SESSION_RECORDS :: 3
 
-	expect_records(test, &reader, session, 0, "before any commit")
+	expect_records(test, reader, session, 0, "before any commit")
 
 	// Neither the record count nor the age limit has been reached.
-	_expect_ok(test, flush_due(&writer, time.tick_now()))
-	expect_records(test, &reader, session, 0, "after a flush that is not due")
+	_expect_ok(test, flush_due(writer, time.tick_now()))
+	expect_records(test, reader, session, 0, "after a flush that is not due")
 
-	deadline, has_deadline := flush_deadline(&writer).?
+	deadline, has_deadline := flush_deadline(writer).?
 	testing.expect(test, has_deadline, "a buffered batch has a deadline")
-	_expect_ok(test, flush_due(&writer, time.tick_add(deadline, time.Second)))
-	expect_records(test, &reader, session, SESSION_RECORDS + 3, "after the age limit")
+	_expect_ok(test, flush_due(writer, time.tick_add(deadline, time.Second)))
+	expect_records(test, reader, session, SESSION_RECORDS + 3, "after the age limit")
 
 	// The batch record limit commits on its own, with no barrier.
 	for _ in 0 ..< JOURNAL_BATCH_RECORDS {
-		append_record(&writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "bulk"})
+		append_record(writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "bulk"})
 	}
-	testing.expect_value(test, flush_deadline(&writer) != nil, true)
-	_expect_ok(test, flush_due(&writer, time.tick_now()))
-	expect_records(test, &reader, session, SESSION_RECORDS + 3 + JOURNAL_BATCH_RECORDS, "after the record limit")
+	testing.expect_value(test, flush_deadline(writer) != nil, true)
+	_expect_ok(test, flush_due(writer, time.tick_now()))
+	expect_records(test, reader, session, SESSION_RECORDS + 3 + JOURNAL_BATCH_RECORDS, "after the record limit")
 
-	testing.expect_value(test, flush_deadline(&writer) == nil, true)
+	testing.expect_value(test, flush_deadline(writer) == nil, true)
 }
 
 @(test)
@@ -216,43 +242,39 @@ test_a_session_has_one_writer_at_a_time :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	first: Journal
-	_open_journal(test, &first, directory)
-	session := _create_session(test, &first, {workspace = "/tmp/project", role = .Main})
-	_commit_ok(test, &first)
+	first := _open_journal(test, directory)
+	session := _create_session(test, first, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(test, first)
 
 	// A second journal cannot take the session the first one holds.
-	second: Journal
-	_open_journal(test, &second, directory)
-	_, claim_error := claim(&second, session)
+	second := _open_journal(test, directory)
+	_, claim_error := claim(second, session)
 	_expect_error(test, claim_error, .Claimed)
-	other := _create_session(test, &second, {workspace = "/tmp/other", role = .Main})
-	_commit_ok(test, &second)
+	other := _create_session(test, second, {workspace = "/tmp/other", role = .Main})
+	_commit_ok(test, second)
 
 	// An id the journal does not hold is not a claim to take.
-	third: Journal
-	_open_journal(test, &third, directory)
-	_, missing_error := claim(&third, _absent_session())
+	third := _open_journal(test, directory)
+	_, missing_error := claim(third, _absent_session())
 	_expect_error(test, missing_error, .Not_Found)
 
 	// Releasing the first writer lets another take over, and the ids it reads
 	// back continue where the session stopped.
-	node_id := append_node(&first, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{detail = "first writer"})
+	node_id := append_node(first, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{detail = "first writer"})
 	testing.expect_value(test, node_id, Node_Id(1))
-	append_record(&first, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
-	branch_id := append_branch(&first, node_id)
+	append_record(first, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	branch_id := append_branch(first, node_id)
 	testing.expect_value(test, branch_id, Branch_Id(2))
-	_commit_ok(test, &first)
-	_expect_ok(test, release(&first))
-	_expect_ok(test, close(&first))
+	_commit_ok(test, first)
+	_expect_ok(test, release(first))
+	_expect_ok(test, close(first))
 
-	_expect_ok(test, close(&second))
-	_expect_ok(test, close(&third))
+	_expect_ok(test, close(second))
+	_expect_ok(test, close(third))
 
-	resumed: Journal
-	_open_journal(test, &resumed, directory)
-	defer _close_journal(test, &resumed)
-	counters, resumed_error := claim(&resumed, session)
+	resumed := _open_journal(test, directory)
+	defer _close_journal(test, resumed)
+	counters, resumed_error := claim(resumed, session)
 	_expect_ok(test, resumed_error)
 	testing.expect_value(test, counters.node, Node_Id(1))
 	testing.expect_value(test, counters.branch, Branch_Id(2))
@@ -260,9 +282,9 @@ test_a_session_has_one_writer_at_a_time :: proc(test: ^testing.T) {
 	testing.expect_value(test, counters.request, Request_Id(0))
 	testing.expect_value(test, counters.call, Call_Id(0))
 
-	next := append_node(&resumed, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant}, _Test_Payload{detail = "second writer"})
+	next := append_node(resumed, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant}, _Test_Payload{detail = "second writer"})
 	testing.expect_value(test, next, Node_Id(2))
-	_commit_ok(test, &resumed)
+	_commit_ok(test, resumed)
 
 	testing.expect(test, other != session, "each session has its own id")
 }
@@ -272,23 +294,22 @@ test_a_failed_commit_latches_and_drops_appends :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	journal: Journal
-	_open_journal(test, &journal, directory)
-	defer _close_journal(test, &journal)
+	journal := _open_journal(test, directory)
+	defer _close_journal(test, journal)
 
-	session := _create_session(test, &journal, {workspace = "/tmp/project", role = .Main})
-	node_id := append_node(&journal, Node{session = session, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "first"})
+	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
+	node_id := append_node(journal, Node{session = session, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "first"})
 	testing.expect_value(test, node_id, Node_Id(1))
-	_commit_ok(test, &journal)
+	_commit_ok(test, journal)
 
 	// The next node reuses the id already committed, which the primary key of
 	// nodes refuses. A journal only hands out ids that have not been used, so
 	// this is the injected storage failure the latch has to survive.
 	journal.counters.node = 0
-	duplicate := append_node(&journal, Node{session = session, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "second"})
+	duplicate := append_node(journal, Node{session = session, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "second"})
 	testing.expect_value(test, duplicate, Node_Id(1))
 
-	_, commit_error := commit(&journal)
+	_, commit_error := commit(journal)
 	// The database's own error is returned and latched, so the harness can report why.
 	cause, is_database := commit_error.(db.Error)
 	testing.expect(test, is_database, "a failed commit should keep the database's error")
@@ -300,13 +321,13 @@ test_a_failed_commit_latches_and_drops_appends :: proc(test: ^testing.T) {
 	// Nothing buffered can be written again, so the batch is dropped, every
 	// later append is dropped, and every later commit reports the latch.
 	testing.expect_value(test, len(journal.pending), 0)
-	append_record(&journal, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "dropped"})
+	append_record(journal, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "dropped"})
 	testing.expect_value(test, len(journal.pending), 0)
-	_, again_error := commit(&journal)
+	_, again_error := commit(journal)
 	testing.expect(test, again_error == commit_error, "a later commit returns the latched failure")
 
 	// What was committed before the failure is still readable.
-	records := _records_of_session(test, &journal, session)
+	records := _records_of_session(test, journal, session)
 	defer records_destroy(records, context.allocator)
 	testing.expect_value(test, len(records), 4)
 }
@@ -317,9 +338,8 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	defer _remove_directory(directory)
 
 	// A database this package created, stamped with a version from the future.
-	created: Journal
-	_open_journal(test, &created, directory)
-	_expect_ok(test, close(&created))
+	created := _open_journal(test, directory)
+	_expect_ok(test, close(created))
 
 	database_path := fmt.tprintf("%s/%s", directory, DATABASE_NAME)
 	connection: db.Conn
@@ -327,10 +347,12 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	_expect_db_ok(test, db.exec(&connection, "PRAGMA user_version = 99"))
 	_expect_db_ok(test, db.close(&connection))
 
-	refused: Journal
-	_expect_error(test, open(&refused, directory, directory, _test_run_id(), .Read_Write), .Schema_Too_New)
-	testing.expect(test, !refused.open, "a refused open leaves a closed journal")
-	_expect_error(test, open(&refused, directory, directory, _test_run_id(), .Read_Only), .Schema_Too_New)
+	refused_1, open_error_1 := open(directory, directory, _test_run_id(), .Read_Write)
+	_expect_error(test, open_error_1, .Schema_Too_New)
+	testing.expect(test, refused_1 == nil, "a refused open returns no journal")
+	refused_2, open_error_2 := open(directory, directory, _test_run_id(), .Read_Only)
+	_expect_error(test, open_error_2, .Schema_Too_New)
+	testing.expect(test, refused_2 == nil, "a refused open returns no journal")
 
 	// A database someone else wrote holds no version this package can read.
 	foreign_directory := _temp_directory(test)
@@ -345,13 +367,19 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	_expect_db_ok(test, db.exec(&foreign_connection, "CREATE TABLE foreign_table (x INTEGER)"))
 	_expect_db_ok(test, db.close(&foreign_connection))
 
-	_expect_error(test, open(&refused, foreign_directory, foreign_directory, _test_run_id(), .Read_Write), .Schema_Unknown)
-	_expect_error(test, open(&refused, foreign_directory, foreign_directory, _test_run_id(), .Read_Only), .Schema_Unknown)
+	refused_3, open_error_3 := open(foreign_directory, foreign_directory, _test_run_id(), .Read_Write)
+	_expect_error(test, open_error_3, .Schema_Unknown)
+	testing.expect(test, refused_3 == nil, "a refused open returns no journal")
+	refused_4, open_error_4 := open(foreign_directory, foreign_directory, _test_run_id(), .Read_Only)
+	_expect_error(test, open_error_4, .Schema_Unknown)
+	testing.expect(test, refused_4 == nil, "a refused open returns no journal")
 
 	// A reader creates nothing, so a directory with no journal is .Not_Found.
 	empty_directory := _temp_directory(test)
 	defer _remove_directory(empty_directory)
-	_expect_error(test, open(&refused, empty_directory, empty_directory, _test_run_id(), .Read_Only), .Not_Found)
+	refused_5, open_error_5 := open(empty_directory, empty_directory, _test_run_id(), .Read_Only)
+	_expect_error(test, open_error_5, .Not_Found)
+	testing.expect(test, refused_5 == nil, "a refused open returns no journal")
 }
 
 @(test)
@@ -359,19 +387,18 @@ test_a_session_created_here_is_claimed_and_numbered :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	journal: Journal
-	_open_journal(test, &journal, directory)
-	defer _close_journal(test, &journal)
+	journal := _open_journal(test, directory)
+	defer _close_journal(test, journal)
 
-	parent := _create_session(test, &journal, {workspace = "/tmp/project", role = .Main})
+	parent := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
 	testing.expect(test, parent != {}, "a created session has an id")
 	testing.expect_value(test, journal.claimed, parent)
 	testing.expect_value(test, journal.counters.branch, Branch_Id(INITIAL_BRANCH))
-	_commit_ok(test, &journal)
-	_expect_ok(test, release(&journal))
+	_commit_ok(test, journal)
+	_expect_ok(test, release(journal))
 
-	child := _create_session(test, &journal, {workspace = "/tmp/other", role = .Subagent, parent_session = parent, parent_call = 7})
-	_commit_ok(test, &journal)
+	child := _create_session(test, journal, {workspace = "/tmp/other", role = .Subagent, parent_session = parent, parent_call = 7})
+	_commit_ok(test, journal)
 
 	// The hex form of an id is what a lock file and a message use.
 	hex_text: [SESSION_ID_HEX_LENGTH]u8
@@ -386,7 +413,7 @@ test_a_session_created_here_is_claimed_and_numbered :: proc(test: ^testing.T) {
 	testing.expect(test, run != {}, "a run id should be created")
 	testing.expect(test, run != _test_run_id(), "run ids should be drawn fresh")
 
-	summaries, list_error := list_sessions(&journal, {}, context.allocator)
+	summaries, list_error := list_sessions(journal, {}, context.allocator)
 	_expect_ok(test, list_error)
 	defer session_summaries_destroy(summaries, context.allocator)
 	testing.expect_value(test, len(summaries), 2)
@@ -405,21 +432,18 @@ test_a_claim_and_its_close_record_claimed_then_released :: proc(test: ^testing.T
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	creator: Journal
-	_open_journal(test, &creator, directory)
-	session := _create_session(test, &creator, {workspace = "/tmp/project", role = .Main})
-	_expect_ok(test, close(&creator))
+	creator := _open_journal(test, directory)
+	session := _create_session(test, creator, {workspace = "/tmp/project", role = .Main})
+	_expect_ok(test, close(creator))
 
-	resumer: Journal
-	_open_journal(test, &resumer, directory)
-	_, claim_error := claim(&resumer, session)
+	resumer := _open_journal(test, directory)
+	_, claim_error := claim(resumer, session)
 	_expect_ok(test, claim_error)
-	_expect_ok(test, close(&resumer))
+	_expect_ok(test, close(resumer))
 
-	reader: Journal
-	_open_journal(test, &reader, directory, .Read_Only)
-	defer _close_journal(test, &reader)
-	records := _records_of_session(test, &reader, session)
+	reader := _open_journal(test, directory, .Read_Only)
+	defer _close_journal(test, reader)
+	records := _records_of_session(test, reader, session)
 	defer records_destroy(records, context.allocator)
 
 	expected := [?]Record_Kind{.Session_Created, .Session_Claimed, .Branch_Created, .Session_Released, .Session_Claimed, .Session_Released}
@@ -436,20 +460,20 @@ test_a_follower_appends_input_the_claimant_reads :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	claimant, follower: Journal
-	_open_journal(test, &claimant, directory)
-	defer _close_journal(test, &claimant)
-	session := _create_session(test, &claimant, {workspace = "/tmp/project", role = .Main})
-	_commit_ok(test, &claimant)
+	claimant, follower: ^Journal
+	claimant = _open_journal(test, directory)
+	defer _close_journal(test, claimant)
+	session := _create_session(test, claimant, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(test, claimant)
 
-	_open_journal(test, &follower, directory)
-	defer _close_journal(test, &follower)
-	_, claim_error := claim(&follower, session)
+	follower = _open_journal(test, directory)
+	defer _close_journal(test, follower)
+	_, claim_error := claim(follower, session)
 	_expect_error(test, claim_error, .Claimed)
-	_expect_ok(test, follow(&follower, session))
-	_expect_ok(test, append_input(&follower, "from the other terminal", .Steering))
+	_expect_ok(test, follow(follower, session))
+	_expect_ok(test, append_input(follower, "from the other terminal", .Steering))
 
-	lines, lines_error := read_inbox(&claimant, session, 0, context.allocator)
+	lines, lines_error := read_inbox(claimant, session, 0, context.allocator)
 	_expect_ok(test, lines_error)
 	defer records_destroy(lines, context.allocator)
 	if !testing.expect_value(test, len(lines), 1) { return }
@@ -468,22 +492,22 @@ test_a_follower_claims_after_the_claimant_closes :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
 
-	claimant, follower: Journal
-	_open_journal(test, &claimant, directory)
-	session := _create_session(test, &claimant, {workspace = "/tmp/project", role = .Main})
-	_ = append_node(&claimant, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{}, _body("hello"))
-	_commit_ok(test, &claimant)
+	claimant, follower: ^Journal
+	claimant = _open_journal(test, directory)
+	session := _create_session(test, claimant, {workspace = "/tmp/project", role = .Main})
+	_ = append_node(claimant, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{}, _body("hello"))
+	_commit_ok(test, claimant)
 
-	_open_journal(test, &follower, directory)
-	defer _close_journal(test, &follower)
-	_expect_ok(test, follow(&follower, session))
-	_, early_error := try_claim(&follower)
+	follower = _open_journal(test, directory)
+	defer _close_journal(test, follower)
+	_expect_ok(test, follow(follower, session))
+	_, early_error := try_claim(follower)
 	_expect_error(test, early_error, .Claimed)
 	testing.expect_value(test, follower.followed, session)
 	testing.expect_value(test, follower.claimed, Session_Id{})
 
-	_expect_ok(test, close(&claimant))
-	counters, claim_error := try_claim(&follower)
+	_expect_ok(test, close(claimant))
+	counters, claim_error := try_claim(follower)
 	_expect_ok(test, claim_error)
 	testing.expect_value(test, follower.claimed, session)
 	testing.expect_value(test, follower.followed, Session_Id{})
@@ -491,8 +515,8 @@ test_a_follower_claims_after_the_claimant_closes :: proc(test: ^testing.T) {
 	testing.expect_value(test, counters.turn, Turn_Id(1))
 	testing.expect_value(test, follower.counters, counters)
 
-	_commit_ok(test, &follower)
-	records := _records_of_session(test, &follower, session)
+	_commit_ok(test, follower)
+	records := _records_of_session(test, follower, session)
 	defer records_destroy(records, context.allocator)
 	claims := 0
 	for record in records {

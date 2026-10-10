@@ -915,12 +915,12 @@ acp_test_session_protocol :: proc(t: ^testing.T, scenario: ACP_Test_Session_Scen
 		locks, _, locks_error := agent.session_lock_directory(context.allocator)
 		if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
 		defer delete(locks, context.allocator)
-		other: journal.Journal
-		if !testing.expect_value(t, journal.open(&other, directory, locks, journal.run_id_create(), .Read_Write, context.allocator), nil) { return }
-		defer _ = journal.close(&other)
-		target, create_error := journal.create_session(&other, {workspace = workspace})
+		other, other_open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Write, context.allocator)
+		if !testing.expect_value(t, other_open_error, nil) { return }
+		defer _ = journal.close(other)
+		target, create_error := journal.create_session(other, {workspace = workspace})
 		if !testing.expect_value(t, create_error, nil) { return }
-		_, commit_error := journal.commit(&other)
+		_, commit_error := journal.commit(other)
 		if !testing.expect_value(t, commit_error, nil) { return }
 		refused := strings.builder_make(context.temp_allocator)
 		target_text: [32]u8
@@ -1360,12 +1360,12 @@ test_acp_prompt_records_an_image_block_as_an_attachment :: proc(t: ^testing.T) {
 	locks, _, locks_error := agent.session_lock_directory(context.allocator)
 	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
 	defer delete(locks, context.allocator)
-	reader: journal.Journal
-	if !testing.expect_value(t, journal.open(&reader, directory, locks, journal.run_id_create(), .Read_Only, context.allocator), nil) { return }
-	defer _ = journal.close(&reader)
+	reader, reader_open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
+	if !testing.expect_value(t, reader_open_error, nil) { return }
+	defer _ = journal.close(reader)
 	session, session_ok := journal.session_id_parse(session_id)
 	if !testing.expect(t, session_ok, "the session id is not a journal id") { return }
-	node, found, read_error := journal.read_last_node(&reader, session, .User, context.temp_allocator)
+	node, found, read_error := journal.read_last_node(reader, session, .User, context.temp_allocator)
 	if !testing.expect_value(t, read_error, nil) { return }
 	if !testing.expect(t, found, "the turn left no user node") { return }
 	user: journal.User
@@ -1748,7 +1748,14 @@ test_acp_idle_v2_store_session_stays_evictable_after_an_owner_wake :: proc(t: ^t
 			acp_session_free(session)
 			return
 		}
-		session.app.setup.store = new(journal.Journal, server.alloc)
+		store, allocation_error := new(journal.Journal, server.alloc)
+		if allocation_error != nil {
+			thread.destroy(worker)
+			acp_session_free(session)
+			testing.fail_now(t, "the fixture store could not be allocated")
+		}
+		store.allocator = server.alloc
+		session.app.setup.store = store
 		worker.data = session
 		session.worker = worker
 		server.sessions[i] = session

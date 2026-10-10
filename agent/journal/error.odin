@@ -92,7 +92,8 @@ error_detach :: proc(error: Error) -> Error {
 	database, is_database := error.(db.Error)
 	if !is_database { return error }
 	failure, _ := database.(db.Failure)
-	copied, _ := strings.clone(failure.message, context.temp_allocator)
+	copied, clone_error := strings.clone(failure.message, context.temp_allocator)
+	if clone_error != nil { return db.error_make(failure.kind, failure.code, "") }
 	return db.error_make(failure.kind, failure.code, copied)
 }
 
