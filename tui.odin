@@ -287,7 +287,12 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 		free_all(context.temp_allocator)
 	}
 	images_sync(app, storage)
-	if present_err := tui.screen_present(&storage.screen, app.terminal, term.profile_default(), cursor); present_err != nil {
+	app.frame_superseded = false
+	present_err := tui.screen_present(&storage.screen, app.terminal, term.profile_default(), cursor)
+	if present_err == term.General_Error.Superseded {
+		// A resize arrived mid-write. The loop renders the newest size next, so this is not an error.
+		app.frame_superseded = true
+	} else if present_err != nil {
 		fmt.eprintln("nabla: present:", present_err)
 	}
 }

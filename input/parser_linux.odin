@@ -15,9 +15,9 @@ ESC_DEADLINE_MS :: 50
 // awaiting a lone ESC, the poll deadline is capped at ESC_DEADLINE_MS; on
 // timeout the ESC resolves as an Escape event.
 //
-// wake is a descriptor made by wake_make, or -1 for none. A signalled wake, or a
+// wakes are descriptors made by wake_make, at most MAX_WAKES. A signalled wake, or a
 // signal that interrupts the poll, ends the wait with zero events and no error so the
-// caller rechecks what it watches. read_events never drains the wake. While a lone
+// caller rechecks what it watches. read_events never drains a wake. While a lone
 // ESC is pending the wait still lasts until its deadline, which bounds the delay.
 @(require_results)
 read_events :: proc(
@@ -25,7 +25,7 @@ read_events :: proc(
 	file: ^os.File,
 	events: ^[dynamic]Event,
 	timeout_ms: i64 = 0,
-	wake: int = -1,
+	wakes: []int = nil,
 	allocator := context.allocator,
 ) -> (
 	count: int,
@@ -46,7 +46,7 @@ read_events :: proc(
 			first_timeout = remaining_timeout
 		}
 	}
-	tty_ready, interrupted, poll_err := input_poll(fd, linux.Fd(wake), i32(min(first_timeout, i64(max(i32)))))
+	tty_ready, interrupted, poll_err := input_poll(fd, wakes, i32(min(first_timeout, i64(max(i32)))))
 	if poll_err != nil {
 		return 0, poll_err
 	}
@@ -63,7 +63,7 @@ read_events :: proc(
 			escape_deadline = time.tick_add(time.tick_now(), time.Duration(ESC_DEADLINE_MS) * time.Millisecond)
 			has_escape_deadline = true
 		}
-		tty_ready, interrupted, poll_err = input_poll(fd, -1, _milliseconds_until(escape_deadline))
+		tty_ready, interrupted, poll_err = input_poll(fd, nil, _milliseconds_until(escape_deadline))
 		if poll_err != nil {
 			return len(events^) - start, poll_err
 		}
@@ -91,17 +91,34 @@ _milliseconds_until :: proc(deadline: time.Tick) -> i32 {
 	return i32((remaining + time.Millisecond - 1) / time.Millisecond)
 }
 
-// input_poll waits once for the tty, and for wake unless it is negative. interrupted
-// reports a readable wake or an EINTR: either one asks the caller to look again, so the
-// wait is not retried.
+// MAX_WAKES is the most wake descriptors one read_events call watches.
+MAX_WAKES :: 4
+
+// input_poll waits once for the tty and for every wake. interrupted reports a readable
+// wake or an EINTR: either one asks the caller to look again, so the wait is not retried.
 @(require_results)
-input_poll :: proc(fd, wake: linux.Fd, timeout: i32) -> (tty_ready, interrupted: bool, err: Error) {
-	poll_descriptors := [2]linux.Poll_Fd{{fd = fd, events = {.IN, .HUP, .ERR, .NVAL}}, {fd = wake, events = {.IN}}}
-	count := 2 if wake >= 0 else 1
-	_, errno := linux.poll(poll_descriptors[:count], timeout)
+input_poll :: proc(fd: linux.Fd, wakes: []int, timeout: i32) -> (tty_ready, interrupted: bool, err: Error) {
+	assert(len(wakes) <= MAX_WAKES, "too many wake descriptors")
+	poll_descriptors: [1 + MAX_WAKES]linux.Poll_Fd
+	poll_descriptors[0] = {
+		fd     = fd,
+		events = {.IN, .HUP, .ERR, .NVAL},
+	}
+	for wake, i in wakes {
+		poll_descriptors[1 + i] = {
+			fd     = linux.Fd(wake),
+			events = {.IN},
+		}
+	}
+	_, errno := linux.poll(poll_descriptors[:1 + len(wakes)], timeout)
 	#partial switch errno {
 	case .NONE:
-		return poll_descriptors[0].revents != {}, count == 2 && poll_descriptors[1].revents != {}, nil
+		for descriptor in poll_descriptors[1:1 + len(wakes)] {
+			if descriptor.revents != {} {
+				interrupted = true
+			}
+		}
+		return poll_descriptors[0].revents != {}, interrupted, nil
 	case .EINTR:
 		return false, true, nil
 	}

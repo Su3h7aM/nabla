@@ -21,6 +21,7 @@ General_Error :: enum u32 {
 	Invalid_Cursor, // a cursor Position is out of the frame bounds
 	Presentation_Workspace_Too_Small, // the caller's output scratch is too small
 	Partial_Write, // a write made zero progress with bytes pending and no cause
+	Superseded, // a frame write stopped because the terminal was resized; not a failure
 }
 
 // Platform_Error resolves per platform: linux.Errno on Linux

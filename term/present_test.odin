@@ -48,11 +48,11 @@ test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
 	out, ok := _encode_frame(buffer, profile, {}, scratch[:])
 	testing.expect(t, ok, "a valid frame must encode")
 
-	expected := "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[2;1H\x1b[mcd\x1b[?25l\x1b[m\x1b[?2026l"
+	expected := "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[2;1H\x1b[mcd\x1b[?25l\x1b[m\x1b[?2026l"
 	testing.expect_value(t, out, expected)
 
 	// The stream carries real ESC bytes and never a literal backslash-e.
-	testing.expect(t, len(out) > 0 && out[0] == 0x1b, "encoded frame must start with a real ESC byte")
+	testing.expect(t, len(out) > 1 && out[0] == 0x18 && out[1] == 0x1b, "encoded frame must start with CAN and a real ESC byte")
 	for i in 0 ..< len(out) {
 		if out[i] == '\\' {
 			testing.expect(t, i + 1 >= len(out) || out[i + 1] != 'e', "mangled ESC literal in output")
@@ -83,7 +83,7 @@ test_encode_reference_bytes_and_escape_correctness :: proc(t: ^testing.T) {
 	padded_scratch: [4096]byte
 	padded_out, padded_ok := _encode_frame(padded, profile_default(), {}, padded_scratch[:])
 	testing.expect(t, padded_ok, "unused trailing cells must not veto the frame")
-	testing.expect_value(t, padded_out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Habc\x1b[?25l\x1b[m\x1b[?2026l")
+	testing.expect_value(t, padded_out, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Habc\x1b[?25l\x1b[m\x1b[?2026l")
 }
 
 @(test)
@@ -106,7 +106,7 @@ test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
 	}
 	out, ok := _encode_frame(buffer, profile, placed, scratch[:])
 	testing.expect(t, ok, "an in-bounds position must encode")
-	testing.expect_value(t, out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hxyz\x1b[1;2H\x1b[?25h\x1b[m\x1b[?2026l")
+	testing.expect_value(t, out, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hxyz\x1b[1;2H\x1b[?25h\x1b[m\x1b[?2026l")
 
 	// Visibility and position are independent: a frame with no position still
 	// sets visibility, and an unplaced cursor keeps the frame's end position.
@@ -122,7 +122,7 @@ test_encode_emits_the_cursor_intent :: proc(t: ^testing.T) {
 		hide_scratch: [4096]byte
 		hide_out, hide_ok := _encode_frame(buffer, profile, intent, hide_scratch[:])
 		testing.expect(t, hide_ok, "hide/show must encode")
-		expected := strings.concatenate({"\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hxyz", sequence, "\x1b[m\x1b[?2026l"})
+		expected := strings.concatenate({"\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hxyz", sequence, "\x1b[m\x1b[?2026l"})
 		defer delete(expected)
 		testing.expect_value(t, hide_out, expected)
 	}
@@ -145,10 +145,10 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 		depth:    Color_Depth,
 		expected: string,
 	} {
-		{.True_Color, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
-		{.Eight_Bit, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;5;196mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
-		{.Four_Bit, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
-		{.None, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.True_Color, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.Eight_Bit, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;5;196mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.Four_Bit, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
+		{.None, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l"},
 	}
 	for fixture in cases {
 		scratch: [4096]byte
@@ -179,7 +179,7 @@ test_encode_reduces_colors_by_depth :: proc(t: ^testing.T) {
 	indexed_scratch: [4096]byte
 	indexed_out, indexed_ok := _encode_frame(Frame_Buffer{columns = 3, rows = 1, cells = indexed}, {color_depth = .Four_Bit}, {}, indexed_scratch[:])
 	testing.expect(t, indexed_ok, "an indexed frame must encode")
-	testing.expect_value(t, indexed_out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l")
+	testing.expect_value(t, indexed_out, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[91mb\x1b[mc\x1b[?25l\x1b[m\x1b[?2026l")
 }
 
 @(test)
@@ -199,7 +199,7 @@ test_encode_emits_style_once_per_run :: proc(t: ^testing.T) {
 	scratch: [4096]byte
 	out, ok := _encode_frame(buffer, {color_depth = .True_Color}, {}, scratch[:])
 	testing.expect(t, ok, "a valid frame must encode")
-	testing.expect_value(t, out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mbcd\x1b[?25l\x1b[m\x1b[?2026l")
+	testing.expect_value(t, out, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Ha\x1b[m\x1b[38;2;255;0;0mbcd\x1b[?25l\x1b[m\x1b[?2026l")
 }
 
 @(test)
@@ -217,7 +217,7 @@ test_encode_validates_frame_and_cells :: proc(t: ^testing.T) {
 	}
 	wide_out, wide_ok := _encode_frame(wide, {color_depth = .True_Color}, {}, scratch[:])
 	testing.expect(t, wide_ok, "a well-formed wide frame must encode")
-	testing.expect_value(t, wide_out, "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1H界\x1b[?25l\x1b[m\x1b[?2026l")
+	testing.expect_value(t, wide_out, "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1H界\x1b[?25l\x1b[m\x1b[?2026l")
 
 	// Malformed wide grids are rejected before any byte is written.
 	width_three := Frame_Buffer {
@@ -400,8 +400,9 @@ test_encode_hyperlinks_close_before_wrapped_row_cursor_moves :: proc(t: ^testing
 		links   = []string{"https://other.example", "https://example.com"},
 	}
 	scratch: [4096]byte
-	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
+	framed, ok := _encode_frame(buffer, {}, {}, scratch[:])
 	if !testing.expect(t, ok) { return }
+	out := framed[len(FRAME_RESET):]
 	open := "\x1b]8;id=2;https://example.com\x1b\\"
 	close := "\x1b]8;;\x1b\\"
 	first_open := strings.index(out, open)
@@ -425,7 +426,7 @@ test_encode_invalid_hyperlink_uri_without_osc8 :: proc(t: ^testing.T) {
 	scratch: [4096]byte
 	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
 	if !testing.expect(t, ok) { return }
-	testing.expect(t, strings.index(out, "\x1b]8;") < 0)
+	testing.expect(t, strings.index(out[len(FRAME_RESET):], "\x1b]8;") < 0)
 }
 
 @(test)
@@ -438,7 +439,7 @@ test_encode_wraps_the_frame_in_synchronized_output :: proc(t: ^testing.T) {
 	scratch: [4096]byte
 	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
 	if !testing.expect(t, ok) { return }
-	testing.expect(t, strings.has_prefix(out, "\x1b[?2026h"))
+	testing.expect(t, strings.has_prefix(out, FRAME_RESET + SYNC_BEGIN))
 	testing.expect(t, strings.has_suffix(out, "\x1b[?2026l"))
 	testing.expect_value(t, strings.count(out, "\x1b[?2026"), 2)
 }
@@ -463,7 +464,7 @@ test_encode_emits_the_cursor_shape :: proc(t: ^testing.T) {
 		scratch: [4096]byte
 		out, ok := _encode_frame(buffer, {}, {shape = shape}, scratch[:])
 		if !testing.expect(t, ok) { return }
-		want := strings.concatenate({"\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hx", expected[shape], "\x1b[?25l\x1b[m\x1b[?2026l"})
+		want := strings.concatenate({"\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hx", expected[shape], "\x1b[?25l\x1b[m\x1b[?2026l"})
 		defer delete(want)
 		testing.expect_value(t, out, want)
 	}
@@ -582,8 +583,70 @@ test_encode_diff_falls_back_to_the_full_frame :: proc(t: ^testing.T) {
 		rows    = 2,
 		cells   = cells,
 	}
-	full := "\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hab\x1b[?25l\x1b[m\x1b[?2026l"
+	full := "\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1Hab\x1b[?25l\x1b[m\x1b[?2026l"
 	scratch: [256]byte
 	testing.expect_value(t, _encode_diff(t, next, nil, {}, scratch[:]), full)
 	testing.expect_value(t, _encode_diff(t, next, &other, {}, scratch[:]), full)
+}
+
+@(test)
+test_encode_full_frame_erases_trailing_default_blanks :: proc(t: ^testing.T) {
+	// Row 0 ends in a run of default blanks after a styled cell: the run becomes one
+	// erase-to-end-of-line after a style reset. Row 1 is blank apart from a styled
+	// space, which is written because erasing it would depend on background color erase.
+	blank := Cell {
+		grapheme = " ",
+		width    = 1,
+	}
+	buffer := Frame_Buffer {
+		columns = 6,
+		rows    = 2,
+		cells   = []Cell {
+			{grapheme = "a", width = 1, style = {foreground = Color(RGB_Color{255, 0, 0})}},
+			blank,
+			blank,
+			blank,
+			blank,
+			blank,
+			blank,
+			blank,
+			blank,
+			blank,
+			blank,
+			{grapheme = " ", width = 1, style = {background = Color(RGB_Color{0, 0, 255})}},
+		},
+	}
+	profile := Target_Profile {
+		color_depth = .True_Color,
+	}
+	scratch: [4096]byte
+	out, ok := _encode_frame(buffer, profile, {}, scratch[:])
+	if !testing.expect(t, ok) { return }
+	expected :=
+		"\x18\x1b]8;;\x1b\\\x1b[?2026h\x1b[H\x1b[m\x1b[1;1H\x1b[m\x1b[38;2;255;0;0ma\x1b[m\x1b[K" +
+		"\x1b[2;1H     \x1b[m\x1b[48;2;0;0;255m \x1b[?25l\x1b[m\x1b[?2026l"
+	testing.expect_value(t, out, expected)
+}
+
+@(test)
+test_encode_full_frame_with_erased_last_row_leaves_the_cursor_in_the_corner :: proc(t: ^testing.T) {
+	// Erasing does not move the cursor, so the frame moves it to the cell that
+	// writing the last cell would have left it in.
+	cells: [6]Cell
+	for &cell in cells {
+		cell = {
+			grapheme = " ",
+			width    = 1,
+		}
+	}
+	cells[0].grapheme = "a"
+	buffer := Frame_Buffer {
+		columns = 6,
+		rows    = 1,
+		cells   = cells[:],
+	}
+	scratch: [4096]byte
+	out, ok := _encode_frame(buffer, {}, {}, scratch[:])
+	if !testing.expect(t, ok) { return }
+	testing.expect(t, strings.contains(out, "a\x1b[K\x1b[1;6H"), "the cursor must end in the bottom-right cell")
 }

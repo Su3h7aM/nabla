@@ -307,6 +307,9 @@ Runtime :: struct {
 	// catalog refresh have stopped, so no thread reads it while it changes. Nil means
 	// there is no frame loop to wake.
 	wake:                     Maybe(int),
+	// resize_wake is the eventfd the SIGWINCH handler signals. Only a resize ends a frame
+	// write early, so it is separate from wake. The frame loop's thread owns it.
+	resize_wake:              Maybe(int),
 	work:                     Work_Chan,
 	worker:                   ^thread.Thread,
 	// worker_done is signaled by the worker as its last action, which is what
@@ -538,8 +541,15 @@ tui_run :: proc(
 		return false
 	}
 	app.run.wake = wake
-	term.set_resize_wake(wake)
 	agent.signal_set_wake(wake)
+	resize_wake, resize_wake_error := input.wake_make()
+	if resize_wake_error != nil {
+		fmt.eprintln("nabla: cannot create the resize descriptor:", resize_wake_error)
+		app_abandoned = app_teardown(app)
+		return false
+	}
+	app.run.resize_wake = resize_wake
+	term.set_resize_wake(resize_wake)
 
 	if !apply_startup_selection(app, flag_provider, flag_model) {
 		fmt.eprintln("nabla:", setup_error_text(app))
@@ -577,11 +587,12 @@ tui_run :: proc(
 
 	read_failed := false
 	for !app.quit {
-		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, tui_wait_ms(app), wake)
+		_, read_err := input.read_events(&app.parser, app.tty, &app.raw, tui_wait_ms(app), {wake, resize_wake})
 		// The drain comes after the poll and before the loop reads any state a wake
 		// announces. A change published while this pass runs then leaves the descriptor
 		// readable, so the next poll returns at once instead of sleeping past it.
 		input.wake_drain(wake)
+		input.wake_drain(resize_wake)
 		if read_err != nil {
 			fmt.eprintln("nabla: input:", read_err)
 			read_failed = true
@@ -644,7 +655,7 @@ tui_run :: proc(
 			menu_rebuild_model(app)
 			app.menu.required = required
 		}
-		if sizable && (count > 0 || resized || recovered || generation_changed(app) || advance_spinner || catalog_updated) {
+		if sizable && (count > 0 || resized || recovered || app.frame_superseded || generation_changed(app) || advance_spinner || catalog_updated) {
 			present_frame(app, app.storage)
 		}
 
@@ -724,8 +735,12 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	}
 	// The worker and the catalog refresh are gone, so nothing signals the wake. The
 	// registrations clear first because a signal handler can still run on any thread.
-	if wake, armed := app.run.wake.?; armed {
+	if resize_wake, armed := app.run.resize_wake.?; armed {
 		term.set_resize_wake(-1)
+		input.wake_destroy(resize_wake)
+		app.run.resize_wake = nil
+	}
+	if wake, armed := app.run.wake.?; armed {
 		agent.signal_set_wake(-1)
 		input.wake_destroy(wake)
 		app.run.wake = nil

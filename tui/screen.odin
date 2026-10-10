@@ -69,7 +69,9 @@ screen_begin :: proc(screen: ^Screen, columns, rows: int) -> (buffer: ^term.Fram
 // full one; its error is returned unchanged. An allocator error is returned when
 // the scratch cannot grow (the snapshot stays valid, nothing was written) or
 // when the frame cannot be copied (the frame was written, the snapshot is
-// forgotten).
+// forgotten). A resize that stops the write returns term.General_Error.Superseded,
+// which is a failed present for this purpose: the snapshot is forgotten and the next
+// frame is a full one.
 @(require_results)
 screen_present :: proc(screen: ^Screen, session: ^term.Session, profile: term.Target_Profile, cursor: term.Cursor) -> term.Error {
 	previous, have_previous := screen.previous.?

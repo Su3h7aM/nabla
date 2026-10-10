@@ -62,8 +62,10 @@
 //   resize contract: the caller compares it with the previous value once per
 //   iteration, and a change invalidates width-dependent text measurements,
 //   supplies the new root extent to layout, and forces a complete redraw.
-//   set_resize_wake only wakes a caller blocked in poll on another
-//   descriptor; viewport remains authoritative.
+//   set_resize_wake wakes a caller blocked in poll on another descriptor and
+//   also ends a frame write that is waiting for the terminal: present then
+//   returns General_Error.Superseded, a normal result that asks for a full
+//   frame at the newest size. viewport remains authoritative.
 // - Viewport also carries the cell area's size in pixels (zero when the
 //   terminal does not report it), for scaling an image to a cell placement.
 //

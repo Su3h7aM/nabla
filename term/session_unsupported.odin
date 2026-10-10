@@ -31,7 +31,7 @@ _session_viewport :: proc(session: ^Session) -> (result: Viewport, err: Error) {
 }
 
 @(require_results)
-_session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
+_session_present :: proc(session: ^Session, bytes: []byte, supersedable := false) -> (committed: int, err: Error) {
 	return 0, General_Error.Unsupported
 }
 

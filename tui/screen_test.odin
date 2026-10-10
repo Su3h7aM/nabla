@@ -100,6 +100,7 @@ test_screen_failed_present_forgets_the_snapshot :: proc(t: ^testing.T) {
 	testing.expect_value(t, screen_present(&screen, &pipe.session, term.profile_default(), {}), nil)
 	full := screen_pipe_take(&pipe, storage[:])
 	testing.expect(t, strings.contains(full, ansi.CSI + ansi.CUP), "the next frame is a full one")
+	testing.expect(t, strings.has_prefix(full, term.FRAME_RESET), "a full frame first repairs what a cut write left open")
 }
 
 @(test)

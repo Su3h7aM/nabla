@@ -25,12 +25,12 @@ test_read_events_returns_when_wake_is_signalled :: proc(t: ^testing.T) {
 	// The tty stays silent and the timeout is infinite, so the call returns only
 	// because the wake was written.
 	wake_signal(wake)
-	count, err := read_events(&parser, reader, &events, -1, wake)
+	count, err := read_events(&parser, reader, &events, -1, {wake})
 	testing.expect(t, err == nil, "a wake is not an error")
 	testing.expect_value(t, count, 0)
 
 	wake_drain(wake)
 	wake_signal(wake)
-	count, err = read_events(&parser, reader, &events, -1, wake)
+	count, err = read_events(&parser, reader, &events, -1, {wake})
 	testing.expect(t, err == nil && count == 0, "a drained wake can be signalled again")
 }

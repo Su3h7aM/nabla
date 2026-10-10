@@ -34,6 +34,9 @@ import "core:unicode/utf8"
 // A hard write failure may occur after a prefix has reached the terminal;
 // terminal contents and cursor state are then unspecified. The caller
 // recovers with a later successful full frame or by closing the session.
+// A full frame begins with FRAME_RESET, so it also repairs a terminal left
+// inside an escape sequence, a hyperlink, or synchronized output by a write
+// that stopped early.
 // There is no transactional acceptance: bytes already consumed by the
 // terminal cannot be undone.
 
@@ -95,6 +98,14 @@ encode :: proc(
 // session when the scratch is too small; on success it writes the encoded
 // frame as one buffered sequence and returns the number of bytes committed
 // before any transport failure.
+//
+// When the terminal is resized while the write waits for the terminal to accept
+// more bytes, present stops, leaves the rest of the frame unwritten, and returns
+// .Superseded with the bytes committed so far. That is not a failure: a newer
+// size exists, and the caller renders it. The terminal is left as after any
+// partial frame, so the caller's next present must be a full frame (previous
+// nil). Only present is supersedable; clipboard, graphics, open, and close
+// always write to the end. See set_resize_wake.
 @(require_results)
 present :: proc(
 	session: ^Session,
@@ -116,7 +127,7 @@ present :: proc(
 	if err != nil || written == 0 {
 		return 0, required, err
 	}
-	committed_bytes, write_err := _session_present(session, output[:written])
+	committed_bytes, write_err := _session_present(session, output[:written], supersedable = true)
 	return committed_bytes, required, write_err
 }
 
@@ -258,6 +269,15 @@ _encoder_write_uint :: proc(encoder: ^_Encoder, value: u64) {
 SYNC_BEGIN :: ansi.CSI + "?2026h"
 SYNC_END :: ansi.CSI + "?2026l"
 
+// FRAME_RESET begins every full frame. CAN (0x18) aborts a control sequence or
+// string that an earlier, unfinished write left open (ECMA-48; xterm and the
+// VT500 parser model return to the ground state on it), and the OSC 8 close
+// ends a hyperlink left open. The SGR reset and the cursor origin follow in the
+// frame itself. Synchronized output needs no end here: the frame's own
+// SYNC_BEGIN keeps a still-open stale frame hidden, and its SYNC_END shows only
+// the new frame.
+FRAME_RESET :: "\x18" + ansi.OSC + ansi.HYPERLINK + ";;" + ansi.ST
+
 // _diff_base returns previous when it describes a grid the buffer can be
 // diffed against, and nil when the whole frame must be encoded.
 @(require_results)
@@ -290,6 +310,9 @@ _serialize :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, previous: ^Frame_Bu
 	// The frame overwrites the viewport without a preliminary clear (framework
 	// contract); the unconditional SGR reset prevents stale attributes from a
 	// previous frame.
+	if previous == nil {
+		_encoder_write_text(encoder, FRAME_RESET)
+	}
 	_encoder_write_text(encoder, SYNC_BEGIN)
 	if previous == nil {
 		_encoder_write_text(encoder, ansi.CSI + ansi.CUP)
@@ -329,13 +352,43 @@ _serialize_full :: proc(encoder: ^_Encoder, buffer: Frame_Buffer, pen: ^_Pen, pr
 		// the diff carries the previous row's last style into the next row —
 		// a default cell after a styled row end emits its own reset.
 		_encoder_write_cursor_position(encoder, {0, y})
-		for x in 0 ..< buffer.columns {
-			_encoder_write_cell(encoder, buffer, buffer.cells[y * buffer.columns + x], pen, profile.color_depth)
+		row := buffer.cells[y * buffer.columns:][:buffer.columns]
+		// A trailing run of default blanks is erased instead of written, but only
+		// when that is shorter. Erase uses the current background, so the pen is
+		// reset to the default style first and the result is the same with or
+		// without background color erase. A blank with another style is written,
+		// since erasing it would depend on the terminal's BCE.
+		written := len(row)
+		for written > 0 && _cell_default_blank(row[written - 1]) {
+			written -= 1
+		}
+		if len(row) - written <= len(ansi.CSI + ansi.EL) {
+			written = len(row)
+		}
+		for cell in row[:written] {
+			_encoder_write_cell(encoder, buffer, cell, pen, profile.color_depth)
+		}
+		if written < len(row) {
+			_encoder_pen_release(encoder, pen)
+			_encoder_style_diff(encoder, pen.style, {}, profile.color_depth)
+			pen.style = {}
+			_encoder_write_text(encoder, ansi.CSI + ansi.EL)
+			// EL leaves the cursor where the run began. The frame promises the cursor in
+			// the bottom-right cell, which is where writing the last cell leaves it.
+			if y == buffer.rows - 1 {
+				_encoder_write_cursor_position(encoder, {buffer.columns - 1, y})
+			}
 		}
 		// A hyperlink never spans the next row's cursor move; the same id reopens
 		// it there, which is what joins the pieces of a wrapped link.
 		_encoder_pen_release(encoder, pen)
 	}
+}
+
+// _cell_default_blank reports whether cell is a space with the default style and no link.
+@(require_results)
+_cell_default_blank :: proc(cell: Cell) -> bool {
+	return cell.grapheme == " " && cell.width == 1 && cell.style == (Style{}) && cell.link == 0
 }
 
 // _serialize_changes writes the cells of buffer that differ from previous. A

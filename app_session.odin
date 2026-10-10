@@ -136,6 +136,9 @@ App :: struct {
 	// viewport_reported latches the one warning a terminal that reports no size
 	// produces. The loop reads it on the front-end's thread only.
 	viewport_reported:          bool,
+	// frame_superseded is set when a resize cut the last frame short, so the loop owes a
+	// frame at the latest size even if the size ends up unchanged. The front-end's thread only.
+	frame_superseded:           bool,
 	spin_lap:                   time.Tick, // last working-frame advance
 	// menu is the open choice list, when menu_open. One component serves every
 	// command whose argument is picked from a list.

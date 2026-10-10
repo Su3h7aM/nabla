@@ -6,6 +6,7 @@ package term
 import "core:sys/linux"
 import "core:testing"
 import "core:thread"
+import "core:time"
 
 // The shared session write loop is the one piece of real I/O that can be
 // exercised without a tty: pipes reproduce EAGAIN backpressure and a broken
@@ -155,4 +156,93 @@ test_session_write_bytes_recovers_from_backpressure :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, nil)
 	testing.expect_value(t, committed, len(payload))
 	testing.expect_value(t, drain.total, filled + len(payload))
+}
+
+@(test)
+test_session_write_bytes_stops_when_the_wake_is_readable_while_blocked :: proc(t: ^testing.T) {
+	// A frame waiting on a terminal that no longer accepts bytes must give up
+	// when a resize arrives, and leave the wake unread for its owner.
+	descriptors: [2]linux.Fd
+	if linux.pipe2(&descriptors, {.NONBLOCK}) != .NONE {
+		testing.expect(t, false, "pipe must open")
+		return
+	}
+	defer linux.close(descriptors[0])
+	defer linux.close(descriptors[1])
+	wake, wake_errno := linux.eventfd(0, {.NONBLOCK})
+	if !testing.expect_value(t, wake_errno, linux.Errno.NONE) { return }
+	defer linux.close(wake)
+
+	chunk: [4096]byte
+	for {
+		if _, errno := linux.write(descriptors[1], chunk[:]); errno != .NONE {
+			break
+		}
+	}
+
+	resizer := thread.create(proc(worker: ^thread.Thread) {
+		time.sleep(20 * time.Millisecond)
+		one := u64(1)
+		_, _ = linux.write(cast(linux.Fd)worker.user_index, ([^]u8)(&one)[:size_of(one)])
+	})
+	resizer.user_index = int(wake)
+	thread.start(resizer)
+	defer thread.destroy(resizer)
+
+	payload: [64]byte
+	committed, err := _session_write_bytes(descriptors[1], payload[:], wake)
+	thread.join(resizer)
+	testing.expect_value(t, err, General_Error.Superseded)
+	testing.expect_value(t, committed, 0)
+
+	counter: u64
+	_, read_errno := linux.read(wake, ([^]u8)(&counter)[:size_of(counter)])
+	testing.expect_value(t, read_errno, linux.Errno.NONE)
+	testing.expect_value(t, counter, 1)
+}
+
+@(test)
+test_session_write_bytes_does_not_spin_on_a_broken_wake :: proc(t: ^testing.T) {
+	// A wake that only reports a hang-up is unusable: the blocked write must fail,
+	// not poll it again and again.
+	full: [2]linux.Fd
+	broken: [2]linux.Fd
+	if linux.pipe2(&full, {.NONBLOCK}) != .NONE || linux.pipe2(&broken, {.NONBLOCK}) != .NONE {
+		testing.expect(t, false, "pipes must open")
+		return
+	}
+	defer linux.close(full[0])
+	defer linux.close(full[1])
+	defer linux.close(broken[0])
+	chunk: [4096]byte
+	for {
+		if _, errno := linux.write(full[1], chunk[:]); errno != .NONE {
+			break
+		}
+	}
+	_ = linux.close(broken[1])
+
+	payload: [8]byte
+	committed, err := _session_write_bytes(full[1], payload[:], broken[0])
+	testing.expect_value(t, err, Platform_Error(.EBADF))
+	testing.expect_value(t, committed, 0)
+}
+
+@(test)
+test_session_poll_out_prefers_the_resize_over_a_writable_terminal :: proc(t: ^testing.T) {
+	writable: [2]linux.Fd
+	if linux.pipe2(&writable, {.NONBLOCK}) != .NONE {
+		testing.expect(t, false, "pipe must open")
+		return
+	}
+	defer linux.close(writable[0])
+	defer linux.close(writable[1])
+	wake, wake_errno := linux.eventfd(0, {.NONBLOCK})
+	if !testing.expect_value(t, wake_errno, linux.Errno.NONE) { return }
+	defer linux.close(wake)
+
+	testing.expect_value(t, _session_poll_out(writable[1], -1), nil)
+	one := u64(1)
+	_, _ = linux.write(wake, ([^]u8)(&one)[:size_of(one)])
+	testing.expect_value(t, _session_poll_out(writable[1], wake), General_Error.Superseded)
 }

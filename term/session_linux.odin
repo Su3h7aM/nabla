@@ -383,14 +383,19 @@ _session_close :: proc(session: ^Session) -> Error {
 	return nil
 }
 
-// _session_present writes bytes (a frame or a clipboard sequence) through the
-// shared write loop and reports the committed byte count.
+// _session_present writes bytes (a frame or another sequence) through the
+// shared write loop and reports the committed byte count. A supersedable write
+// stops with .Superseded when the resize wake becomes readable while it waits.
 @(require_results)
-_session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, err: Error) {
+_session_present :: proc(session: ^Session, bytes: []byte, supersedable := false) -> (committed: int, err: Error) {
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}
-	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes)
+	wake := linux.Fd(-1)
+	if supersedable {
+		wake = linux.Fd(sync.atomic_load(&sigwinch_wake))
+	}
+	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes, wake)
 }
 
 // _session_write_bytes writes all of bytes to fd, retrying EINTR, waiting
@@ -399,9 +404,12 @@ _session_present :: proc(session: ^Session, bytes: []byte) -> (committed: int, e
 // short write cannot leave a setup or teardown sequence half-applied.
 // Nonzero write failures preserve their Platform_Error cause; a write that
 // returns zero while bytes remain is the one narrow Partial_Write case
-// (no errno exists to preserve).
+// (no errno exists to preserve). A negative wake is never polled; a
+// nonnegative wake is polled beside fd while the write waits, and once it is
+// readable the write stops with .Superseded, leaving the rest of bytes unwritten.
+// The wake is not read, so its owner still sees it.
 @(require_results)
-_session_write_bytes :: proc(fd: linux.Fd, bytes: []byte) -> (committed: int, err: Error) {
+_session_write_bytes :: proc(fd: linux.Fd, bytes: []byte, wake := linux.Fd(-1)) -> (committed: int, err: Error) {
 	offset := 0
 	for offset < len(bytes) {
 		when #config(NABLA_TERM_TEST_HOOKS, false) {
@@ -420,9 +428,8 @@ _session_write_bytes :: proc(fd: linux.Fd, bytes: []byte) -> (committed: int, er
 			case .EINTR:
 				continue
 			case .EAGAIN:
-				wait_ok, poll_err := _session_poll_out(fd)
-				if !wait_ok {
-					return offset, poll_err
+				if wait_err := _session_poll_out(fd, wake); wait_err != nil {
+					return offset, wait_err
 				}
 				continue
 			case:
@@ -438,22 +445,35 @@ _session_write_bytes :: proc(fd: linux.Fd, bytes: []byte) -> (committed: int, er
 	return offset, nil
 }
 
-// _session_poll_out waits (blocking) until the descriptor is writable. A
-// poll failure preserves its Platform_Error cause; EINTR is retried. There
-// is no separate public poll-error channel: the write path surfaces this
-// cause directly.
+// _session_poll_out waits (blocking) until the write can make progress. It returns
+// .Superseded when a nonnegative wake is readable, even if fd is ready too. A wake
+// that reports only an error or hang-up is unusable and returns EBADF, so the write
+// cannot spin on it. Any state of fd (writable, error, hang-up) returns nil, and the
+// next write reports its own outcome. A poll failure preserves its Platform_Error
+// cause; EINTR is retried. There is no separate public poll-error channel: the
+// write path surfaces this cause directly.
 @(require_results)
-_session_poll_out :: proc(fd: linux.Fd) -> (ok: bool, err: Error) {
+_session_poll_out :: proc(fd, wake: linux.Fd) -> Error {
 	for {
-		poll_descriptors := [1]linux.Poll_Fd{{fd = fd, events = {.OUT}}}
+		poll_descriptors := [2]linux.Poll_Fd{{fd = fd, events = {.OUT}}, {fd = wake, events = {.IN}}}
+		// A negative fd is ignored by poll.
 		_, errno := linux.poll(poll_descriptors[:], -1)
 		if errno == .NONE {
-			return true, nil
+			if .IN in poll_descriptors[1].revents {
+				return General_Error.Superseded
+			}
+			if poll_descriptors[1].revents != {} {
+				return Platform_Error(.EBADF)
+			}
+			if poll_descriptors[0].revents != {} {
+				return nil
+			}
+			continue
 		}
 		if errno == .EINTR {
 			continue
 		}
-		return false, Platform_Error(errno)
+		return Platform_Error(errno)
 	}
 }
 
