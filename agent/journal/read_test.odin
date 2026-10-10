@@ -54,6 +54,46 @@ test_payload_allocation_failure_does_not_mark_corruption :: proc(test: ^testing.
 }
 
 @(test)
+test_read_records_filters_by_node_in_seq_order :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	journal := _open_journal(test, directory)
+	defer _close_journal(test, journal)
+
+	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
+	for node in Node_Id(1) ..= Node_Id(3) {
+		append_record(journal, Record{session = session, node = node, kind = .Tool_Proposed}, _Test_Payload{detail = "call"})
+		append_record(journal, Record{session = session, node = node, kind = .Tool_Admitted}, _Test_Payload{detail = "call"})
+		append_record(journal, Record{session = session, node = node, kind = .Tool_Completed}, _Test_Payload{detail = "call"})
+	}
+	_commit_ok(test, journal)
+
+	nodes := []Node_Id{3, 1}
+	records, last, error := read_records(journal, Filter{session = session, kinds = {.Tool_Proposed, .Tool_Completed}, nodes = nodes}, 0, 0, context.allocator)
+	_expect_ok(test, error)
+	defer records_destroy(records, context.allocator)
+	if !testing.expect_value(test, len(records), 4) { return }
+	testing.expect_value(test, last, records[3].seq)
+	expected := [?]struct {
+		node: Node_Id,
+		kind: Record_Kind,
+	}{{1, .Tool_Proposed}, {1, .Tool_Completed}, {3, .Tool_Proposed}, {3, .Tool_Completed}}
+	for record, index in records {
+		testing.expect_value(test, record.node, expected[index].node)
+		testing.expect_value(test, record.kind, expected[index].kind)
+		if index > 0 { testing.expect(test, record.seq > records[index - 1].seq, "records should be ordered by seq") }
+	}
+
+	latest, found, latest_error := read_latest(journal, Filter{session = session, nodes = nodes}, context.allocator)
+	_expect_ok(test, latest_error)
+	if !testing.expect(test, found) { return }
+	defer record_destroy(&latest, context.allocator)
+	testing.expect_value(test, latest.node, Node_Id(3))
+	testing.expect_value(test, latest.kind, Record_Kind.Tool_Completed)
+}
+
+@(test)
 test_read_records_filters_and_pages :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)

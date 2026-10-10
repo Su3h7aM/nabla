@@ -109,7 +109,7 @@ read_records :: proc(
 	query := Query{}
 	query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE seq > ?", i64(after)) or_return
 	query_filter(&query, &filter) or_return
-	query_add(&query, " ORDER BY seq ASC") or_return
+	query_order_by_seq(&query, &filter, "ASC") or_return
 	if page > 0 { query_add(&query, " LIMIT ?", i64(page)) or_return }
 
 	records, error = query_records(journal, strings.to_string(query.sql), query.arguments[:], allocator)
@@ -146,7 +146,8 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	query := Query{}
 	query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE 1 = 1") or_return
 	query_filter(&query, &filter) or_return
-	query_add(&query, " ORDER BY seq DESC LIMIT 1") or_return
+	query_order_by_seq(&query, &filter, "DESC") or_return
+	query_add(&query, " LIMIT 1") or_return
 
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
@@ -777,7 +778,7 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	if filter.call != 0 { query_add(query, " AND call = ?", i64(filter.call)) or_return }
 	if filter.subagent != {} { query_add(query, " AND subagent = ?", db.Value(filter.subagent[:])) or_return }
 	if filter.kinds != {} {
-		query_add(query, " AND kind IN (") or_return
+		query_add(query, " AND +kind IN (" if len(filter.nodes) > 0 else " AND kind IN (") or_return
 		separator := ""
 		for kind in filter.kinds {
 			query_add(query, separator) or_return
@@ -795,6 +796,17 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	}
 	if filter.parent_call != 0 { query_add(query, " AND parent_call = ?", i64(filter.parent_call)) or_return }
 	return nil
+}
+
+// query_order_by_seq orders by seq. A node filter is the most selective term, but the
+// session_seq and session_kind_seq indexes also satisfy the order, so the planner scans
+// the whole session through them. The unary plus on the ORDER BY term keeps the planner
+// from choosing a session index just because it yields seq order, which leaves
+// records_session_node and a small sort.
+@(private, require_results)
+query_order_by_seq :: proc(query: ^Query, filter: ^Filter, direction: string) -> mem.Allocator_Error {
+	query_add(query, " ORDER BY +seq " if len(filter.nodes) > 0 else " ORDER BY seq ") or_return
+	return query_add(query, direction)
 }
 
 // query_first runs a query that yields one row and returns it. The caller
