@@ -72,7 +72,7 @@ Tests live in the package they validate: `<source>_test.odin` beside the source,
 
 Use **mise** for everything: it installs Odin and runs the tasks `build`, `check`, `fmt`, and `test` (`mise run <task>`). Each task is a standalone Bash script under `scripts/` that also runs directly; read it before changing it.
 
-The tasks run the `odin` on `PATH`, which is the version mise installs. With `ODIN_ROOT` set they run `$ODIN_ROOT/odin` and that tree's `core`, `base`, and `vendor` instead, for example `ODIN_ROOT=/home/su3h7am/Projects/Odin mise run check` for the maintainer's fork. The fork has compiler checks the mise version lacks, so run `check` and `test` with it before committing a change that touches ownership or pointers.
+The tasks run the `odin` on `PATH`, which is the version mise installs. With `ODIN_ROOT` set they run `$ODIN_ROOT/odin` and that tree's `core`, `base`, and `vendor` instead, for example `ODIN_ROOT=/home/su3h7am/Projects/Odin mise run check` for the maintainer's fork. The mise version and the fork differ in places, and code must compile with both. The fork has compiler checks the mise version lacks, so run `check` and `test` with it before committing a change that touches ownership or pointers.
 
 Before committing a code change, run `mise run fmt`, `mise run check`, and the tests covering what you touched. `mise run test` is the full gate. Documentation-only changes need no run.
 
