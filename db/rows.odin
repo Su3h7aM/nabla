@@ -8,8 +8,8 @@ package db
 // closing anything. rows_close is for stopping early, and is safe on a set that
 // already ended or never opened.
 //
-// The zero value is a closed set. A live Rows must not be copied or moved: the
-// connection holds its address as the one execution currently running.
+// The zero value is a closed set. A live Rows must not be copied or moved: it
+// owns the one execution currently holding its connection.
 Rows :: struct {
 	connection:      ^Conn,
 	statement_state: rawptr,
@@ -35,7 +35,7 @@ rows_execute :: proc(rows: ^Rows, arguments: []Value, materialize: bool) -> Erro
 
 	rows.state = state
 	rows.materialize = materialize
-	connection.active = rows
+	connection.active = true
 	return nil
 }
 
@@ -67,7 +67,8 @@ rows_next :: proc(rows: ^Rows) -> (values: []Value, has_row: bool, err: Error) {
 				// the rows it is about to hold.
 				buffer, alloc_err := make([]Value, connection.driver.columns(rows.state), connection.allocator)
 				if alloc_err != nil {
-					connection.driver.execution_finish(rows.state)
+					// The allocation failure already ends this execution; cleanup cannot change its outcome.
+					_ = connection.driver.execution_finish(rows.state)
 					rows_release(rows)
 					return nil, false, error_make(.Out_Of_Memory, 0, "row buffer allocation failed")
 				}
@@ -108,7 +109,7 @@ rows_release :: proc(rows: ^Rows) {
 			connection.driver.finalize(rows.statement_state)
 		}
 		if rows.values != nil { delete(rows.values, connection.allocator) }
-		if connection.active == rows { connection.active = nil }
+		connection.active = false
 	}
 	rows^ = {}
 }

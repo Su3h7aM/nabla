@@ -67,7 +67,7 @@ prepare :: proc(connection: ^Conn, statement: ^Statement, sql: string) -> Error 
 @(require_results)
 statement_close :: proc(statement: ^Statement) -> Error {
 	if statement.state == nil { return nil }
-	if statement.connection.active != nil {
+	if statement.connection.active {
 		return error_make(.Invalid_State, 0, "a result set is still open on the connection")
 	}
 	statement.connection.driver.finalize(statement.state)

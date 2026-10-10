@@ -261,6 +261,42 @@ test_statement_query_borrows_the_statement :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_an_open_result_set_exclusively_holds_the_connection :: proc(t: ^testing.T) {
+	calls: Fake_Calls
+	connection: Conn
+	_fake_open(&connection, &calls)
+	defer _ = close(&connection)
+
+	statement: Statement
+	_expect_ok(t, prepare(&connection, &statement, "SELECT a, b"))
+	defer _ = statement_close(&statement)
+
+	rows, other: Rows
+	_expect_ok(t, statement_query(&statement, &rows))
+	defer _ = rows_close(&rows)
+	defer _ = rows_close(&other)
+
+	testing.expect_value(t, error_kind(query(&connection, &other, "SELECT a, b")), Error_Kind.Invalid_State)
+	_expect_ok(t, rows_close(&other))
+	testing.expect_value(t, error_kind(exec(&connection, "SELECT a, b")), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(statement_exec(&statement)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(statement_close(&statement)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(close(&connection)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(begin(&connection)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(commit(&connection)), Error_Kind.Invalid_State)
+	testing.expect_value(t, error_kind(rollback(&connection)), Error_Kind.Invalid_State)
+	testing.expect_value(t, calls.prepare, 1)
+	testing.expect_value(t, calls.execute, 1)
+
+	_expect_ok(t, rows_close(&rows))
+	_expect_ok(t, statement_query(&statement, &other))
+	_expect_ok(t, rows_close(&rows))
+	testing.expect_value(t, error_kind(statement_query(&statement, &rows)), Error_Kind.Invalid_State)
+	_expect_ok(t, rows_close(&other))
+	_expect_ok(t, statement_exec(&statement))
+}
+
+@(test)
 test_rows_next_stops_at_the_end :: proc(t: ^testing.T) {
 	calls: Fake_Calls
 	connection: Conn

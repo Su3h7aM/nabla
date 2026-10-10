@@ -17,9 +17,9 @@ Conn :: struct {
 	state:      rawptr,
 	allocator:  mem.Allocator,
 
-	// active is the result set currently holding the connection, if any. The
-	// connection runs nothing else until it is closed.
-	active:     ^Rows,
+	// active reports whether a result set holds the connection. The connection
+	// runs nothing else until the set ends or is closed.
+	active:     bool,
 
 	// statements is every prepared statement that has not been closed. close
 	// refuses to run while the list is non-empty, so a statement never
@@ -60,7 +60,7 @@ connection_idle :: proc(connection: ^Conn) -> Error {
 	if connection.state == nil {
 		return error_make(.Invalid_State, 0, "connection is closed")
 	}
-	if connection.active != nil {
+	if connection.active {
 		return error_make(.Invalid_State, 0, "a result set is still open")
 	}
 	return nil
@@ -74,7 +74,7 @@ connection_idle :: proc(connection: ^Conn) -> Error {
 @(require_results)
 close :: proc(connection: ^Conn) -> Error {
 	if connection.state == nil { return nil }
-	if connection.active != nil {
+	if connection.active {
 		return error_make(.Invalid_State, 0, "a result set is still open")
 	}
 	if connection.statements != nil {
