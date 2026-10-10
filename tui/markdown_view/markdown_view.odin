@@ -54,22 +54,25 @@ SPACES :: "                    "
 
 @(private)
 Declarer :: struct {
-	target:    Target,
-	theme:     Theme,
-	allocator: mem.Allocator,
+	target:      Target,
+	theme:       Theme,
+	hard_breaks: bool,
+	allocator:   mem.Allocator,
 }
 
 // declare adds the blocks of document to the open element of target. A document
-// without blocks adds nothing. The text, runs, and marker strings come from
+// without blocks adds nothing. With hard_breaks a soft line break is drawn as a line
+// break instead of a space, as cmark's CMARK_OPT_HARDBREAKS does. The text, runs, and marker strings come from
 // allocator and have no destroy: pass the temp allocator or an arena that lives
 // until the frame result is released. The only error is an allocation failure,
 // after which the frame holds a partial document.
 @(require_results)
-declare :: proc(target: Target, document: markdown.Document, theme: Theme, allocator := context.temp_allocator) -> mem.Allocator_Error {
+declare :: proc(target: Target, document: markdown.Document, theme: Theme, hard_breaks := false, allocator := context.temp_allocator) -> mem.Allocator_Error {
 	declarer := Declarer {
-		target    = target,
-		theme     = theme,
-		allocator = allocator,
+		target      = target,
+		theme       = theme,
+		hard_breaks = hard_breaks,
+		allocator   = allocator,
 	}
 	return declare_blocks(&declarer, document.blocks, false)
 }
@@ -163,8 +166,8 @@ declare_inline :: proc(declarer: ^Declarer, spans: []markdown.Span, base: term.S
 	}
 	defer delete(text_body.pieces)
 	for span, index in spans {
-		if span.text == "\n" {
-			text_body_add(declarer, &text_body, span.text, tui.Paint{style = base}) or_return
+		if span.text == "\n" || (declarer.hard_breaks && .Soft_Break in span.style) {
+			text_body_add(declarer, &text_body, "\n", tui.Paint{style = base}) or_return
 			continue
 		}
 		is_link := .Link in span.style

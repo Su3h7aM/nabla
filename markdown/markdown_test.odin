@@ -71,14 +71,17 @@ outline_spans :: proc(builder: ^strings.Builder, spans: []Span) {
 		.Strikethrough = 'x',
 		.Code          = 'c',
 		.Link          = 'l',
+		.Soft_Break    = 0,
 	}
 	for span in spans {
-		if span.style == {} {
+		// The soft break flag marks a space, which the outline shows as the space.
+		style := span.style - {.Soft_Break}
+		if style == {} {
 			strings.write_string(builder, span.text)
 			continue
 		}
 		strings.write_byte(builder, '{')
-		for flag in span.style {
+		for flag in style {
 			strings.write_byte(builder, FLAG_LETTERS[flag])
 		}
 		if .Link in span.style {
@@ -147,6 +150,11 @@ test_link_target_parsing_handles_unmatched_and_nested_parentheses :: proc(t: ^te
 @(test)
 test_line_breaks :: proc(t: ^testing.T) {
 	expect_outline(t, "soft\nbreak", "p soft break\n")
+	document, err := parse("soft\nbreak")
+	defer destroy(&document)
+	testing.expect_value(t, err, nil)
+	paragraph, is_paragraph := document.blocks[0].(Paragraph)
+	testing.expect(t, is_paragraph && len(paragraph.spans) == 3 && paragraph.spans[1].style == {.Soft_Break}, "a soft break is a span flagged Soft_Break")
 	expect_outline(t, "hard  \nbreak\\\nagain\\", "p hard\nbreak\nagain\\\n")
 	expect_outline(t, "*across\nlines*", "p {e:across}{e: }{e:lines}\n")
 }

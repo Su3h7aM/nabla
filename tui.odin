@@ -731,7 +731,7 @@ message_split :: proc(kind: Entry_Kind, raw: string) -> (heading, body: string) 
 }
 
 // declare_message_entry adds a user, assistant, or subagent message with its body as
-// Markdown. A user or subagent message is a band: its element paints the band's
+// Markdown that keeps its line breaks. A user or subagent message is a band: its element paints the band's
 // background, with one padding row above and below, and draw_bands stretches that
 // background across the terminal. A subagent message has its heading in bold above the
 // body. Text the cache cannot parse is drawn as it is.
@@ -788,16 +788,16 @@ markdown_theme :: proc(base: term.Style) -> markdown_view.Theme {
 	return theme
 }
 
-// declare_markdown_entry adds a message body rendered from Markdown over the style base.
-// Layout wraps it and sizes its tables. An allocation failure leaves the body partial for
-// this frame, and the next frame declares it again.
+// declare_markdown_entry adds a message body rendered from Markdown over the style base,
+// with soft line breaks drawn as line breaks. Layout wraps it and sizes its tables. An
+// allocation failure leaves the body partial for this frame, and the next frame declares it again.
 declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, document: markdown.Document, base: term.Style) {
 	target := markdown_view.Target {
 		ctx    = ctx,
 		paints = &storage.paints,
 		links  = &storage.links,
 	}
-	_ = markdown_view.declare(target, document, markdown_theme(base), context.temp_allocator)
+	_ = markdown_view.declare(target, document, markdown_theme(base), hard_breaks = true)
 }
 
 // storage_paint returns the id of value in the frame's paint table, or zero when the table cannot grow.

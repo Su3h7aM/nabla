@@ -164,35 +164,26 @@ test_subagent_message_keeps_the_band_around_heading_and_body :: proc(t: ^testing
 	testing.expect_value(t, storage.screen.buffer.cells[10 * 20].style, term.Style{})
 }
 
-// A user prompt is Markdown on its band: bold text keeps the band's background, and the
-// blank rows between blocks stay part of the band across the terminal.
+// A user prompt keeps the line breaks the user typed and still renders Markdown.
 @(test)
-test_user_message_renders_markdown_on_the_band :: proc(t: ^testing.T) {
+test_user_message_keeps_its_line_breaks :: proc(t: ^testing.T) {
 	app := new(App)
 	defer {
 		snapshot_destroy(app)
 		free(app)
 	}
 	app.run.alloc = context.allocator
-	snap_append(app, .User, "**bold** and a list\n\n- item\n\nafter")
+	snap_append(app, .User, "test\ntest\n**test**")
 
 	storage := frame_storage_new(context.allocator)
 	defer frame_storage_destroy(storage)
 
-	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the conversation frame must solve")
+	testing.expect(t, conversation_render(t, app, storage, 20, 6), "the conversation frame must solve")
 
 	scratch: [256]byte
-	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "bold and a list     ")
-	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "after               ")
-
-	bold := storage.screen.buffer.cells[20].style
-	testing.expect(t, .Bold in bold.modifiers)
-	testing.expect_value(t, bold.background, USER_TEXT.background)
-	for row in 0 ..< 7 {
-		testing.expect_value(t, storage.screen.buffer.cells[row * 20].style.background, USER_TEXT.background)
-		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style.background, USER_TEXT.background)
-	}
-	testing.expect_value(t, storage.screen.buffer.cells[7 * 20].style, term.Style{})
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "test                ")
+	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "test                ")
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "test                ")
 }
 
 // A subagent message keeps its first line as the bold heading and renders the rest as

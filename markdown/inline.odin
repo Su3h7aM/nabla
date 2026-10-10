@@ -95,7 +95,7 @@ parse_inlines :: proc(lines: []string, allocator: mem.Allocator) -> (spans: []Sp
 		if hard_break || backslash_break {
 			add_token(&parser, "\n") or_return
 		} else {
-			add_token(&parser, " ") or_return
+			add_token(&parser, " ", {.Soft_Break}) or_return
 		}
 	}
 

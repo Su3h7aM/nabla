@@ -78,7 +78,8 @@ Thematic_Break :: struct {}
 // flattened: `**a *b***` yields "a " as Strong and "b" as Strong and Emphasis.
 // A span inside a link carries the Link flag and the link destination in url.
 // The text of a span holds a line feed only for a hard line break, whose text
-// is exactly "\n"; a soft line break is a span holding one space.
+// is exactly "\n"; a soft line break is a span holding one space with the
+// Soft_Break flag, so a renderer may draw it as a space or as a line break.
 Span :: struct {
 	text:  string,
 	style: Style,
@@ -91,6 +92,7 @@ Style_Flag :: enum u8 {
 	Strikethrough,
 	Code,
 	Link,
+	Soft_Break,
 }
 
 Style :: bit_set[Style_Flag;u8]
