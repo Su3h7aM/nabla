@@ -219,7 +219,8 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 // wheel_scroll turns a vertical wheel report inside the transcript into a scroll. An expanded
 // box under the pointer takes it, becomes the target, and consumes the report even at its first
 // or last row, as the arrow keys do. Anywhere else the transcript scrolls, drops any active box,
-// and focus moves to the box nearest the middle of the view, if any.
+// and focus moves to the box nearest the middle of the view, if any. Scrolling down at the
+// bottom of the history does nothing.
 wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	delta: int
 	#partial switch mouse.button {
@@ -241,6 +242,7 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 			app.transcript.active_call = 0
 		}
 	}
+	if delta > 0 && transcript_at_bottom(app) { return }
 	transcript_scroll_by(app, delta)
 	transcript_reselect(app)
 }

@@ -924,6 +924,28 @@ test_a_collapsed_tool_box_never_captures_the_wheel :: proc(t: ^testing.T) {
 	}
 }
 
+// At the bottom of the history a downward wheel report is ignored and leaves the keyboard on the prompt;
+// scrolling up from there still moves the view and focuses the transcript.
+@(test)
+test_wheel_down_at_the_bottom_does_not_focus_the_transcript :: proc(t: ^testing.T) {
+	app := selection_app(t)
+	defer selection_app_destroy(app)
+	// Wheel scrolls only content that exceeds the viewport, which these small frames may not.
+	widgets.scroll_set_range(&app.conversation_scroll, 100)
+	scroll_back(app, 0)
+	row := conversation_row_with(app.storage, "alpha")
+	if !testing.expect(t, row >= 0, "the entry must be drawn") { return }
+	column := app.conversation_rect.x + 1
+
+	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Down, x = column, y = row})
+	testing.expect(t, !app.transcript.focused, "wheel down at the bottom must not focus the transcript")
+	testing.expect_value(t, scrolled_back(app), 0)
+
+	wheel_scroll(app, input.Mouse_Event{button = .Wheel_Up, x = column, y = row})
+	testing.expect(t, app.transcript.focused, "wheel up must focus the transcript")
+	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
+}
+
 // selection_report builds a mouse report for a screen cell.
 selection_report :: proc(button: input.Mouse_Button, column, row: int, motion := false, release := false) -> input.Mouse_Event {
 	return {button = button, x = column, y = row, motion = motion, release = release}

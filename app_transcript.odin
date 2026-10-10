@@ -903,3 +903,9 @@ transcript_activate :: proc(app: ^App) {
 	if call not_in transcript.expanded { box_toggle(app, call) }
 	if call in transcript.expanded { transcript.active_call = call }
 }
+
+// transcript_at_bottom reports whether the view shows the end of the whole history, not only of the loaded window.
+transcript_at_bottom :: proc(app: ^App) -> bool {
+	scroll := app.conversation_scroll
+	return app.transcript.end == len(app.transcript.path) && widgets.scroll_offset(scroll) >= scroll.range
+}
