@@ -24,12 +24,18 @@ Display_Status :: enum u8 {
 //
 // Measurement, truncation, and drawing all run this traversal, so a string that
 // measures N columns also draws as N columns.
+//
+// A printable ASCII byte followed by the end or another ASCII byte is a whole
+// one-cell cluster, so it skips the grapheme iterator. offset is the byte where
+// the next cluster starts; graphemes is resumed only while its continue_grapheme
+// flag says it holds a cluster that starts at offset.
 Display_Iterator :: struct {
 	graphemes: Grapheme_Iterator,
 	profile:   Width_Profile,
 	column:    int,
 	spaces:    int,
 	tab_end:   int,
+	offset:    int,
 }
 
 display_iterator_make :: proc(value: string, profile: Width_Profile = DEFAULT_WIDTH_PROFILE) -> Display_Iterator {
@@ -46,15 +52,33 @@ display_next :: proc(iterator: ^Display_Iterator) -> (cluster: Display_Cluster, 
 		return {text = " ", width = 1, end = iterator.tab_end}, .OK
 	}
 	for {
+		value := iterator.graphemes.str
+		start := iterator.offset
+		if start >= len(value) {
+			return {}, .Done
+		}
+		if byte := value[start]; 0x20 <= byte && byte <= 0x7E && (start + 1 == len(value) || value[start + 1] < utf8.RUNE_SELF) {
+			iterator.graphemes.continue_grapheme = false
+			iterator.offset = start + 1
+			iterator.column += 1
+			return {text = value[start:start + 1], width = 1, end = start + 1}, .OK
+		}
+		if !iterator.graphemes.continue_grapheme {
+			iterator.graphemes = {
+				str         = value,
+				curr_offset = start,
+			}
+		}
 		_, grapheme, ok := grapheme_iterate(&iterator.graphemes)
 		if !ok {
 			return {}, .Done
 		}
+		end := grapheme.byte_index + len(grapheme.text)
+		iterator.offset = end
 		if !utf8.valid_string(grapheme.text) {
 			return {}, .Invalid_Text
 		}
 		code_point, _ := utf8.decode_rune(grapheme.text)
-		end := grapheme.byte_index + len(grapheme.text)
 		switch {
 		case code_point == '\n' || code_point == '\r':
 			return {}, .Invalid_Text
