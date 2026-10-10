@@ -237,21 +237,47 @@ input_move_right :: proc(input: ^Input) -> bool {
 	return true
 }
 
-input_move_home :: proc(input: ^Input) -> bool {
-	if input.cursor == 0 {
+// input_move_home and input_move_end move the caret to the start and end of the row
+// drawn at width. The end of a wrapped row is its last grapheme, because the offset
+// after it is drawn at the start of the next row.
+input_move_home :: proc(input: ^Input, width: int, profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE) -> bool {
+	lines, lines_error := input_lines(input, width, profile)
+	if lines_error != nil {
 		return false
 	}
-	input.cursor = 0
-	input.last_edit = .None
-	return true
+	return _input_move_to(input, lines[input_cursor_row(input, lines[:])].start)
 }
 
-input_move_end :: proc(input: ^Input) -> bool {
-	end := len(input_text(input))
-	if input.cursor == end {
+input_move_end :: proc(input: ^Input, width: int, profile: text.Width_Profile = text.DEFAULT_WIDTH_PROFILE) -> bool {
+	lines, lines_error := input_lines(input, width, profile)
+	if lines_error != nil {
 		return false
 	}
-	input.cursor = end
+	value := input_text(input)
+	line := lines[input_cursor_row(input, lines[:])]
+	end := line.end
+	if end < len(value) && value[end] != '\n' {
+		end = text.prev_grapheme_offset(value, end)
+	}
+	return _input_move_to(input, end)
+}
+
+// input_move_text_start and input_move_text_end move the caret to the start and end
+// of the whole text.
+input_move_text_start :: proc(input: ^Input) -> bool {
+	return _input_move_to(input, 0)
+}
+
+input_move_text_end :: proc(input: ^Input) -> bool {
+	return _input_move_to(input, len(input.text))
+}
+
+@(private)
+_input_move_to :: proc(input: ^Input, offset: int) -> bool {
+	if input.cursor == offset {
+		return false
+	}
+	input.cursor = offset
 	input.last_edit = .None
 	return true
 }
@@ -285,9 +311,17 @@ input_key :: proc(input: ^Input, key: keys.Key_Event, width: int, profile: text.
 			_ = input_move_right(input)
 		}
 	case .Home:
-		_ = input_move_home(input)
+		if control {
+			_ = input_move_text_start(input)
+		} else {
+			_ = input_move_home(input, width, profile)
+		}
 	case .End:
-		_ = input_move_end(input)
+		if control {
+			_ = input_move_text_end(input)
+		} else {
+			_ = input_move_end(input, width, profile)
+		}
 	case .Up:
 		return bare && input_move_up(input, width, profile), nil
 	case .Down:
@@ -312,7 +346,7 @@ input_key :: proc(input: ^Input, key: keys.Key_Event, width: int, profile: text.
 		}
 		input_insert_newline(input) or_return
 	case .Character:
-		return _input_key_character(input, key)
+		return _input_key_character(input, key, width, profile)
 	case .Tab, .Escape, .Page_Up, .Page_Down, .Insert, .F1, .F2, .F3, .F4, .F5, .F6, .F7, .F8, .F9, .F10, .F11, .F12:
 		return false, nil
 	}
@@ -320,7 +354,7 @@ input_key :: proc(input: ^Input, key: keys.Key_Event, width: int, profile: text.
 }
 
 @(private)
-_input_key_character :: proc(input: ^Input, key: keys.Key_Event) -> (handled: bool, err: mem.Allocator_Error) {
+_input_key_character :: proc(input: ^Input, key: keys.Key_Event, width: int, profile: text.Width_Profile) -> (handled: bool, err: mem.Allocator_Error) {
 	control := .Control in key.modifiers
 	alt := .Alt in key.modifiers
 	shift := .Shift in key.modifiers
@@ -328,9 +362,9 @@ _input_key_character :: proc(input: ^Input, key: keys.Key_Event) -> (handled: bo
 	case control && !alt:
 		switch unicode.to_lower(key.character) {
 		case 'a':
-			_ = input_move_home(input)
+			_ = input_move_home(input, width, profile)
 		case 'e':
-			_ = input_move_end(input)
+			_ = input_move_end(input, width, profile)
 		case 'h':
 			_ = input_backspace(input) or_return
 		case 'w':

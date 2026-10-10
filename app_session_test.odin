@@ -3251,6 +3251,7 @@ test_keyboard_arrows_scroll_only_the_active_tool_box :: proc(t: ^testing.T) {
 	handle_event(&app, input.Key_Event{code = .Enter})
 	handle_event(&app, input.Key_Event{code = .Character, character = 'x'})
 	testing.expect(t, !app.transcript.focused && app.transcript.active_call == 0, "typing leaves transcript focus and deactivates the box")
+	widgets.input_clear(&app.input)
 	handle_event(&app, input.Key_Event{code = .Tab})
 	_ = app_keyboard_tool(t, &app, storage, 0)
 	handle_event(&app, input.Key_Event{code = .Enter})

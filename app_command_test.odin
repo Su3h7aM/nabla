@@ -110,6 +110,29 @@ test_tab_completes_a_unique_prefix :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_tab_indents_a_non_empty_prompt :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+
+	testing.expect(t, widgets.input_insert(&app.input, "note") == nil)
+	handle_key(&app, {code = .Tab})
+	testing.expect_value(t, widgets.input_text(&app.input), "note\t")
+	testing.expect(t, !app.transcript.focused, "Tab in text does not leave the prompt")
+
+	// A command prefix still completes instead of indenting.
+	widgets.input_clear(&app.input)
+	testing.expect(t, widgets.input_insert(&app.input, "/he") == nil)
+	handle_key(&app, {code = .Tab})
+	testing.expect_value(t, widgets.input_text(&app.input), "/help")
+
+	widgets.input_clear(&app.input)
+	handle_key(&app, {code = .Tab})
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+	testing.expect(t, app.transcript.focused, "Tab on an empty prompt focuses the transcript")
+}
+
+@(test)
 test_editing_starts_a_new_cycle :: proc(t: ^testing.T) {
 	app: App
 	command_app(t, &app)

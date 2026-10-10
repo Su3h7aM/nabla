@@ -87,11 +87,11 @@ test_input_edits_by_cluster :: proc(t: ^testing.T) {
 	testing.expect(t, input_backspace(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "x")
 
-	testing.expect(t, input_move_end(&input))
+	testing.expect(t, input_move_text_end(&input))
 	testing.expect(t, input_insert(&input, "a\nb\tc") == nil)
 	testing.expect_value(t, input_text(&input), "xa\nb\tc")
 
-	testing.expect(t, input_move_home(&input))
+	testing.expect(t, input_move_text_start(&input))
 	testing.expect(t, input_delete(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "a\nb\tc")
 }
@@ -153,7 +153,7 @@ test_input_moves_between_drawn_rows :: proc(t: ^testing.T) {
 	input_init(&wrapped)
 	defer input_destroy(&wrapped)
 	testing.expect(t, input_insert(&wrapped, "abcdefgh") == nil)
-	testing.expect(t, input_move_home(&wrapped))
+	testing.expect(t, input_move_text_start(&wrapped))
 	testing.expect(t, input_move_down(&wrapped, 3))
 	testing.expect_value(t, input_cursor(&wrapped), 3)
 	testing.expect(t, input_move_down(&wrapped, 3))
@@ -444,7 +444,7 @@ test_input_word_motion_and_deletion :: proc(t: ^testing.T) {
 	testing.expect(t, input_delete_word_back(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "foo .baz")
 	testing.expect_value(t, string(input.kill[:]), "bar")
-	testing.expect(t, input_move_home(&input))
+	testing.expect(t, input_move_text_start(&input))
 	testing.expect(t, !(input_delete_word_back(&input) or_else false))
 	testing.expect(t, !input_move_word_left(&input))
 }
@@ -460,7 +460,7 @@ test_input_kill_and_yank :: proc(t: ^testing.T) {
 	testing.expect(t, input_kill_to_start(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "one two\n")
 	testing.expect(t, !(input_kill_to_start(&input) or_else false))
-	testing.expect(t, input_move_home(&input))
+	testing.expect(t, input_move_text_start(&input))
 	testing.expect(t, input_move_word_right(&input))
 	testing.expect(t, input_kill_to_end(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "one\n")
@@ -523,7 +523,7 @@ test_input_undo_steps_split_at_motion_and_kills :: proc(t: ^testing.T) {
 	testing.expect(t, input_undo(&input) or_else false)
 	testing.expect_value(t, input_text(&input), "ab")
 
-	testing.expect(t, input_move_end(&input))
+	testing.expect(t, input_move_text_end(&input))
 	testing.expect(t, input_kill_to_start(&input) or_else false)
 	testing.expect(t, input_yank(&input) or_else false)
 	testing.expect(t, input_yank(&input) or_else false)
@@ -561,6 +561,34 @@ test_input_key_dispatches_bindings :: proc(t: ^testing.T) {
 	testing.expect(t, !(input_key(&input, {code = .Up}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "no row above the first")
 	testing.expect(t, input_key(&input, {code = .Down}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
 	testing.expect(t, !(input_key(&input, {code = .Down}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "no row below the last")
+}
+
+@(test)
+test_input_home_end_move_by_row :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	// Rows at width 3: "abc", "def", "g", then "xy" after the line break.
+	testing.expect(t, input_insert(&input, "abcdefg\nxy") == nil)
+	profile := text.DEFAULT_WIDTH_PROFILE
+	testing.expect(t, input_move_home(&input, 3))
+	testing.expect_value(t, input_cursor(&input), len("abcdefg\n"))
+	testing.expect(t, !input_move_home(&input, 3))
+	testing.expect(t, input_move_end(&input, 3))
+	testing.expect_value(t, input_cursor(&input), len("abcdefg\nxy"))
+
+	// A wrapped row ends on its last character, so the caret stays on that row.
+	testing.expect(t, input_move_up(&input, 3))
+	testing.expect(t, input_move_up(&input, 3))
+	testing.expect(t, input_key(&input, {code = .Home}, 3, profile) or_else false)
+	testing.expect_value(t, input_cursor(&input), len("abc"))
+	testing.expect(t, input_key(&input, {code = .End}, 3, profile) or_else false)
+	testing.expect_value(t, input_cursor(&input), len("abcde"))
+	testing.expect(t, input_key(&input, {code = .Home, modifiers = {.Control}}, 3, profile) or_else false)
+	testing.expect_value(t, input_cursor(&input), 0)
+	testing.expect(t, input_key(&input, {code = .End, modifiers = {.Control}}, 3, profile) or_else false)
+	testing.expect_value(t, input_cursor(&input), len("abcdefg\nxy"))
 }
 
 @(test)

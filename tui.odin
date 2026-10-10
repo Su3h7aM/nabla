@@ -19,9 +19,9 @@ import "nabla:tui"
 import "nabla:tui/markdown_view"
 import "nabla:tui/widgets"
 
-// The prompt shows at most five wrapped rows. Its border adds two more, then
+// The prompt shows at most ten wrapped rows. Its border adds two more, then
 // the working directory and status each use one row.
-INPUT_MAX_ROWS :: 5
+INPUT_MAX_ROWS :: 10
 
 // Styles use the terminal's default foreground/background and ANSI palette.
 // Indexed status colors follow the user's terminal theme instead of defining a
@@ -309,7 +309,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	}
 	clear(&storage.shown)
 
-	// The prompt grows with wrapped input until five content rows, then keeps the
+	// The prompt grows with wrapped input until ten content rows, then keeps the
 	// caret visible by scrolling those rows inside its border.
 	content := tui.Cell_Rect {
 		x      = 1,
@@ -1063,7 +1063,7 @@ input_visible_rows :: proc(input: ^widgets.Input, width: int) -> (rows: int, err
 }
 
 // draw_input draws a rounded prompt box and returns the caret. The box grows
-// through five content rows; after that the rows scroll around the caret, which
+// through ten content rows; after that the rows scroll around the caret, which
 // is the widget's own window (draw_input).
 @(require_results)
 draw_input :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) -> (cursor: term.Cursor, err: mem.Allocator_Error) {

@@ -572,7 +572,12 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 		scroll_page(app, up = false)
 		return
 	case .Tab:
-		if !complete_command(app) { transcript_focus(app) }
+		if complete_command(app) { return }
+		if widgets.input_text(&app.input) == "" {
+			transcript_focus(app)
+		} else if widgets.input_insert(&app.input, "\t") != nil {
+			snap_append(app, .Warning, "the prompt could not be edited")
+		}
 		return
 	case .Character:
 		if .Control in key.modifiers {
