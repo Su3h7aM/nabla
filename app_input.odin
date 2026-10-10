@@ -615,13 +615,23 @@ submit :: proc(app: ^App) {
 			return
 		}
 	} else {
+		// Slash commands read the raw text above; a prompt or steering line carries the pasted
+		// text its markers stand for.
+		expanded, expand_error := widgets.input_expanded(&app.input, app.run.alloc)
+		if expand_error != nil {
+			snap_append(app, .Warning, "the prompt could not be prepared; it is still in the prompt")
+			completion_reset(app)
+			return
+		}
+		defer delete(expanded, app.run.alloc)
+		line := strings.trim_space(expanded)
 		// A follower has no turn of its own to steer: its line goes to the runner as a
 		// prompt, and the runner delivers it at its next settled point.
 		if runtime_busy(app) && !runtime_following(app) {
 			// A steering line is not a command: commands keep their own path, which
 			// decides what can happen while a turn is running.
 			transcript_jump_bottom(app)
-			if !agent.steer_push(&app.run.steer, text) {
+			if !agent.steer_push(&app.run.steer, line) {
 				// The line could not be queued, and the prompt still holds it: the text stays
 				// where the user put it rather than being cleared into a warning.
 				snap_append(app, .Warning, "the steering line could not be queued; it is still in the prompt")
@@ -632,10 +642,10 @@ submit :: proc(app: ^App) {
 			// holds it, so the transcript never claims a line the session does not have.
 		} else {
 			transcript_jump_bottom(app)
-			enqueue(app, .Prompt, text)
+			enqueue(app, .Prompt, line)
 		}
 		// The line left the prompt, so it enters the history the arrow keys walk.
-		if !widgets.history_push(&app.history, text) {
+		if !widgets.history_push(&app.history, line) {
 			snap_append(app, .Warning, "the prompt could not be added to the history")
 		}
 	}
@@ -751,7 +761,7 @@ enqueue :: proc(app: ^App, kind: Work_Kind, text: string = "") {
 // paste_insert inserts a bracketed paste at the caret. The prompt applies its text rule, so
 // line breaks are kept and CR and CRLF read as the one break they mean.
 paste_insert :: proc(app: ^App, text_value: string) {
-	if widgets.input_insert(&app.input, text_value) != nil {
+	if widgets.input_paste(&app.input, text_value) != nil {
 		snap_append(app, .Warning, "the prompt could not hold the pasted text")
 	}
 }
@@ -777,8 +787,7 @@ history_recall :: proc(app: ^App, older: bool) {
 		entry, ok = widgets.history_next(&app.history)
 	}
 	if !ok { return }
-	widgets.input_clear(&app.input)
-	if widgets.input_insert(&app.input, entry) != nil {
+	if widgets.input_replace(&app.input, entry) != nil {
 		snap_append(app, .Warning, "the recalled prompt could not be shown")
 	}
 }

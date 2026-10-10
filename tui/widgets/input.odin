@@ -1,7 +1,9 @@
 package widgets
 
+import "core:fmt"
 import "core:mem"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
 import "core:unicode"
 import "core:unicode/utf8"
@@ -20,14 +22,26 @@ import "nabla:tui"
 // hold owned snapshots of the text taken before an edit that starts a new run:
 // a run is consecutive edits of one Input_Edit_Kind, and typing ends a run at
 // whitespace. Their allocator is the one input_init pinned.
+//
+// pastes holds the full text of each large paste input_paste collapsed into a
+// marker, in order: marker number N names pastes[N-1]. The Input owns the strings,
+// input_clear and input_destroy free them.
 Input :: struct {
 	text:      [dynamic]u8,
 	cursor:    int,
 	kill:      [dynamic]u8,
 	undo:      [dynamic]Input_Snapshot,
 	redo:      [dynamic]Input_Snapshot,
+	pastes:    [dynamic]string,
 	last_edit: Input_Edit_Kind,
 }
+
+// PASTE_COLLAPSE_LINES is the most lines a paste may have and still be inserted as
+// text; a paste with more becomes a marker.
+PASTE_COLLAPSE_LINES :: 5
+
+@(private)
+PASTE_MARKER_PREFIX :: "[Pasted text #"
 
 Input_Edit_Kind :: enum {
 	None,
@@ -58,6 +72,7 @@ input_init :: proc(input: ^Input, allocator := context.allocator) {
 	input.kill = make([dynamic]u8, 0, 0, allocator)
 	input.undo = make([dynamic]Input_Snapshot, 0, 0, allocator)
 	input.redo = make([dynamic]Input_Snapshot, 0, 0, allocator)
+	input.pastes = make([dynamic]string, 0, 0, allocator)
 }
 
 input_text :: proc(input: ^Input) -> string {
@@ -68,9 +83,24 @@ input_cursor :: proc(input: ^Input) -> int {
 	return input.cursor
 }
 
-// input_clear empties the text and forgets the undo and redo history; the kill
-// slot stays.
+// input_clear empties the text, forgets the undo and redo history and the collapsed
+// pastes; the kill slot stays.
 input_clear :: proc(input: ^Input) {
+	_input_pastes_clear(input)
+	_input_reset_text(input)
+}
+
+// input_replace replaces the whole text with value, which input_insert sanitizes,
+// and forgets the undo and redo history. The collapsed pastes stay, because the
+// text it replaces may be a draft that still holds their markers.
+@(require_results)
+input_replace :: proc(input: ^Input, value: string) -> mem.Allocator_Error {
+	_input_reset_text(input)
+	return input_insert(input, value)
+}
+
+@(private)
+_input_reset_text :: proc(input: ^Input) {
 	clear(&input.text)
 	input.cursor = 0
 	_input_snapshots_clear(&input.undo)
@@ -78,7 +108,17 @@ input_clear :: proc(input: ^Input) {
 	input.last_edit = .None
 }
 
+@(private)
+_input_pastes_clear :: proc(input: ^Input) {
+	for paste in input.pastes {
+		delete(paste, input.pastes.allocator)
+	}
+	clear(&input.pastes)
+}
+
 input_destroy :: proc(input: ^Input) {
+	_input_pastes_clear(input)
+	delete(input.pastes)
 	_input_snapshots_clear(&input.undo)
 	_input_snapshots_clear(&input.redo)
 	delete(input.undo)
@@ -134,13 +174,157 @@ input_insert_newline :: proc(input: ^Input) -> mem.Allocator_Error {
 	return input_insert(input, "\n")
 }
 
+// input_paste inserts a paste at the cursor. A paste of more than PASTE_COLLAPSE_LINES
+// lines is stored in the registry and a marker `[Pasted text #N +L lines]` is inserted
+// in its place, as one undo step. Pasting the same text again with the cursor right
+// after its marker replaces the marker with the text, also as one step. Any other paste
+// is inserted as input_insert does. It returns an allocation failure and leaves the
+// text unchanged.
+@(require_results)
+input_paste :: proc(input: ^Input, value: string) -> mem.Allocator_Error {
+	normalized: [dynamic]u8
+	normalized.allocator = context.temp_allocator
+	sanitizer: text.Sanitizer
+	text.sanitizer_write(&sanitizer, &normalized, value) or_return
+	text.sanitizer_flush(&sanitizer, &normalized) or_return
+	pasted := string(normalized[:])
+	lines := _paste_lines(pasted)
+	if lines <= PASTE_COLLAPSE_LINES {
+		return input_insert(input, pasted)
+	}
+
+	if start, number, ok := _input_marker_before(input, input.cursor); ok && input.pastes[number - 1] == pasted {
+		marker_end := input.cursor
+		_input_record(input, .Other) or_return
+		_input_insert(input, pasted) or_return
+		_input_remove(input, start, marker_end)
+		input.cursor -= marker_end - start
+		return nil
+	}
+
+	stored := strings.clone(pasted, input.pastes.allocator) or_return
+	if _, err := append(&input.pastes, stored); err != nil {
+		delete(stored, input.pastes.allocator)
+		return err
+	}
+	buffer: [64]u8
+	marker := _paste_marker(buffer[:], len(input.pastes), lines)
+	err := _input_record(input, .Other)
+	if err == nil {
+		err = _input_insert(input, marker)
+	}
+	if err != nil {
+		pop(&input.pastes)
+		delete(stored, input.pastes.allocator)
+	}
+	return err
+}
+
+// input_expanded returns the text with every paste marker whose number is in the
+// registry replaced by the pasted text. A marker that does not match its entry, such
+// as one edited by hand, stays as it is. The caller owns the result, allocated with
+// allocator.
+@(require_results)
+input_expanded :: proc(input: ^Input, allocator := context.allocator) -> (expanded: string, err: mem.Allocator_Error) {
+	buffer := make([dynamic]u8, 0, len(input.text), allocator) or_return
+	defer if err != nil {
+		delete(buffer)
+	}
+	rest := input_text(input)
+	for {
+		index := strings.index(rest, PASTE_MARKER_PREFIX)
+		if index < 0 {
+			break
+		}
+		length := _input_marker_length(rest[index:])
+		number, ok := _paste_marker_number(input, rest[index:index + length])
+		if !ok {
+			// Only the bracket is consumed, so a marker inside a stray prefix is still found.
+			length = 1
+		}
+		append(&buffer, rest[:index]) or_return
+		append(&buffer, input.pastes[number - 1] if ok else rest[index:index + length]) or_return
+		rest = rest[index + length:]
+	}
+	append(&buffer, rest) or_return
+	return string(buffer[:]), nil
+}
+
+@(private)
+_paste_lines :: proc(value: string) -> int {
+	return strings.count(value, "\n") + 1
+}
+
+@(private)
+_paste_marker :: proc(buffer: []u8, number, lines: int) -> string {
+	return fmt.bprintf(buffer, "%s%d +%d lines]", PASTE_MARKER_PREFIX, number, lines)
+}
+
+// _input_marker_length returns the length of the bracketed word at the start of
+// value, up to and including the first `]`, or the whole value when there is none.
+@(private)
+_input_marker_length :: proc(value: string) -> int {
+	if close := strings.index_byte(value, ']'); close >= 0 {
+		return close + 1
+	}
+	return len(value)
+}
+
+// _paste_marker_number returns the registry number candidate names when it is exactly
+// the marker input_paste writes for that entry.
+@(private)
+_paste_marker_number :: proc(input: ^Input, candidate: string) -> (number: int, ok: bool) {
+	if !strings.has_prefix(candidate, PASTE_MARKER_PREFIX) {
+		return 0, false
+	}
+	rest := candidate[len(PASTE_MARKER_PREFIX):]
+	digits := rest[:max(strings.index_byte(rest, ' '), 0)]
+	number, ok = strconv.parse_int(digits, 10)
+	if !ok || number < 1 || number > len(input.pastes) {
+		return 0, false
+	}
+	buffer: [64]u8
+	return number, candidate == _paste_marker(buffer[:], number, _paste_lines(input.pastes[number - 1]))
+}
+
+// _input_marker_before finds a marker that ends exactly at offset end.
+@(private)
+_input_marker_before :: proc(input: ^Input, end: int) -> (start, number: int, ok: bool) {
+	if end <= 0 || input.text[end - 1] != ']' {
+		return 0, 0, false
+	}
+	start = strings.last_index_byte(string(input.text[:end]), '[')
+	if start < 0 {
+		return 0, 0, false
+	}
+	number, ok = _paste_marker_number(input, string(input.text[start:end]))
+	return start, number, ok
+}
+
+// _input_marker_after finds a marker that starts exactly at offset start and returns
+// the offset after it.
+@(private)
+_input_marker_after :: proc(input: ^Input, start: int) -> (end: int, ok: bool) {
+	rest := string(input.text[start:])
+	if !strings.has_prefix(rest, PASTE_MARKER_PREFIX) {
+		return 0, false
+	}
+	end = start + _input_marker_length(rest)
+	_, ok = _paste_marker_number(input, string(input.text[start:end]))
+	return end, ok
+}
+
 // The edits below that return (changed, err) report changed false when there was
 // nothing to edit, and an allocation failure as err with the text unchanged.
+// input_backspace and input_delete remove a whole paste marker next to the caret.
 input_backspace :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error) {
 	if input.cursor <= 0 {
 		return false, nil
 	}
 	start := text.prev_grapheme_offset(input_text(input), input.cursor)
+	if marker_start, _, ok := _input_marker_before(input, input.cursor); ok {
+		start = marker_start
+	}
 	_input_record(input, .Delete_Back) or_return
 	_input_remove(input, start, input.cursor)
 	input.cursor = start
@@ -153,7 +337,8 @@ input_delete :: proc(input: ^Input) -> (changed: bool, err: mem.Allocator_Error)
 		return false, nil
 	}
 	_input_record(input, .Delete_Forward) or_return
-	_input_remove(input, input.cursor, text.next_grapheme_offset(value, input.cursor))
+	end, is_marker := _input_marker_after(input, input.cursor)
+	_input_remove(input, input.cursor, end if is_marker else text.next_grapheme_offset(value, input.cursor))
 	return true, nil
 }
 

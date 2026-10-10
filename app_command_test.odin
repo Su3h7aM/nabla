@@ -383,3 +383,29 @@ test_history_keeps_the_line_being_typed :: proc(t: ^testing.T) {
 		work_destroy(&app, work)
 	}
 }
+
+// A large paste shows as a marker in the prompt, and the line that is sent and kept in the
+// history carries the whole text.
+@(test)
+test_submit_sends_the_text_a_paste_marker_stands_for :: proc(t: ^testing.T) {
+	app: App
+	command_app(t, &app)
+	defer command_app_end(&app)
+	set_running(&app, false)
+
+	pasted := "one\ntwo\nthree\nfour\nfive\nsix"
+	paste_insert(&app, pasted)
+	testing.expect(t, strings.has_prefix(widgets.input_text(&app.input), "[Pasted text #1"))
+	testing.expect(t, widgets.input_insert(&app.input, " done") == nil)
+	submit(&app)
+
+	work, received := chan.try_recv(app.run.work)
+	if !testing.expect(t, received, "the prompt should reach the worker") { return }
+	testing.expect_value(t, work.kind, Work_Kind.Prompt)
+	testing.expect_value(t, work.text, "one\ntwo\nthree\nfour\nfive\nsix done")
+	work_destroy(&app, work)
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+	recalled, found := widgets.history_previous(&app.history, "")
+	testing.expect(t, found)
+	testing.expect_value(t, recalled, "one\ntwo\nthree\nfour\nfive\nsix done")
+}

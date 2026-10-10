@@ -644,3 +644,55 @@ test_input_draw_allocation_failure_leaves_the_frame_unchanged :: proc(t: ^testin
 	testing.expect_value(t, err, mem.Allocator_Error.Out_Of_Memory)
 	testing.expect_value(t, storage[0].grapheme, "x")
 }
+
+// A paste of more than PASTE_COLLAPSE_LINES lines becomes a marker; pasting the same text
+// right after it expands it in place, and a different text adds a second marker.
+@(test)
+test_input_paste_collapses_large_text_and_expands_on_repeat :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+
+	five := "1\n2\n3\n4\n5"
+	six := "1\n2\n3\n4\n5\n6"
+	testing.expect(t, input_paste(&input, five) == nil)
+	testing.expect_value(t, input_text(&input), five)
+	input_clear(&input)
+
+	testing.expect(t, input_paste(&input, six) == nil)
+	testing.expect_value(t, input_text(&input), "[Pasted text #1 +6 lines]")
+	testing.expect(t, input_insert(&input, " tail") == nil)
+	expanded, err := input_expanded(&input)
+	defer delete(expanded)
+	testing.expect(t, err == nil)
+	testing.expect_value(t, expanded, "1\n2\n3\n4\n5\n6 tail")
+
+	// A different text does not expand the marker before the caret.
+	input_clear(&input)
+	testing.expect(t, input_paste(&input, six) == nil)
+	testing.expect(t, input_paste(&input, "a\nb\nc\nd\ne\nf\ng") == nil)
+	testing.expect_value(t, input_text(&input), "[Pasted text #1 +6 lines][Pasted text #2 +7 lines]")
+
+	// The same text after its marker expands it, as one undo step.
+	input_clear(&input)
+	testing.expect(t, input_paste(&input, six) == nil)
+	testing.expect(t, input_paste(&input, six) == nil)
+	testing.expect_value(t, input_text(&input), six)
+	testing.expect_value(t, input_cursor(&input), len(six))
+	testing.expect(t, input_undo(&input) or_else false)
+	testing.expect_value(t, input_text(&input), "[Pasted text #1 +6 lines]")
+
+	// A marker edited by hand is literal text, and a whole marker is deleted at once.
+	input_clear(&input)
+	testing.expect(t, input_paste(&input, six) == nil)
+	testing.expect(t, input_move_left(&input))
+	testing.expect(t, input_delete(&input) or_else false)
+	edited, edited_err := input_expanded(&input)
+	defer delete(edited)
+	testing.expect(t, edited_err == nil)
+	testing.expect_value(t, edited, "[Pasted text #1 +6 lines")
+	input_clear(&input)
+	testing.expect(t, input_paste(&input, six) == nil)
+	testing.expect(t, input_backspace(&input) or_else false)
+	testing.expect_value(t, input_text(&input), "")
+}
