@@ -16,7 +16,7 @@ Job_Test_Hold :: struct {
 }
 
 job_test_hold_run :: proc(job: ^Job) {
-	hold := cast(^Job_Test_Hold)job
+	hold := container_of(job, Job_Test_Hold, "job")
 	_ = sync.sema_wait_with_timeout(&hold.release, COMPACT_HOLD_BOUND)
 }
 

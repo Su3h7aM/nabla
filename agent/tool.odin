@@ -10,6 +10,7 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:agent/skills"
 import "nabla:ai"
+import "nabla:mcp"
 
 // Tool_Control is the caller's interruption policy for one execution. A zero
 // value runs with no cancellation. interrupt is the execution's own stop token
@@ -135,6 +136,14 @@ Tool_Placement :: enum {
 	Lua,
 }
 
+// Tool_Lane is the serialization domain of a definition: calls in the same lane never run
+// at once. nil is the native lane shared by every native tool, an MCP tool's lane is its
+// client, and a blocking agent start holds the lane of its own job.
+Tool_Lane :: union {
+	^mcp.Client,
+	^Tool_Job,
+}
+
 // Tool_Definition is one tool the harness can run. The strings are owned by the
 // registry that holds the definition.
 Tool_Definition :: struct {
@@ -156,9 +165,7 @@ Tool_Definition :: struct {
 	// pointer but never frees it; the registering adapter owns the state. Only the
 	// paired execute procedure may cast it back.
 	backend:        rawptr,
-	// lane is the serialization domain: calls with the same lane never run at once.
-	// nil is the native lane; an MCP tool's lane is its client.
-	lane:           rawptr,
+	lane:           Tool_Lane,
 }
 
 // Tool_Registry owns the tools available to a session. It is built before the

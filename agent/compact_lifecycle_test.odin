@@ -1233,18 +1233,20 @@ test_a_failed_chain_waits_for_the_context_to_move :: proc(test: ^testing.T) {
 // would. A summary against a real provider is a transport that observes cancellation, so only
 // a hold like this can outlive its stop. A test allocates one on the process heap: the worker
 // reaches it after the test's frame may be gone, and the owner releases the thread handle,
-// never the test. The hold is the job: it embeds the compaction job as its first field.
+// never the test. The owner frees the compaction job, so it is the first field of the hold.
 Compact_Summary_Hold :: struct {
 	using compact: Compact_Job,
 	release:       sync.Sema,
 }
+
+#assert(offset_of(Compact_Summary_Hold, compact) == 0)
 
 // COMPACT_HOLD_BOUND is how long a hold ignores its stop. It outlasts anything a test waits, so a
 // test that abandons one never waits for the hold to give up by itself.
 COMPACT_HOLD_BOUND :: time.Minute
 
 compact_summary_hold_run :: proc(job: ^Job) {
-	hold := cast(^Compact_Summary_Hold)job
+	hold := container_of(container_of(job, Compact_Job, "job"), Compact_Summary_Hold, "compact")
 	_ = sync.sema_wait_with_timeout(&hold.release, COMPACT_HOLD_BOUND)
 }
 

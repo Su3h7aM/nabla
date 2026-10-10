@@ -17,9 +17,8 @@ Job_Phase :: enum u8 {
 }
 
 // Job is the part every worker kind shares: one thread, the fact that it finished, and what
-// the owner needs to stop waiting for it. A kind embeds it as the first field of its own
-// record, so a pointer to the record is a pointer to the Job and back, and keeps its own
-// inputs and results beside it.
+// the owner needs to stop waiting for it. A kind embeds it in its own record, recovers the
+// record with container_of, and keeps its own inputs and results beside it.
 //
 // The worker writes its results into its kind's record and then `published`, and nothing
 // after the wake. The owner reads those results only once `published` is set.
@@ -181,18 +180,18 @@ job_reclaim :: proc(chat: ^Chat_Session) {
 	for index := len(jobs) - 1; index >= 0; index -= 1 {
 		job := jobs[index]
 		if !job_published(job) { continue }
-		if job.kind == .Tool && (cast(^Tool_Job)job).tabled { continue }
-		if job.kind == .Provider_Attempt && cast(^Chat_Request_Worker)job == chat.chain.attempt { continue }
+		if job.kind == .Tool && container_of(job, Tool_Job, "worker").tabled { continue }
+		if job.kind == .Provider_Attempt && container_of(job, Chat_Request_Worker, "worker") == chat.chain.attempt { continue }
 		thread.destroy(job.thread)
 		job.thread = nil
 		chat_record_job_reclaimed(chat, job.record, job.kind)
 		switch job.kind {
 		case .Compaction:
-			chat_compact_job_destroy(cast(^Compact_Job)job)
+			chat_compact_job_destroy(container_of(job, Compact_Job, "job"))
 		case .Tool:
-			tool_job_release(cast(^Tool_Job)job)
+			tool_job_release(container_of(job, Tool_Job, "worker"))
 		case .Provider_Attempt:
-			chat_request_worker_reclaim(cast(^Chat_Request_Worker)job)
+			chat_request_worker_reclaim(container_of(job, Chat_Request_Worker, "worker"))
 		case .Subagent:
 			// Subagents keep their own list until they move onto Job, so none is listed here.
 			assert(false, "an abandoned job of a kind that has not moved onto Job")

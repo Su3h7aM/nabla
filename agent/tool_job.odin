@@ -104,8 +104,7 @@ Tool_Job_Effect :: enum {
 // Tool_Job is one admitted call.
 Tool_Job :: struct {
 	// worker is the shared worker lifecycle: the thread, its publication, and the stop
-	// patience. It is the first field, so a pointer to the call is a pointer to its Job. It
-	// is not embedded with using, because the call's own phase has the same name.
+	// patience. It is not embedded with using, because the call's own phase has the same name.
 	worker:         Job,
 	// identity, owned by the table and stable for the job's life
 	id:             u64,
@@ -117,7 +116,7 @@ Tool_Job :: struct {
 
 	// placement
 	placement:      Tool_Placement,
-	lane:           rawptr, // borrowed backend identity; nil is the shared native lane
+	lane:           Tool_Lane,
 	execute:        Tool_Execute,
 
 	// Lua execution data. A nested call is embedded in its child job so the call
@@ -634,7 +633,7 @@ tool_jobs_lane_abandoned :: proc(jobs: ^Tool_Jobs) -> ^Tool_Job {
 			if other.phase == .Abandoned && other.lane == job.lane { return job }
 		}
 		for other in jobs.chat.abandoned {
-			if other.kind == .Tool && (cast(^Tool_Job)other).lane == job.lane { return job }
+			if other.kind == .Tool && container_of(other, Tool_Job, "worker").lane == job.lane { return job }
 		}
 	}
 	return nil
@@ -1058,6 +1057,6 @@ tool_job_request_stop :: proc(job: ^Tool_Job) {
 // tool_job_run executes one call on the job's thread. job_main publishes after it returns.
 @(private)
 tool_job_run :: proc(worker: ^Job) {
-	job := cast(^Tool_Job)worker
+	job := container_of(worker, Tool_Job, "worker")
 	job.result = tool_job_execute(job)
 }

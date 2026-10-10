@@ -14,6 +14,7 @@ import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:ai"
+import "nabla:mcp"
 
 // The tool job suite. It holds the properties the batch's phases exist for: a call
 // runs off the owner's thread, a lane serializes what must not overlap, the worker
@@ -39,12 +40,14 @@ Tool_Job_Hold_State :: struct {
 	release: i32,
 }
 
-// Tool_Job_Hold_Lane is the borrowed backend identity a held definition is
-// registered with. Distinct addresses are distinct lanes; definitions sharing
-// one address run one at a time. The lane carries its test's state, so the
-// executor reaches per-test counters through tool_context.backend.
+// Tool_Job_Hold_Lane is the borrowed backend a held definition is registered with.
+// Its client's address is the lane: distinct addresses are distinct lanes, and
+// definitions sharing one run one at a time. The client is never used. The lane
+// carries its test's state, so the executor reaches per-test counters through
+// tool_context.backend.
 Tool_Job_Hold_Lane :: struct {
-	state: ^Tool_Job_Hold_State,
+	state:  ^Tool_Job_Hold_State,
+	client: mcp.Client,
 }
 
 tool_job_hold_lane :: proc(state: ^Tool_Job_Hold_State) -> Tool_Job_Hold_Lane {
@@ -99,7 +102,7 @@ tool_job_hold_definition :: proc(lane: ^Tool_Job_Hold_Lane, name: string, execut
 		placement = .Worker,
 		execute = execute,
 		backend = lane,
-		lane = lane,
+		lane = &lane.client,
 	}
 }
 

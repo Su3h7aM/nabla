@@ -382,7 +382,7 @@ chat_compact_event :: proc(user_data: rawptr, event: ai.Provider_Event) {
 // has published, and the owner records the compaction's lifecycle.
 @(private)
 chat_compact_run :: proc(shared: ^Job) {
-	job := cast(^Compact_Job)shared
+	job := container_of(shared, Compact_Job, "job")
 	job.started_at = time.tick_now()
 
 	connection := ai.Provider_Connection {

@@ -45,7 +45,7 @@ Chat_Request_Worker :: struct {
 // chat_request_worker_run is the job body. It stores the terminal and nothing more: job_main
 // publishes it.
 chat_request_worker_run :: proc(job: ^Job) {
-	chat_request_worker_attempt(cast(^Chat_Request_Worker)job)
+	chat_request_worker_attempt(container_of(job, Chat_Request_Worker, "worker"))
 }
 
 // chat_request_worker_free releases an attempt record whose worker has published, together

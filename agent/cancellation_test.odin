@@ -167,12 +167,14 @@ Chain_Attempt_Hold :: struct {
 	release: sync.Sema,
 }
 
+#assert(offset_of(Chain_Attempt_Hold, attempt) == 0)
+
 // CHAIN_HOLD_BOUND is how long a hold ignores its stop. It outlasts anything a test waits, so a
 // test that abandons one never waits for the hold to give up by itself.
 CHAIN_HOLD_BOUND :: time.Minute
 
 chain_attempt_hold_serve :: proc(job: ^Job) {
-	hold := cast(^Chain_Attempt_Hold)job
+	hold := container_of(container_of(job, Chat_Request_Worker, "worker"), Chain_Attempt_Hold, "attempt")
 	_ = sync.sema_wait_with_timeout(&hold.release, CHAIN_HOLD_BOUND)
 }
 
