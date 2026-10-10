@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
@@ -699,4 +700,54 @@ test_a_line_accepted_before_a_crash_goes_with_the_next_prompt_once :: proc(test:
 	testing.expect(test, line_at >= 0 && prompt_at > line_at, "the line is read before the prompt that delivered it")
 	delivered, _ = journal.last_delivered_message(next.store, next.session)
 	testing.expect_value(test, delivered, accepted_seq)
+}
+
+@(test)
+test_background_completions_are_delivered_once_as_job_input :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	outcomes := [?]journal.Tool_Outcome{.Success, .Cancelled, .Unknown, .Tool_Failed}
+	expected := [?]string{"finished", "stopped", "lost", "failed"}
+	body := "result text"
+	attachments, attachment_error := attachments_record(
+		chat.store,
+		{{Media = .PNG, Name = "shot.png", Data = []u8{0x89, 'P', 'N', 'G'}}},
+		context.temp_allocator,
+	)
+	if !testing.expect_value(test, attachment_error, nil) { return }
+	for outcome, index in outcomes {
+		journal.append_record(
+			chat.store,
+			journal.Record{session = chat.session, kind = .Background_Completed, call = journal.Call_Id(index + 42)},
+			journal.Background_Completed{outcome = journal.TOOL_OUTCOME_NAMES[outcome], tool = "shell", attachments = attachments},
+			transmute([]u8)body,
+		)
+	}
+	testing.expect(test, chat_commit(chat, "the completions could not be recorded"))
+	testing.expect(test, chat_inbox_reports_pending(chat), "a completion wakes an idle session")
+	testing.expect_value(test, chat_inbox_deliver(chat, {}), len(outcomes))
+	testing.expect_value(test, chat_inbox_deliver(chat, {}), 0)
+	testing.expect(test, !chat_inbox_reports_pending(chat))
+	arena: virtual.Arena
+	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
+	defer virtual.arena_destroy(&arena)
+	projection := _test_projection(test, chat, &arena)
+	if !testing.expect_value(test, len(projection.items), len(outcomes)) { return }
+	for item, index in projection.items {
+		user, is_user := item.payload.(Projected_User)
+		if !testing.expect(test, is_user) { return }
+		testing.expect_value(test, user.origin, journal.User_Origin.Job)
+		testing.expect_value(test, user.text, fmt.tprintf("job-%d (shell) %s\nresult text", index + 42, expected[index]))
+		if !testing.expect_value(test, len(user.attachments), 1) { return }
+		testing.expect_value(test, user.attachments[0].Name, "shot.png")
+		testing.expect_value(test, user.attachments[0].Media, ai.Provider_Media.PNG)
+		testing.expect_value(test, string(user.attachments[0].Data), "\x89PNG")
+	}
+	cursor, cursor_error := journal.last_delivered_message(chat.store, chat.session)
+	testing.expect_value(test, cursor_error, nil)
+	inbox, inbox_error := journal.read_inbox(chat.store, chat.session, cursor, context.temp_allocator)
+	testing.expect_value(test, inbox_error, nil)
+	testing.expect_value(test, len(inbox), 0)
 }

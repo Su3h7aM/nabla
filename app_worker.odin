@@ -1068,7 +1068,7 @@ user_entry_kind :: proc(origin: journal.User_Origin) -> (kind: Entry_Kind) {
 		kind = .User
 	case .Harness:
 		kind = .Notice
-	case .Agent:
+	case .Agent, .Job:
 		kind = .Subagent
 	}
 	return

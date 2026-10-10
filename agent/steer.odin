@@ -302,7 +302,17 @@ chat_inbox_stage :: proc(chat: ^Chat_Session, records: []journal.Record) -> []St
 	if staged_error != nil { return nil }
 	for record, index in records {
 		text, origin := inbox_text(record)
-		node := chat_node(chat, .User, journal.User{origin = journal.USER_ORIGIN_NAMES[origin], message = record.seq}, transmute([]u8)text)
+		user := journal.User {
+			origin  = journal.USER_ORIGIN_NAMES[origin],
+			message = record.seq,
+		}
+		if record.kind == .Background_Completed {
+			completed: journal.Background_Completed
+			if journal.payload_decode(record.data, &completed, context.temp_allocator) == nil {
+				user.attachments = completed.attachments
+			}
+		}
+		node := chat_node(chat, .User, user, transmute([]u8)text)
 		if node == 0 { return staged[:index] }
 		chat.delivered = record.seq
 		staged[index] = {
@@ -330,7 +340,7 @@ chat_inbox_deliver :: proc(chat: ^Chat_Session, observer: Chat_Observer) -> int 
 }
 
 // chat_inbox_reports_pending reports whether something is waiting that was committed after
-// this process claimed the session and starts a turn of its own: an agent's report or
+// this process claimed the session and starts a turn of its own: a background tool completion, an agent's report or
 // message, or a line another process sent (section 8.6 of the architecture). A line this
 // process accepted does not count, since its own prompt or turn already holds it, and
 // neither does anything older than the claim: that waits for the next prompt. The lines
@@ -359,7 +369,8 @@ user_input_origin :: proc(record: journal.Record) -> journal.User_Origin {
 }
 
 // inbox_text is the text a User node carries for one inbox record, and the origin the
-// node names. A report from or to another agent starts with a one-line heading naming
+// node names. A background tool completion starts with "job-<call> (<tool>) <state>"
+// and a newline, then its unmodified result body. A report from or to another agent starts with a one-line heading naming
 // the sender and the kind: "<name> answered", "<name> failed", "<name> stopped",
 // "<name> asks", or "orchestrator says". Everything after the first newline is the
 // body the front-end shows below the heading. The name is the one the start call gave
@@ -371,6 +382,20 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 	#partial switch record.kind {
 	case .User_Input:
 		return body, user_input_origin(record)
+	case .Background_Completed:
+		completed: journal.Background_Completed
+		_ = journal.payload_decode(record.data, &completed, context.temp_allocator)
+		state := "failed"
+		switch completed.outcome {
+		case journal.TOOL_OUTCOME_NAMES[.Success]:
+			state = "finished"
+		case journal.TOOL_OUTCOME_NAMES[.Cancelled]:
+			state = "stopped"
+		case journal.TOOL_OUTCOME_NAMES[.Unknown]:
+			state = "lost"
+		}
+		name := background_job_name(record.call, context.temp_allocator)
+		return fmt.tprintf("%s (%s) %s\n%s", name, completed.tool, state, body), .Job
 	case .Subagent_Completed:
 		completed: journal.Subagent_Completed
 		// A payload that cannot be read still reports that the child ended.

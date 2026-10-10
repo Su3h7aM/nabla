@@ -122,7 +122,7 @@ read_records :: proc(
 // read_inbox returns the records that address session with seq above after, oldest
 // first. Only committed records are visible, so a line whose commit was busy is delivered
 // after it lands, never twice. They are the user.input records of session, the subagent.completed records of
-// its background children (a blocking child's answer is already its call's result, and a
+// its background tool completions, its background children (a blocking child's answer is already its call's result, and a
 // call that reported no child started has nothing to report), the subagent.message
 // records its children sent it, and the subagent.message records its parent sent it when
 // it is a child. Whatever process committed them, the seq is the order, so a session
@@ -610,7 +610,7 @@ INBOX_QUERY ::
 	`SELECT ` +
 	RECORD_COLUMNS +
 	` FROM records AS inbound WHERE inbound.seq > ?2 AND (
-	(inbound.session = ?1 AND inbound.kind = 'user.input')
+	(inbound.session = ?1 AND inbound.kind IN ('user.input', 'background.completed'))
 	OR (inbound.session = ?1 AND inbound.kind = 'subagent.completed'
 		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started'
 			AND started.call IS inbound.call AND started.subagent IS inbound.subagent AND json_extract(started.data, '$.background') = 1)

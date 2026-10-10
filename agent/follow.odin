@@ -158,9 +158,9 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 		// any other delivery is that report's first display.
 		if user.message != 0 && follow_delivered_input(store, user.message) { return nil }
 		origin, _ := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
-		// A delivered agent report shows as user text with its origin, so the
+		// A delivered agent or job report shows as user text with its origin, so the
 		// front-end renders it as a subagent entry rather than a notice.
-		if origin == .Prompt || origin == .Agent {
+		if origin == .Prompt || origin == .Agent || origin == .Job {
 			_observer_user_text(observer, body, origin)
 		} else {
 			_observer_message(observer, .Notice, body)

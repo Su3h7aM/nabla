@@ -119,6 +119,16 @@ test_a_follower_shows_a_delivered_agent_report_as_user_text :: proc(test: ^testi
 	if !testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the poll failed") { return }
 	if !testing.expect_value(test, len(log.events), 1) { return }
 	testing.expect_value(test, log.events[0], "user:agent-1 answered\nforty-two:agent")
+	_ = journal.append_node(
+		store,
+		{session = session, branch = journal.INITIAL_BRANCH, kind = .User, turn = 1},
+		journal.User{origin = journal.USER_ORIGIN_NAMES[.Job]},
+		follow_body("job-42 (shell) finished\nresult"),
+	)
+	follow_commit(test, store)
+	if !testing.expect(test, follow_poll(follower, session, &follow, observer) == nil, "the job poll failed") { return }
+	if !testing.expect_value(test, len(log.events), 2) { return }
+	testing.expect_value(test, log.events[1], "user:job-42 (shell) finished\nresult:job")
 }
 // A follower shows a line another agent sent exactly once: the `user.input`
 // record shows it, and the User node that delivers it is a repeat of the line,

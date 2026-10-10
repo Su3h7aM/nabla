@@ -45,6 +45,7 @@ Recovery_Rule :: enum {
 	// Subagent_Unstarted is a native child that never created its session, because it was
 	// still queued or its process ended before its first commit.
 	Subagent_Unstarted,
+	Background_Call,
 }
 
 @(private, require_results)
@@ -72,6 +73,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 		header.call = Call_Id(row_int(&row))
 		header.parent_call = Call_Id(row_int(&row))
 		header.subagent = Session_Id(row_id(&row))
+		data := row_view(&row)
 		if row.error != nil || rule > max(Recovery_Rule) { return corrupt(journal, Journal_Error.Corrupt, journal.claimed, 0) }
 
 		unknown := Call_Completed {
@@ -99,6 +101,18 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 		case .Admitted_Call:
 			header.kind = .Tool_Completed
 			append_record(journal, header, unknown)
+			recovery.calls += 1
+		case .Background_Call:
+			admitted: Tool_Admitted
+			payload_decode(data, &admitted, context.temp_allocator, journal, journal.claimed) or_return
+			header.kind = .Background_Completed
+			body := fmt.tprintf("error unknown: %s\n", recover_kept_detail("it may have taken effect", kept_directory, header.call))
+			append_record(
+				journal,
+				header,
+				Background_Completed{outcome = TOOL_OUTCOME_NAMES[.Unknown], detail = "it may have taken effect", tool = admitted.tool},
+				transmute([]u8)body,
+			)
 			recovery.calls += 1
 		case .Lua:
 			header.kind = .Lua_Completed
@@ -184,7 +198,7 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 // Each rule finds work whose closing record is missing, so a second recovery
 // finds nothing.
 @(private)
-RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call, parent_call, subagent FROM (
+RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call, parent_call, subagent, data FROM (
 	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = 'turn.started'
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND turn = open.turn AND kind = 'turn.completed')
 	UNION ALL
@@ -196,6 +210,7 @@ RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call,
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind IN ('tool.admitted', 'tool.completed'))
 	UNION ALL
 	SELECT 3, * FROM records AS open WHERE session = ?1 AND kind = 'tool.admitted'
+		AND COALESCE(json_extract(open.data, '$.background'), 0) = 0
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = 'tool.completed')
 	UNION ALL
 	SELECT CASE kind WHEN 'lua.started' THEN 4 WHEN 'task.started' THEN 5
@@ -204,6 +219,10 @@ RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call,
 		FROM records AS open WHERE session = ?1 AND kind IN ('lua.started', 'task.started', 'subagent.started')
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call
 			AND kind IN ('lua.completed', 'task.completed', 'subagent.completed'))
+	UNION ALL
+	SELECT 8, * FROM records AS open WHERE session = ?1 AND kind = 'tool.admitted'
+		AND json_extract(open.data, '$.background') = 1
+		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = 'background.completed')
 ) ORDER BY seq`
 
 @(private)

@@ -559,7 +559,10 @@ rating.recorded rating.cleared assessment.recorded
 runtime.message job.abandoned job.reclaimed
 selection.changed selection.fit selection.applied
 subagent.message
+background.completed
 ```
+
+`tool.admitted` carries `background: true` for a detached call, false otherwise.
 
 Every record fills the correlation columns that exist at that point: session, branch, node, turn, request, attempt, job, call, parent call, task, subagent, hook, provider, model. A record states one fact at the boundary that observed it, once. Summaries are computed by readers.
 
@@ -589,7 +592,8 @@ On claiming a session, in one transaction:
 | `turn.started` without `turn.completed` | `turn.completed{Interrupted}` |
 | `request.sent` without terminal | `request.interrupted`; never resent |
 | `tool.proposed` (committed response) without `tool.admitted` | `tool.completed{Not_Executed}` |
-| `tool.admitted` without `tool.completed` | `tool.completed{Unknown, "it may have taken effect"}` (roots and Lua children) |
+| `tool.admitted{background: false}` without `tool.completed` | `tool.completed{Unknown, "it may have taken effect"}` (roots and Lua children) |
+| `tool.admitted{background: true}` without `background.completed` | `background.completed{Unknown, "it may have taken effect"}` with the tool name and kept stream files in the body |
 | `lua.started`, `task.started`, `subagent.started` without completion | `*.completed{Unknown}`; scripts are never resumed. A native child whose session row was never created gets `subagent.completed{Not_Executed}`, since it never ran |
 | `Assistant` node with calls and no `Results` node | `Results` node built from committed and recovered results |
 | compaction output without `checkpoint.installed` | nothing; audit data only |

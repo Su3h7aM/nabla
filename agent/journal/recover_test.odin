@@ -2,6 +2,9 @@
 #+private file
 package journal
 
+import "core:fmt"
+import "core:os"
+import "core:strings"
 import "core:testing"
 
 import "nabla:db"
@@ -204,6 +207,7 @@ test_recovery_that_fails_after_staging_writes_nothing :: proc(test: ^testing.T) 
 	writer := _open_journal(test, directory)
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
 	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+	append_record(writer, Record{session = session, call = 42, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell", background = true})
 	_commit_ok(test, writer)
 	_expect_ok(test, close(writer))
 
@@ -211,7 +215,7 @@ test_recovery_that_fails_after_staging_writes_nothing :: proc(test: ^testing.T) 
 	_, claim_error := claim(journal, session)
 	_expect_ok(test, claim_error)
 
-	// The open turn is staged first; the query for unanswered calls then fails
+	// The open turn and background completion are staged first; the query for unanswered calls then fails
 	// because its table is gone.
 	_expect_db_ok(test, db.exec(&journal.connection, "DROP TABLE nodes"))
 	_, recover_error := recover(journal)
@@ -224,7 +228,11 @@ test_recovery_that_fails_after_staging_writes_nothing :: proc(test: ^testing.T) 
 	records := _records_of_session(test, reader, session)
 	defer records_destroy(records, context.allocator)
 	for record in records {
-		testing.expect(test, record.kind != .Turn_Completed && record.kind != .Session_Recovered, "recovery wrote nothing")
+		testing.expect(
+			test,
+			record.kind != .Turn_Completed && record.kind != .Background_Completed && record.kind != .Session_Recovered,
+			"recovery wrote nothing",
+		)
 	}
 }
 
@@ -299,4 +307,58 @@ test_recovery_settles_delegations_by_whether_the_child_started :: proc(test: ^te
 	_expect_ok(test, again_error)
 	testing.expect_value(test, again, Recovery{})
 	_close_journal(test, child_writer)
+}
+
+@(test)
+test_recovery_settles_open_background_calls_once :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+	stdout_path := fmt.tprintf("%s/42%s", directory, KEPT_STDOUT_SUFFIX)
+	stderr_path := fmt.tprintf("%s/42%s", directory, KEPT_STDERR_SUFFIX)
+	if os.write_entire_file(stdout_path, "partial output") != nil || os.write_entire_file(stderr_path, "partial error") != nil {
+		testing.fail_now(test, "the kept streams could not be written")
+	}
+	writer := _open_journal(test, directory)
+	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
+	for call in ([]Call_Id{42, 43, 44}) {
+		append_record(writer, Record{session = session, call = call, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell", background = true})
+	}
+	append_record(writer, Record{session = session, call = 43, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
+	append_record(
+		writer,
+		Record{session = session, call = 44, kind = .Background_Completed},
+		Background_Completed{tool = "shell", outcome = TOOL_OUTCOME_NAMES[.Success]},
+	)
+	_commit_ok(test, writer)
+	_expect_ok(test, close(writer))
+	store := _open_journal(test, directory)
+	defer _close_journal(test, store)
+	_, claim_error := claim(store, session)
+	_expect_ok(test, claim_error)
+	recovery, recover_error := recover(store, directory)
+	_expect_ok(test, recover_error)
+	testing.expect_value(test, recovery.calls, 2)
+	inbox, inbox_error := read_inbox(store, session, 0, context.allocator)
+	_expect_ok(test, inbox_error)
+	defer records_destroy(inbox, context.allocator)
+	if !testing.expect_value(test, len(inbox), 3) { return }
+	for record in inbox {
+		payload: Background_Completed
+		_decode_payload(test, record.data, &payload)
+		testing.expect_value(test, payload.tool, "shell")
+		if record.call == 44 {
+			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Success])
+			continue
+		}
+		testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Unknown])
+		testing.expect_value(test, payload.detail, "it may have taken effect")
+		testing.expect(test, strings.has_prefix(string(record.body), "error unknown: it may have taken effect"))
+		if record.call == 42 {
+			testing.expect(test, strings.contains(string(record.body), fmt.tprintf("%s (14 bytes)", stdout_path)))
+			testing.expect(test, strings.contains(string(record.body), fmt.tprintf("%s (13 bytes)", stderr_path)))
+		}
+	}
+	again, again_error := recover(store, directory)
+	_expect_ok(test, again_error)
+	testing.expect_value(test, again, Recovery{})
 }

@@ -459,6 +459,12 @@ subagent_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string
 	return fmt.aprintf("agent-%d", call, allocator = allocator)
 }
 
+// background_job_name returns the stable call-based id of a background tool, allocated with allocator.
+@(require_results)
+background_job_name :: proc(call: journal.Call_Id, allocator: mem.Allocator) -> string {
+	return fmt.aprintf("job-%d", call, allocator = allocator)
+}
+
 // Subagent_Resume says which finished child a start continues. name is its id, which is also
 // what tells a start from a continuation, and the instruction it was defined with goes in the
 // start's args. provider_id, model_id, and effort are its newest selection, which a

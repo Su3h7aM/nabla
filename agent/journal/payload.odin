@@ -95,6 +95,7 @@ User_Origin :: enum u8 {
 	Steering,
 	Harness,
 	Agent,
+	Job,
 }
 
 USER_ORIGIN_NAMES := [User_Origin]string {
@@ -102,6 +103,7 @@ USER_ORIGIN_NAMES := [User_Origin]string {
 	.Steering = "steering",
 	.Harness  = "harness",
 	.Agent    = "agent",
+	.Job      = "job",
 }
 
 Request_Purpose :: enum u8 {
@@ -138,6 +140,15 @@ Completion :: struct {
 	version:     int,
 	outcome:     string,
 	detail:      string,
+	attachments: []Attachment `json:"attachments,omitempty"`,
+}
+
+// Background_Completed carries the rendered tool result in the body; call names the background call.
+Background_Completed :: struct {
+	version:     int,
+	outcome:     string, // TOOL_OUTCOME_NAMES
+	detail:      string,
+	tool:        string,
 	attachments: []Attachment `json:"attachments,omitempty"`,
 }
 
@@ -459,9 +470,10 @@ Tool_Proposed :: struct {
 
 // Tool_Admitted carries the arguments the tool runs with in the body.
 Tool_Admitted :: struct {
-	version: int,
-	tool:    string,
-	repairs: []string,
+	version:    int,
+	tool:       string,
+	repairs:    []string,
+	background: bool,
 }
 
 // Tool_Started is the owner's dispatch of an admitted call, immediately before its
@@ -542,7 +554,7 @@ Job_Reclaimed :: struct {
 User :: struct {
 	version:     int,
 	origin:      string, // USER_ORIGIN_NAMES
-	// message is the seq of the user.input, subagent.completed, or subagent.message
+	// message is the seq of the user.input, background.completed, subagent.completed, or subagent.message
 	// record this node delivers, 0 for none. The highest one is where the session's
 	// reading of its inbox resumes.
 	message:     Journal_Seq,

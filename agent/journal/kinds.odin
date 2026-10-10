@@ -59,6 +59,7 @@ Record_Kind :: enum u8 {
 	Subagent_Message,
 	Selection_Fit,
 	Selection_Applied,
+	Background_Completed,
 }
 
 RECORD_KIND_NAMES := [Record_Kind]string {
@@ -117,6 +118,7 @@ RECORD_KIND_NAMES := [Record_Kind]string {
 	.Subagent_Message       = "subagent.message",
 	.Selection_Fit          = "selection.fit",
 	.Selection_Applied      = "selection.applied",
+	.Background_Completed   = "background.completed",
 }
 
 // Node_Kind is the closed set of committed conversational steps, stored in the
