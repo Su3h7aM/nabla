@@ -43,22 +43,22 @@ LABEL_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
 // A user message is a band across the terminal. Its background is the terminal's
-// black with light text, the darkest color a theme offers, so the text keeps its
-// contrast however the theme is set.
+// brightest color with dark text, so the text keeps its contrast however the theme is set.
 USER_TEXT :: term.Style {
-	background = term.Indexed_Color(0),
+	background = term.Indexed_Color(15),
+	foreground = term.Indexed_Color(0),
 }
 // A subagent message is a band like a user message. Its background is the
-// terminal's gray with dark text, so the two read apart.
+// terminal's darkest color with light text, so the two read apart.
 SUBAGENT_TEXT :: term.Style {
-	background = term.Indexed_Color(7),
-	foreground = term.Indexed_Color(0),
+	background = term.Indexed_Color(0),
+	foreground = term.Indexed_Color(15),
 }
 // The heading of a subagent message names who sent it and why. Bold sets it
-// apart from the body; the gray background and dark text match the band behind it.
+// apart from the body; the background and light text match the band behind it.
 SUBAGENT_LABEL :: term.Style {
-	background = term.Indexed_Color(7),
-	foreground = term.Indexed_Color(0),
+	background = term.Indexed_Color(0),
+	foreground = term.Indexed_Color(15),
 	modifiers  = {.Bold},
 }
 AGENT_TEXT :: term.Style{}
@@ -736,7 +736,7 @@ MARKDOWN_LINK_SCHEMES := [?]string{"http", "https", "mailto"}
 markdown_theme :: proc(base: term.Style) -> markdown_view.Theme {
 	theme := markdown_view.Theme {
 		base = base,
-		code = {foreground = term.Indexed_Color(6)},
+		code = {foreground = term.Indexed_Color(1)},
 		link = {foreground = term.Indexed_Color(4), modifiers = {.Underline}},
 		dim = {modifiers = {.Dim}},
 		table_header = {modifiers = {.Bold}},
