@@ -59,8 +59,8 @@ http_post_sse :: proc(
 	api: API_Kind,
 	facts: HTTP_Response_Facts,
 	observer: Provider_Operation_Observer,
-	user_data: rawptr,
-	callback: client.Chunk_Callback,
+	state: $T,
+	callback: proc(_: T, _: []u8),
 ) -> client.Failure {
 	// The wait hook needs a pointer that outlives the request, so the control
 	// value lives in a local for the duration of this call.
@@ -92,7 +92,7 @@ http_post_sse :: proc(
 		complete  = http_relay_transfer,
 	}
 
-	return sse.post({url = request.url, body = request.body, headers = request.headers, allocator = request.allocator}, options, user_data, callback)
+	return sse.post({url = request.url, body = request.body, headers = request.headers, allocator = request.allocator}, options, state, callback)
 }
 
 // HTTP_Relay is what one HTTP exchange reports into: the operation's own facts

@@ -130,8 +130,7 @@ https_keep_going :: proc(_: rawptr) -> Wait_Status {
 	return .Ready
 }
 
-https_collect :: proc(user_data: rawptr, chunk: []u8) {
-	body := cast(^HTTPS_Body)user_data
+https_collect :: proc(body: ^HTTPS_Body, chunk: []u8) {
 	room := cap(body.buffer) - len(body.buffer)
 	if room <= 0 { return }
 	count := min(room, len(chunk))

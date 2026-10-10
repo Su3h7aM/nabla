@@ -988,8 +988,7 @@ provider_sse_event :: proc(user_data: rawptr, event: sse.Event) {
 	}
 }
 
-provider_http_chunk :: proc(user_data: rawptr, chunk: []u8) {
-	state := cast(^Provider_Request_Stream_State)user_data
+provider_http_chunk :: proc(state: ^Provider_Request_Stream_State, chunk: []u8) {
 	if state.failed { return }
 	state.response_bytes += u64(len(chunk))
 	if state.observer.report != nil {

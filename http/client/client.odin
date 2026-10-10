@@ -47,10 +47,6 @@ failure_destroy :: proc(failure: ^Failure, allocator: mem.Allocator) {
 	failure^ = {}
 }
 
-// Chunk_Callback receives response body bytes as they arrive. A nil callback
-// discards the body.
-Chunk_Callback :: #type proc(user_data: rawptr, chunk: []u8)
-
 Header :: struct {
 	name:  string,
 	value: string,
@@ -67,7 +63,8 @@ Request :: struct {
 }
 
 // stream_request performs one request and delivers the response body through
-// callback. Cancellation and deadlines reach every blocking phase except name
+// callback, which is called synchronously and may be nil to discard the body.
+// Cancellation and deadlines reach every blocking phase except name
 // resolution, which is bracketed instead of interrupted.
 //
 // The body is delivered whatever the status is. A response this client will not
@@ -75,7 +72,7 @@ Request :: struct {
 // limit on a body (RFC 9110 5.4), so no size is invented here and the caller
 // decides how much of it to keep.
 @(require_results)
-stream_request :: proc(request: Request, options: Options, user_data: rawptr, callback: Chunk_Callback) -> (failure: Failure) {
+stream_request :: proc(request: Request, options: Options, state: $T, callback: proc(_: T, _: []u8)) -> (failure: Failure) {
 	// One observation per request, reported on every path once validation has
 	// begun. The phase names the stage about to run, so an error inside a stage is
 	// reported as that stage: a failure before anything was written cannot be
@@ -85,7 +82,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 	defer transfer_complete(options.observer, &summary, &phase, &failure)
 
 	if loop_failure := event_loop_acquire(request.allocator); loop_failure.kind != .None { return loop_failure }
-	defer nbio.release_thread_event_loop()
+	defer event_loop_release()
 
 	exchange, open_failure := exchange_open(request, options, &phase, &summary)
 	if open_failure.kind != .None { return open_failure }
@@ -149,7 +146,7 @@ stream_request :: proc(request: Request, options: Options, user_data: rawptr, ca
 		if refusal.kind != .None { return refusal }
 		return failure_from_error(framing_err, request.allocator)
 	}
-	if body_err := stream_body(&exchange.reader, framing, length, user_data, callback); body_err != .None {
+	if body_err := stream_body(&exchange.reader, framing, length, state, callback); body_err != .None {
 		if refusal.kind != .None {
 			refusal.cause = body_err
 			return refusal
@@ -240,6 +237,11 @@ event_loop_acquire :: proc(allocator: mem.Allocator) -> Failure {
 		return failure_from_error(.None, allocator, .Transport, "the event loop could not be started")
 	}
 	return {}
+}
+
+// event_loop_release ends the bracket event_loop_acquire began.
+event_loop_release :: proc() {
+	nbio.release_thread_event_loop()
 }
 
 // request_send validates a request, opens its connection, and writes it. The
@@ -714,16 +716,16 @@ response_framing :: proc(status: int, version: http.Version, method: http.Method
 }
 
 @(require_results)
-stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
+stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, state: $T, callback: proc(_: T, _: []u8)) -> Error {
 	switch framing {
 	case .None:
 		return .None
 	case .Chunked:
-		return stream_chunked(reader, user_data, callback)
+		return stream_chunked(reader, state, callback)
 	case .Exact:
-		return stream_exact(reader, length, user_data, callback)
+		return stream_exact(reader, length, state, callback)
 	case .Until_Close:
-		return stream_until_closed(reader, user_data, callback)
+		return stream_until_closed(reader, state, callback)
 	}
 	return .None
 }
@@ -731,11 +733,11 @@ stream_body :: proc(reader: ^Reader, framing: Body_Framing, length: int, user_da
 // stream_exact delivers exactly length octets. Each chunk is a view of the
 // reader's buffer, borrowed for the callback.
 @(require_results)
-stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: Chunk_Callback) -> Error {
+stream_exact :: proc(reader: ^Reader, length: int, state: $T, callback: proc(_: T, _: []u8)) -> Error {
 	remaining := length
 	for remaining > 0 {
 		chunk := reader_take(reader, remaining) or_return
-		if callback != nil { callback(user_data, chunk) }
+		if callback != nil { callback(state, chunk) }
 		remaining -= len(chunk)
 	}
 	return .None
@@ -743,17 +745,17 @@ stream_exact :: proc(reader: ^Reader, length: int, user_data: rawptr, callback: 
 
 // stream_until_closed delivers everything until the peer closes the stream.
 @(require_results)
-stream_until_closed :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callback) -> Error {
+stream_until_closed :: proc(reader: ^Reader, state: $T, callback: proc(_: T, _: []u8)) -> Error {
 	for {
 		chunk, err := reader_take(reader, max(int))
 		if err == .Closed { return .None }
 		if err != .None { return err }
-		if callback != nil { callback(user_data, chunk) }
+		if callback != nil { callback(state, chunk) }
 	}
 }
 
 @(require_results)
-stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callback) -> Error {
+stream_chunked :: proc(reader: ^Reader, state: $T, callback: proc(_: T, _: []u8)) -> Error {
 	for {
 		line, line_err := reader_line(reader)
 		if line_err != .None { return line_err }
@@ -772,7 +774,7 @@ stream_chunked :: proc(reader: ^Reader, user_data: rawptr, callback: Chunk_Callb
 			if section_err != .None { return section_err }
 			return .None
 		}
-		if err := stream_exact(reader, size, user_data, callback); err != .None { return err }
+		if err := stream_exact(reader, size, state, callback); err != .None { return err }
 		ending: [2]u8
 		if err := reader_read_full(reader, ending[:]); err != .None { return err }
 		if ending[0] != '\r' || ending[1] != '\n' { return .Bad_Response }

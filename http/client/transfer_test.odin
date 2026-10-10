@@ -59,6 +59,10 @@ refusal_body_serve :: proc(thread_handle: ^thread.Thread) {
 	}
 }
 
+Transfer_Discard :: struct {}
+
+transfer_discard :: proc(_: Transfer_Discard, _: []u8) {  }
+
 Body_Cancel_State :: struct {
 	cancelled: bool,
 	bytes:     int,
@@ -69,8 +73,7 @@ body_cancel_probe :: proc(user_data: rawptr) -> Wait_Status {
 	return .Cancelled if state.cancelled else .Ready
 }
 
-body_cancel_collect :: proc(user_data: rawptr, chunk: []u8) {
-	state := cast(^Body_Cancel_State)user_data
+body_cancel_collect :: proc(state: ^Body_Cancel_State, chunk: []u8) {
 	state.bytes += len(chunk)
 	state.cancelled = true
 }
@@ -84,7 +87,7 @@ test_failure_destroy_releases_any_kind :: proc(t: ^testing.T) {
 	defer mem.tracking_allocator_destroy(&track)
 	allocator := mem.tracking_allocator(&track)
 
-	failure := stream_request({url = "ftp://api.example.com/v1/messages", method = .Post, allocator = allocator}, {}, nil, nil)
+	failure := stream_request({url = "ftp://api.example.com/v1/messages", method = .Post, allocator = allocator}, {}, Transfer_Discard{}, transfer_discard)
 	// A refused URL is a failure the transport never saw, and it still owns its text.
 	testing.expect_value(t, failure.kind, Failure_Kind.Invalid_URL)
 	testing.expect_value(t, failure.cause, Error.None)
@@ -102,7 +105,7 @@ test_transfer_reports_a_request_that_was_never_written :: proc(t: ^testing.T) {
 	// connected, or written, and the summary says exactly that.
 	for url in ([]string{"ftp://api.example.com/v1/messages", "api.example.com/v1/messages"}) {
 		log: Transfer_Log
-		failure := stream_request({url = url, method = .Post, allocator = context.allocator}, transfer_log_options(&log), nil, nil)
+		failure := stream_request({url = url, method = .Post, allocator = context.allocator}, transfer_log_options(&log), Transfer_Discard{}, transfer_discard)
 
 		testing.expect_value(t, failure.kind, Failure_Kind.Invalid_URL)
 		testing.expect_value(t, log.calls, 1)
@@ -117,7 +120,12 @@ test_transfer_reports_a_request_that_was_never_written :: proc(t: ^testing.T) {
 
 	// An empty host is refused at the same boundary, with the same account.
 	log: Transfer_Log
-	failure := stream_request({url = "https:///v1/messages", method = .Post, allocator = context.allocator}, transfer_log_options(&log), nil, nil)
+	failure := stream_request(
+		{url = "https:///v1/messages", method = .Post, allocator = context.allocator},
+		transfer_log_options(&log),
+		Transfer_Discard{},
+		transfer_discard,
+	)
 	defer failure_destroy(&failure, context.allocator)
 	testing.expect_value(t, failure.kind, Failure_Kind.Invalid_URL)
 	testing.expect_value(t, log.summary.stopped_at, Transfer_Phase.Validate)
@@ -171,7 +179,7 @@ test_refused_response_preserves_body_cancellation :: proc(t: ^testing.T) {
 test_a_zero_observer_is_no_observer :: proc(t: ^testing.T) {
 	// Observing is opt-in, so a caller that wants none pays nothing and a zero
 	// observer must not be reached through a nil callback.
-	failure := stream_request({url = "ftp://api.example.com", method = .Post, allocator = context.allocator}, {}, nil, nil)
+	failure := stream_request({url = "ftp://api.example.com", method = .Post, allocator = context.allocator}, {}, Transfer_Discard{}, transfer_discard)
 	defer failure_destroy(&failure, context.allocator)
 	testing.expect_value(t, failure.kind, Failure_Kind.Invalid_URL)
 }

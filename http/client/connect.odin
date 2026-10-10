@@ -1,6 +1,5 @@
 package client
 
-import "core:nbio"
 import "core:net"
 import "core:strings"
 
@@ -18,8 +17,8 @@ connect_request :: proc(
 	proxy_url: string,
 	headers: []Header,
 	options: Options,
-	user_data: rawptr,
-	callback: Chunk_Callback,
+	state: $T,
+	callback: proc(_: T, _: []u8),
 	allocator := context.allocator,
 ) -> (
 	response: ^Upgraded,
@@ -30,7 +29,7 @@ connect_request :: proc(
 	defer transfer_complete(options.observer, &summary, &phase, &failure)
 
 	if loop_failure := event_loop_acquire(allocator); loop_failure.kind != .None { return nil, loop_failure }
-	defer nbio.release_thread_event_loop()
+	defer event_loop_release()
 
 	request := Request {
 		url       = proxy_url,
@@ -74,7 +73,7 @@ connect_request :: proc(
 		summary.declared_body_bytes = u64(length)
 	}
 	if framing_err != .None { return nil, failure }
-	if body_err := stream_body(&exchange.reader, framing, length, user_data, callback); body_err != .None {
+	if body_err := stream_body(&exchange.reader, framing, length, state, callback); body_err != .None {
 		failure.cause = body_err
 		return nil, failure
 	}

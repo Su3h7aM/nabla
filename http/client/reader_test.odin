@@ -56,8 +56,7 @@ Collector :: struct {
 	buffer: [dynamic]u8,
 }
 
-collect :: proc(user_data: rawptr, chunk: []u8) {
-	collector := (^Collector)(user_data)
+collect :: proc(collector: ^Collector, chunk: []u8) {
 	append(&collector.buffer, ..chunk)
 }
 
@@ -313,7 +312,11 @@ test_incomplete_bodies :: proc(t: ^testing.T) {
 	testing.expect_value(t, discarded_err, Error.None)
 	discarded_framing, discarded_length, discarded_framing_err := response_framing(discarded_status.code, discarded_status.version, .Post, discarded_headers)
 	testing.expect_value(t, discarded_framing_err, Error.None)
-	testing.expect_value(t, stream_body(&discarded, discarded_framing, discarded_length, nil, nil), Error.Closed)
+	testing.expect_value(
+		t,
+		stream_body(&discarded, discarded_framing, discarded_length, cast(^Collector)nil, cast(proc(_: ^Collector, _: []u8))nil),
+		Error.Closed,
+	)
 }
 
 @(test)

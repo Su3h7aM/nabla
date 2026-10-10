@@ -17,8 +17,7 @@ Fetch_Body :: struct {
 	failed: bool,
 }
 
-fetch_collect :: proc(user_data: rawptr, chunk: []u8) {
-	body := cast(^Fetch_Body)user_data
+fetch_collect :: proc(body: ^Fetch_Body, chunk: []u8) {
 	if body.failed { return }
 	written, append_error := append(&body.bytes, ..chunk)
 	if append_error != nil || written != len(chunk) { body.failed = true }

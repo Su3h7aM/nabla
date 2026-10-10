@@ -27,7 +27,7 @@ Post_Request :: struct {
 // classification, not a caller-specific taxonomy -- mapping it into provider
 // error kinds is the caller's job.
 @(require_results)
-post :: proc(request: Post_Request, options: client.Options, user_data: rawptr, callback: client.Chunk_Callback) -> client.Failure {
+post :: proc(request: Post_Request, options: client.Options, state: $T, callback: proc(_: T, _: []u8)) -> client.Failure {
 	headers, headers_err := make([dynamic]client.Header, 0, len(request.headers) + 2, request.allocator)
 	if headers_err != nil {
 		return client.failure_from_error(.No_Room, request.allocator, .Transport, "the event stream request could not be built")
@@ -40,7 +40,7 @@ post :: proc(request: Post_Request, options: client.Options, user_data: rawptr, 
 	return client.stream_request(
 		{url = request.url, method = .Post, headers = headers[:], body = request.body, expected_content_type = CONTENT_TYPE, allocator = request.allocator},
 		options,
-		user_data,
+		state,
 		callback,
 	)
 }

@@ -62,11 +62,9 @@ reader_fill :: proc(reader: ^Reader) -> Error {
 			size, overflowed = intrinsics.overflow_mul(len(reader.buffer), 2)
 			if overflowed { return .Bad_Response }
 		}
-		grown, make_err := make([]u8, size, reader.allocator)
-		if make_err != nil { return .No_Room }
-		copy(grown, reader.buffer[:reader.tail])
-		delete(reader.buffer, reader.allocator)
-		reader.buffer = grown
+		grown, resize_err := mem.resize(raw_data(reader.buffer), len(reader.buffer), size, allocator = reader.allocator)
+		if resize_err != nil { return .No_Room }
+		reader.buffer = mem.slice_ptr(cast(^u8)grown, size)
 	}
 	count, err := reader.read(reader.user_data, reader.buffer[reader.tail:])
 	if err != .None { return err }

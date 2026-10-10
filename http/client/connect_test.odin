@@ -98,8 +98,7 @@ connect_test_stop :: proc(listener: net.TCP_Socket, worker: ^thread.Thread) {
 	if listener != 0 { net.close(listener) }
 }
 
-connect_test_collect :: proc(user_data: rawptr, chunk: []u8) {
-	body := cast(^Connect_Test_Body)user_data
+connect_test_collect :: proc(body: ^Connect_Test_Body, chunk: []u8) {
 	count := min(len(chunk), len(body.bytes) - body.length)
 	copy(body.bytes[body.length:body.length + count], chunk[:count])
 	body.length += count
@@ -118,7 +117,7 @@ test_connect_hands_off_coalesced_tunnel_bytes_and_destroy_closes_it :: proc(t: ^
 	}
 	if worker == nil { return }
 
-	response, failure := connect_request("destination.example:443", url, nil, {}, nil, nil)
+	response, failure := connect_request("destination.example:443", url, nil, {}, cast(^Connect_Test_Body)nil, connect_test_collect)
 	defer failure_destroy(&failure, context.allocator)
 	if !testing.expect_value(t, failure.kind, Failure_Kind.None) { return }
 	if !testing.expect(t, response != nil, "a successful CONNECT returned no tunnel") { return }
