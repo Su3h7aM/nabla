@@ -3515,10 +3515,10 @@ test_clicking_ordinary_text_selects_its_rendered_row_for_keyboard_navigation :: 
 	defer app_session_end(&app, directory)
 	widgets.input_init(&app.input, app.run.alloc)
 	defer widgets.input_destroy(&app.input)
-	prefix, prefix_error := strings.repeat("ordinary row\n", 50, context.allocator)
+	prefix, prefix_error := strings.repeat("ordinary row\n\n", 50, context.allocator)
 	defer delete(prefix, context.allocator)
 	if prefix_error != nil { testing.fail_now(t, "the ordinary message could not be allocated") }
-	head := app_history_node(&app, 0, .User, fmt.tprintf("%ssecond distinctive line\nthird line\nfourth line", prefix))
+	head := app_history_node(&app, 0, .User, fmt.tprintf("%ssecond distinctive line\n\nthird line\n\nfourth line", prefix))
 	_ = app_history_node(&app, head, .Assistant, "answer")
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the history could not be committed") }
 	storage := frame_storage_new(context.allocator)
@@ -3570,7 +3570,7 @@ test_arrow_keys_move_ordinary_scroll_one_row_per_press :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 	widgets.input_init(&app.input, app.run.alloc)
 	defer widgets.input_destroy(&app.input)
-	prefix, prefix_error := strings.repeat("ordinary row\n", 50, context.allocator)
+	prefix, prefix_error := strings.repeat("ordinary row\n\n", 50, context.allocator)
 	defer delete(prefix, context.allocator)
 	if prefix_error != nil { testing.fail_now(t, "the ordinary message could not be allocated") }
 	head := app_history_node(&app, 0, .User, fmt.tprintf("%slast distinctive line", prefix))

@@ -569,7 +569,7 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	defer subagent_control_destroy(&control)
 	if !control.switching { return "" }
 	if refused := acp_session_configure(connection, connection.opened, control.acp_model, control.effort, false); refused != "" {
-		text := fmt.tprintf("%s asks\nYour request to switch model or effort was not applied: %s", member.name, refused)
+		text := fmt.tprintf("%s asks:\nYour request to switch model or effort was not applied: %s", member.name, refused)
 		// The ACP child owns no journal session. Feedback enters the parent's inbox as agent input.
 		sender, sender_open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Write, member.allocator)
 		if sender_open_error != nil { return "the refusal of a model switch could not be recorded" }

@@ -13,6 +13,10 @@ import "nabla:tui"
 // Theme is the terminal style of each element. The zero value styles nothing and
 // allows no links.
 Theme :: struct {
+	// base is the style under every element, so a document can be declared on a
+	// colored background. The styles below are merged over it. The zero value adds
+	// nothing.
+	base:         term.Style,
 	// code styles text_body code and code blocks, link styles link text, and both
 	// are merged over the style of the span's other flags.
 	code:         term.Style,
@@ -98,9 +102,10 @@ declare_blocks :: proc(declarer: ^Declarer, blocks: []markdown.Block, tight: boo
 declare_block :: proc(declarer: ^Declarer, block: markdown.Block) -> mem.Allocator_Error {
 	switch value in block {
 	case markdown.Paragraph:
-		declare_inline(declarer, value.spans, {}, .Start) or_return
+		declare_inline(declarer, value.spans, declarer.theme.base, .Start) or_return
 	case markdown.Heading:
-		declare_inline(declarer, value.spans, declarer.theme.headings[clamp(value.level - 1, 0, 5)], .Start) or_return
+		heading := style_merge(declarer.theme.base, declarer.theme.headings[clamp(value.level - 1, 0, 5)])
+		declare_inline(declarer, value.spans, heading, .Start) or_return
 	case markdown.Code_Block:
 		declare_code_block(declarer, value) or_return
 	case markdown.Quote:
@@ -111,7 +116,7 @@ declare_block :: proc(declarer: ^Declarer, block: markdown.Block) -> mem.Allocat
 		declare_table(declarer, value) or_return
 	case markdown.Thematic_Break:
 		rule := tui.Paint {
-			style = declarer.theme.dim,
+			style = decoration_style(declarer.theme),
 			fill  = "─",
 		}
 		id := tui.paint(declarer.target.paints, rule) or_return
@@ -170,7 +175,7 @@ declare_inline :: proc(declarer: ^Declarer, spans: []markdown.Span, base: term.S
 		text_body_add(declarer, &text_body, span.text, tui.Paint{style = span_style(declarer.theme, span.style, base), link = link}) or_return
 		if is_link && link_group_end(spans, index) && !link_text_is_url(spans, index) {
 			dim := tui.Paint {
-				style = declarer.theme.dim,
+				style = decoration_style(declarer.theme),
 				link  = link,
 			}
 			text_body_add(declarer, &text_body, LINK_URL_PREFIX, dim) or_return
@@ -236,6 +241,12 @@ style_merge :: proc(base, over: term.Style) -> term.Style {
 	return style
 }
 
+// decoration_style is the theme's dim style over its base.
+@(private)
+decoration_style :: proc(theme: Theme) -> term.Style {
+	return style_merge(theme.base, theme.dim)
+}
+
 @(private)
 link_group_end :: proc(spans: []markdown.Span, index: int) -> bool {
 	if index + 1 >= len(spans) {
@@ -299,11 +310,11 @@ declare_code_block :: proc(declarer: ^Declarer, block: markdown.Code_Block) -> m
 	inset.padding.left = CODE_INSET
 	if layout.element(ctx, layout.Element_Desc{layout = inset}) {
 		if block.info != "" {
-			dim := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim}) or_return
+			dim := tui.paint(declarer.target.paints, tui.Paint{style = decoration_style(declarer.theme)}) or_return
 			layout.text(ctx, layout.Text_Desc{text = block.info, style = TEXT_STYLE, paint = dim})
 		}
 		if body != "" {
-			code := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.code}) or_return
+			code := tui.paint(declarer.target.paints, tui.Paint{style = style_merge(declarer.theme.base, declarer.theme.code)}) or_return
 			layout.text(ctx, layout.Text_Desc{text = body, style = {size = 1, wrap = .Characters}, paint = code})
 		}
 	}
@@ -313,7 +324,7 @@ declare_code_block :: proc(declarer: ^Declarer, block: markdown.Code_Block) -> m
 @(private, require_results)
 declare_quote :: proc(declarer: ^Declarer, quote: markdown.Quote) -> mem.Allocator_Error {
 	bar := tui.Paint {
-		style = declarer.theme.dim,
+		style = decoration_style(declarer.theme),
 		border = tui.Border{vertical = "│"},
 	}
 	id := tui.paint(declarer.target.paints, bar) or_return
@@ -348,7 +359,7 @@ declare_list :: proc(declarer: ^Declarer, list: markdown.List) -> mem.Allocator_
 			}
 			marker_columns := text.text_columns(marker)
 			if layout.element(ctx, layout.Element_Desc{layout = {flow = .Row, sizing = {width = layout.grow(), height = layout.fit()}}}) {
-				paint := tui.paint(declarer.target.paints, tui.Paint{}) or_return
+				paint := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.base}) or_return
 				layout.text(
 					ctx,
 					layout.Text_Desc {
@@ -408,7 +419,7 @@ declare_table :: proc(declarer: ^Declarer, table: markdown.Table) -> mem.Allocat
 @(private, require_results)
 declare_table_rule :: proc(declarer: ^Declarer, columns: int, left, middle, right: string) -> mem.Allocator_Error {
 	ctx := declarer.target.ctx
-	rule := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim, fill = "─"}) or_return
+	rule := tui.paint(declarer.target.paints, tui.Paint{style = decoration_style(declarer.theme), fill = "─"}) or_return
 	if layout.table_row(ctx, layout.Element_Desc{layout = {align = .Stretch, sizing = {width = layout.fit(), height = layout.fixed(1)}}}) {
 		for column in 0 ..< columns {
 			declare_table_junction(declarer, left if column == 0 else middle) or_return
@@ -424,7 +435,7 @@ declare_table_rule :: proc(declarer: ^Declarer, columns: int, left, middle, righ
 
 @(private, require_results)
 declare_table_junction :: proc(declarer: ^Declarer, glyph: string) -> mem.Allocator_Error {
-	paint := tui.paint(declarer.target.paints, tui.Paint{style = declarer.theme.dim, fill = glyph}) or_return
+	paint := tui.paint(declarer.target.paints, tui.Paint{style = decoration_style(declarer.theme), fill = glyph}) or_return
 	layout.content(
 		declarer.target.ctx,
 		layout.Element_Desc{layout = {sizing = {width = layout.fixed(1), height = layout.fit()}}, paint = {background = paint}},
@@ -435,7 +446,7 @@ declare_table_junction :: proc(declarer: ^Declarer, glyph: string) -> mem.Alloca
 @(private, require_results)
 declare_table_row :: proc(declarer: ^Declarer, cells: []markdown.Cell, alignments: []markdown.Alignment, header: bool) -> mem.Allocator_Error {
 	ctx := declarer.target.ctx
-	base := declarer.theme.table_header if header else term.Style{}
+	base := style_merge(declarer.theme.base, declarer.theme.table_header) if header else declarer.theme.base
 	if layout.table_row(ctx, layout.Element_Desc{layout = {align = .Stretch, sizing = {width = layout.fit(), height = layout.fit()}}}) {
 		for cell, column in cells {
 			declare_table_junction(declarer, "│") or_return

@@ -536,17 +536,27 @@ conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.P
 	return next
 }
 
-// draw_bands fills the whole terminal row behind each text line whose paint has a background; a layout element would only span the conversation's width.
+// draw_bands fills the whole terminal row behind each text line whose paint has a background, and behind each
+// background fill that repeats the space; a layout element would only span the conversation's width.
 @(require_results)
 draw_bands :: proc(storage: ^Frame_Storage, frame_result: layout.Frame_Result, viewport: tui.Cell_Rect) -> bool {
 	for command in frame_result.commands {
-		text_data, is_text := command.data.(layout.Text_Cmd)
-		if !is_text { continue }
-		value, found := tui.paint_of(storage.paints[:], text_data.paint)
-		if !found || value.style.background == nil { continue }
-		line, project_err := tui.project_rect_integral(command.bounds)
+		paint: layout.Paint
+		switch data in command.data {
+		case layout.Text_Cmd:
+			paint = data.paint
+		case layout.Fill_Cmd:
+			paint = data.paint
+		case layout.Border_Cmd, layout.Image_Cmd, layout.Custom_Cmd:
+			continue
+		}
+		value, found := tui.paint_of(storage.paints[:], paint)
+		if !found || value.style.background == nil || value.fill != "" { continue }
+		rows, project_err := tui.project_rect_integral(command.bounds)
 		if project_err != nil { return false }
-		tui.fill(&storage.screen.buffer, {x = 0, y = viewport.y + line.y, width = storage.screen.buffer.columns, height = 1}, " ", value.style)
+		first := max(rows.y, 0)
+		last := min(rows.y + rows.height, viewport.height)
+		tui.fill(&storage.screen.buffer, {x = 0, y = viewport.y + first, width = storage.screen.buffer.columns, height = last - first}, " ", value.style)
 	}
 	return true
 }
@@ -645,67 +655,73 @@ selection_cell_blank :: proc(cell: term.Cell) -> bool {
 // separates entries, so the spacing scrolls with the content instead of being
 // pasted in at draw time.
 declare_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry, width: int, elapsed: time.Duration) {
-	if entry.kind == .Tool || entry.kind == .Codemode {
+	switch entry.kind {
+	case .Tool, .Codemode:
 		declare_tool_entry(ctx, storage, entry, width, elapsed)
-		return
-	}
-	if entry.kind == .Assistant {
-		if document, parse_error := markdown_cache_document(&storage.markdown, entry); parse_error == nil {
-			declare_markdown_entry(ctx, storage, document)
-			return
+	case .User, .Assistant, .Subagent:
+		declare_message_entry(ctx, storage, entry)
+	case .Notice, .Warning, .Error:
+		cleaned := text.sanitize_text(string(entry.text[:]), context.temp_allocator) or_else ""
+		if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
+			if len(cleaned) > 0 {
+				layout.text(
+					ctx,
+					layout.Text_Desc{text = cleaned, style = {size = 1, wrap = .Words}, paint = storage_paint(storage, {style = entry_style(entry.kind)})},
+				)
+			}
 		}
-	}
-	if entry.kind == .Subagent {
-		declare_subagent_entry(ctx, storage, entry)
-		return
-	}
-	cleaned := text.sanitize_text(string(entry.text[:]), context.temp_allocator) or_else ""
-	body_paint := storage_paint(storage, {style = entry_style(entry.kind)})
-	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
-		if entry.kind == .User { declare_band_pad(ctx, body_paint) }
-		if len(cleaned) > 0 {
-			layout.text(ctx, layout.Text_Desc{text = cleaned, style = {size = 1, wrap = .Words}, paint = body_paint})
-		}
-		if entry.kind == .User { declare_band_pad(ctx, body_paint) }
 	}
 }
 
 // text_entry_layout is the column a text entry sits in. Its bottom padding is the blank
-// row that separates entries, and stretching gives a band the full width.
+// row that separates entries.
 text_entry_layout :: proc() -> layout.Layout_Style {
-	return {flow = .Column, sizing = layout.Sizing{width = layout.fit(), height = layout.fit()}, align = .Stretch, padding = layout.Edges{bottom = 1}}
+	return {flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.fit()}, align = .Stretch, padding = layout.Edges{bottom = 1}}
 }
 
-// declare_band_pad reserves one row of a band's background. The row is a single cell
-// wide: the renderer paints a band row across the whole terminal, so the row only has
-// to exist, and `Wrap.None` is what keeps one cell one line.
-declare_band_pad :: proc(ctx: ^layout.Context, band: layout.Paint) {
-	layout.text(ctx, layout.Text_Desc{text = " ", style = {size = 1, wrap = .None}, paint = band})
+// message_split returns the part of a message's raw text that is a heading and the part
+// that is prose. A subagent message starts with a line naming the sender and the kind,
+// written by the harness, so the split reads no wording. The prose of every other message
+// is all of it.
+message_split :: proc(kind: Entry_Kind, raw: string) -> (heading, body: string) {
+	if kind != .Subagent { return "", raw }
+	split := strings.index_byte(raw, '\n')
+	if split < 0 { return raw, "" }
+	return raw[:split], raw[split + 1:]
 }
 
-// declare_subagent_entry adds one message from another agent on the subagent band: the
-// first line as a bold heading naming the sender and the kind, the rest as the body
-// below it. The heading is the first line by the sender's contract, so the split
-// reads no wording.
-declare_subagent_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry) {
-	cleaned := text.sanitize_text(string(entry.text[:]), context.temp_allocator) or_else ""
-	heading := cleaned
-	rest := ""
-	if split := strings.index_byte(cleaned, '\n'); split >= 0 {
-		heading = cleaned[:split]
-		rest = cleaned[split + 1:]
+// declare_message_entry adds a user, assistant, or subagent message with its body as
+// Markdown. A user or subagent message is a band: its element paints the band's
+// background, with one padding row above and below, and draw_bands stretches that
+// background across the terminal. A subagent message has its heading in bold above the
+// body. Text the cache cannot parse is drawn as it is.
+declare_message_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry: ^Entry) {
+	heading, body := message_split(entry.kind, string(entry.text[:]))
+	base := entry_style(entry.kind)
+	band := layout.Element_Desc {
+		layout = {flow = .Column, sizing = layout.Sizing{width = layout.grow(), height = layout.fit()}, align = .Stretch},
 	}
-	heading_paint := storage_paint(storage, {style = SUBAGENT_LABEL})
-	band_paint := storage_paint(storage, {style = SUBAGENT_TEXT})
+	if heading != "" && body != "" { band.layout.gap = 1 }
+	if entry.kind != .Assistant {
+		band.layout.padding = layout.Edges {
+			top    = 1,
+			bottom = 1,
+		}
+		band.paint = {
+			background = storage_paint(storage, {style = base}),
+		}
+	}
 	if layout.element(ctx, layout.Element_Desc{layout = text_entry_layout()}) {
-		declare_band_pad(ctx, band_paint)
-		if len(heading) > 0 {
-			layout.text(ctx, layout.Text_Desc{text = heading, style = {size = 1, wrap = .Words}, paint = heading_paint})
+		if layout.element(ctx, band) {
+			if label := text.sanitize_text(heading, context.temp_allocator) or_else ""; label != "" {
+				layout.text(ctx, layout.Text_Desc{text = label, style = {size = 1, wrap = .Words}, paint = storage_paint(storage, {style = SUBAGENT_LABEL})})
+			}
+			if document, parse_error := markdown_cache_document(&storage.markdown, entry); parse_error == nil {
+				declare_markdown_entry(ctx, storage, document, base)
+			} else if cleaned := text.sanitize_text(body, context.temp_allocator) or_else ""; cleaned != "" {
+				layout.text(ctx, layout.Text_Desc{text = cleaned, style = {size = 1, wrap = .Words}, paint = storage_paint(storage, {style = base})})
+			}
 		}
-		if len(rest) > 0 {
-			layout.text(ctx, layout.Text_Desc{text = rest, style = {size = 1, wrap = .Words}, paint = band_paint})
-		}
-		declare_band_pad(ctx, band_paint)
 	}
 }
 
@@ -717,8 +733,9 @@ MARKDOWN_LINK_SCHEMES := [?]string{"http", "https", "mailto"}
 // markdown_theme is the Markdown look. Nabla has no theme, so it uses only the
 // terminal's default colors, ANSI indices 1 to 6, and modifiers, and follows whatever
 // theme the terminal has.
-markdown_theme :: proc() -> markdown_view.Theme {
+markdown_theme :: proc(base: term.Style) -> markdown_view.Theme {
 	theme := markdown_view.Theme {
+		base = base,
 		code = {foreground = term.Indexed_Color(6)},
 		link = {foreground = term.Indexed_Color(4), modifiers = {.Underline}},
 		dim = {modifiers = {.Dim}},
@@ -731,23 +748,16 @@ markdown_theme :: proc() -> markdown_view.Theme {
 	return theme
 }
 
-// declare_markdown_entry adds an assistant message rendered from Markdown. Layout
-// wraps it and sizes its tables. An allocation failure
-// leaves the entry partial for this frame, and the next frame declares it again.
-declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, document: markdown.Document) {
-	entry_layout := layout.Layout_Style {
-		flow = .Column,
-		sizing = layout.Sizing{width = layout.grow(), height = layout.fit()},
-		padding = layout.Edges{bottom = 1},
+// declare_markdown_entry adds a message body rendered from Markdown over the style base.
+// Layout wraps it and sizes its tables. An allocation failure leaves the body partial for
+// this frame, and the next frame declares it again.
+declare_markdown_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, document: markdown.Document, base: term.Style) {
+	target := markdown_view.Target {
+		ctx    = ctx,
+		paints = &storage.paints,
+		links  = &storage.links,
 	}
-	if layout.element(ctx, layout.Element_Desc{layout = entry_layout}) {
-		target := markdown_view.Target {
-			ctx    = ctx,
-			paints = &storage.paints,
-			links  = &storage.links,
-		}
-		_ = markdown_view.declare(target, document, markdown_theme(), context.temp_allocator)
-	}
+	_ = markdown_view.declare(target, document, markdown_theme(base), context.temp_allocator)
 }
 
 // storage_paint returns the id of value in the frame's paint table, or zero when the table cannot grow.

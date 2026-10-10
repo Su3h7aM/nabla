@@ -27,7 +27,7 @@ Rendered :: struct {
 }
 
 // render declares source into a columns by rows frame and draws it into rows.
-render :: proc(t: ^testing.T, rendered: ^Rendered, context_: ^layout.Context, source: string, columns, rows: int, overflow := false) {
+render :: proc(t: ^testing.T, rendered: ^Rendered, context_: ^layout.Context, source: string, columns, rows: int, overflow := false, theme := THEME) {
 	document, parse_error := markdown.parse(source, context.temp_allocator)
 	testing.expect_value(t, parse_error, nil)
 	measure := tui.Measure_Context {
@@ -43,7 +43,7 @@ render :: proc(t: ^testing.T, rendered: ^Rendered, context_: ^layout.Context, so
 				paints = &rendered.paints,
 				links  = &rendered.links,
 			}
-			testing.expect_value(t, declare(target, document, THEME), nil)
+			testing.expect_value(t, declare(target, document, theme), nil)
 		}
 	}
 	frame, frame_error := layout.result(context_)
@@ -185,4 +185,33 @@ test_code_block_keeps_indentation_and_splits_long_lines :: proc(t: ^testing.T) {
 	url: Rendered
 	render(t, &url, &context_, "see https://example.com/long", 10, 4)
 	testing.expect_value(t, strings.join(url.rows[:], "\n", context.temp_allocator), "see\nhttps://ex\nample.com/\nlong")
+}
+
+@(test)
+test_theme_base_reaches_every_element :: proc(t: ^testing.T) {
+	context_ := new_context(t)
+	defer layout.destroy(&context_)
+	theme := THEME
+	theme.base = {
+		background = term.Indexed_Color(5),
+	}
+	rendered: Rendered
+	render(t, &rendered, &context_, "# title\n\n- item\n\n> quote\n\n---\n\n```\ncode\n```\n\n| a |\n| - |\n| b |", 20, 24, theme = theme)
+	painted := 0
+	for command in rendered.frame.commands {
+		paint: layout.Paint
+		#partial switch data in command.data {
+		case layout.Text_Cmd:
+			paint = data.paint
+		case layout.Fill_Cmd:
+			paint = data.paint
+		case layout.Border_Cmd:
+			paint = data.paint
+		}
+		value, found := tui.paint_of(rendered.paints[:], paint)
+		if !found { continue }
+		testing.expect_value(t, value.style.background, theme.base.background)
+		painted += 1
+	}
+	testing.expect(t, painted >= 12, "the marker, bar, rules, code, and table cells are all painted")
 }

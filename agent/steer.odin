@@ -290,12 +290,12 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 	return body, .Agent
 }
 
-// inbox_report is heading, then body on the lines below it, or the heading alone when the
-// body is empty. Text is in temp memory.
+// inbox_report is heading and a colon, then body on the lines below it, or the heading
+// alone when the body is empty. Text is in temp memory.
 @(private)
 inbox_report :: proc(heading, body: string) -> string {
 	if body == "" { return heading }
-	return fmt.tprintf("%s\n%s", heading, body)
+	return fmt.tprintf("%s:\n%s", heading, body)
 }
 
 // inbox_last_text is the paragraph a report of a child that did not complete adds after

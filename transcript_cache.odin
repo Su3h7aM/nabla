@@ -7,9 +7,9 @@ import "core:mem/virtual"
 import "nabla:markdown"
 import "nabla:text"
 
-// Markdown_Cache keeps the parsed Markdown of assistant entries between frames. The
-// transcript is still declared from scratch every frame; the cache only spares
-// sanitizing and parsing text that has not changed. It is a memo, not a model of the
+// Markdown_Cache keeps the parsed Markdown of the message entries (user, assistant, and
+// subagent) between frames. The transcript is still declared from scratch every frame;
+// the cache only spares sanitizing and parsing text that has not changed. It is a memo, not a model of the
 // screen: a record is valid for one (entry id, text revision) and lives only while frames
 // keep asking for it, so whatever the transcript stops drawing is dropped at the next
 // sweep. The zero value is an empty cache that allocates its map from
@@ -45,7 +45,8 @@ markdown_cache_destroy :: proc(cache: ^Markdown_Cache) {
 	cache^ = {}
 }
 
-// markdown_cache_document returns entry's text parsed as Markdown, parsing it only when the
+// markdown_cache_document returns entry's body parsed as Markdown (see message_split for
+// what a subagent entry's body leaves out), parsing it only when the
 // entry's revision changed since the cached record. The document is owned by the cache and
 // stays valid until the next call for the same entry, the sweep that drops it, or destroy.
 // On an allocation error the entry has no record and the caller draws the text another way.
@@ -67,7 +68,8 @@ markdown_cache_document :: proc(cache: ^Markdown_Cache, entry: ^Entry) -> (docum
 	}
 	allocator := virtual.arena_allocator(&record.arena)
 	cleaned: string
-	if cleaned, err = text.sanitize_text(string(entry.text[:]), allocator); err == nil {
+	_, body := message_split(entry.kind, string(entry.text[:]))
+	if cleaned, err = text.sanitize_text(body, allocator); err == nil {
 		record.document, err = markdown.parse(cleaned, allocator)
 	}
 	if err != nil {

@@ -139,22 +139,87 @@ test_subagent_message_keeps_the_band_around_heading_and_body :: proc(t: ^testing
 	scratch: [256]byte
 	testing.expect_value(t, conversation_glyph_row(storage, 0, scratch[:]), "                    ")
 	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "agent-1 answered    ")
-	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "forty-two is the    ")
-	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "answer to everything")
-	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 2, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "forty-two is the    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 4, scratch[:]), "answer to everything")
 	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "                    ")
 	testing.expect_value(t, conversation_glyph_row(storage, 6, scratch[:]), "                    ")
-	testing.expect_value(t, conversation_glyph_row(storage, 7, scratch[:]), "agent-2 failed      ")
-	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 7, scratch[:]), "                    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 8, scratch[:]), "agent-2 failed      ")
+	testing.expect_value(t, conversation_glyph_row(storage, 9, scratch[:]), "                    ")
 
-	for row in 0 ..< 5 {
+	// The row between the heading and the body is blank but still part of the band.
+	for column in 0 ..< 20 {
+		testing.expect_value(t, storage.screen.buffer.cells[2 * 20 + column].style.background, SUBAGENT_TEXT.background)
+	}
+
+	for row in 0 ..< 6 {
 		testing.expect_value(t, storage.screen.buffer.cells[row * 20].style.background, SUBAGENT_TEXT.background)
 		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
 	}
-	testing.expect_value(t, storage.screen.buffer.cells[5 * 20].style, term.Style{})
-	for row in 6 ..< 9 {
+	testing.expect_value(t, storage.screen.buffer.cells[6 * 20].style, term.Style{})
+	for row in 7 ..< 10 {
 		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style.background, SUBAGENT_TEXT.background)
 	}
+	testing.expect_value(t, storage.screen.buffer.cells[10 * 20].style, term.Style{})
+}
+
+// A user prompt is Markdown on its band: bold text keeps the band's background, and the
+// blank rows between blocks stay part of the band across the terminal.
+@(test)
+test_user_message_renders_markdown_on_the_band :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	snap_append(app, .User, "**bold** and a list\n\n- item\n\nafter")
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	testing.expect(t, conversation_render(t, app, storage, 20, 10), "the conversation frame must solve")
+
+	scratch: [256]byte
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "bold and a list     ")
+	testing.expect_value(t, conversation_glyph_row(storage, 5, scratch[:]), "after               ")
+
+	bold := storage.screen.buffer.cells[20].style
+	testing.expect(t, .Bold in bold.modifiers)
+	testing.expect_value(t, bold.background, USER_TEXT.background)
+	for row in 0 ..< 7 {
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20].style.background, USER_TEXT.background)
+		testing.expect_value(t, storage.screen.buffer.cells[row * 20 + 19].style.background, USER_TEXT.background)
+	}
+	testing.expect_value(t, storage.screen.buffer.cells[7 * 20].style, term.Style{})
+}
+
+// A subagent message keeps its first line as the bold heading and renders the rest as
+// Markdown on the same band.
+@(test)
+test_subagent_body_renders_markdown_under_the_heading :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	snap_append(app, .Subagent, "agent-1 answered\n**yes** it is 42")
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	testing.expect(t, conversation_render(t, app, storage, 20, 6), "the conversation frame must solve")
+
+	scratch: [256]byte
+	testing.expect_value(t, conversation_glyph_row(storage, 1, scratch[:]), "agent-1 answered    ")
+	testing.expect_value(t, conversation_glyph_row(storage, 3, scratch[:]), "yes it is 42        ")
+	testing.expect(t, .Bold in storage.screen.buffer.cells[20].style.modifiers)
+	testing.expect(t, .Bold in storage.screen.buffer.cells[60].style.modifiers)
+	testing.expect(t, .Bold not_in storage.screen.buffer.cells[60 + 4].style.modifiers)
+	testing.expect_value(t, storage.screen.buffer.cells[60 + 4].style.background, SUBAGENT_TEXT.background)
+	testing.expect_value(t, storage.screen.buffer.cells[4 * 20 + 19].style.background, SUBAGENT_TEXT.background)
 }
 
 @(test)
