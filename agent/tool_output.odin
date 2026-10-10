@@ -414,77 +414,123 @@ tool_result_body :: proc(text: string) -> string {
 
 // --- ownership -------------------------------------------------------------------
 
-// tool_output_clone copies every string and slice output borrows into its own memory, so a
-// result outlives the buffers its executor used.
+// tool_output_clone copies every borrowed string and slice with allocator. The caller
+// owns the result and releases it with tool_output_destroy using the same allocator.
+// On allocation failure, it releases partial copies and returns nil with the error.
 @(require_results)
 tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (owned: Tool_Output, allocation_error: mem.Allocator_Error) {
-	// Every owned field is emptied before its copy is made, so a clone that fails partway
-	// frees only its own copies and never the memory the executor still owns.
-	defer if allocation_error != nil { tool_output_destroy(&owned, allocator) }
-	owned = output
-	switch &value in owned {
+	switch borrowed in output {
 	case Read_Output:
-		borrowed := value
-		value.path = ""
-		value.content = ""
+		value := Read_Output {
+			first_line  = borrowed.first_line,
+			line_count  = borrowed.line_count,
+			total_lines = borrowed.total_lines,
+			truncated   = borrowed.truncated,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.path = strings.clone(borrowed.path, allocator) or_return
 		value.content = strings.clone(borrowed.content, allocator) or_return
+		owned = value
 	case Read_Media_Output:
-		borrowed := value
-		value.path = ""
-		value.media_type = ""
+		value := Read_Media_Output {
+			bytes = borrowed.bytes,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.path = strings.clone(borrowed.path, allocator) or_return
 		value.media_type = strings.clone(borrowed.media_type, allocator) or_return
+		owned = value
 	case Write_Output:
-		borrowed := value
-		value.path = ""
+		value := Write_Output {
+			bytes = borrowed.bytes,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.path = strings.clone(borrowed.path, allocator) or_return
+		owned = value
 	case Edit_Output:
-		borrowed := value
-		value.summary = ""
+		value := Edit_Output {
+			files                     = borrowed.files,
+			whitespace_repaired_hunks = borrowed.whitespace_repaired_hunks,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.summary = strings.clone(borrowed.summary, allocator) or_return
+		owned = value
 	case Shell_Output:
-		borrowed := value
-		value.stdout = ""
-		value.stderr = ""
-		value.stdout_file = ""
-		value.stderr_file = ""
+		value := Shell_Output {
+			exit_code    = borrowed.exit_code,
+			stdout_bytes = borrowed.stdout_bytes,
+			stderr_bytes = borrowed.stderr_bytes,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.stdout = strings.clone(borrowed.stdout, allocator) or_return
 		value.stderr = strings.clone(borrowed.stderr, allocator) or_return
 		value.stdout_file = strings.clone(borrowed.stdout_file, allocator) or_return
 		value.stderr_file = strings.clone(borrowed.stderr_file, allocator) or_return
+		owned = value
 	case Skills_Output:
-		borrowed := value
-		value.skills = nil
+		value := Skills_Output {
+			total_matches = borrowed.total_matches,
+			next_offset   = borrowed.next_offset,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.skills = make([]Skill_Record, len(borrowed.skills), allocator) or_return
 		for item, index in borrowed.skills {
 			value.skills[index].name = strings.clone(item.name, allocator) or_return
 			value.skills[index].source = strings.clone(item.source, allocator) or_return
 			value.skills[index].description = strings.clone(item.description, allocator) or_return
 		}
+		owned = value
 	case Skill_Output:
-		borrowed := value
-		value.name = ""
-		value.path = ""
-		value.directory = ""
-		value.content_digest = ""
-		value.instructions = ""
+		value: Skill_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.name = strings.clone(borrowed.name, allocator) or_return
 		value.path = strings.clone(borrowed.path, allocator) or_return
 		value.directory = strings.clone(borrowed.directory, allocator) or_return
 		value.content_digest = strings.clone(borrowed.content_digest, allocator) or_return
 		value.instructions = strings.clone(borrowed.instructions, allocator) or_return
+		owned = value
 	case Compact_Output:
-		borrowed := value
-		value.state = ""
+		value: Compact_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.state = strings.clone(borrowed.state, allocator) or_return
+		owned = value
 	case Agents_Output:
-		borrowed := value.content
-		value.content = ""
-		value.content = strings.clone(borrowed, allocator) or_return
+		value: Agents_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
+		value.content = strings.clone(borrowed.content, allocator) or_return
+		owned = value
 	case Agent_Output:
-		borrowed := value
-		value = {}
+		value: Agent_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.agent = strings.clone(borrowed.agent, allocator) or_return
 		value.status = strings.clone(borrowed.status, allocator) or_return
 		value.model = strings.clone(borrowed.model, allocator) or_return
@@ -493,13 +539,15 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.acp_session = strings.clone(borrowed.acp_session, allocator) or_return
 		value.notice = strings.clone(borrowed.notice, allocator) or_return
 		value.answer = strings.clone(borrowed.answer, allocator) or_return
+		owned = value
 	case Codemode_Output:
-		borrowed := value
-		value.failure = ""
-		value.value = ""
-		value.traceback = ""
-		value.logs = ""
-		value.calls = nil
+		value := Codemode_Output {
+			calls_total = borrowed.calls_total,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.failure = strings.clone(borrowed.failure, allocator) or_return
 		value.value = strings.clone(borrowed.value, allocator) or_return
 		value.traceback = strings.clone(borrowed.traceback, allocator) or_return
@@ -510,10 +558,13 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 			value.calls[index].name = strings.clone(item.name, allocator) or_return
 			value.calls[index].outcome = strings.clone(item.outcome, allocator) or_return
 		}
+		owned = value
 	case MCP_Output:
-		borrowed := value
-		value.structured_content = ""
-		value.content = nil
+		value: MCP_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.structured_content = strings.clone(borrowed.structured_content, allocator) or_return
 		value.content = make([]MCP_Block, len(borrowed.content), allocator) or_return
 		for item, index in borrowed.content {
@@ -521,14 +572,17 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 			value.content[index].text = strings.clone(item.text, allocator) or_return
 			value.content[index].detail = strings.clone(item.detail, allocator) or_return
 		}
+		owned = value
 	case Argument_Failure:
-		borrowed := value
-		value.kind = ""
-		value.field = ""
-		value.expected = ""
+		value: Argument_Failure
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
 		value.kind = strings.clone(borrowed.kind, allocator) or_return
 		value.field = strings.clone(borrowed.field, allocator) or_return
 		value.expected = strings.clone(borrowed.expected, allocator) or_return
+		owned = value
 	case nil:
 	}
 	return
