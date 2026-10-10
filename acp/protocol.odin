@@ -101,6 +101,8 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 	}
 	result.kind = .Response
 	if error_present {
+		owned_key, _ := delete_key(&value.(json.Object), "error")
+		delete(owned_key, allocator)
 		parsed_error, error_error := parse_rpc_error(error_value, allocator)
 		if error_error != .None {
 			destroy_envelope(&result, allocator)
@@ -109,7 +111,9 @@ parse_envelope :: proc(payload: string, allocator := context.allocator) -> (Enve
 		result.rpc_error = parsed_error
 	}
 	if result_present {
-		result.result = json.clone_value(result_value, allocator)
+		owned_key, _ := delete_key(&value.(json.Object), "result")
+		delete(owned_key, allocator)
+		result.result = result_value
 	}
 	return result, .None
 }
@@ -217,8 +221,12 @@ object_id :: proc(object: json.Object, key: string, allocator := context.allocat
 	}
 	return nil, .Invalid_ID
 }
+// parse_rpc_error takes ownership of value on success and failure. A successful
+// result owns its message and data with allocator.
 @(require_results)
 parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (RPC_Error, Envelope_Error) {
+	value := value
+	defer json.destroy_value(value, allocator)
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, .Invalid_Error }
 	code_value, code_present := object["code"]
@@ -233,7 +241,9 @@ parse_rpc_error :: proc(value: json.Value, allocator := context.allocator) -> (R
 		message = message,
 	}
 	if data, present := object["data"]; present {
-		result.data = json.clone_value(data, allocator)
+		owned_key, _ := delete_key(&value.(json.Object), "data")
+		delete(owned_key, allocator)
+		result.data = data
 	}
 	return result, .None
 }

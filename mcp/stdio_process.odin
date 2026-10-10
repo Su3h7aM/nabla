@@ -150,7 +150,8 @@ stdio_wait :: proc(
 			}
 			count += 1
 		}
-		if err = subprocess.poll(entries[:count], control.deadline_at, control.has_deadline); err != nil { return .Failed, .None, err }
+		deadline, has_deadline := control.deadline.?
+		if err = subprocess.poll(entries[:count], deadline, has_deadline); err != nil { return .Failed, .None, err }
 		if entries[0].ready { return .Ready, .None, nil }
 		if subprocess.child_poll(child) { return .Server_Gone, .None, nil }
 	}

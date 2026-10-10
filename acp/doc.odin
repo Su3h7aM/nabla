@@ -23,8 +23,9 @@
 //
 // A Writer encodes each complete frame before transferring its owned bytes to an
 // unbounded FIFO. One writer thread owns the stream, so senders never wait for I/O
-// and frames keep queue order. A write error closes the writer; writer_failed reports
-// it and later sends fail. writer_destroy drains queued frames for the
+// and frames keep queue order. A response encoding or queueing failure, or a write
+// error, closes the writer; writer_failed reports it and later sends fail.
+// writer_destroy drains queued frames for the
 // caller's shutdown patience, then abandons a writer thread still blocked in I/O.
 // A refusal is a value instead: a frame or a message a peer's answer cannot be built
 // from is reported as Frame_Error or Envelope_Error, with the sentence a client reads

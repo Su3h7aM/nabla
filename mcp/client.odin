@@ -19,6 +19,7 @@ CLIENT_HANDSHAKE_TIMEOUT :: 5 * time.Second
 // process was started from, the request id counter, and the revision the server
 // agreed to speak. One request is in flight at a time; a request made while another
 // is in flight, from any thread, is refused with Busy before anything is written.
+// A live Client must not move after client_start: its stderr drainer borrows its address.
 Client :: struct {
 	stdio:     Stdio,
 	config:    Stdio_Config,
@@ -149,9 +150,8 @@ client_initialize :: proc(client: ^Client, options: Operation_Options, allocator
 	// The notification shares the handshake's observer and deadline. Only callers
 	// that supplied no deadline receive the package default.
 	handshake_control := control
-	if !handshake_control.has_deadline {
-		handshake_control.deadline_at = time.tick_add(time.tick_now(), CLIENT_HANDSHAKE_TIMEOUT)
-		handshake_control.has_deadline = true
+	if handshake_control.deadline == nil {
+		handshake_control.deadline = time.tick_add(time.tick_now(), CLIENT_HANDSHAKE_TIMEOUT)
 	}
 	// The continuation keeps the caller's observer: the notification is part of
 	// the same handshake the caller asked to watch.

@@ -124,8 +124,7 @@ mcp_operation :: proc(timeout: time.Duration) -> mcp.Operation_Options {
 	options: mcp.Operation_Options
 	if timeout > 0 {
 		options.control = {
-			deadline_at  = time.tick_add(time.tick_now(), timeout),
-			has_deadline = true,
+			deadline = time.tick_add(time.tick_now(), timeout),
 		}
 	}
 	return options

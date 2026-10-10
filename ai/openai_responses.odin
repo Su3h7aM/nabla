@@ -334,25 +334,16 @@ openai_responses_record_bytes :: proc(record: string, out: ^strings.Builder, all
 	array, is_array := items.(json.Array)
 	if !is_array { return false, .Invalid_Message }
 	first := true
-	for item in array {
+	for &item in array {
 		replayed, is_object := item.(json.Object)
 		if !is_object || !openai_responses_replay_item_ok(replayed, allocator) { return false, .Invalid_Message }
-		// An output item carries a terminal status; the input-item schema has no such
-		// field, and an endpoint refuses a field it does not know. Everything else
-		// survives, so the record stays replayable.
-		clone, clone_error := make(json.Object, len(replayed), allocator)
-		if clone_error != nil { return false, .Allocation }
-		for key, value in replayed {
-			if key == "status" { continue }
-			owned_key, key_error := strings.clone(key, allocator)
-			if key_error != nil {
-				json.destroy_value(json.Value(clone), allocator)
-				return false, .Allocation
-			}
-			clone[owned_key] = json.Value(json.clone_value(value, allocator))
+		// Output status is not a field in the input-item schema.
+		if _, present := replayed["status"]; present {
+			owned_key, status := delete_key(&item.(json.Object), "status")
+			delete(owned_key, allocator)
+			json.destroy_value(status, allocator)
 		}
-		text, unparse_err := json.unparse(json.Value(clone), {sort_maps_by_key = true}, allocator)
-		json.destroy_value(json.Value(clone), allocator)
+		text, unparse_err := json.unparse(item, {sort_maps_by_key = true}, allocator)
 		if unparse_err != nil { return false, .Allocation }
 		if !first && strings.write_byte(out, ',') != 1 {
 			delete(text, allocator)

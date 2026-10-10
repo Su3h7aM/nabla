@@ -5,6 +5,7 @@ package acp
 import "core:bytes"
 import "core:encoding/json"
 import "core:io"
+import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -41,6 +42,32 @@ test_writer_finish :: proc(t: ^testing.T, writer: ^Writer) {
 
 test_writer_cleanup :: proc(writer: ^Writer) {
 	_ = writer_destroy(writer, time.Second)
+}
+
+@(test)
+test_writer_latches_response_serialization_failure :: proc(t: ^testing.T) {
+	buffer: bytes.Buffer
+	bytes.buffer_init_allocator(&buffer, 0, 0, context.allocator)
+	defer bytes.buffer_destroy(&buffer)
+	variants := []bool{false, true}
+	for error_reply in variants {
+		writer, writer_error := writer_init(test_writer_stream(&buffer))
+		if writer_error != nil { testing.fail_now(t, "the writer could not be created") }
+		defer test_writer_cleanup(&writer)
+		previous_allocator := context.temp_allocator
+		context.temp_allocator = mem.nil_allocator()
+		queued := false
+		if error_reply {
+			queued = writer_write_error(&writer, i64(1), ERROR_INVALID_PARAMS, "invalid")
+		} else {
+			queued = writer_write_response(&writer, i64(1), Session_New_Result{session_id = "session"})
+		}
+		context.temp_allocator = previous_allocator
+		testing.expect(t, !queued)
+		testing.expect(t, writer_failed(&writer), "a response that could not be encoded must latch the writer failure")
+		testing.expect(t, !writer_write_response(&writer, i64(2), Empty_Result{}), "a failed writer must refuse later replies")
+		test_writer_finish(t, &writer)
+	}
 }
 
 Test_Writer_Stall :: struct {

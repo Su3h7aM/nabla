@@ -41,3 +41,19 @@ mcp_failing_allocate :: proc(
 ) {
 	return nil, .Out_Of_Memory
 }
+
+@(test)
+test_message_admission_reports_key_and_map_allocation_failure :: proc(t: ^testing.T) {
+	previous_allocator := context.temp_allocator
+	context.temp_allocator = mem.Allocator {
+		procedure = mcp_failing_allocate,
+	}
+	defer context.temp_allocator = previous_allocator
+	lines := []string{`{"":null}`, `{"jsonrpc":"2.0","id":1,"result":{}}`}
+	for line in lines {
+		message, err := message_decode(line, context.allocator)
+		defer message_destroy(&message, context.allocator)
+		defer error_destroy(&err, context.allocator)
+		testing.expect_value(t, err.kind, Error_Kind.Out_Of_Memory)
+	}
+}

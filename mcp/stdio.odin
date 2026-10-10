@@ -93,6 +93,7 @@ stdio_config_destroy :: proc(config: ^Stdio_Config, allocator := context.allocat
 // Standard input and output carry one JSON-RPC message per line. Standard error is
 // diagnostic text only: a thread drains it so a chatty server cannot block on a full
 // pipe, and a request outcome never depends on it.
+// A live Stdio must not move after stdio_start: its stderr drainer borrows its address.
 Stdio :: struct {
 	pipes:            Stdio_Pipes,
 	child:            subprocess.Child,
@@ -179,7 +180,10 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 		return stdio_spawn_error("the standard error drain could not be prepared", stop_error, allocator)
 	}
 	stdio.drain_stop_read, stdio.drain_stop_write = stop_read, stop_write
+	previous_allocator := context.allocator
+	context.allocator = allocator
 	stdio.stderr_thread = thread.create(stdio_stderr_serve)
+	context.allocator = previous_allocator
 	if stdio.stderr_thread == nil {
 		stdio_stop(stdio)
 		return error_make(.Out_Of_Memory, allocator = allocator)
@@ -380,6 +384,7 @@ stdio_stderr_attach :: proc(stdio: ^Stdio, err: ^Error) {
 // next write and never answer.
 stdio_stderr_serve :: proc(thread: ^thread.Thread) {
 	stdio := cast(^Stdio)thread.data
+	context.allocator = stdio.allocator
 	buffer: [4096]u8
 	// The drain ends at end of stream, on a read error, or when stdio_stop closes the
 	// stop pipe: descendants of the server can hold standard error open after it exits.

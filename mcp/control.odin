@@ -23,14 +23,11 @@ Stop :: enum {
 // timeout. The caller keeps its own cancellation vocabulary: this package only
 // observes it.
 Control :: struct {
-	user_data:    rawptr,
-	interrupted:  proc(user_data: rawptr) -> bool,
-	// deadline_at is the absolute instant the operation must stop by; has_deadline
-	// says whether it applies. It is a monotonic tick, so a wall-clock change
-	// cannot make it fire early.
-	deadline_at:  time.Tick,
-	has_deadline: bool,
-	wake:         ^os.File,
+	user_data:   rawptr,
+	interrupted: proc(user_data: rawptr) -> bool,
+	// deadline is the absolute monotonic instant the operation must stop by.
+	deadline:    Maybe(time.Tick),
+	wake:        ^os.File,
 }
 
 // Wire_Direction is which way one message travelled.
@@ -84,7 +81,7 @@ operation_report :: proc(options: Operation_Options, report: Wire_Report) {
 
 control_stop :: proc(control: Control) -> Stop {
 	if control.interrupted != nil && control.interrupted(control.user_data) { return .Cancelled }
-	if control.has_deadline && time.tick_since(control.deadline_at) >= 0 { return .Timed_Out }
+	if deadline, present := control.deadline.?; present && time.tick_since(deadline) >= 0 { return .Timed_Out }
 	return .None
 }
 

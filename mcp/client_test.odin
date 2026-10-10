@@ -31,8 +31,7 @@ done
 	client.version = .V2026_07_28
 
 	control := Control {
-		deadline_at  = time.tick_add(time.tick_now(), CLIENT_TEST_BOUND),
-		has_deadline = true,
+		deadline = time.tick_add(time.tick_now(), CLIENT_TEST_BOUND),
 	}
 	page, err := client_tools_list(&client, {control = control})
 	defer tool_page_destroy(&page)
@@ -64,8 +63,7 @@ done
 	client.version = .V2026_07_28
 
 	control := Control {
-		deadline_at  = time.tick_add(time.tick_now(), CLIENT_TEST_BOUND),
-		has_deadline = true,
+		deadline = time.tick_add(time.tick_now(), CLIENT_TEST_BOUND),
 	}
 	page, err := client_tools_list(&client, {control = control})
 	defer tool_page_destroy(&page)

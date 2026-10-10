@@ -1,6 +1,7 @@
 #+test
 package websocket
 
+import "base:runtime"
 import "core:mem"
 import "core:testing"
 
@@ -57,6 +58,48 @@ fixture_connection :: proc(t: ^testing.T, fixture: ^Fixture, incoming: []u8) -> 
 	)
 	if !testing.expect(t, err == .None, "a connection could not be prepared") { return nil }
 	return connection
+}
+
+@(test)
+test_init_failure_leaves_transport_owned_by_caller :: proc(t: ^testing.T) {
+	fixture: Fixture
+	state := Init_Test_Allocator {
+		backing = context.allocator,
+	}
+	connection, err := init(
+		{read = fixture_read, write = fixture_write, release = fixture_release, user_data = &fixture},
+		mem.Allocator{procedure = init_test_allocate, data = &state},
+	)
+	testing.expect_value(t, err, Error.No_Room)
+	testing.expect(t, connection == nil)
+	testing.expect_value(t, state.allocations, 2)
+	testing.expect(t, fixture.released == 0, "failed init released a transport the caller still owns")
+	fixture_release(&fixture)
+	testing.expect_value(t, fixture.released, 1)
+}
+
+Init_Test_Allocator :: struct {
+	backing:     mem.Allocator,
+	allocations: int,
+}
+
+init_test_allocate :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	loc: runtime.Source_Code_Location = #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	state := cast(^Init_Test_Allocator)data
+	if mode == .Alloc || mode == .Alloc_Non_Zeroed {
+		state.allocations += 1
+		if state.allocations == 2 { return nil, .Out_Of_Memory }
+	}
+	return state.backing.procedure(state.backing.data, mode, size, alignment, old_memory, old_size, loc)
 }
 
 @(test)

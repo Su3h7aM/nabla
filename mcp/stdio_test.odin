@@ -107,11 +107,10 @@ test_stdio_read_wakes_for_a_stop :: proc(t: ^testing.T) {
 	defer thread.destroy(stopper)
 
 	control := Control {
-		user_data    = &stop,
-		interrupted  = stdio_test_interrupted,
-		deadline_at  = time.tick_add(time.tick_now(), STDIO_TEST_BOUND),
-		has_deadline = true,
-		wake         = stop.wake_read,
+		user_data   = &stop,
+		interrupted = stdio_test_interrupted,
+		deadline    = time.tick_add(time.tick_now(), STDIO_TEST_BOUND),
+		wake        = stop.wake_read,
 	}
 	_, read_error := stdio_read_line(&stdio, control)
 	defer error_destroy(&read_error)

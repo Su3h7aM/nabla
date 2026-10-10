@@ -3,13 +3,13 @@ package mcp
 import "core:encoding/json"
 
 // Document_Problem names why a JSON document the server sent cannot be used.
-// None is the zero value, so a fresh result reads as no problem.
 Document_Problem :: enum {
 	None,
 	Too_Deep,
 	Syntax,
 	Duplicate_Key,
 	Not_Object,
+	Allocation,
 }
 
 // document_admit reports the first structural defect in a document a server
@@ -54,16 +54,14 @@ mcp_token_bad :: proc(token: json.Token, err: json.Error) -> bool {
 
 @(private, require_results)
 mcp_admit_object :: proc(tokenizer: ^json.Tokenizer, depth, depth_limit: int) -> Document_Problem {
-	// The depth check belongs to the container rather than to its caller: every
-	// level enters through here, and a check made once at the root would miss
-	// every level below it.
 	if depth > depth_limit { return .Too_Deep }
-	seen := make(map[string]bool, context.temp_allocator)
-	defer delete(seen)
+	seen, allocation_error := make(map[string]bool, 0, context.temp_allocator)
+	if allocation_error != nil { return .Allocation }
+	defer {
+		for key in seen { delete(key, context.temp_allocator) }
+		delete(seen)
+	}
 
-	// comma records that the previous iteration ended on a comma, which is what
-	// makes a trailing comma detectable: it is only inspected immediately after
-	// one, because that is the only position where a closing brace is illegal.
 	comma := false
 	for {
 		token, token_err := json.get_token(tokenizer)
@@ -75,9 +73,19 @@ mcp_admit_object :: proc(tokenizer: ^json.Tokenizer, depth, depth_limit: int) ->
 		if token.kind != .String { return .Syntax }
 
 		key, key_err := json.unquote_string(token, .JSON, context.temp_allocator)
-		if key_err != nil { return .Syntax }
-		if seen[key] { return .Duplicate_Key }
-		seen[key] = true
+		if key_err != nil {
+			if key_err == .Out_Of_Memory || key_err == .Invalid_Allocator { return .Allocation }
+			return .Syntax
+		}
+		_, _, inserted, insertion_error := map_entry(&seen, key)
+		if insertion_error != nil {
+			delete(key, context.temp_allocator)
+			return .Allocation
+		}
+		if !inserted {
+			delete(key, context.temp_allocator)
+			return .Duplicate_Key
+		}
 
 		colon, colon_err := json.get_token(tokenizer)
 		if mcp_token_bad(colon, colon_err) || colon.kind != .Colon { return .Syntax }

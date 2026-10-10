@@ -102,8 +102,7 @@ tool_mcp_options :: proc(ctx: ^Tool_Context) -> mcp.Operation_Options {
 		control = {user_data = ctx.control.interrupt, interrupted = tool_mcp_interrupted, wake = ctx.control.wake},
 	}
 	if ctx.timeout > 0 {
-		options.control.deadline_at = time.tick_add(time.tick_now(), ctx.timeout)
-		options.control.has_deadline = true
+		options.control.deadline = time.tick_add(time.tick_now(), ctx.timeout)
 	}
 	return options
 }

@@ -412,10 +412,15 @@ message_decode :: proc(line: string, allocator := context.allocator) -> (message
 		return {}, error_make(.Malformed_Message, "it repeats a field name", allocator = allocator)
 	case .Not_Object, .Syntax:
 		return {}, error_make(.Malformed_Message, allocator = allocator)
+	case .Allocation:
+		return {}, error_make(.Out_Of_Memory, allocator = allocator)
 	}
 
 	root, parse_err := json.parse_string(line, .JSON, true, allocator)
-	if parse_err != nil { return {}, error_make(.Malformed_Message, allocator = allocator) }
+	if parse_err != nil {
+		if parse_err == .Out_Of_Memory || parse_err == .Invalid_Allocator { return {}, error_make(.Out_Of_Memory, allocator = allocator) }
+		return {}, error_make(.Malformed_Message, allocator = allocator)
+	}
 	object, is_object := root.(json.Object)
 	if !is_object {
 		json.destroy_value(root, allocator)

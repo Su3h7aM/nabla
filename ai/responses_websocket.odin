@@ -136,6 +136,8 @@ Provider_WebSocket_Request :: proc(
 	if connect_err := Provider_WebSocket_Connect(session, encoded, options); connect_err.kind != .None {
 		return connect_err
 	}
+	// The binding borrows interruption storage only until this operation returns.
+	defer session.control = {}
 	if options.observer.report != nil {
 		options.observer.report(
 			options.observer.user_data,
@@ -159,9 +161,6 @@ Provider_WebSocket_Request :: proc(
 	defer Provider_Event_Destroy(&state.completion, allocator)
 	defer Provider_Stream_Destroy(&state.stream)
 	defer provider_state_release(&state)
-	// The probe binding names interruption storage that belongs to this operation, so
-	// it is cleared before the session can outlive it.
-	defer session.control = {}
 
 	for {
 		result, stale := provider_websocket_exchange(session, encoded, &state, options, reused)

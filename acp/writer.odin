@@ -103,7 +103,7 @@ writer_destroy :: proc(writer: ^Writer, patience: time.Duration) -> bool {
 	return true
 }
 
-// writer_failed reports whether an I/O error closed the output stream.
+// writer_failed reports whether a response could not be queued or I/O failed.
 writer_failed :: proc(writer: ^Writer) -> bool {
 	state := writer.state
 	if state == nil { return true }
@@ -117,16 +117,28 @@ writer_failed :: proc(writer: ^Writer) -> bool {
 writer_submit_value :: proc(writer: ^Writer, id: JSONRPC_Id, key: string, value: $T) -> bool {
 	state := writer.state
 	if state == nil { return false }
+	queued := false
+	defer if !queued { writer_latch_failure(state) }
 	body, marshal_error := json.marshal(value, allocator = context.temp_allocator)
 	if marshal_error != nil { return false }
 	defer delete(body, context.temp_allocator)
 	frame, encoded := writer_encode_frame(state, id, key, body)
 	if !encoded { return false }
-	return writer_submit_frame(state, frame, true)
+	queued = writer_submit_frame(state, frame, true)
+	return queued
+}
+
+@(private)
+writer_latch_failure :: proc(state: ^Writer_State) {
+	sync.mutex_guard(&state.mutex)
+	state.failed = true
+	state.closed = true
+	state.closing = true
+	sync.cond_broadcast(&state.ready)
 }
 
 // writer_write_response serializes a result before transferring its complete frame to
-// the writer thread. True means queued, not written.
+// the writer thread. True means queued, not written. False latches writer_failed.
 @(require_results)
 writer_write_response :: proc(writer: ^Writer, id: JSONRPC_Id, result: $T) -> bool {
 	return writer_submit_value(writer, id, `"result":`, result)
@@ -139,7 +151,7 @@ RPC_Error_Wire :: struct {
 }
 
 // writer_write_error serializes an error before transferring its complete frame to the
-// writer thread. True means queued, not written.
+// writer thread. True means queued, not written. False latches writer_failed.
 @(require_results)
 writer_write_error :: proc(writer: ^Writer, id: JSONRPC_Id, code: i64, message: string) -> bool {
 	return writer_submit_value(writer, id, `"error":`, RPC_Error_Wire{code = code, message = message})

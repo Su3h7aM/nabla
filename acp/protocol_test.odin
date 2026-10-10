@@ -49,6 +49,27 @@ test_envelope_kinds_and_validation :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_response_subtrees_remain_owned_after_parsing :: proc(t: ^testing.T) {
+	response, response_error := parse_envelope(`{"jsonrpc":"2.0","id":1,"result":{"items":[{"text":"result"}]}}`)
+	if response_error != .None { testing.fail_now(t, "the response could not be parsed") }
+	defer destroy_envelope(&response)
+	result := response.result.(json.Object)
+	items := result["items"].(json.Array)
+	testing.expect_value(t, string(items[0].(json.Object)["text"].(json.String)), "result")
+
+	error_response, error_response_error := parse_envelope(
+		`{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"invalid","data":{"items":[{"text":"detail"}]}}}`,
+	)
+	if error_response_error != .None { testing.fail_now(t, "the error response could not be parsed") }
+	defer destroy_envelope(&error_response)
+	rpc_error := error_response.rpc_error.?
+	testing.expect_value(t, rpc_error.message, "invalid")
+	data := rpc_error.data.(json.Object)
+	details := data["items"].(json.Array)
+	testing.expect_value(t, string(details[0].(json.Object)["text"].(json.String)), "detail")
+}
+
+@(test)
 test_prompt_params_decode_reads_blob_metadata_without_copying_payload :: proc(t: ^testing.T) {
 	envelope, envelope_err := parse_envelope(
 		`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"resource","resource":{"uri":"file:///a.bin","mimeType":"application/octet-stream","blob":"YWJj"}}]}}`,
