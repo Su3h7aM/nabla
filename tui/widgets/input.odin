@@ -552,6 +552,8 @@ _input_key_character :: proc(input: ^Input, key: keys.Key_Event, width: int, pro
 			_ = input_move_end(input, width, profile)
 		case 'h':
 			_ = input_backspace(input) or_return
+		case 'j':
+			input_insert_newline(input) or_return
 		case 'w':
 			_ = input_delete_word_back(input) or_return
 		case 'k':

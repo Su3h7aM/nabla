@@ -561,6 +561,12 @@ test_input_key_dispatches_bindings :: proc(t: ^testing.T) {
 	testing.expect(t, !(input_key(&input, {code = .Up}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "no row above the first")
 	testing.expect(t, input_key(&input, {code = .Down}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false)
 	testing.expect(t, !(input_key(&input, {code = .Down}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false), "no row below the last")
+	testing.expect(
+		t,
+		input_key(&input, {code = .Character, character = 'j', modifiers = {.Control}}, 20, text.DEFAULT_WIDTH_PROFILE) or_else false,
+		"raw LF is Ctrl+J",
+	)
+	testing.expect_value(t, input_text(&input), "\n\nfoo bar")
 }
 
 @(test)
