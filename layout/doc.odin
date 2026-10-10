@@ -16,7 +16,7 @@
 // `Border_Style.paint`, `Text_Desc.paint`, and `Image_Content.paint`. Layout
 // computes geometry and carries each id through to the matching command
 // unchanged. Paint 0 means nothing is drawn, so layout emits no command for it.
-// Paint never affects measurement, and the measure cache ignores it.
+// Paint never affects measurement, and the text caches ignore it.
 //
 // Read this package comment as the canonical composition guide. In particular,
 // `frame` and `element` use Odin's deferred lexical scopes: the declaration
@@ -43,6 +43,7 @@
 //             depth = 32,
 //             diagnostics = 64,
 //             measured_words = 256,
+//             measured_texts = 64,
 //         },
 //         cull = .Visible,
 //     }
@@ -294,6 +295,12 @@
 // width policy, terminal resize behavior, or another caller-owned measurement
 // input changes. The generation invalidates cached measurements; it does not
 // extend the lifetime of borrowed text or callback data.
+//
+// A text whose content and style match an earlier frame is not measured or
+// broken again at any width: the context keeps its words and sizes, up to
+// `measured_texts` texts and `measured_words` words, and frees a text once
+// three solves pass without it. A full pool only means that text is measured
+// each frame; geometry is the same.
 //
 // # Publication and errors
 //

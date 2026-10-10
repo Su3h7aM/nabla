@@ -374,6 +374,31 @@ test_conversation_raises_its_budget_instead_of_reserving_the_worst_case :: proc(
 	)
 }
 
+// The text cache pools never fail a frame when full, so the budget follows how full
+// they got: a transcript with more texts than the starting pool holds raises it.
+@(test)
+test_conversation_raises_its_text_cache_when_it_fills :: proc(t: ^testing.T) {
+	app := new(App)
+	defer {
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	for value in 0 ..< 600 {
+		snap_append(app, .User, fmt.tprintf("message %d with enough words to wrap across a few columns", value))
+	}
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	if !testing.expect(t, storage != nil, "the frame storage must be allocated") { return }
+
+	initial := storage.capacities.measured_texts
+	for _ in 0 ..< 2 {
+		testing.expect(t, conversation_render(t, app, storage, 60, 20), "the transcript must solve")
+	}
+	testing.expect(t, storage.capacities.measured_texts > initial, "a full text pool must be raised")
+}
+
 // An unbreakable token wider than the viewport must not widen the conversation.
 // Before the root clipped horizontally, one long token set its minimum width, so
 // every entry wrapped at that width and was cut off at the terminal edge instead

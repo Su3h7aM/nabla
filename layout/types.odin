@@ -320,6 +320,7 @@ Pool_Id :: enum u8 {
 	Measured_Words,
 	Overlays,
 	Measure_Cache,
+	Measured_Texts,
 	Id_Table,
 	Depth,
 	Diagnostics,
@@ -387,13 +388,16 @@ MAX_DEPTH :: 1 << 12
 
 Capacities :: struct {
 	nodes, children, clips, commands, text_lines, overlays:    int,
+	// measure_cache holds line and run sizes, which depend on where a text
+	// wraps; one entry per distinct wrapped line or painted prefix in play.
 	measure_cache, id_table, depth, diagnostics, debug_labels: int,
-	// Words retained across a frame so wrapping reuses the advances intrinsic
-	// sizing already measured instead of re-measuring each word. Zero disables
-	// the reuse: wrapping still produces identical geometry, it just measures
-	// each word again. Budget one entry per whitespace-separated word across
-	// every text node declared in a frame.
-	measured_words:                                            int,
+	// Distinct texts and their words kept across frames, so a text whose
+	// content and style did not change costs no measurement. A text stays until
+	// three solves pass without it. Budget one text per distinct string and one
+	// word per whitespace-separated word across the texts of the last few
+	// frames. A full pool is not an error: the text is measured again each
+	// frame, with identical geometry. Zero in either disables the reuse.
+	measured_texts, measured_words:                            int,
 	// Table columns declared in a frame, summed over all tables.
 	tracks:                                                    int,
 }

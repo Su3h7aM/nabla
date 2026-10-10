@@ -95,9 +95,10 @@ _text_runs_valid :: proc "contextless" (text: string, runs: []Text_Run) -> bool 
 /*
 Fold the identity of a text node's content and style into one key.
 
-Runs measured from this node differ only by which substring they cover, so the
-per-run key is this value extended with that substring's offset and length, so
-a cache lookup costs a few multiplies rather than a hash over the text.
+It names the text's item in the text cache. Runs measured from this node
+differ only by which substring they cover, so the per-run key is this value
+extended with that substring's offset and length, so a cache lookup costs a
+few multiplies rather than a hash over the text.
 */
 @(private)
 _text_identity_key :: proc(state: ^_Context_State, input: _Node_Input) -> u64 {
@@ -136,6 +137,7 @@ invalidate_metrics :: proc(ctx: ^Context, generation: u32) {
 		entry = {}
 	}
 	state._measure_cache_count = 0
+	_text_cache_clear(&state._text_cache)
 }
 
 /*
@@ -170,8 +172,12 @@ _measure_cache_key :: proc(state: ^_Context_State, node: Node_Handle, text: stri
 }
 
 // _run_offset_in returns a borrowed run's offset, rejecting strings outside text.
+// An empty run has no address of its own and measures the same anywhere.
 @(private, require_results)
 _run_offset_in :: proc "contextless" (text, run: string) -> (offset: int, within: bool) {
+	if len(run) == 0 {
+		return 0, true
+	}
 	if len(run) > len(text) {
 		return 0, false
 	}
@@ -302,39 +308,80 @@ Width is the widest hard segment; the floor is the widest unbreakable run: the
 widest grapheme when words or characters may wrap, the whole segment otherwise.
 Height is the resolved line height times the hard-segment count, which is the
 line count before any soft wrapping.
+
+The measurement is width-independent, so a text whose item is in the text cache
+is restored with no service call at all.
 */
 @(private)
 _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Measure_Result {
 	input := &state._node_inputs[node]
+	cache := &state._text_cache
+
+	summary: _Text_Summary
+	input.text_item = _text_cache_find(cache, input.text_key, state._generation)
+	if input.text_item != 0 {
+		summary = cache.items[input.text_item - 1].summary
+	} else {
+		recorded: bool
+		summary, recorded = _measure_text_summary(state, node)
+		if recorded {
+			input.text_item = _text_cache_insert(cache, input.text_key, state._generation, summary)
+		}
+	}
+	_update_high_water(state, .Measured_Texts, cache.item_count)
+	_update_high_water(state, .Measured_Words, cache.word_peak)
+
+	line_height := f64(input.text_style.line_height)
+	if line_height == 0 {
+		line_height = summary.natural_line_height
+	}
+	input.line_height = _finite_scalar(state, node, .Y, line_height, false)
+
+	height := line_height * f64(summary.segment_count)
+	return Measure_Result {
+		size = {_finite_scalar(state, node, .X, summary.widest, false), _finite_scalar(state, node, .Y, height, false)},
+		min_size = {_finite_scalar(state, node, .X, summary.longest_unbreakable, false), _finite_scalar(state, node, .Y, height, false)},
+	}
+}
+
+/*
+Measure a text node through the services.
+
+Words are recorded with their advances in the text cache's word pool so wrapping
+can pack lines by summing, rather than measuring every word a second time.
+`recorded` is false when the summary cannot be cached: the frame failed, or the
+word pool cannot hold the text, in which case no word is retained.
+*/
+@(private)
+_measure_text_summary :: proc(state: ^_Context_State, node: Node_Handle) -> (summary: _Text_Summary, recorded: bool) {
+	input := &state._node_inputs[node]
+	cache := &state._text_cache
 	text := input.text
 	wrap := input.text_style.wrap
 
-	widest: f64
-	longest_unbreakable: f64
-	natural_line_height: f64
-	segment_count := 0
+	cacheable := len(cache.buckets) > 0
+	recording := cacheable && wrap != .None && len(cache.words) > 0
+	word_tail: i32
+	segment_measured: Measure_Result
 
-	// Words measured here are recorded with their advances so wrapping can pack
-	// lines by summing, rather than measuring every word a second time. The
-	// records are dropped wholesale if the pool cannot hold them, which costs
-	// speed and nothing else.
-	input.word_start = len(state._measured_words)
-	input.word_count = 0
-	recording := wrap == .Words && cap(state._measured_words) > 0
+	// The line a one-segment Words text packs into: from its first word to its
+	// last, with the fit decision replayed in the order wrapping makes it.
+	first_word_start, previous_end: int
+	segment_words, first_segment_words := 0, 0
+	line_running, line_fit: f64
 
 	// Wrap.None never calls the breaker: the whole string is one segment,
 	// measured once, which preserves the historical whole-string behavior
 	// (including the measurer error it provokes when no measurer is set).
 	if wrap == .None {
-		measured := _measure_text_run_cached(state, node, text, _unbounded_request())
-		widest = math.max(widest, f64(measured.size.x))
-		longest_unbreakable = math.max(longest_unbreakable, f64(measured.size.x))
-		natural_line_height = math.max(natural_line_height, f64(measured.size.y))
-		segment_count = 1
+		segment_measured = _measure_text_uncached(state, node, text)
+		summary.widest = f64(segment_measured.size.x)
+		summary.longest_unbreakable = f64(segment_measured.size.x)
+		summary.natural_line_height = f64(segment_measured.size.y)
+		summary.segment_count = 1
 	} else {
 		offset := 0
 		segment_start := 0
-		segment_index := 0
 		for {
 			piece_end, next_offset, kind := _break_text(state, node, text, offset)
 			if state._frame_error != .None {
@@ -342,39 +389,49 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 			}
 			// A non-empty piece is a word when words may wrap.
 			if wrap == .Words && piece_end > offset {
-				word := text[offset:piece_end]
-				word_measured := _measure_text_run_cached(state, node, word, _unbounded_request())
-				longest_unbreakable = math.max(longest_unbreakable, _widest_grapheme(state, node, offset, piece_end))
-				natural_line_height = math.max(natural_line_height, f64(word_measured.size.y))
+				word_measured := _measure_text_uncached(state, node, text[offset:piece_end])
+				summary.longest_unbreakable = math.max(summary.longest_unbreakable, _widest_grapheme(state, node, offset, piece_end))
+				summary.natural_line_height = math.max(summary.natural_line_height, f64(word_measured.size.y))
 
 				if recording {
-					// The separator is the whitespace between this word and the
-					// next, so its advance is measured once here alongside the
-					// word itself. A Mandatory separator is a line terminator
-					// that belongs to the break, not to the word.
-					separator_end := piece_end
-					separator_width: Scalar
-					if kind == .Optional && next_offset > piece_end {
-						separator := text[piece_end:next_offset]
-						separator_end = next_offset
-						separator_width = _measure_text_run_cached(state, node, separator, _unbounded_request()).size.x
-					}
-					record := _Measured_Word {
-						offset          = i32(offset),
-						length          = i32(piece_end - offset),
-						separator_end   = i32(separator_end),
-						width           = word_measured.size.x,
-						separator_width = separator_width,
-						height          = word_measured.size.y,
-						segment         = i32(segment_index),
-					}
-					if !_try_append(&state._measured_words, record) {
-						// Out of room: fall back to measuring during wrapping.
+					previous_tail := word_tail
+					record := _text_cache_append_word(cache, &summary, &word_tail)
+					if record == nil {
+						// Out of room: the text is measured again next frame.
 						// Geometry is unchanged either way, so this is not a frame error.
 						recording = false
-						input.word_count = 0
 					} else {
-						input.word_count += 1
+						record^ = _Measured_Word {
+							offset = i32(offset),
+							span = {length = u32(piece_end - offset)},
+							width = word_measured.size.x,
+							segment = i32(summary.segment_count),
+						}
+						// The separator of the previous word is the whole gap up
+						// to this word, however many break pieces it holds, so its
+						// advance is measured once here.
+						gap_width: f64
+						if segment_words > 0 {
+							previous := &cache.words[previous_tail - 1]
+							if gap := text[previous_end:offset]; len(gap) > 0 {
+								previous.separator_width = _measure_text_uncached(state, node, gap).size.x
+							}
+							gap_width = f64(previous.separator_width)
+						}
+						if summary.segment_count == 0 {
+							word_width := f64(word_measured.size.x)
+							if first_segment_words == 0 {
+								first_word_start = offset
+								line_running = word_width
+								line_fit = word_width
+							} else {
+								line_fit = math.max(line_fit, line_running + gap_width + word_width)
+								line_running += gap_width + word_width
+							}
+							first_segment_words += 1
+						}
+						previous_end = piece_end
+						segment_words += 1
 					}
 				}
 			}
@@ -382,18 +439,32 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 			// follows. Measure it as one unit: widest, natural line height, and
 			// the shrink floor when words do not wrap.
 			if kind == .Mandatory || kind == .None {
-				segment := text[segment_start:piece_end]
-				measured := _measure_text_run_cached(state, node, segment, _unbounded_request())
-				widest = math.max(widest, f64(measured.size.x))
-				natural_line_height = math.max(natural_line_height, f64(measured.size.y))
+				segment_measured = _measure_text_uncached(state, node, text[segment_start:piece_end])
+				summary.widest = math.max(summary.widest, f64(segment_measured.size.x))
+				summary.natural_line_height = math.max(summary.natural_line_height, f64(segment_measured.size.y))
+				// A segment is one record unless it has words of its own.
+				if recording && (wrap != .Words || segment_words == 0) {
+					record := _text_cache_append_word(cache, &summary, &word_tail)
+					if record == nil {
+						recording = false
+					} else {
+						record^ = _Measured_Word {
+							offset = i32(segment_start),
+							span = {length = u32(piece_end - segment_start), wordless = wrap == .Words},
+							width = segment_measured.size.x,
+							baseline = segment_measured.baseline,
+							segment = i32(summary.segment_count),
+						}
+					}
+				}
+				segment_words = 0
 				if wrap == .Characters {
-					longest_unbreakable = math.max(longest_unbreakable, _widest_grapheme(state, node, segment_start, piece_end))
+					summary.longest_unbreakable = math.max(summary.longest_unbreakable, _widest_grapheme(state, node, segment_start, piece_end))
 				} else if wrap != .Words {
-					longest_unbreakable = math.max(longest_unbreakable, f64(measured.size.x))
+					summary.longest_unbreakable = math.max(summary.longest_unbreakable, f64(segment_measured.size.x))
 				}
 				segment_start = next_offset
-				segment_index += 1
-				segment_count += 1
+				summary.segment_count += 1
 				if kind == .None {
 					break
 				}
@@ -401,23 +472,40 @@ _measure_text_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Me
 			offset = next_offset
 		}
 	}
-	if !recording {
-		input.word_count = 0
-	}
-	input.segment_count = segment_count
-	_update_high_water(state, .Measured_Words, len(state._measured_words))
 
-	line_height := f64(input.text_style.line_height)
-	if line_height == 0 {
-		line_height = natural_line_height
+	recorded = cacheable && (wrap == .None || recording) && state._frame_error == .None
+	if !recorded {
+		_text_cache_free_words(cache, summary.word_head)
+		summary.word_head = 0
+		summary.word_count = 0
+		return summary, false
 	}
-	input.line_height = _finite_scalar(state, node, .Y, line_height, false)
 
-	height := line_height * f64(segment_count)
-	return Measure_Result {
-		size = {_finite_scalar(state, node, .X, widest, false), _finite_scalar(state, node, .Y, height, false)},
-		min_size = {_finite_scalar(state, node, .X, longest_unbreakable, false), _finite_scalar(state, node, .Y, height, false)},
+	if summary.segment_count == 1 {
+		summary.line_end = len(text)
+		summary.line_width = segment_measured.size.x
+		summary.line_baseline = segment_measured.baseline
+		if wrap == .Characters {
+			summary.line_fit_width = summary.widest
+		}
+		if wrap == .Words && first_segment_words > 0 {
+			summary.line_start = first_word_start
+			summary.line_end = previous_end
+			summary.line_fit_width = line_fit
+			if summary.line_start != 0 || summary.line_end != len(text) {
+				line_measured := _measure_text_uncached(state, node, text[summary.line_start:summary.line_end])
+				summary.line_width = line_measured.size.x
+				summary.line_baseline = line_measured.baseline
+				if state._frame_error != .None {
+					_text_cache_free_words(cache, summary.word_head)
+					summary.word_head = 0
+					summary.word_count = 0
+					return summary, false
+				}
+			}
+		}
 	}
+	return summary, true
 }
 
 /*
@@ -448,7 +536,7 @@ run when no `Services.grapheme_end` is set.
 _widest_grapheme :: proc(state: ^_Context_State, node: Node_Handle, start, end: int) -> f64 {
 	input := &state._node_inputs[node]
 	if state._services.grapheme_end == nil {
-		return f64(_measure_text_run_cached(state, node, input.text[start:end], _unbounded_request()).size.x)
+		return f64(_measure_text_uncached(state, node, input.text[start:end]).size.x)
 	}
 	widest: f64
 	for offset := start; offset < end; {
@@ -456,7 +544,7 @@ _widest_grapheme :: proc(state: ^_Context_State, node: Node_Handle, start, end: 
 		if state._frame_error != .None {
 			break
 		}
-		widest = math.max(widest, f64(_measure_text_run_cached(state, node, input.text[offset:next], _unbounded_request()).size.x))
+		widest = math.max(widest, f64(_measure_text_uncached(state, node, input.text[offset:next]).size.x))
 		offset = next
 	}
 	return widest
@@ -504,7 +592,12 @@ _split_wide_run :: proc(state: ^_Context_State, node: Node_Handle, start, end: i
 @(private, require_results)
 _append_text_line :: proc(state: ^_Context_State, node: Node_Handle, line: string, line_index: int) -> (Vec2, bool) {
 	measured := _measure_text_run_cached(state, node, line, _unbounded_request())
-	size := Vec2{measured.size.x, state._node_inputs[node].line_height}
+	return _push_text_line(state, node, line, measured.size.x, measured.baseline, line_index)
+}
+
+@(private, require_results)
+_push_text_line :: proc(state: ^_Context_State, node: Node_Handle, line: string, width, baseline: Scalar, line_index: int) -> (Vec2, bool) {
+	size := Vec2{width, state._node_inputs[node].line_height}
 	if line_index > int(max(u16)) {
 		_latch_capacity_error(state, .Text_Lines, state._node_inputs[node].loc)
 		return size, false
@@ -513,7 +606,7 @@ _append_text_line :: proc(state: ^_Context_State, node: Node_Handle, line: strin
 		text     = line,
 		size     = size,
 		line     = u16(line_index),
-		baseline = measured.baseline,
+		baseline = baseline,
 	}
 	if !_try_append(&state._text_lines, record) {
 		_latch_capacity_error(state, .Text_Lines, state._node_inputs[node].loc)
@@ -542,8 +635,17 @@ _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	wrap := input.text_style.wrap
 	widest: f64
 
-	if input.word_count > 0 {
-		return _wrap_text_node_from_records(state, node, available)
+	if input.text_item != 0 {
+		summary := state._text_cache.items[input.text_item - 1].summary
+		if summary.segment_count == 1 && summary.line_fit_width <= available {
+			return _wrap_text_node_single_line(state, node, summary)
+		}
+		if summary.word_count > 0 {
+			if wrap == .Words {
+				return _wrap_text_node_from_records(state, node, available)
+			}
+			return _wrap_text_node_from_segments(state, node, summary, available)
+		}
 	}
 
 	if wrap == .None {
@@ -679,32 +781,93 @@ _wrap_text_node :: proc(state: ^_Context_State, node: Node_Handle) -> bool {
 	// would make the next width pass see a narrower preferred size and prevent
 	// the node from re-expanding into space that later became available.
 	_ = widest
+	_set_text_block_height(state, node)
+	return true
+}
+
+// _set_text_block_height sizes the block to its emitted lines. The height is a
+// hard floor: shrinking it would clip lines.
+@(private)
+_set_text_block_height :: proc(state: ^_Context_State, node: Node_Handle) {
+	input := &state._node_inputs[node]
 	block_height := f64(input.line_height) * f64(input.text_line_count)
 	input.content_size.y = _finite_scalar(state, node, .Y, block_height, false)
-	// The wrapped block height is a hard floor: shrinking height would clip lines.
 	input.content_minimum.y = input.content_size.y
+}
+
+/*
+Emit the one line a text of a single hard segment fits on, from its summary.
+
+The summary holds the line's range, size, and baseline, so the line needs no
+breaking and no measurement.
+*/
+@(private, require_results)
+_wrap_text_node_single_line :: proc(state: ^_Context_State, node: Node_Handle, summary: _Text_Summary) -> bool {
+	input := &state._node_inputs[node]
+	if _, appended := _push_text_line(state, node, input.text[summary.line_start:summary.line_end], summary.line_width, summary.line_baseline, 0); !appended {
+		return false
+	}
+	input.text_line_count = 1
+	_set_text_block_height(state, node)
 	return true
 }
 
 /*
-Break a text node into lines using the advances recorded at intrinsic sizing.
+Emit one line per cached hard segment of a Newlines or Characters text.
+
+A segment that fits, or any segment of a Newlines text, becomes a line from its
+record alone. A Characters segment wider than `available` is split at grapheme
+boundaries first.
+*/
+@(private, require_results)
+_wrap_text_node_from_segments :: proc(state: ^_Context_State, node: Node_Handle, summary: _Text_Summary, available: f64) -> bool {
+	input := &state._node_inputs[node]
+	for handle := summary.word_head; handle != 0; {
+		record := state._text_cache.words[handle - 1]
+		handle = record.next
+		start := int(record.offset)
+		end := start + int(record.span.length)
+		appended: bool
+		if input.text_style.wrap == .Characters && f64(record.width) > available {
+			rest, _, split := _split_wide_run(state, node, start, end, available)
+			if !split {
+				return false
+			}
+			_, appended = _append_text_line(state, node, input.text[rest:end], input.text_line_count)
+		} else {
+			_, appended = _push_text_line(state, node, input.text[start:end], record.width, record.baseline, input.text_line_count)
+		}
+		if !appended {
+			return false
+		}
+		input.text_line_count += 1
+	}
+	_set_text_block_height(state, node)
+	return true
+}
+
+/*
+Break a text node into lines using the advances in its cached words.
 
 Intrinsic sizing already measured every word to find the shrink floor, so
 packing lines here needs no measurement at all, just a running sum over the
 records and one line measurement per emitted line. Line breaking is identical
 to the measuring path: greedy packing, a word too wide for an empty line
-occupies that line alone, and a hard segment always occupies at least one line.
+occupies that line alone, and a hard segment without words is one line holding
+the segment as written.
 */
 @(private, require_results)
 _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, available: f64) -> bool {
 	input := &state._node_inputs[node]
-	words := state._measured_words[input.word_start:input.word_start + input.word_count]
+	summary := state._text_cache.items[input.text_item - 1].summary
 
 	line_start := -1
 	line_end := 0
 	line_width: f64
 	segment := i32(0)
-	segment_lines := 0
+	// Advance of the gap after the previous word, which a word joining the
+	// line pays before its own.
+	previous_separator: f64
 
 	flush_line :: proc(state: ^_Context_State, node: Node_Handle, text: string) -> bool {
 		input := &state._node_inputs[node]
@@ -716,7 +879,10 @@ _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, 
 		return true
 	}
 
-	for record, index in words {
+	for handle := summary.word_head; handle != 0; {
+		record := state._text_cache.words[handle - 1]
+		handle = record.next
+
 		// A new hard segment always starts a new line, because a newline is a
 		// break the wrapper may not undo.
 		if record.segment != segment {
@@ -724,78 +890,54 @@ _wrap_text_node_from_records :: proc(state: ^_Context_State, node: Node_Handle, 
 				if !flush_line(state, node, input.text[line_start:line_end]) {
 					return false
 				}
-				segment_lines += 1
-			}
-			if segment_lines == 0 {
-				// The previous segment held no words at all, so it still owes a
-				// line: an empty one.
-				if !flush_line(state, node, "") {
-					return false
-				}
-			}
-			for empty in segment + 1 ..< record.segment {
-				_ = empty
-				if !flush_line(state, node, "") {
-					return false
-				}
+				line_start = -1
 			}
 			segment = record.segment
-			segment_lines = 0
-			line_start = -1
-			line_width = 0
 		}
 
-		word_end := int(record.offset) + int(record.length)
+		start := int(record.offset)
+		word_end := start + int(record.span.length)
+		if record.span.wordless {
+			_, appended := _push_text_line(state, node, input.text[start:word_end], record.width, record.baseline, input.text_line_count)
+			if !appended {
+				return false
+			}
+			input.text_line_count += 1
+			continue
+		}
 		if line_start >= 0 {
-			previous := words[index - 1]
-			if line_width + f64(previous.separator_width) + f64(record.width) > available {
+			if line_width + previous_separator + f64(record.width) > available {
 				if !flush_line(state, node, input.text[line_start:line_end]) {
 					return false
 				}
-				segment_lines += 1
 				line_start = -1
 			} else {
-				line_width += f64(previous.separator_width) + f64(record.width)
+				line_width += previous_separator + f64(record.width)
 				line_end = word_end
-				continue
 			}
 		}
-		line_start = int(record.offset)
-		line_end = word_end
-		line_width = f64(record.width)
-		if line_width > available {
-			rest, rest_width, split := _split_wide_run(state, node, line_start, word_end, available)
-			if !split {
-				return false
+		if line_start < 0 {
+			line_start = start
+			line_end = word_end
+			line_width = f64(record.width)
+			if line_width > available {
+				rest, rest_width, split := _split_wide_run(state, node, line_start, word_end, available)
+				if !split {
+					return false
+				}
+				line_start = rest
+				line_width = rest_width
 			}
-			line_start = rest
-			line_width = rest_width
 		}
+		previous_separator = f64(record.separator_width)
 	}
 
 	if line_start >= 0 {
 		if !flush_line(state, node, input.text[line_start:line_end]) {
 			return false
 		}
-		segment_lines += 1
 	}
-	if segment_lines == 0 {
-		if !flush_line(state, node, "") {
-			return false
-		}
-	}
-	// Segments after the last word carry no words of their own but still occupy
-	// a line each.
-	for trailing in int(segment) + 1 ..< input.segment_count {
-		_ = trailing
-		if !flush_line(state, node, "") {
-			return false
-		}
-	}
-
-	block_height := f64(input.line_height) * f64(input.text_line_count)
-	input.content_size.y = _finite_scalar(state, node, .Y, block_height, false)
-	input.content_minimum.y = input.content_size.y
+	_set_text_block_height(state, node)
 	return true
 }
 

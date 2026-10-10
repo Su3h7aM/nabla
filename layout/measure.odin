@@ -102,6 +102,14 @@ _measure_text_run_cached :: proc(state: ^_Context_State, node: Node_Handle, text
 	return measured
 }
 
+// _measure_text_uncached measures an unbounded run straight through the
+// service. A failure latches the frame error and returns a zero result.
+@(private)
+_measure_text_uncached :: proc(state: ^_Context_State, node: Node_Handle, text: string) -> Measure_Result {
+	measured, _ := _measure_text_run(state, node, text, _unbounded_request())
+	return measured
+}
+
 @(private)
 _measure_node_intrinsic :: proc(state: ^_Context_State, node: Node_Handle) -> Measure_Result {
 	input := &state._node_inputs[node]

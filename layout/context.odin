@@ -59,11 +59,10 @@ _Node_Input :: struct {
 	text_key:          u64,
 	text_line_start:   int,
 	text_line_count:   int,
-	// Range of this node's records in `_measured_words`, filled by intrinsic
-	// measurement and consumed by wrapping.
-	word_start:        int,
-	word_count:        int,
-	segment_count:     int,
+	// Handle of this node's item in the text cache, zero when the text was
+	// measured without caching. Set by intrinsic measurement and consumed by
+	// wrapping.
+	text_item:         i32,
 	line_height:       Scalar,
 	is_text:           bool,
 }
@@ -75,30 +74,6 @@ _Text_Line_Record :: struct {
 	size:     Vec2,
 	line:     u16,
 	baseline: Scalar,
-}
-
-/*
-One word of a text node, measured once per frame.
-
-Intrinsic sizing already has to visit every word to find the shrink floor, so
-it records each word's advance here and wrapping consumes the record instead of
-re-measuring. Offsets are relative to the node's own text, so the records stay
-valid however the string is sliced later.
-
-`separator_width` is the advance of the whitespace run that follows the word,
-folded in here so packing a line is a running sum with no lookups at all.
-*/
-@(private)
-_Measured_Word :: struct {
-	offset:          i32,
-	length:          i32,
-	separator_end:   i32,
-	width:           Scalar,
-	separator_width: Scalar,
-	height:          Scalar,
-	// Index of the hard segment this word belongs to, so wrapping can find
-	// segment boundaries without rescanning the string for newlines.
-	segment:         i32,
 }
 
 /*
@@ -190,7 +165,7 @@ _Context_State :: struct {
 	_clips:                [dynamic]Resolved_Clip,
 	_commands:             [dynamic]Render_Command,
 	_text_lines:           [dynamic]_Text_Line_Record,
-	_measured_words:       [dynamic]_Measured_Word,
+	_text_cache:           _Text_Cache,
 	_roots:                [dynamic]_Paint_Root,
 	_measure_cache:        [dynamic]_Measure_Cache_Entry,
 	_id_table:             []_Id_Table_Entry,
@@ -254,6 +229,8 @@ STORAGE_ALIGNMENT :: max(
 	align_of(Resolved_Clip),
 	align_of(Render_Command),
 	align_of(_Text_Line_Record),
+	align_of(_Measured_Word),
+	align_of(_Text_Item),
 	align_of(_Paint_Root),
 	align_of(i32),
 	align_of(u64),
@@ -371,6 +348,16 @@ _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partitio
 	if !ok {
 		return false
 	}
+	text_items: []_Text_Item
+	text_items, ok = _partition_take_slice(partition, _Text_Item, capacities.measured_texts)
+	if !ok {
+		return false
+	}
+	text_buckets: []i32
+	text_buckets, ok = _partition_take_slice(partition, i32, _text_bucket_count(capacities.measured_texts))
+	if !ok {
+		return false
+	}
 	// The normal-flow tree is always a paint root, so the pool holds one more
 	// entry than the configured overlay budget. The count is computed with a
 	// checked add because `storage_size` is public and unvalidated, and because
@@ -459,7 +446,12 @@ _partition_storage :: proc(state: ^_Context_State, partition: ^_Storage_Partitio
 		state._clips = mem.buffer_from_slice(clips)
 		state._commands = mem.buffer_from_slice(commands)
 		state._text_lines = mem.buffer_from_slice(text_lines)
-		state._measured_words = mem.buffer_from_slice(measured_words)
+		mem.zero_slice(text_buckets)
+		state._text_cache = _Text_Cache {
+			buckets = text_buckets,
+			items   = text_items,
+			words   = measured_words,
+		}
 		state._roots = mem.buffer_from_slice(roots)
 		state._root_order = mem.buffer_from_slice(root_order)
 		state._root_paint = mem.buffer_from_slice(root_paint)
@@ -522,6 +514,7 @@ _config_is_valid :: proc(config: Options) -> bool {
 	   capacities.commands < 0 ||
 	   capacities.text_lines < 0 ||
 	   capacities.measured_words < 0 ||
+	   capacities.measured_texts < 0 ||
 	   capacities.tracks < 0 ||
 	   capacities.overlays < 0 ||
 	   capacities.measure_cache < 0 ||
@@ -530,6 +523,10 @@ _config_is_valid :: proc(config: Options) -> bool {
 		return false
 	}
 	if u64(capacities.nodes) > u64(max(u32)) || capacities.depth > MAX_DEPTH || u64(capacities.overlays) > u64(max(u32)) {
+		return false
+	}
+	// Words and items are named by 32-bit handles.
+	if u64(capacities.measured_words) > u64(max(i32)) || u64(capacities.measured_texts) > u64(max(i32)) {
 		return false
 	}
 	return storage_size(capacities) > 0
@@ -748,6 +745,7 @@ _capacities_are_nonnegative :: proc "contextless" (capacities: Capacities) -> bo
 		capacities.commands >= 0 &&
 		capacities.text_lines >= 0 &&
 		capacities.measured_words >= 0 &&
+		capacities.measured_texts >= 0 &&
 		capacities.tracks >= 0 &&
 		capacities.overlays >= 0 &&
 		capacities.measure_cache >= 0 &&
@@ -767,6 +765,7 @@ _capacities_union :: proc "contextless" (current, requested: Capacities) -> Capa
 		commands = max(current.commands, requested.commands),
 		text_lines = max(current.text_lines, requested.text_lines),
 		measured_words = max(current.measured_words, requested.measured_words),
+		measured_texts = max(current.measured_texts, requested.measured_texts),
 		tracks = max(current.tracks, requested.tracks),
 		overlays = max(current.overlays, requested.overlays),
 		measure_cache = max(current.measure_cache, requested.measure_cache),

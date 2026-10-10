@@ -136,9 +136,10 @@ CONVERSATION_CAPACITIES :: layout.Capacities {
 	clips          = 16,
 	commands       = 512,
 	text_lines     = 1024,
-	measured_words = 4096,
+	measured_words = 16384,
+	measured_texts = 512,
 	tracks         = 64,
-	measure_cache  = 512,
+	measure_cache  = 1024,
 	id_table       = 8,
 	depth          = 8,
 	diagnostics    = 64,
@@ -414,7 +415,8 @@ draw_conversation :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rec
 // conversation_solve declares one conversation frame and returns its solved result,
 // raising the layout budget when the frame ran out of a pool. Each pool pays this once
 // per session, so the storage settles at what this session used instead of a worst-case
-// reservation. False means the budget could not be raised.
+// reservation. The text cache pools never fail a frame, so they are raised before the
+// frame from what earlier solves filled. False means the budget could not be raised.
 @(require_results)
 conversation_solve :: proc(
 	app: ^App,
@@ -427,6 +429,7 @@ conversation_solve :: proc(
 	layout.Frame_Result,
 	bool,
 ) {
+	conversation_text_cache_raise(storage)
 	declare_conversation(app, storage, viewport, width, offset, order)
 	frame_result, frame_error := layout.result(&storage.layout_ctx)
 	for _ in 0 ..< CONVERSATION_GROW_ATTEMPTS {
@@ -443,6 +446,25 @@ conversation_solve :: proc(
 		return {}, false
 	}
 	return frame_result, true
+}
+
+// conversation_text_cache_raise doubles a text cache pool whose high-water mark reached
+// its capacity. A full pool only costs speed (the text is measured again every frame),
+// so layout reports no error for it and the budget follows the statistics instead.
+// It runs between solves because a raise invalidates the previous frame result, and a
+// failed raise changes nothing: the pool stays as it was.
+conversation_text_cache_raise :: proc(storage: ^Frame_Storage) {
+	high_water := layout.statistics(&storage.layout_ctx).pool_high_water
+	next := storage.capacities
+	if high_water[.Measured_Words] >= next.measured_words {
+		next = conversation_capacities_raise(next, .Measured_Words)
+	}
+	if high_water[.Measured_Texts] >= next.measured_texts {
+		next = conversation_capacities_raise(next, .Measured_Texts)
+	}
+	if next != storage.capacities && layout.reserve(&storage.layout_ctx, next) == nil {
+		storage.capacities = next
+	}
 }
 
 // declare_conversation declares one frame's tree: the transcript column, the startup hint
@@ -529,6 +551,8 @@ conversation_capacities_raise :: proc(current: layout.Capacities, pool: layout.P
 		next.text_lines = max(current.text_lines * 2, 256)
 	case .Measured_Words:
 		next.measured_words = max(current.measured_words * 2, 1024)
+	case .Measured_Texts:
+		next.measured_texts = max(current.measured_texts * 2, 256)
 	case .Tracks:
 		next.tracks = max(current.tracks * 2, 64)
 	case .Overlays:

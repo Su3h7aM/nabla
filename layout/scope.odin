@@ -11,7 +11,6 @@ _reset_frame_state :: proc(state: ^_Context_State) {
 	clear(&state._clips)
 	clear(&state._commands)
 	clear(&state._text_lines)
-	clear(&state._measured_words)
 	clear(&state._roots)
 	clear(&state._root_order)
 	clear(&state._root_paint)

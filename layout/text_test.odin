@@ -3,6 +3,7 @@
 package layout
 
 import "core:math"
+import "core:slice"
 import "core:testing"
 import "core:unicode/utf8"
 
@@ -216,47 +217,205 @@ test_wrapped_text_does_not_report_horizontal_overflow :: proc(t: ^testing.T) {
 	testing.expect(t, found, "an unbreakable run wider than the box must report overflow")
 }
 
-@(test)
-test_text_measurement_cache_and_missing_services :: proc(t: ^testing.T) {
-	calls := 0
-	counter := &calls
-	measure_counting :: proc(user_data: rawptr, text: string, style: Text_Style, request: Measure_Request) -> (Measure_Result, Measure_Error) {
-		(^int)(user_data)^ += 1
-		return _measure_monospace(nil, text, style, request)
+Service_Calls :: struct {
+	measure:  int,
+	break_at: int,
+	grapheme: int,
+}
+
+_measure_counting :: proc(user_data: rawptr, text: string, style: Text_Style, request: Measure_Request) -> (Measure_Result, Measure_Error) {
+	(^Service_Calls)(user_data).measure += 1
+	return _measure_monospace(nil, text, style, request)
+}
+
+_break_counting :: proc(user_data: rawptr, value: string, offset: int) -> (int, int, Text_Break_Kind, Text_Break_Error) {
+	(^Service_Calls)(user_data).break_at += 1
+	return _break_ascii(nil, value, offset)
+}
+
+_grapheme_counting :: proc(user_data: rawptr, value: string, offset: int) -> int {
+	(^Service_Calls)(user_data).grapheme += 1
+	return _grapheme_rune(nil, value, offset)
+}
+
+_counting_services :: proc(calls: ^Service_Calls) -> Services {
+	return Services {
+		measure_text = _measure_counting,
+		measure_text_user_data = calls,
+		break_text = _break_counting,
+		break_text_user_data = calls,
+		grapheme_end = _grapheme_counting,
+		grapheme_end_user_data = calls,
 	}
+}
 
-	// Measurements are reused across frames until metrics are invalidated.
-	ctx: Context
-	services := _services()
-	services.measure_text = measure_counting
-	services.measure_text_user_data = counter
-	testing.expect_value(t, init(&ctx, _test_options()), nil)
-	defer destroy(&ctx)
+Sample :: struct {
+	text: string,
+	wrap: Wrap,
+}
 
-	declare :: proc(ctx: ^Context, services: Services) {
-		set_services(ctx, services)
-		if frame(ctx, {500, 500}) {
-			text(ctx, {text = "aaa bbb ccc", sizing = {fixed(100), fit()}})
+// _solve_texts solves one frame of the given texts, stacked in a column of the given width.
+_solve_texts :: proc(ctx: ^Context, calls: ^Service_Calls, samples: []Sample, width := Scalar(100)) -> Frame_Error {
+	calls^ = {}
+	set_services(ctx, _counting_services(calls))
+	if frame(ctx, {500, 500}) {
+		if element(ctx, {layout = {flow = .Column, align = .Stretch, sizing = {fixed(width), fit()}}}) {
+			for sample in samples {
+				text(ctx, {text = sample.text, style = {wrap = sample.wrap}, sizing = {grow(), fit()}})
+			}
 		}
 	}
+	_, err := result(ctx)
+	return err
+}
 
-	declare(&ctx, services)
-	_, first_error := result(&ctx)
-	testing.expect_value(t, first_error, Frame_Error.None)
-	first_calls := calls
-	testing.expect(t, first_calls > 0)
+// _geometry_of copies what a solve published: node rectangles and every text line.
+_geometry_of :: proc(ctx: ^Context) -> (nodes: []Resolved_Node, lines: []_Text_Line_Record) {
+	frame_result, _ := result(ctx)
+	return slice.clone(frame_result.nodes), slice.clone(_context_state(ctx)._text_lines[:])
+}
 
-	declare(&ctx, services)
-	_, second_error := result(&ctx)
-	testing.expect_value(t, second_error, Frame_Error.None)
-	testing.expect_value(t, calls, first_calls)
+@(test)
+test_unchanged_text_costs_no_service_calls_on_later_frames :: proc(t: ^testing.T) {
+	options := _test_options()
+	options.capacities.nodes = 64
+	options.capacities.children = 64
+	options.capacities.commands = 256
+	options.capacities.text_lines = 256
+	options.capacities.measure_cache = 256
+	ctx: Context
+	testing.expect_value(t, init(&ctx, options), nil)
+	defer destroy(&ctx)
+
+	// Wrapped, one line, padded, hard segments, characters, and unwrapped text.
+	texts := []Sample {
+		{"aaa bbb ccc ddd", .Words},
+		{"one two", .Words},
+		{"  pad  ", .Words},
+		{"ab\n\ncd", .Words},
+		{"xyz", .Characters},
+		{"kept", .None},
+		{"x\ny", .Newlines},
+		{"p\n\nq", .Characters},
+	}
+	calls: Service_Calls
+
+	testing.expect_value(t, _solve_texts(&ctx, &calls, texts), Frame_Error.None)
+	testing.expect(t, calls.measure > 0 && calls.break_at > 0 && calls.grapheme > 0)
+	first_nodes, first_lines := _geometry_of(&ctx)
+	defer delete(first_nodes)
+	defer delete(first_lines)
+	testing.expect_value(t, len(_text_lines_of(&ctx, 2)), 2)
+	testing.expect_value(t, _text_lines_of(&ctx, 4)[0].text, "pad")
+
+	testing.expect_value(t, _solve_texts(&ctx, &calls, texts), Frame_Error.None)
+	testing.expect_value(t, calls, Service_Calls{})
+	second_nodes, second_lines := _geometry_of(&ctx)
+	defer delete(second_nodes)
+	defer delete(second_lines)
+	testing.expect(t, slice.equal(first_nodes, second_nodes))
+	testing.expect(t, slice.equal(first_lines, second_lines))
 
 	invalidate_metrics(&ctx, 1)
-	declare(&ctx, services)
-	_, third_error := result(&ctx)
-	testing.expect_value(t, third_error, Frame_Error.None)
-	testing.expect(t, calls > first_calls)
+	testing.expect_value(t, _solve_texts(&ctx, &calls, texts), Frame_Error.None)
+	testing.expect(t, calls.measure > 0)
 
+	// The cached paths place every line exactly where a context with no text
+	// cache does, including words wider than the box and padded or empty lines.
+	uncached_options := options
+	uncached_options.capacities.measured_texts = 0
+	uncached: Context
+	testing.expect_value(t, init(&uncached, uncached_options), nil)
+	defer destroy(&uncached)
+	varied := []Sample {
+		{"aaaa bbbb cccc dddd", .Words},
+		{"abcdefghijklmnopqrstuvwxyz é", .Words},
+		{" lead and trail ", .Words},
+		{"  ", .Words},
+		{"", .Words},
+		{"a\n\nb c", .Words},
+		{"a\n  \nb", .Words},
+		{"a  b", .Words},
+		{"  a   b  ", .Words},
+		{"  \t", .Words},
+		{"abcdefghijklmnopqrstuvwxyz é", .Characters},
+		{"two\nlines", .Newlines},
+		{"ab\nabcdefghijklmnopqrstuvwxyz\n", .Characters},
+		{"kept whole and wider than the box", .None},
+	}
+	for width in ([?]Scalar{100, 30}) {
+		testing.expect_value(t, _solve_texts(&ctx, &calls, varied, width), Frame_Error.None)
+		cached_nodes, cached_lines := _geometry_of(&ctx)
+		defer delete(cached_nodes)
+		defer delete(cached_lines)
+		testing.expect_value(t, _solve_texts(&uncached, &calls, varied, width), Frame_Error.None)
+		plain_nodes, plain_lines := _geometry_of(&uncached)
+		defer delete(plain_nodes)
+		defer delete(plain_lines)
+		testing.expect(t, slice.equal(cached_nodes, plain_nodes))
+		testing.expect(t, slice.equal(cached_lines, plain_lines))
+	}
+}
+
+@(test)
+test_text_larger_than_the_word_pool_shows_as_a_full_pool_until_raised :: proc(t: ^testing.T) {
+	options := _test_options()
+	options.capacities.measured_words = 3
+	ctx: Context
+	testing.expect_value(t, init(&ctx, options), nil)
+	defer destroy(&ctx)
+
+	calls: Service_Calls
+	long := []Sample{{"aaa bbb ccc ddd eee", .Words}}
+	testing.expect_value(t, _solve_texts(&ctx, &calls, long), Frame_Error.None)
+	testing.expect_value(t, statistics(&ctx).pool_high_water[.Measured_Words], 3)
+	testing.expect_value(t, _context_state(&ctx)._text_cache.word_count, 0)
+
+	// Once the pool is raised the text is cached and later frames cost nothing.
+	testing.expect_value(t, reserve(&ctx, Capacities{measured_words = 16}), nil)
+	testing.expect_value(t, _solve_texts(&ctx, &calls, long), Frame_Error.None)
+	testing.expect_value(t, _solve_texts(&ctx, &calls, long), Frame_Error.None)
+	testing.expect_value(t, calls, Service_Calls{})
+}
+
+@(test)
+test_unused_text_is_evicted_after_three_solves_and_its_words_reused :: proc(t: ^testing.T) {
+	// The pools hold exactly one text of three words.
+	options := _test_options()
+	options.capacities.measured_words = 3
+	options.capacities.measured_texts = 2
+	ctx: Context
+	testing.expect_value(t, init(&ctx, options), nil)
+	defer destroy(&ctx)
+	cache := &_context_state(&ctx)._text_cache
+
+	calls: Service_Calls
+	first := []Sample{{"aaa bbb ccc", .Words}}
+	second := []Sample{{"ddd eee fff", .Words}}
+	testing.expect_value(t, _solve_texts(&ctx, &calls, first), Frame_Error.None)
+	testing.expect_value(t, cache.word_count, 3)
+
+	// While the first text is young the second finds no room: it is measured
+	// again each frame, correctly and without a frame error.
+	for _ in 0 ..< 2 {
+		testing.expect_value(t, _solve_texts(&ctx, &calls, second), Frame_Error.None)
+		testing.expect(t, calls.measure > 0 && calls.break_at > 0)
+		testing.expect_value(t, len(_text_lines_of(&ctx, 2)), 2)
+		testing.expect_value(t, cache.item_count, 1)
+	}
+
+	// Three solves after its last use the first text is freed by the probe, and
+	// the second takes over its words.
+	testing.expect_value(t, _solve_texts(&ctx, &calls, second), Frame_Error.None)
+	testing.expect_value(t, cache.item_count, 1)
+	testing.expect_value(t, cache.word_count, 3)
+	testing.expect_value(t, _solve_texts(&ctx, &calls, second), Frame_Error.None)
+	testing.expect_value(t, calls, Service_Calls{})
+	testing.expect_value(t, len(_text_lines_of(&ctx, 2)), 2)
+}
+
+@(test)
+test_missing_text_services_fail_the_frame :: proc(t: ^testing.T) {
 	// The seams are required where they are needed: no measurer means no
 	// geometry, and a wrapping node with no breaker must not fall back.
 	{
