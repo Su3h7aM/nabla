@@ -3,6 +3,7 @@
 #+private file
 package widgets
 
+import "core:mem"
 import "core:testing"
 import "core:time"
 import keys "nabla:input"
@@ -596,4 +597,22 @@ test_history_keeps_the_draft :: proc(t: ^testing.T) {
 	testing.expect_value(t, entry, "two")
 	entry, _ = history_next(&history)
 	testing.expect_value(t, entry, "fresh")
+}
+
+@(test)
+test_input_draw_allocation_failure_leaves_the_frame_unchanged :: proc(t: ^testing.T) {
+	input: Input
+	input_init(&input)
+	defer input_destroy(&input)
+	storage: [1]term.Cell
+	frame := _frame(storage[:], 1, 1)
+	if !testing.expect(t, tui.put(&frame, 0, 0, "x", {})) { return }
+
+	backing: [1]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, backing[:])
+	context.temp_allocator = mem.arena_allocator(&arena)
+	_, err := draw_input_rect(&frame, {width = 1, height = 1}, &input, {})
+	testing.expect_value(t, err, mem.Allocator_Error.Out_Of_Memory)
+	testing.expect_value(t, storage[0].grapheme, "x")
 }

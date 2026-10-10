@@ -52,6 +52,7 @@ Input_Line :: struct {
 	end:   int,
 }
 
+// input_init prepares an uninitialized input with allocator. It must not own storage.
 input_init :: proc(input: ^Input, allocator := context.allocator) {
 	input.text = make([dynamic]u8, 0, 0, allocator)
 	input.kill = make([dynamic]u8, 0, 0, allocator)
@@ -113,7 +114,8 @@ _input_insert :: proc(input: ^Input, value: string) -> mem.Allocator_Error {
 		err = text.sanitizer_flush(&sanitizer, &input.text)
 	}
 	if err != nil {
-		resize(&input.text, previous_length)
+		// Restoring the previous length only shrinks the array and cannot allocate.
+		_ = resize(&input.text, previous_length)
 		return err
 	}
 	slice.rotate_left(input.text[input.cursor:], previous_length - input.cursor)
@@ -385,7 +387,7 @@ input_lines :: proc(
 	lines: [dynamic]Input_Line,
 	err: mem.Allocator_Error,
 ) {
-	lines = make([dynamic]Input_Line, 0, 8, context.temp_allocator)
+	lines = make([dynamic]Input_Line, 0, 8, context.temp_allocator) or_return
 	value := input_text(input)
 	start := 0
 	for {
@@ -637,10 +639,9 @@ _input_snapshots_clear :: proc(snapshots: ^[dynamic]Input_Snapshot) {
 	clear(snapshots)
 }
 
-// _input_remove deletes [start, end). The asserted span makes the resize a
-// shrink, which cannot allocate.
 _input_remove :: proc(input: ^Input, start, end: int) {
 	assert(start >= 0 && end >= start && end <= len(input.text))
 	copy(input.text[start:], input.text[end:])
-	resize(&input.text, len(input.text) - (end - start))
+	// Removing an existing span only shrinks the array and cannot allocate.
+	_ = resize(&input.text, len(input.text) - (end - start))
 }

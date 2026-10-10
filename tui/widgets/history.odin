@@ -13,6 +13,7 @@ History :: struct {
 	draft:   string,
 }
 
+// history_init prepares an uninitialized history with allocator. It must not own entries or a draft.
 history_init :: proc(history: ^History, allocator := context.allocator) {
 	history.entries = make([dynamic]string, 0, 0, allocator)
 }
@@ -45,6 +46,7 @@ history_push :: proc(history: ^History, entry: string) -> bool {
 // saves current as the draft. It returns false when there is no older entry or
 // the draft could not be saved. The result borrows the history and is valid
 // until the next call that changes it.
+@(require_results)
 history_previous :: proc(history: ^History, current: string) -> (entry: string, ok: bool) {
 	if history.back >= len(history.entries) {
 		return "", false
@@ -64,6 +66,7 @@ history_previous :: proc(history: ^History, current: string) -> (entry: string, 
 // history_next steps to the next newer entry and returns it; past the newest it
 // returns the saved draft. It returns false when not browsing. The result borrows
 // the history, like history_previous.
+@(require_results)
 history_next :: proc(history: ^History) -> (entry: string, ok: bool) {
 	if history.back == 0 {
 		return "", false

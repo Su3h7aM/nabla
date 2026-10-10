@@ -169,15 +169,7 @@ _measure_cache_key :: proc(state: ^_Context_State, node: Node_Handle, text: stri
 	return key, true
 }
 
-/*
-Locate a measured run inside its node's text.
-
-Runs handed to the measurer are always slices of the node's own string, so the
-offset is pointer arithmetic rather than a search. A run that does not lie
-within the node's text has no stable identity relative to it and is reported as
-not cacheable, which keeps the key sound if a future caller measures a string
-from elsewhere.
-*/
+// _run_offset_in returns a borrowed run's offset, rejecting strings outside text.
 @(private, require_results)
 _run_offset_in :: proc "contextless" (text, run: string) -> (offset: int, within: bool) {
 	if len(run) > len(text) {
@@ -188,11 +180,11 @@ _run_offset_in :: proc "contextless" (text, run: string) -> (offset: int, within
 	if run_base < base {
 		return 0, false
 	}
-	offset = int(run_base - base)
-	if offset + len(run) > len(text) {
+	distance := run_base - base
+	if distance > uintptr(len(text) - len(run)) {
 		return 0, false
 	}
-	return offset, true
+	return int(distance), true
 }
 
 @(private)

@@ -29,6 +29,7 @@ Draw_Error :: enum u8 {
 // when a command or clip is not on the cell grid, Invalid_Border when a border
 // glyph is not one cell wide under profile, and Allocation_Failed when images
 // could not grow; commands before the failing one stay drawn.
+@(require_results)
 draw_commands :: proc(
 	buffer: ^term.Frame_Buffer,
 	paints: []Paint,

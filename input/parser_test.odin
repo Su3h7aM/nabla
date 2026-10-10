@@ -2,6 +2,7 @@
 #+private file
 package input
 
+import "core:mem"
 import "core:testing"
 
 _feed_events :: proc(t: ^testing.T, data: string, expected: []Event) {
@@ -218,6 +219,28 @@ test_bracketed_paste :: proc(t: ^testing.T) {
 	_feed_events(t, "\e[200~a\r\nb\e[201~", []Event{Paste{text = "a\r\nb"}})
 	// A complete paste followed by a key keeps both events.
 	_feed_events(t, "\e[200~x\e[201~q", []Event{Paste{text = "x"}, Key_Event{code = .Character, character = 'q'}})
+}
+
+@(test)
+test_bracketed_paste_allocation_failure_can_be_retried :: proc(t: ^testing.T) {
+	parser: Parser
+	parser_init(&parser)
+	defer parser_destroy(&parser)
+	events: [dynamic]Event
+	defer events_destroy(&events)
+	marker := "\e[200~"
+	backing: [1]byte
+	arena: mem.Arena
+	mem.arena_init(&arena, backing[:])
+	testing.expect_value(t, feed(&parser, transmute([]byte)marker, &events, mem.arena_allocator(&arena)), Error(mem.Allocator_Error.Out_Of_Memory))
+	testing.expect_value(t, len(events), 0)
+
+	// The failed allocation leaves the sequence waiting for its final byte.
+	retry := "~hello\e[201~q"
+	if !testing.expect_value(t, feed(&parser, transmute([]byte)retry, &events), nil) { return }
+	if !testing.expect_value(t, len(events), 2) { return }
+	testing.expect_value(t, events[0], Event(Paste{text = "hello"}))
+	testing.expect_value(t, events[1], Event(Key_Event{code = .Character, character = 'q'}))
 }
 
 @(test)

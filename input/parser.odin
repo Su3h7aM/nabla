@@ -47,6 +47,7 @@ Parser :: struct {
 	paste:           [dynamic]u8,
 }
 
+// parser_init prepares an uninitialized parser. It must not own paste scratch.
 parser_init :: proc(parser: ^Parser) {
 	parser^ = {}
 }
@@ -247,7 +248,7 @@ parser_sequence :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event
 	if input_byte >= 0x40 && input_byte <= 0x7e {
 		if parser.state == .Csi && input_byte == '~' && parser_param(parser, 0) == 200 {
 			if parser.paste == nil {
-				parser.paste = make([dynamic]u8, 0, 64, allocator)
+				parser.paste = make([dynamic]u8, 0, 64, allocator) or_return
 			} else {
 				clear(&parser.paste)
 			}
