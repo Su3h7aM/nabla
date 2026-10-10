@@ -144,7 +144,9 @@ scanner_scan :: proc(scanner: ^Scanner, user_data: rawptr, callback: Scan_Callba
 
 scanner_on_read :: proc(op: ^nbio.Operation, scanner: ^Scanner) {
 	scanner.recv = nil
+	previous_temp := context.temp_allocator
 	context.temp_allocator = virtual.arena_allocator(&scanner.connection.temp_allocator)
+	defer context.temp_allocator = previous_temp
 	defer scanner_scan(scanner, scanner.user_data, scanner.callback)
 
 	if op.recv.err != nil {

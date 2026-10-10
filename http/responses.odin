@@ -1,6 +1,6 @@
 package http
 
-import "core:bytes"
+import "base:runtime"
 import "core:encoding/json"
 import "core:io"
 import "core:log"
@@ -11,16 +11,18 @@ import "core:strings"
 // Sets the response to one that sends the given HTML.
 respond_html :: proc(response: ^Response, html: string, status: Status = .OK, loc := #caller_location) {
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Html))
-	body_set(response, html, loc)
+	if err := headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Html));
+	   err != nil { response._err = err; respond(response, loc); return }
+	if err := body_set(response, html, loc); err != nil { response._err = err }
 	respond(response, loc)
 }
 
 // Sets the response to one that sends the given plain text.
 respond_plain :: proc(response: ^Response, text: string, status: Status = .OK, loc := #caller_location) {
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Plain))
-	body_set(response, text, loc)
+	if err := headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Plain));
+	   err != nil { response._err = err; respond(response, loc); return }
+	if err := body_set(response, text, loc); err != nil { response._err = err }
 	respond(response, loc)
 }
 
@@ -42,7 +44,7 @@ respond_file :: proc(response: ^Response, path: string, content_type: Maybe(MIME
 	assert(!response.sent, "response has already been sent", loc)
 
 	mime := content_type.? or_else mime_from_extension(path)
-	headers_set_content_type(&response.headers, mime_to_content_type(mime))
+	if err := headers_set_content_type(&response.headers, mime_to_content_type(mime)); err != nil { response._err = err; respond(response, loc); return }
 
 	nbio.open_poly(path, response, on_open)
 
@@ -71,10 +73,18 @@ respond_file :: proc(response: ^Response, path: string, content_type: Maybe(MIME
 		case nil:
 			assert(op.stat.size < i64(max(int)))
 
-			_response_write_heading(response, int(op.stat.size))
-
-			bytes.buffer_grow(&response._buf, int(op.stat.size))
-			buffer := _dynamic_unwritten(response._buf.buf)[:op.stat.size]
+			if err := _response_write_heading(response, int(op.stat.size)); err != nil {
+				nbio.close(op.stat.handle)
+				respond(response)
+				return
+			}
+			if err := reserve(&response._buf, len(response._buf) + int(op.stat.size)); err != nil {
+				response._err = err
+				nbio.close(op.stat.handle)
+				respond(response)
+				return
+			}
+			buffer := _dynamic_unwritten(response._buf)[:op.stat.size]
 
 			nbio.read_poly2(op.stat.handle, 0, buffer, path, response, on_read, all = true)
 		}
@@ -87,7 +97,7 @@ respond_file :: proc(response: ^Response, path: string, content_type: Maybe(MIME
 			log.errorf("a file response could not read its file: %v", op.read.err)
 			respond_with_status(response, .Internal_Server_Error)
 		case nil:
-			_dynamic_add_len(&response._buf.buf, op.read.read)
+			_dynamic_add_len(&response._buf, op.read.read)
 			respond_with_status(response, .OK)
 		}
 	}
@@ -102,8 +112,8 @@ respond_file_content :: proc(response: ^Response, path: string, content: []byte,
 	mime := mime_from_extension(path)
 
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(mime))
-	body_set(response, content, loc)
+	if err := headers_set_content_type(&response.headers, mime_to_content_type(mime)); err != nil { response._err = err; respond(response, loc); return }
+	if err := body_set(response, content, loc); err != nil { response._err = err }
 	respond(response, loc)
 }
 
@@ -147,25 +157,41 @@ respond_json :: proc(
 	options: json.Marshal_Options = {},
 	loc := #caller_location,
 ) -> (
-	err: json.Marshal_Error,
+	err: union #shared_nil {
+		json.Marshal_Error,
+		runtime.Allocator_Error,
+	},
 ) {
 	options := options
 
 	response.status = status
-	headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Json))
+	if type_err := headers_set_content_type(&response.headers, mime_to_content_type(MIME_Type.Json));
+	   type_err != nil { response._err = type_err; respond(response, loc); return type_err }
 
 	// Going to write a MINIMUM of 128 bytes at a time.
 	writer: Response_Writer
 	buffer: [128]byte
-	response_writer_init(&writer, response, buffer[:])
+	if _, writer_err := response_writer_init(&writer, response, buffer[:]); writer_err != nil {
+		response._err = writer_err
+		respond(response, loc)
+		return writer_err
+	}
 
 	// Ends the body and sends the response.
 	// The close is what sends the response, and the call is already returning when
 	// it runs, so its own failure has no channel left to travel on.
-	defer _ = io.close(writer.output)
+	defer {
+		if close_err := io.close(writer.output); close_err != nil {
+			if err == nil {
+				marshal_err: json.Marshal_Error = close_err
+				err = marshal_err
+			}
+			connection_close(response._conn)
+		}
+	}
 
 	if err = json.marshal_to_writer(writer.output, value, &options); err != nil {
-		headers_set_close(&response.headers)
+		if close_err := headers_set_close(&response.headers); close_err != nil { response._err = close_err }
 		response_status(response, .Internal_Server_Error)
 	}
 

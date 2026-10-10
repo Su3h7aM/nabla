@@ -1,7 +1,5 @@
 package http
 
-import "base:runtime"
-
 import "core:bufio"
 import "core:log"
 import "core:mem"
@@ -74,6 +72,7 @@ Server :: struct {
 
 Server_Thread :: struct {
 	thread:      ^thread.Thread,
+	err:         Server_Error,
 	event_loop:  ^nbio.Event_Loop,
 	connections: map[net.TCP_Socket]^Connection,
 	state:       Server_State,
@@ -100,7 +99,13 @@ Default_Endpoint := net.Endpoint {
 	port    = 8080,
 }
 
+Server_Start_Error :: enum {
+	None,
+	Thread_Start_Failed,
+}
+
 Server_Error :: union #shared_nil {
+	Server_Start_Error,
 	net.Network_Error,
 	nbio.General_Error,
 	mem.Allocator_Error,
@@ -121,9 +126,20 @@ listen :: proc(server: ^Server, endpoint: net.Endpoint = Default_Endpoint, opts:
 	return nil
 }
 
+// serve runs the server until server_shutdown or a failure, and returns the first thread error.
+// It releases the calling thread's nbio event loop that listen acquired, so it must hold the only
+// remaining reference to that loop; operations still pending in a shared loop are not retired.
 @(require_results)
 serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
-	if atomic_load(&server.closing) { return }
+	defer {
+		// The listener is being abandoned, so a shutdown error changes nothing.
+		_ = net.shutdown(server.tcp_socket, .Both)
+		net.close(server.tcp_socket)
+	}
+	if atomic_load(&server.closing) {
+		nbio.release_thread_event_loop()
+		return
+	}
 	server.handler = handler
 
 	if server.opts.thread_count == 0 {
@@ -132,27 +148,43 @@ serve :: proc(server: ^Server, handler: Handler) -> (err: Server_Error) {
 
 	thread_count := max(1, server.opts.thread_count)
 	threads, threads_err := make([]Server_Thread, thread_count, server.connection_allocator)
-	if threads_err != nil { return threads_err }
-	sync.wait_group_add(&server.threads_closed, thread_count)
-	if sync.mutex_guard(&server.threads_mutex) {
-		server.threads = threads
-		for &server_thread in server.threads[1:] {
-			server_thread.thread = thread.create_and_start_with_poly_data2(server, &server_thread, _server_thread_init, context)
+	if threads_err != nil {
+		nbio.release_thread_event_loop()
+		return threads_err
+	}
+	if sync.mutex_guard(&server.threads_mutex) { server.threads = threads }
+	for &server_thread in server.threads[1:] {
+		// Count before starting: a worker can finish before creation returns.
+		sync.wait_group_add(&server.threads_closed, 1)
+		server_thread.thread = thread.create_and_start_with_poly_data2(server, &server_thread, _server_thread_init)
+		if server_thread.thread == nil {
+			sync.wait_group_done(&server.threads_closed)
+			err = Server_Start_Error.Thread_Start_Failed
+			server_shutdown(server)
+			break
 		}
 	}
 
-	_server_thread_init(server, &server.threads[0])
+	if err == nil {
+		sync.wait_group_add(&server.threads_closed, 1)
+		_server_thread_init(server, &server.threads[0])
+	} else {
+		nbio.release_thread_event_loop()
+	}
 
 	sync.wait(&server.threads_closed)
+	for server_thread in server.threads {
+		if server_thread.thread != nil {
+			thread.join(server_thread.thread)
+			thread.destroy(server_thread.thread)
+		}
+		if err == nil { err = server_thread.err }
+	}
 
-	// A failed shutdown changes nothing: the socket closes on the next line.
-	_ = net.shutdown(server.tcp_socket, .Both)
-	net.close(server.tcp_socket)
 	sync.mutex_guard(&server.threads_mutex)
-	for server_thread in server.threads[1:] { thread.destroy(server_thread.thread) }
 	delete(server.threads, server.connection_allocator)
 	server.threads = nil
-	return nil
+	return err
 }
 
 @(require_results)
@@ -169,41 +201,54 @@ listen_and_serve :: proc(
 }
 
 _server_thread_init :: proc(server: ^Server, server_thread: ^Server_Thread) {
-	current_thread = server_thread
 	defer sync.wait_group_done(&server.threads_closed)
+	server_thread.err = _server_thread_run(server, server_thread)
+	if server_thread.err != nil { server_shutdown(server) }
+}
 
+@(require_results)
+_server_thread_run :: proc(server: ^Server, server_thread: ^Server_Thread) -> (err: Server_Error) {
+	previous_thread := current_thread
+	current_thread = server_thread
+	defer current_thread = previous_thread
+	context.allocator = server.connection_allocator
 	if current_thread != &server.threads[0] {
-		if err := nbio.acquire_thread_event_loop(); err != nil {
-			log.errorf("a server thread could not start its event loop: %v", err)
-			return
-		}
+		if loop_err := nbio.acquire_thread_event_loop(); loop_err != nil { return loop_err }
 	}
-	current_thread.connections = make(map[net.TCP_Socket]^Connection)
+
+	scratch: virtual.Arena
+	if scratch_err := virtual.arena_init_growing(&scratch); scratch_err != nil {
+		nbio.release_thread_event_loop()
+		return scratch_err
+	}
+	defer virtual.arena_destroy(&scratch)
+	previous_temp := context.temp_allocator
+	context.temp_allocator = virtual.arena_allocator(&scratch)
+	defer context.temp_allocator = previous_temp
+	current_thread.state = .Serving
+	defer {
+		cleanup_err := _server_thread_cleanup(server, err == nil)
+		if err == nil && cleanup_err != nil { err = cleanup_err }
+	}
+
+	current_thread.connections = make(map[net.TCP_Socket]^Connection, 0, server.connection_allocator) or_return
 	if sync.mutex_guard(&server.threads_mutex) {
 		current_thread.event_loop = nbio.current_thread_event_loop()
 	}
 
 	current_thread.accept = nbio.accept_poly(server.tcp_socket, server, on_accept)
 	if current_thread == &server.threads[0] && server.interrupt_read != nil {
-		// The event loop polls descriptors, and the pipe's read end is one.
 		current_thread.interrupt = nbio.poll_poly(net.TCP_Socket(os.fd(server.interrupt_read)), .Receive, server, on_interrupt)
 	}
 
-	current_thread.state = .Serving
-	for current_thread.state != .Closed {
-		if atomic_load(&server.closing) {
-			_server_thread_shutdown(server)
-			break
+	for !atomic_load(&server.closing) {
+		if tick_err := nbio.tick(); tick_err != nil {
+			server_shutdown(server)
+			return tick_err
 		}
-		if err := nbio.tick(); err != nil {
-			log.errorf("non-blocking io tick error: %v", err)
-			break
-		}
+		free_all(virtual.arena_allocator(&scratch))
 	}
-
-	if current_thread != &server.threads[0] {
-		runtime.default_temp_allocator_destroy(auto_cast context.temp_allocator.data)
-	}
+	return nil
 }
 
 // server_shutdown starts a graceful shutdown from any thread: every thread
@@ -219,7 +264,8 @@ server_shutdown :: proc(server: ^Server) {
 	}
 }
 
-_server_thread_shutdown :: proc(server: ^Server, loc := #caller_location) {
+@(require_results)
+_server_thread_cleanup :: proc(server: ^Server, graceful: bool, loc := #caller_location) -> (err: nbio.General_Error) {
 	assert_on_server_thread(loc)
 
 	current_thread.state = .Closing
@@ -232,32 +278,33 @@ _server_thread_shutdown :: proc(server: ^Server, loc := #caller_location) {
 		current_thread.interrupt = nil
 	}
 
-	// Connections between requests close now; active ones close after their
-	// response, because clean_request_loop sees the server closing. Every
-	// state change arrives through the loop, so ticking waits for the next.
-	for len(current_thread.connections) > 0 {
+	// Active requests finish their response before closing.
+	for graceful && len(current_thread.connections) > 0 {
 		for _, connection in current_thread.connections {
 			#partial switch connection.state {
 			case .New, .Idle, .Pending:
 				connection_close(connection)
 			}
 		}
-		if err := nbio.tick(); err != nil {
-			log.errorf("non-blocking io tick error during shutdown: %v", err)
-			break
-		}
+		if err = nbio.tick(); err != nil { break }
 	}
-	delete(current_thread.connections)
-
 	current_thread.state = .Cleaning
-	if err := nbio.run(); err != nil {
-		log.errorf("non-blocking io error while draining: %v", err)
-	}
+	if graceful && err == nil { err = nbio.run() }
 	if sync.mutex_guard(&server.threads_mutex) {
 		current_thread.event_loop = nil
 	}
 	nbio.release_thread_event_loop()
+	// Releasing the loop retires operations before any remaining callback data.
+	for _, connection in current_thread.connections {
+		net.close(connection.socket)
+		virtual.arena_destroy(&connection.temp_allocator)
+		scanner_destroy(&connection.scanner)
+		free(connection, server.connection_allocator)
+	}
+	delete(current_thread.connections)
+	current_thread.connections = nil
 	current_thread.state = .Closed
+	return
 }
 
 @(private)
@@ -418,7 +465,14 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 	connection.server = server
 	connection.socket = op.accept.client
 	connection.loop.request.client = op.accept.client_endpoint
-	current_thread.connections[connection.socket] = connection
+	_, entry, _, registration_err := map_entry(&current_thread.connections, connection.socket)
+	if registration_err != nil {
+		log.errorf("a connection could not be registered: %v", registration_err)
+		net.close(connection.socket)
+		free(connection, server.connection_allocator)
+		return
+	}
+	entry^ = connection
 
 	scanner_init(&connection.scanner, connection, server.connection_allocator)
 	if err := virtual.arena_init_growing(&connection.temp_allocator); err != nil {
@@ -426,7 +480,9 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 		connection_close(connection)
 		return
 	}
+	previous_temp := context.temp_allocator
 	context.temp_allocator = virtual.arena_allocator(&connection.temp_allocator)
+	defer context.temp_allocator = previous_temp
 	connection_handle_request(connection, context.temp_allocator)
 }
 
@@ -435,7 +491,7 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 // no longer be framed.
 @(private)
 respond_early :: proc(loop: ^Loop, status: Status) {
-	headers_set_close(&loop.response.headers)
+	if err := headers_set_close(&loop.response.headers); err != nil { loop.response._err = err }
 	loop.response.status = status
 	respond(&loop.response)
 }
@@ -562,7 +618,9 @@ connection_handle_request :: proc(connection: ^Connection, allocator := context.
 	}
 
 	on_continue_sent :: proc(op: ^nbio.Operation, loop: ^Loop) {
+		previous_temp := context.temp_allocator
 		context.temp_allocator = virtual.arena_allocator(&loop.connection.temp_allocator)
+		defer context.temp_allocator = previous_temp
 		if op.send.err != nil {
 			clean_request_loop(loop.connection, close_connection = true)
 			return

@@ -1,6 +1,7 @@
 package http
 
-import "core:bytes"
+import "base:runtime"
+
 import "core:io"
 import "core:log"
 import "core:mem/virtual"
@@ -16,12 +17,9 @@ Response :: struct {
 
 	// NOTE: use `http.response_status` if the response body might have been set already.
 	status:           Status,
-
-	// Only for internal usage.
 	_conn:            ^Connection,
-	// TODO/PERF: with some internal refactoring, we should be able to write directly to the
-	// connection (maybe a small buffer in this struct).
-	_buf:             bytes.Buffer,
+	_buf:             [dynamic]byte,
+	_err:             runtime.Allocator_Error,
 	_heading_written: bool,
 	// _head_len is where the head ends in _buf, which is all a HEAD request is
 	// sent (RFC 9110 9.3.2).
@@ -31,45 +29,54 @@ Response :: struct {
 response_init :: proc(response: ^Response, allocator := context.allocator) {
 	response.status = .Not_Found
 	response.cookies.allocator = allocator
-	response._buf.buf.allocator = allocator
+	response._buf.allocator = allocator
 
 	headers_init(&response.headers, allocator)
 }
 
-body_set_bytes :: proc(response: ^Response, content: []byte, loc := #caller_location) {
-	assert(bytes.buffer_length(&response._buf) == 0, "the response body has already been written", loc)
-	_response_write_heading(response, len(content))
-	bytes.buffer_write(&response._buf, content)
+// response_append appends content with the response allocator. An allocation
+// error is returned and retained so a partial response is never sent.
+@(require_results)
+response_append :: proc(response: ^Response, content: []byte) -> runtime.Allocator_Error {
+	if response._err != nil { return response._err }
+	_, response._err = append(&response._buf, ..content)
+	return response._err
 }
 
-body_set_str :: proc(response: ^Response, content: string, loc := #caller_location) {
-	body_set_bytes(response, transmute([]byte)content, loc)
+@(private, require_results)
+response_append_string :: proc(response: ^Response, content: string) -> runtime.Allocator_Error {
+	return response_append(response, transmute([]byte)content)
 }
 
-/*
-Sets the response body. After calling this you can no longer add headers to the response.
-If, after calling, you want to change the status code, use the `response_status` procedure.
+// body_set_bytes writes the heading and content with the response allocator.
+// An allocation error prevents the response from being sent.
+@(require_results)
+body_set_bytes :: proc(response: ^Response, content: []byte, loc := #caller_location) -> runtime.Allocator_Error {
+	assert(len(response._buf) == 0, "the response body has already been written", loc)
+	_response_write_heading(response, len(content)) or_return
+	return response_append(response, content)
+}
 
-For bodies where you do not know the size or want an `io.Writer`, use the `response_writer_init`
-procedure to create a writer.
-*/
+@(require_results)
+body_set_str :: proc(response: ^Response, content: string, loc := #caller_location) -> runtime.Allocator_Error {
+	return body_set_bytes(response, transmute([]byte)content, loc)
+}
+
+// body_set writes the heading and body. Later header changes have no effect;
+// response_status can still change the status.
 body_set :: proc {
 	body_set_str,
 	body_set_bytes,
 }
 
-/*
-Sets the status code with the safety of being able to do this after writing (part of) the body.
-*/
+// response_status changes the status even after the body was written.
 response_status :: proc(response: ^Response, status: Status) {
 	if response.status == status { return }
 
 	response.status = status
 
-	// If we have already written the heading, we can address the bytes directly to overwrite,
-	// this is because of the fact that every status code is of length 3, and because we omit
-	// the "optional" reason phrase out of the response.
-	if bytes.buffer_length(&response._buf) > 0 {
+	// The status code has a fixed width and the reason phrase is omitted.
+	if len(response._buf) > 0 {
 		OFFSET :: len("HTTP/1.1 ")
 
 		status_text := status_string(response.status)
@@ -79,7 +86,7 @@ response_status :: proc(response: ^Response, status: Status) {
 			status_text = status_text[0:4]
 		}
 
-		copy(response._buf.buf[OFFSET:OFFSET + 4], status_text)
+		copy(response._buf[OFFSET:OFFSET + 4], status_text)
 	}
 }
 
@@ -96,29 +103,20 @@ Response_Writer :: struct {
 	ended:           bool,
 }
 
-/*
-Initialize a writer you can use to write responses. Use the `body_set` procedure group if you have
-a string or byte slice.
-
-The buffer can be used to avoid very small writes, like the ones when you use the json package
-(each write in the json package is only a few bytes). You are allowed to pass nil which will disable
-buffering.
-
-The body is framed with the chunked transfer coding. A server must not send
-that to an HTTP/1.0 client (RFC 9112 6.1), so its body is framed by closing the
-connection instead.
-
-NOTE: You need to call io.destroy to signal the end of the body, OR io.close to send the response.
-*/
-response_writer_init :: proc(writer: ^Response_Writer, response: ^Response, buffer: []byte) -> io.Writer {
+// response_writer_init frames an unknown-length body, chunked for HTTP/1.1 and
+// close-delimited for HTTP/1.0. buffer is borrowed and never grows. io.close
+// sends the response; io.destroy only ends the body. Allocation errors leave
+// the response unsent.
+@(require_results)
+response_writer_init :: proc(writer: ^Response_Writer, response: ^Response, buffer: []byte) -> (output: io.Writer, err: runtime.Allocator_Error) {
 	line, has_line := response._conn.loop.request.line.?
 	writer.close_delimited = has_line && line.version.minor == 0
 	if writer.close_delimited {
-		headers_set_close(&response.headers)
+		headers_set_close(&response.headers) or_return
 	} else {
-		headers_set_unsafe(&response.headers, "transfer-encoding", "chunked")
+		_ = headers_set_unsafe(&response.headers, "transfer-encoding", "chunked") or_return
 	}
-	_response_write_heading(response, -1)
+	_response_write_heading(response, -1) or_return
 
 	writer.buffer = slice.into_dynamic(buffer)
 	writer.response = response
@@ -126,52 +124,46 @@ response_writer_init :: proc(writer: ^Response_Writer, response: ^Response, buff
 	writer.output = io.Stream {
 		procedure = proc(stream_data: rawptr, mode: io.Stream_Mode, content: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
 			writer := (^Response_Writer)(stream_data)
-			body_buffer := &writer.response._buf
+			if writer.response._err != nil { return 0, .Short_Write }
 
 			#partial switch mode {
 			case .Flush:
 				assert(!writer.ended)
 
-				response_writer_chunk(writer, body_buffer, writer.buffer[:])
+				response_writer_chunk(writer, writer.buffer[:]) or_return
 				clear(&writer.buffer)
 				return 0, nil
 
 			case .Destroy:
 				assert(!writer.ended)
 
-				// Write what is left.
-				response_writer_chunk(writer, body_buffer, writer.buffer[:])
+				response_writer_chunk(writer, writer.buffer[:]) or_return
 
-				response_writer_end(writer, body_buffer)
+				response_writer_end(writer) or_return
 				return 0, nil
 
 			case .Close:
-				// Write what is left.
-				response_writer_chunk(writer, body_buffer, writer.buffer[:])
+				response_writer_chunk(writer, writer.buffer[:]) or_return
 
-				if !writer.ended { response_writer_end(writer, body_buffer) }
+				if !writer.ended { response_writer_end(writer) or_return }
 
-				// Send the response.
 				respond(writer.response)
 				return 0, nil
 
 			case .Write:
 				assert(!writer.ended)
 
-				// No space, first write writer.buffer, then check again for space, if still no space,
-				// fully write the given content.
 				if len(writer.buffer) + len(content) > cap(writer.buffer) {
-					response_writer_chunk(writer, body_buffer, writer.buffer[:])
+					response_writer_chunk(writer, writer.buffer[:]) or_return
 					clear(&writer.buffer)
 
 					if len(content) > cap(writer.buffer) {
-						response_writer_chunk(writer, body_buffer, content)
+						response_writer_chunk(writer, content) or_return
 					} else {
-						append(&writer.buffer, ..content)
+						if _, append_err := append(&writer.buffer, ..content); append_err != nil { return 0, .Short_Write }
 					}
 				} else {
-					// Space, append bytes to the buffer.
-					append(&writer.buffer, ..content)
+					if _, append_err := append(&writer.buffer, ..content); append_err != nil { return 0, .Short_Write }
 				}
 
 				return i64(len(content)), .None
@@ -183,58 +175,68 @@ response_writer_init :: proc(writer: ^Response_Writer, response: ^Response, buff
 		},
 		data = writer,
 	}
-	return writer.output
+	return writer.output, nil
 }
 
-// response_writer_chunk appends one piece of the body, framed as one chunk
-// (RFC 9112 7.1) unless the body is delimited by the connection closing.
-@(private)
-response_writer_chunk :: proc(writer: ^Response_Writer, body_buffer: ^bytes.Buffer, chunk: []byte) {
-	if len(chunk) == 0 { return }
+// response_writer_chunk frames one chunk. Allocation errors become io.Error
+// only at this writer boundary; the response retains their original value.
+@(private, require_results)
+response_writer_chunk :: proc(writer: ^Response_Writer, chunk: []byte) -> io.Error {
+	if len(chunk) == 0 { return nil }
+	response := writer.response
 	if writer.close_delimited {
-		bytes.buffer_write(body_buffer, chunk)
-		return
+		if response_append(response, chunk) != nil { return .Short_Write }
+		return nil
 	}
 	size_text: [16]byte
-	bytes.buffer_write_string(body_buffer, strconv.write_int(size_text[:], i64(len(chunk)), 16))
-	bytes.buffer_write_string(body_buffer, "\r\n")
-	bytes.buffer_write(body_buffer, chunk)
-	bytes.buffer_write_string(body_buffer, "\r\n")
+	if response_append_string(response, strconv.write_int(size_text[:], i64(len(chunk)), 16)) != nil ||
+	   response_append_string(response, "\r\n") != nil ||
+	   response_append(response, chunk) != nil ||
+	   response_append_string(response, "\r\n") != nil { return .Short_Write }
+	return nil
 }
 
-// response_writer_end ends the body: the last chunk and an empty trailer
-// section end a chunked one.
-@(private)
-response_writer_end :: proc(writer: ^Response_Writer, body_buffer: ^bytes.Buffer) {
-	if !writer.close_delimited { bytes.buffer_write_string(body_buffer, "0\r\n\r\n") }
+@(private, require_results)
+response_writer_end :: proc(writer: ^Response_Writer) -> io.Error {
+	if !writer.close_delimited && response_append_string(writer.response, "0\r\n\r\n") != nil { return .Short_Write }
 	writer.ended = true
+	return nil
 }
 
-/*
-Writes the response status and headers to the buffer.
+// response_buffer_writer adapts checked response appends to io.Writer.
+@(private)
+response_buffer_writer :: proc(response: ^Response) -> io.Writer {
+	return {data = response, procedure = proc(data: rawptr, mode: io.Stream_Mode, content: []byte, offset: i64, whence: io.Seek_From) -> (i64, io.Error) {
+			response := cast(^Response)data
+			#partial switch mode {
+			case .Write:
+				if response_append(response, content) != nil { return 0, .Short_Write }
+				return i64(len(content)), nil
+			case .Query:
+				return io.query_utility({.Write})
+			}
+			return 0, .Empty
+		}}
+}
 
-This is automatically called before writing anything to the Response.body or before calling a procedure
-that sends the response.
+// _response_write_heading omits Content-Length when content_length is negative.
+@(require_results)
+_response_write_heading :: proc(response: ^Response, content_length: int) -> runtime.Allocator_Error {
+	if response._err != nil { return response._err }
+	if response._heading_written { return nil }
 
-You can pass `content_length < 0` to omit the content-length header, note that this header is
-required on most responses, but there are things like transfer-encodings that could leave it out.
-*/
-_response_write_heading :: proc(response: ^Response, content_length: int) {
-	if response._heading_written { return }
-	response._heading_written = true
-
-	write_string :: bytes.buffer_write_string
+	write_string :: response_append_string
 	connection := response._conn
-	body_buffer := &response._buf
+	body_buffer := response
 
 	MIN :: len("HTTP/1.1 200 \r\ndate: \r\ncontent-length: 1000\r\n") + HTTP_DATE_LENGTH
 	AVG_HEADER_SIZE :: 20
 	reserve_size := MIN + content_length + (AVG_HEADER_SIZE * headers_count(response.headers))
-	bytes.buffer_grow(&response._buf, reserve_size)
+	if err := reserve(&response._buf, max(0, reserve_size)); err != nil {
+		response._err = err
+		return err
+	}
 
-	// According to RFC 7230 3.1.2 the reason phrase is insignificant,
-	// because not doing so (and the fact that a status code is always length 3), we can change
-	// the status code when we are already writing a body by just addressing the 3 bytes directly.
 	status_text := status_string(response.status)
 	if len(status_text) < 4 {
 		status_text = "500 "
@@ -242,56 +244,54 @@ _response_write_heading :: proc(response: ^Response, content_length: int) {
 		status_text = status_text[0:4]
 	}
 
-	write_string(body_buffer, "HTTP/1.1 ")
-	write_string(body_buffer, status_text)
-	write_string(body_buffer, "\r\n")
+	write_string(body_buffer, "HTTP/1.1 ") or_return
+	write_string(body_buffer, status_text) or_return
+	write_string(body_buffer, "\r\n") or_return
 
 	// RFC 9110 6.6.1: an origin server with a clock sends Date in every 2xx,
 	// 3xx, and 4xx response, and may in 1xx and 5xx ones.
 	if !status_is_informational(response.status) && !headers_has_unsafe(response.headers, "date") {
-		write_string(body_buffer, "date: ")
-		write_string(body_buffer, server_date())
-		write_string(body_buffer, "\r\n")
+		write_string(body_buffer, "date: ") or_return
+		write_string(body_buffer, server_date()) or_return
+		write_string(body_buffer, "\r\n") or_return
 	}
 
 	if (content_length > -1 && !headers_has_unsafe(response.headers, "content-length") && response_needs_content_length(response, connection)) {
 		if content_length == 0 {
-			write_string(body_buffer, "content-length: 0\r\n")
+			write_string(body_buffer, "content-length: 0\r\n") or_return
 		} else {
-			write_string(body_buffer, "content-length: ")
+			write_string(body_buffer, "content-length: ") or_return
 
 			assert(content_length < 1000000000000000000 && content_length > -1000000000000000000)
 			number_text: [20]byte
-			write_string(body_buffer, strconv.write_int(number_text[:], i64(content_length), 10))
-			write_string(body_buffer, "\r\n")
+			write_string(body_buffer, strconv.write_int(number_text[:], i64(content_length), 10)) or_return
+			write_string(body_buffer, "\r\n") or_return
 		}
 	}
 
-	stream := bytes.buffer_to_stream(body_buffer)
+	stream := response_buffer_writer(response)
 
-	// The head is written into a core:bytes.Buffer, whose writes report no
-	// failure: it grows with a resize whose allocation error it drops, so a
-	// writer over it can only ever return nil.
 	for header, value in response.headers._kv {
-		write_string(body_buffer, header) // already has newlines escaped.
-		write_string(body_buffer, ": ")
-		_ = write_escaped_newlines(stream, value)
-		write_string(body_buffer, "\r\n")
+		write_string(body_buffer, header) or_return // already has newlines escaped.
+		write_string(body_buffer, ": ") or_return
+		if write_escaped_newlines(stream, value) != nil { return response._err }
+		write_string(body_buffer, "\r\n") or_return
 	}
 	for value in response.headers._set_cookie_values {
-		write_string(body_buffer, "set-cookie: ")
-		_ = write_escaped_newlines(stream, value)
-		write_string(body_buffer, "\r\n")
+		write_string(body_buffer, "set-cookie: ") or_return
+		if write_escaped_newlines(stream, value) != nil { return response._err }
+		write_string(body_buffer, "\r\n") or_return
 	}
 
 	for cookie in response.cookies {
-		_ = cookie_write(stream, cookie)
-		write_string(body_buffer, "\r\n")
+		if cookie_write(stream, cookie) != nil { return response._err }
+		write_string(body_buffer, "\r\n") or_return
 	}
 
-	// Empty line denotes end of headers and start of body.
-	write_string(body_buffer, "\r\n")
-	response._head_len = bytes.buffer_length(body_buffer)
+	write_string(body_buffer, "\r\n") or_return
+	response._head_len = len(response._buf)
+	response._heading_written = true
+	return nil
 }
 
 // Sends the response over the connection.
@@ -301,6 +301,10 @@ _response_write_heading :: proc(response: ^Response, content_length: int) {
 response_send :: proc(response: ^Response, connection: ^Connection, loc := #caller_location) {
 	assert(!response.sent, "response has already been sent", loc)
 	response.sent = true
+	if response._err != nil {
+		connection_close(connection)
+		return
+	}
 
 	// RFC 9112 9.3: a server reads the entire request body or closes the
 	// connection after its response, or the unread rest would be taken for the
@@ -308,15 +312,22 @@ response_send :: proc(response: ^Response, connection: ^Connection, loc := #call
 	// behalf, so the connection closes instead.
 	will_close := response_must_close(&connection.loop.request, response)
 	if !will_close && connection.loop.request._body_ok == nil && request_has_body(&connection.loop.request) {
-		headers_set_close(&response.headers)
+		if err := headers_set_close(&response.headers); err != nil { response._err = err }
 		will_close = true
+	}
+	if response._err != nil {
+		connection_close(connection)
+		return
 	}
 	if will_close && !connection_set_state(connection, .Will_Close) { return }
 
-	if bytes.buffer_length(&response._buf) == 0 {
-		_response_write_heading(response, 0)
+	if len(response._buf) == 0 {
+		if err := _response_write_heading(response, 0); err != nil {
+			connection_close(connection)
+			return
+		}
 	}
-	body := bytes.buffer_to_bytes(&response._buf)
+	body := response._buf[:]
 	if connection.loop.request.is_head { body = body[:response._head_len] }
 	nbio.send_poly(connection.socket, {body}, connection, on_response_sent)
 }
@@ -344,7 +355,9 @@ on_response_sent :: proc(op: ^nbio.Operation, connection: ^Connection) {
 
 @(private)
 clean_request_loop :: proc(connection: ^Connection, close_connection: Maybe(bool) = nil) {
+	previous_temp := context.temp_allocator
 	context.temp_allocator = virtual.arena_allocator(&connection.temp_allocator)
+	defer context.temp_allocator = previous_temp
 	free_all(context.temp_allocator)
 
 	scanner_reset(&connection.scanner)
@@ -396,19 +409,19 @@ response_must_close :: proc(request: ^Request, response: ^Response) -> bool {
 
 	// A body that could not be read leaves the rest of the stream unframed.
 	if body_ok, got_body := request._body_ok.?; got_body && !body_ok {
-		headers_set_close(&response.headers)
+		if err := headers_set_close(&response.headers); err != nil { response._err = err }
 		return true
 	}
 
 	if response._conn.state >= .Will_Close {
-		headers_set_close(&response.headers)
+		if err := headers_set_close(&response.headers); err != nil { response._err = err }
 		return true
 	}
 
 	// RFC 9112 9.3: an HTTP/1.0 connection persists only when the client asked
 	// with keep-alive, which this server does not offer.
 	if line, has_line := request.line.?; !has_line || line.version.minor == 0 {
-		headers_set_close(&response.headers)
+		if err := headers_set_close(&response.headers); err != nil { response._err = err }
 		return true
 	}
 	return false

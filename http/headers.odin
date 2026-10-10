@@ -3,11 +3,11 @@ package http
 import "base:runtime"
 
 import "core:strings"
+import "core:unicode/utf8"
 
-// Headers is a field section keyed by lowercase field name. Field names are
-// case-insensitive (RFC 9110 5.1). The _unsafe procedures take a name that is
-// already lowercase and never allocate; the others lowercase it first, which
-// needs the section's own allocator.
+// Headers owns field names and values with its allocator. Names are lowercase
+// and case-insensitive (RFC 9110 5.1). The _unsafe procedures require an already
+// lowercase name; only the lookup and deletion variants avoid allocation.
 Headers :: struct {
 	_kv:                map[string]string,
 	_set_cookie_values: [dynamic]string,
@@ -15,13 +15,13 @@ Headers :: struct {
 }
 
 // headers_init sets the allocator that owns the section's map, extra Set-Cookie
-// values, and each name and value header_parse copies into it.
+// values, and every cloned name and value.
 headers_init :: proc(headers: ^Headers, allocator := context.temp_allocator) {
 	headers._kv.allocator = allocator
 	headers._set_cookie_values.allocator = allocator
 }
 
-// headers_destroy releases a section filled by header_parse: its names, values,
+// headers_destroy releases the section's owned names, values,
 // extra Set-Cookie values, and the map.
 headers_destroy :: proc(headers: ^Headers) {
 	allocator := headers._kv.allocator
@@ -39,23 +39,41 @@ headers_count :: #force_inline proc(headers: Headers) -> int {
 	return len(headers._kv)
 }
 
-// headers_set stores a value under a name it lowercases first, and returns that
-// name. The section borrows the value. mem_err is set, and nothing is stored,
-// when the name could not be built.
+// headers_set clones the name and value into the section and returns its canonical
+// lowercase name. Allocation failure leaves the section unchanged.
 @(require_results)
-headers_set :: proc(headers: ^Headers, key: string, value: string, loc := #caller_location) -> (name: string, mem_err: runtime.Allocator_Error) {
-	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
-	name, mem_err = sanitize_key(headers^, key)
-	if mem_err != nil { return }
-	headers._kv[name] = value
-	if name == "set-cookie" { headers_clear_set_cookie_values(headers) }
-	return
+headers_set :: proc(headers: ^Headers, key: string, value: string, loc := #caller_location) -> (name: string, err: runtime.Allocator_Error) {
+	headers_assert_writable(headers, loc)
+	name = sanitize_key(headers^, key) or_return
+	return headers_store(headers, name, value)
 }
 
-headers_set_unsafe :: #force_inline proc(headers: ^Headers, key: string, value: string, loc := #caller_location) {
-	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
-	headers._kv[key] = value
-	if key == "set-cookie" { headers_clear_set_cookie_values(headers) }
+// headers_set_unsafe clones an already lowercase name and its value into the
+// section. It returns the canonical name, or an allocation error without changes.
+@(require_results)
+headers_set_unsafe :: proc(headers: ^Headers, key: string, value: string, loc := #caller_location) -> (name: string, err: runtime.Allocator_Error) {
+	headers_assert_writable(headers, loc)
+	name = strings.clone(key, headers_allocator(headers^)) or_return
+	return headers_store(headers, name, value)
+}
+
+@(private, require_results)
+headers_store :: proc(headers: ^Headers, name, value: string) -> (key: string, err: runtime.Allocator_Error) {
+	allocator := headers_allocator(headers^)
+	transferred := false
+	defer if !transferred { delete(name, allocator) }
+	cloned := strings.clone(value, allocator) or_return
+	defer if !transferred { delete(cloned, allocator) }
+	if headers._kv.allocator.procedure == nil { headers_init(headers, allocator) }
+	key_ptr, value_ptr, inserted := map_entry(&headers._kv, name) or_return
+	if !inserted {
+		delete(name, allocator)
+		delete(value_ptr^, allocator)
+	}
+	value_ptr^ = cloned
+	transferred = true
+	if key_ptr^ == "set-cookie" { headers_clear_set_cookie_values(headers) }
+	return key_ptr^, nil
 }
 
 // headers_get returns the value stored under a name it lowercases first, and
@@ -105,9 +123,10 @@ headers_assert_writable :: proc(headers: ^Headers, loc := #caller_location) {
 	assert(!headers.readonly, "these headers are readonly, did you accidentally try to set a header on the request?", loc)
 }
 
-// headers_entry returns the entry for a name it lowercases first, inserted with a
-// zero value when the section had none. mem_err is set when the name could not be
-// built, or when the entry's allocation failed.
+// headers_entry returns the canonical name and mutable value for key, inserting
+// an empty value when absent. Names and values belong to the section allocator;
+// callers replacing a non-empty value must free it and allocate its replacement
+// with that allocator. Returned pointers expire when the map grows or removes them.
 @(require_results)
 headers_entry :: proc(
 	headers: ^Headers,
@@ -117,19 +136,16 @@ headers_entry :: proc(
 	key_ptr: ^string,
 	value_ptr: ^string,
 	just_inserted: bool,
-	mem_err: runtime.Allocator_Error,
+	err: runtime.Allocator_Error,
 ) {
 	headers_assert_writable(headers, loc)
-	name, name_err := sanitize_key(headers^, key)
-	if name_err != nil { return nil, nil, false, name_err }
-	key_ptr, value_ptr, just_inserted, mem_err = map_entry(&headers._kv, name)
-	// The map keeps the name only when it inserted it.
-	if mem_err != nil || !just_inserted { delete(name, headers_allocator(headers^)) }
-	return
+	name := sanitize_key(headers^, key) or_return
+	return headers_insert_entry(headers, name)
 }
 
+// headers_entry_unsafe is headers_entry for an already lowercase key.
 @(require_results)
-headers_entry_unsafe :: #force_inline proc(
+headers_entry_unsafe :: proc(
 	headers: ^Headers,
 	key: string,
 	loc := #caller_location,
@@ -137,10 +153,19 @@ headers_entry_unsafe :: #force_inline proc(
 	key_ptr: ^string,
 	value_ptr: ^string,
 	just_inserted: bool,
-	mem_err: runtime.Allocator_Error,
+	err: runtime.Allocator_Error,
 ) {
 	headers_assert_writable(headers, loc)
-	key_ptr, value_ptr, just_inserted, mem_err = map_entry(&headers._kv, key)
+	name := strings.clone(key, headers_allocator(headers^)) or_return
+	return headers_insert_entry(headers, name)
+}
+
+@(private, require_results)
+headers_insert_entry :: proc(headers: ^Headers, name: string) -> (key_ptr: ^string, value_ptr: ^string, inserted: bool, err: runtime.Allocator_Error) {
+	allocator := headers_allocator(headers^)
+	if headers._kv.allocator.procedure == nil { headers_init(headers, allocator) }
+	key_ptr, value_ptr, inserted, err = map_entry(&headers._kv, name)
+	if err != nil || !inserted { delete(name, allocator) }
 	return
 }
 
@@ -159,22 +184,25 @@ headers_has_unsafe :: #force_inline proc(headers: Headers, key: string) -> bool 
 	return key in headers._kv
 }
 
-// headers_delete removes the field with a name it lowercases first, returning what
-// it removed. mem_err is set, and nothing is removed, when the name could not be
-// built.
+// headers_delete frees the field with a name it lowercases first. An allocation
+// error leaves the section unchanged.
 @(require_results)
-headers_delete :: proc(headers: ^Headers, key: string) -> (deleted_key: string, deleted_value: string, mem_err: runtime.Allocator_Error) {
-	name, name_err := sanitize_key(headers^, key)
-	if name_err != nil { return "", "", name_err }
+headers_delete :: proc(headers: ^Headers, key: string, loc := #caller_location) -> runtime.Allocator_Error {
+	headers_assert_writable(headers, loc)
+	name := sanitize_key(headers^, key) or_return
 	defer delete(name, headers_allocator(headers^))
-	deleted_key, deleted_value = delete_key(&headers._kv, name)
-	if name == "set-cookie" { headers_clear_set_cookie_values(headers) }
-	return
+	headers_delete_unsafe(headers, name, loc)
+	return nil
 }
 
-headers_delete_unsafe :: #force_inline proc(headers: ^Headers, key: string) {
-	delete_key(&headers._kv, key)
-	if key == "set-cookie" { headers_clear_set_cookie_values(headers) }
+// headers_delete_unsafe frees the field under an already lowercase name.
+headers_delete_unsafe :: proc(headers: ^Headers, key: string, loc := #caller_location) {
+	headers_assert_writable(headers, loc)
+	removed_key, removed_value := delete_key(&headers._kv, key)
+	if removed_key == "set-cookie" { headers_clear_set_cookie_values(headers) }
+	allocator := headers_allocator(headers^)
+	delete(removed_key, allocator)
+	delete(removed_value, allocator)
 }
 
 headers_set_content_type :: proc {
@@ -182,16 +210,21 @@ headers_set_content_type :: proc {
 	headers_set_content_type_string,
 }
 
-headers_set_content_type_string :: #force_inline proc(headers: ^Headers, content_type: string) {
-	headers_set_unsafe(headers, "content-type", content_type)
+@(require_results)
+headers_set_content_type_string :: proc(headers: ^Headers, content_type: string) -> runtime.Allocator_Error {
+	_, err := headers_set_unsafe(headers, "content-type", content_type)
+	return err
 }
 
-headers_set_content_type_mime :: #force_inline proc(headers: ^Headers, content_type: MIME_Type) {
-	headers_set_unsafe(headers, "content-type", mime_to_content_type(content_type))
+@(require_results)
+headers_set_content_type_mime :: proc(headers: ^Headers, content_type: MIME_Type) -> runtime.Allocator_Error {
+	return headers_set_content_type_string(headers, mime_to_content_type(content_type))
 }
 
-headers_set_close :: #force_inline proc(headers: ^Headers) {
-	headers_set_unsafe(headers, "connection", "close")
+@(require_results)
+headers_set_close :: proc(headers: ^Headers) -> runtime.Allocator_Error {
+	_, err := headers_set_unsafe(headers, "connection", "close")
+	return err
 }
 
 @(private)
@@ -227,8 +260,8 @@ sanitize_key :: proc(headers: Headers, key: string) -> (name: string, mem_err: r
 @(private, require_results)
 write_escaped_character :: proc(builder: ^strings.Builder, character: rune) -> bool {
 	if character == '\n' { return strings.write_string(builder, "\\n") == 2 }
-	written, write_err := strings.write_rune(builder, character)
-	return write_err == nil && written > 0
+	encoded, width := utf8.encode_rune(character)
+	return strings.write_bytes(builder, encoded[:width]) == width
 }
 
 // headers_allocator returns the allocator a section's names and values live in.

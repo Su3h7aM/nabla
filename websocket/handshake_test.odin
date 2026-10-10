@@ -60,7 +60,8 @@ test_upgrade_response_selects_only_an_offered_protocol_and_no_extension :: proc(
 	testing.expect_value(t, failure.kind, Dial_Error.None)
 
 	unoffered_headers := accepted_headers
-	http.headers_set_unsafe(&unoffered_headers, "sec-websocket-protocol", "chat.v3")
+	_, set_err := http.headers_set_unsafe(&unoffered_headers, "sec-websocket-protocol", "chat.v3")
+	testing.expect(t, set_err == nil)
 	unoffered := client.Upgraded {
 		headers = unoffered_headers,
 	}
@@ -70,7 +71,8 @@ test_upgrade_response_selects_only_an_offered_protocol_and_no_extension :: proc(
 	// A subprotocol is an exact token, so a different case is a different protocol
 	// and was not offered.
 	cased_headers := accepted_headers
-	http.headers_set_unsafe(&cased_headers, "sec-websocket-protocol", "CHAT.V2")
+	_, set_err = http.headers_set_unsafe(&cased_headers, "sec-websocket-protocol", "CHAT.V2")
+	testing.expect(t, set_err == nil)
 	cased := client.Upgraded {
 		headers = cased_headers,
 	}
@@ -81,8 +83,10 @@ test_upgrade_response_selects_only_an_offered_protocol_and_no_extension :: proc(
 	testing.expect(t, handshake_headers_invalid(duplicate, context.temp_allocator) != "", "a repeated offer was accepted")
 
 	extension_headers := accepted_headers
-	http.headers_set_unsafe(&extension_headers, "sec-websocket-protocol", "chat.v2")
-	http.headers_set_unsafe(&extension_headers, "sec-websocket-extensions", "permessage-deflate")
+	_, set_err = http.headers_set_unsafe(&extension_headers, "sec-websocket-protocol", "chat.v2")
+	testing.expect(t, set_err == nil)
+	_, set_err = http.headers_set_unsafe(&extension_headers, "sec-websocket-extensions", "permessage-deflate")
+	testing.expect(t, set_err == nil)
 	extension := client.Upgraded {
 		headers = extension_headers,
 	}

@@ -37,30 +37,32 @@ middleware_proc :: proc(next: Maybe(^Handler), handle: Handler_Proc) -> Handler 
 	return result
 }
 
-Rate_Limit_On_Limit :: struct {
+// Rate_Limit_Callback is a retained callback invoked after the limiter unlocks.
+Rate_Limit_Callback :: struct {
 	user_data: rawptr,
 	on_limit:  proc(request: ^Request, response: ^Response, user_data: rawptr),
 }
 
-// Convenience method to create a Rate_Limit_On_Limit that writes the given message.
-rate_limit_message :: proc(message: ^string) -> Rate_Limit_On_Limit {
-	return Rate_Limit_On_Limit{user_data = message, on_limit = proc(_: ^Request, response: ^Response, user_data: rawptr) {
-			text := (^string)(user_data)
-			body_set(response, text^)
-			respond(response)
-		}}
+// Rate_Limit_On_Limit borrows a message or stores a custom callback. The message
+// and callback data must outlive the limiter.
+Rate_Limit_On_Limit :: union {
+	string,
+	Rate_Limit_Callback,
+}
+
+// rate_limit_message borrows message until the limiter is destroyed.
+rate_limit_message :: proc(message: string) -> Rate_Limit_On_Limit {
+	return message
 }
 
 Rate_Limit_Opts :: struct {
 	window:   time.Duration,
 	max:      int,
-
-	// Optional handler to call when a request is being rate-limited, allows you to customize the response.
-	on_limit: Maybe(Rate_Limit_On_Limit),
+	on_limit: Rate_Limit_On_Limit,
 }
 
 Rate_Limit_Data :: struct {
-	opts:       ^Rate_Limit_Opts,
+	opts:       Rate_Limit_Opts,
 	next_sweep: time.Time,
 	hits:       map[net.Address]int,
 	mu:         sync.Mutex,
@@ -77,7 +79,7 @@ rate_limit_destroy :: proc(data: ^Rate_Limit_Data) {
 rate_limit :: proc(
 	data: ^Rate_Limit_Data,
 	next: ^Handler,
-	opts: ^Rate_Limit_Opts,
+	opts: Rate_Limit_Opts,
 	allocator := context.allocator,
 ) -> (
 	result: Handler,
@@ -99,31 +101,37 @@ rate_limit :: proc(
 
 		sync.lock(&data.mu)
 
-		// PERF: if this is not performing, we could run a thread that sweeps on a regular basis.
 		if time.since(data.next_sweep) > 0 {
 			clear(&data.hits)
 			data.next_sweep = time.time_add(time.now(), data.opts.window)
 		}
 
-		hits := data.hits[request.client.address]
-		data.hits[request.client.address] = hits + 1
+		_, count, _, count_err := map_entry(&data.hits, request.client.address)
+		if count_err != nil {
+			sync.unlock(&data.mu)
+			respond(response, .Internal_Server_Error)
+			return
+		}
+		hits := count^
+		count^ += 1
+		next_sweep := data.next_sweep
 		sync.unlock(&data.mu)
 
 		if hits > data.opts.max {
 			response.status = .Too_Many_Requests
 
-			retry_after := i64(time.diff(time.now(), data.next_sweep) / time.Second)
-			buffer, buffer_err := make([]byte, 32, context.temp_allocator)
-			// Without room for the delay the limit is still answered, just without
-			// the header that states when to come back.
-			if buffer_err == nil {
-				retry_text := strconv.write_int(buffer, retry_after, 10)
-				headers_set_unsafe(&response.headers, "retry-after", retry_text)
-			}
+			retry_after := i64(time.diff(time.now(), next_sweep) / time.Second)
+			buffer: [32]byte
+			retry_text := strconv.write_int(buffer[:], retry_after, 10)
+			if _, err := headers_set_unsafe(&response.headers, "retry-after", retry_text); err != nil { response._err = err }
 
-			if on_limit, ok := data.opts.on_limit.(Rate_Limit_On_Limit); ok {
-				on_limit.on_limit(request, response, on_limit.user_data)
-			} else {
+			switch on_limit in data.opts.on_limit {
+			case string:
+				if err := body_set(response, on_limit); err != nil { response._err = err }
+				respond(response)
+			case Rate_Limit_Callback:
+				if on_limit.on_limit != nil { on_limit.on_limit(request, response, on_limit.user_data) } else { respond(response) }
+			case nil:
 				respond(response)
 			}
 			return

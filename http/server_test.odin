@@ -2,6 +2,7 @@
 #+private file
 package http
 
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -52,7 +53,7 @@ test_server_start :: proc(t: ^testing.T, fixture: ^Test_Server) -> bool {
 	fixture,
 	proc(fixture: ^Test_Server) {
 		opts := Default_Server_Opts
-		opts.thread_count = 1
+		opts.thread_count = 2
 		listen_err := listen(&fixture.server, {address = net.IP4_Loopback, port = 0}, opts)
 		if listen_err == nil {
 			bound, bound_err := net.bound_endpoint(fixture.server.tcp_socket)
@@ -157,4 +158,22 @@ test_server_follows_rfc_9112 :: proc(t: ^testing.T) {
 	// RFC 9112 6.1: a Transfer-Encoding in an HTTP/1.0 request is faulty framing.
 	faulty := exchange(t, at, "POST /echo HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
 	testing.expectf(t, strings.has_prefix(faulty, "HTTP/1.1 400 "), "Transfer-Encoding in HTTP/1.0: %q", faulty)
+}
+
+@(test)
+test_server_thread_start_failure_stops_started_workers :: proc(t: ^testing.T) {
+	server: Server
+	opts := Default_Server_Opts
+	opts.thread_count = 3
+	if !testing.expect(t, listen(&server, {address = net.IP4_Loopback, port = 0}, opts) == nil) { return }
+	state := Test_Failing_Allocator {
+		backing = context.allocator,
+		fail_at = 2,
+	}
+	context.allocator = mem.Allocator {
+		procedure = test_failing_allocator,
+		data      = &state,
+	}
+	err := serve(&server, handler(test_handle))
+	testing.expect(t, err == Server_Start_Error.Thread_Start_Failed)
 }

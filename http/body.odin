@@ -280,7 +280,11 @@ _body_chunked :: proc(request: ^Request, max_length: int = -1, user_data: rawptr
 			headers_delete_unsafe(&state.request.headers, "trailer")
 			coding := headers_get_unsafe(state.request.headers, "transfer-encoding")
 			if comma := strings.last_index_byte(coding, ','); comma >= 0 {
-				headers_set_unsafe(&state.request.headers, "transfer-encoding", trim_ows(coding[:comma]))
+				if _, set_err := headers_set_unsafe(&state.request.headers, "transfer-encoding", trim_ows(coding[:comma])); set_err != nil {
+					state.request.headers.readonly = true
+					state.callback(state.user_data, "", .Unknown)
+					return
+				}
 			} else {
 				headers_delete_unsafe(&state.request.headers, "transfer-encoding")
 			}
