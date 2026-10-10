@@ -16,20 +16,20 @@ import "nabla:tui/widgets"
 
 CATALOG_PIPELINE_MODELS_DEV :: `{"test-provider":{"id":"test-provider","models":{"discovered-model":{"id":"discovered-model","limit":{"context":128000,"output":4096},"tool_call":true,"reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]}}}}`
 
-catalog_pipeline_provider_fetch :: proc(_: rawptr, _: string, _: string, allocator: mem.Allocator) -> ([]u8, bool) {
+catalog_pipeline_provider_fetch :: proc(_: ^bool, _: string, _: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	body := `{"data":[{"id":"discovered-model"}]}`
 	bytes := make([]u8, len(body), allocator)
 	copy(bytes, body)
 	return bytes, true
 }
 
-catalog_pipeline_models_dev_fetch :: proc(_: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
+catalog_pipeline_models_dev_fetch :: proc(_: ^bool, allocator: mem.Allocator) -> ([]u8, bool) {
 	bytes := make([]u8, len(CATALOG_PIPELINE_MODELS_DEV), allocator)
 	copy(bytes, CATALOG_PIPELINE_MODELS_DEV)
 	return bytes, true
 }
 
-catalog_pipeline_models_dev_unreachable :: proc(_: rawptr, _: mem.Allocator) -> ([]u8, bool) { return nil, false }
+catalog_pipeline_models_dev_unreachable :: proc(_: ^bool, _: mem.Allocator) -> ([]u8, bool) { return nil, false }
 
 // Catalog_Pipeline_Fixture is the smallest app a refresh runs in: an isolated
 // cache directory, one configured provider, and the catalog the startup path

@@ -42,26 +42,22 @@ Models_Dev_Error :: enum {
 	Missing_Identity,
 }
 
-// Models_Dev_Fetch delivers a catalog body owned by the caller. Production uses
-// models_dev_fetch; a test supplies its own, which is how the cache policy is
-// exercised without the network.
-Models_Dev_Fetch :: #type proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool)
-
 // models_dev_catalog returns the catalog, preferring a fresh cache that can answer a
-// request for `providers` and refreshing it otherwise. A refresh that fails leaves the
-// cached copy in place, so a network problem degrades to stale metadata, never to none.
-// The returned body is owned by the caller.
+// request for `providers` and refreshing it otherwise. fetch delivers a catalog body owned
+// by the caller; production passes models_dev_fetch and a test supplies its own. A refresh
+// that fails leaves the cached copy in place, so a network problem degrades to stale
+// metadata, never to none. The returned body is owned by the caller.
 @(require_results)
 models_dev_catalog :: proc(
-	fetch: Models_Dev_Fetch = models_dev_fetch,
-	user_data: rawptr = nil,
+	user_data: $T,
+	fetch: proc(user_data: T, allocator: mem.Allocator) -> ([]u8, bool),
 	providers: []string = {},
 	allocator := context.allocator,
 ) -> (
 	[]u8,
 	Models_Dev_Error,
 ) {
-	return models_dev_catalog_at(time.now(), fetch, user_data, providers, allocator)
+	return models_dev_catalog_at(time.now(), user_data, fetch, providers, allocator)
 }
 
 // models_dev_catalog_at is the same policy against an explicit clock, so the
@@ -69,8 +65,8 @@ models_dev_catalog :: proc(
 @(require_results)
 models_dev_catalog_at :: proc(
 	now: time.Time,
-	fetch: Models_Dev_Fetch,
-	user_data: rawptr,
+	user_data: $T,
+	fetch: proc(user_data: T, allocator: mem.Allocator) -> ([]u8, bool),
 	providers: []string,
 	allocator: mem.Allocator,
 ) -> (
@@ -174,15 +170,15 @@ models_dev_cached_sources :: proc(providers: []string = {}, allocator := context
 // and released with catalog_sources_destroy.
 @(require_results)
 models_dev_sources :: proc(
-	fetch: Models_Dev_Fetch = models_dev_fetch,
-	user_data: rawptr = nil,
+	user_data: $T,
+	fetch: proc(user_data: T, allocator: mem.Allocator) -> ([]u8, bool),
 	providers: []string = {},
 	allocator := context.allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
 	Models_Dev_Error,
 ) {
-	body, body_err := models_dev_catalog(fetch, user_data, providers, allocator)
+	body, body_err := models_dev_catalog(user_data, fetch, providers, allocator)
 	if body_err != .None { return {}, body_err }
 	defer delete(body, allocator)
 
@@ -206,13 +202,14 @@ models_dev_cache_path :: proc(allocator := context.allocator) -> (string, Models
 
 // models_dev_fetch performs the one request this source needs. It is deliberately
 // thin: freshness, caching, and persistence are the caller's decisions, so none
-// of them has to be exercised to test them.
+// of them has to be exercised to test them. The request ends early when cancel, if not
+// nil, becomes true.
 @(require_results)
-models_dev_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
+models_dev_fetch :: proc(cancel: ^bool, allocator: mem.Allocator) -> ([]u8, bool) {
 	return fetch_get(
 		{url = MODELS_DEV_URL, method = .Get, expected_content_type = "application/json", allocator = allocator},
 		MODELS_DEV_TIMEOUT,
-		cast(^bool)user_data,
+		cancel,
 		allocator,
 	)
 }

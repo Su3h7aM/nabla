@@ -24,8 +24,7 @@ Discovery_Stub :: struct {
 	api_key:  string,
 }
 
-discovery_stub_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
-	stub := cast(^Discovery_Stub)user_data
+discovery_stub_fetch :: proc(stub: ^Discovery_Stub, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	stub.calls += 1
 	stub.base_url = base_url
 	stub.api_key = api_key
@@ -46,7 +45,7 @@ test_discovery_lists_a_provider_and_states_only_ids :: proc(t: ^testing.T) {
 	}
 	providers := []Catalog_Provider_Source{discovery_source("proxy", "http://proxy.test/v1", "literal-key")}
 
-	discovered, discovered_ok := discover_provider_models(providers, discovery_stub_fetch, &stub, context.allocator)
+	discovered, discovered_ok := discover_provider_models(providers, &stub, discovery_stub_fetch, context.allocator)
 	testing.expect(t, discovered_ok)
 	defer catalog_sources_destroy(&discovered, context.allocator)
 
@@ -79,7 +78,7 @@ test_discovery_skips_a_provider_it_cannot_ask :: proc(t: ^testing.T) {
 		discovery_source("proxy", "http://proxy.test/v1", "literal-key"),
 	}
 
-	discovered, discovered_ok := discover_provider_models(providers, discovery_stub_fetch, &stub, context.allocator)
+	discovered, discovered_ok := discover_provider_models(providers, &stub, discovery_stub_fetch, context.allocator)
 	testing.expect(t, discovered_ok)
 	defer catalog_sources_destroy(&discovered, context.allocator)
 
@@ -101,7 +100,7 @@ test_discovery_contributes_to_the_catalog_without_overriding_the_user :: proc(t:
 	}
 	user := []Catalog_Provider_Source{{id = "proxy", base_url = "http://proxy.test/v1", api_key = "literal-key", models = []Catalog_Model_Source{configured}}}
 
-	discovered, discovered_ok := discover_provider_models(user, discovery_stub_fetch, &stub, context.allocator)
+	discovered, discovered_ok := discover_provider_models(user, &stub, discovery_stub_fetch, context.allocator)
 	testing.expect(t, discovered_ok)
 	defer catalog_sources_destroy(&discovered, context.allocator)
 	resolved, err := resolve_catalog(user, discovered[:], {})
@@ -125,7 +124,7 @@ test_provider_discovery_refreshes_once_and_serves_the_cache :: proc(t: ^testing.
 		first := Discovery_Stub {
 			body = DISCOVERY_FIXTURE,
 		}
-		refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &first, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh(providers, &first, discovery_stub_fetch, context.allocator)
 		testing.expect(t, refreshed_ok)
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, first.calls, 1)
@@ -134,7 +133,7 @@ test_provider_discovery_refreshes_once_and_serves_the_cache :: proc(t: ^testing.
 		second := Discovery_Stub {
 			body = `{"data":[{"id":"wrong"}]}`,
 		}
-		fresh, fresh_ok := provider_models_refresh(providers, discovery_stub_fetch, &second, context.allocator)
+		fresh, fresh_ok := provider_models_refresh(providers, &second, discovery_stub_fetch, context.allocator)
 		testing.expect(t, fresh_ok)
 		defer catalog_sources_destroy(&fresh)
 		testing.expect_value(t, second.calls, 0)
@@ -159,7 +158,7 @@ test_provider_discovery_replaces_an_invalid_fresh_cache :: proc(t: ^testing.T) {
 		stub := Discovery_Stub {
 			body = DISCOVERY_FIXTURE,
 		}
-		refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh(providers, &stub, discovery_stub_fetch, context.allocator)
 		testing.expect(t, refreshed_ok)
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, stub.calls, 1)
@@ -180,7 +179,7 @@ test_provider_discovery_replaces_a_stale_listing_with_an_empty_listing :: proc(t
 			body = `{"data":[]}`,
 		}
 		stale_at := time.time_add(time.now(), PROVIDER_MODELS_FRESH * 2)
-		refreshed, refreshed_ok := provider_models_refresh_at(stale_at, providers, discovery_stub_fetch, &stub, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh_at(stale_at, providers, &stub, discovery_stub_fetch, context.allocator)
 		if !testing.expect(t, refreshed_ok) { return }
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, stub.calls, 1)
@@ -215,7 +214,7 @@ test_provider_discovery_fetches_without_a_cache_directory :: proc(t: ^testing.T)
 	stub := Discovery_Stub {
 		body = DISCOVERY_FIXTURE,
 	}
-	refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+	refreshed, refreshed_ok := provider_models_refresh(providers, &stub, discovery_stub_fetch, context.allocator)
 	if !testing.expect(t, refreshed_ok) { return }
 	defer catalog_sources_destroy(&refreshed)
 	testing.expect_value(t, stub.calls, 1)
@@ -241,7 +240,7 @@ test_provider_discovery_reads_a_listing_of_any_size :: proc(t: ^testing.T) {
 		testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil)
 
 		stub := Discovery_Stub{}
-		refreshed, refreshed_ok := provider_models_refresh(providers, discovery_stub_fetch, &stub, context.allocator)
+		refreshed, refreshed_ok := provider_models_refresh(providers, &stub, discovery_stub_fetch, context.allocator)
 		testing.expect(t, refreshed_ok)
 		defer catalog_sources_destroy(&refreshed)
 		testing.expect_value(t, stub.calls, 0)

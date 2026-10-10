@@ -38,8 +38,7 @@ Models_Dev_Stub :: struct {
 MODELS_DEV_STUB_OLD: string : `{"stub": {"id": "stub", "models": {"stub/old": {"id": "stub/old"}}}}`
 MODELS_DEV_STUB_NEW: string : `{"stub": {"id": "stub", "models": {"stub/new": {"id": "stub/new"}}}}`
 
-models_dev_stub_fetch :: proc(user_data: rawptr, allocator: mem.Allocator) -> ([]u8, bool) {
-	stub := cast(^Models_Dev_Stub)user_data
+models_dev_stub_fetch :: proc(stub: ^Models_Dev_Stub, allocator: mem.Allocator) -> ([]u8, bool) {
 	stub.calls += 1
 	if stub.body == "" { return nil, false }
 	bytes := make([]u8, len(stub.body), allocator)
@@ -133,7 +132,7 @@ test_models_dev_uses_a_fresh_cache_without_fetching :: proc(t: ^testing.T) {
 		stub := Models_Dev_Stub {
 			body = MODELS_DEV_STUB_NEW,
 		}
-		body, err := models_dev_catalog(models_dev_stub_fetch, &stub, {}, context.temp_allocator)
+		body, err := models_dev_catalog(&stub, models_dev_stub_fetch, {}, context.temp_allocator)
 		testing.expect_value(t, err, Models_Dev_Error.None)
 		testing.expect_value(t, string(body), MODELS_DEV_STUB_OLD)
 		testing.expect_value(t, stub.calls, 0)
@@ -155,7 +154,7 @@ test_models_dev_refresh_failure_keeps_the_stale_cache :: proc(t: ^testing.T) {
 			// refresh; the refresh fails, and the cached copy survives.
 			stale_at := time.time_add(time.now(), MODELS_DEV_FRESH * 2)
 			stub := Models_Dev_Stub{}
-			body, err := models_dev_catalog_at(stale_at, models_dev_stub_fetch, &stub, {}, context.temp_allocator)
+			body, err := models_dev_catalog_at(stale_at, &stub, models_dev_stub_fetch, {}, context.temp_allocator)
 			testing.expect_value(t, stub.calls, 1)
 			testing.expect_value(t, err, Models_Dev_Error.None)
 			testing.expect_value(t, string(body), MODELS_DEV_STUB_OLD)
@@ -183,7 +182,7 @@ test_models_dev_refresh_replaces_a_stale_cache :: proc(t: ^testing.T) {
 			stub := Models_Dev_Stub {
 				body = MODELS_DEV_STUB_NEW,
 			}
-			body, err := models_dev_catalog_at(stale_at, models_dev_stub_fetch, &stub, {}, context.temp_allocator)
+			body, err := models_dev_catalog_at(stale_at, &stub, models_dev_stub_fetch, {}, context.temp_allocator)
 			testing.expect_value(t, stub.calls, 1)
 			testing.expect_value(t, err, Models_Dev_Error.None)
 			testing.expect_value(t, string(body), MODELS_DEV_STUB_NEW)
@@ -196,7 +195,7 @@ test_models_dev_refresh_replaces_a_stale_cache :: proc(t: ^testing.T) {
 			second := Models_Dev_Stub {
 				body = MODELS_DEV_STUB_OLD,
 			}
-			again, again_err := models_dev_catalog(models_dev_stub_fetch, &second, {}, context.temp_allocator)
+			again, again_err := models_dev_catalog(&second, models_dev_stub_fetch, {}, context.temp_allocator)
 			testing.expect_value(t, again_err, Models_Dev_Error.None)
 			testing.expect_value(t, string(again), MODELS_DEV_STUB_NEW)
 			testing.expect_value(t, second.calls, 0)
@@ -230,7 +229,7 @@ test_models_dev_reports_an_unusable_cache_directory :: proc(t: ^testing.T) {
 	stub := Models_Dev_Stub {
 		body = MODELS_DEV_STUB_NEW,
 	}
-	body, err := models_dev_catalog(models_dev_stub_fetch, &stub, {}, context.temp_allocator)
+	body, err := models_dev_catalog(&stub, models_dev_stub_fetch, {}, context.temp_allocator)
 	testing.expect_value(t, err, Models_Dev_Error.None)
 	testing.expect_value(t, string(body), MODELS_DEV_STUB_NEW)
 	// The network result remains useful even though the configured cache path failed.
@@ -254,7 +253,7 @@ test_models_dev_replaces_a_fresh_cache_that_cannot_answer :: proc(t: ^testing.T)
 			stub := Models_Dev_Stub {
 				body = MODELS_DEV_FIXTURE,
 			}
-			sources, err := models_dev_sources(models_dev_stub_fetch, &stub, []string{"acme"}, context.allocator)
+			sources, err := models_dev_sources(&stub, models_dev_stub_fetch, []string{"acme"}, context.allocator)
 			testing.expect_value(t, err, Models_Dev_Error.None)
 			defer catalog_sources_destroy(&sources)
 			testing.expect_value(t, stub.calls, 1)
@@ -266,7 +265,7 @@ test_models_dev_replaces_a_fresh_cache_that_cannot_answer :: proc(t: ^testing.T)
 			second := Models_Dev_Stub {
 				body = MODELS_DEV_STUB_NEW,
 			}
-			again, again_err := models_dev_sources(models_dev_stub_fetch, &second, []string{"acme"}, context.allocator)
+			again, again_err := models_dev_sources(&second, models_dev_stub_fetch, []string{"acme"}, context.allocator)
 			testing.expect_value(t, again_err, Models_Dev_Error.None)
 			defer catalog_sources_destroy(&again)
 			testing.expect_value(t, second.calls, 0)
@@ -330,7 +329,7 @@ test_models_dev_unusable_document_never_replaces_a_valid_cache :: proc(t: ^testi
 				stub := Models_Dev_Stub {
 					body = unusable,
 				}
-				body, err := models_dev_catalog_at(stale_at, models_dev_stub_fetch, &stub, {}, context.temp_allocator)
+				body, err := models_dev_catalog_at(stale_at, &stub, models_dev_stub_fetch, {}, context.temp_allocator)
 				testing.expect_value(t, stub.calls, 1)
 				testing.expect_value(t, err, Models_Dev_Error.None)
 				testing.expect_value(t, string(body), MODELS_DEV_STUB_OLD)
@@ -353,7 +352,7 @@ test_models_dev_unusable_document_without_a_cache_is_reported :: proc(t: ^testin
 			stub := Models_Dev_Stub {
 				body = "not json",
 			}
-			body, err := models_dev_catalog(models_dev_stub_fetch, &stub, {}, context.temp_allocator)
+			body, err := models_dev_catalog(&stub, models_dev_stub_fetch, {}, context.temp_allocator)
 			testing.expect_value(t, err, Models_Dev_Error.Invalid_Data)
 			testing.expect(t, body == nil)
 
@@ -375,7 +374,7 @@ test_models_dev_sources_are_the_resolver_input :: proc(t: ^testing.T) {
 			stub := Models_Dev_Stub {
 				body = MODELS_DEV_FIXTURE,
 			}
-			sources, err := models_dev_sources(models_dev_stub_fetch, &stub, {}, context.allocator)
+			sources, err := models_dev_sources(&stub, models_dev_stub_fetch, {}, context.allocator)
 			testing.expect_value(t, err, Models_Dev_Error.None)
 			defer catalog_sources_destroy(&sources)
 			testing.expect_value(t, stub.calls, 1)
@@ -411,7 +410,7 @@ test_models_dev_sources_reports_an_unusable_document :: proc(t: ^testing.T) {
 			broken := Models_Dev_Stub {
 				body = `{"stub": {"models": {}}}`,
 			}
-			sources, err := models_dev_sources(models_dev_stub_fetch, &broken, {}, context.allocator)
+			sources, err := models_dev_sources(&broken, models_dev_stub_fetch, {}, context.allocator)
 			testing.expect_value(t, err, Models_Dev_Error.Invalid_Data)
 			testing.expect_value(t, len(sources), 0)
 			catalog_sources_destroy(&sources)
@@ -423,7 +422,7 @@ test_models_dev_sources_reports_an_unusable_document :: proc(t: ^testing.T) {
 			// A served cache that cannot be parsed is reported by kind, so a damaged
 			// document stays distinguishable from an unreachable service.
 			testing.expect(t, os.write_entire_file(path, transmute([]u8)string(`{"stub": {"models": {}}}`)) == nil)
-			cached, cached_err := models_dev_sources(models_dev_stub_fetch, &broken, {}, context.allocator)
+			cached, cached_err := models_dev_sources(&broken, models_dev_stub_fetch, {}, context.allocator)
 			testing.expect_value(t, cached_err, Models_Dev_Error.Missing_Identity)
 			testing.expect_value(t, len(cached), 0)
 			catalog_sources_destroy(&cached)

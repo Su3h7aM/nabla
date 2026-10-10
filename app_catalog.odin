@@ -92,7 +92,11 @@ catalog_refresh :: proc(app: ^App) {
 	catalog_refresh_with(app, agent.provider_models_fetch, agent.models_dev_fetch)
 }
 
-catalog_refresh_with :: proc(app: ^App, provider_fetch: agent.Provider_Models_Fetch, models_dev_fetch: agent.Models_Dev_Fetch) {
+catalog_refresh_with :: proc(
+	app: ^App,
+	provider_fetch: proc(cancel: ^bool, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
+	models_dev_fetch: proc(cancel: ^bool, allocator: mem.Allocator) -> ([]u8, bool),
+) {
 	allocator := app.run.alloc
 	names, names_error := make([]string, len(app.catalog_sources), context.temp_allocator)
 	if names_error != nil {
@@ -106,7 +110,7 @@ catalog_refresh_with :: proc(app: ^App, provider_fetch: agent.Provider_Models_Fe
 	// result is published: the user's configuration, then the provider listing,
 	// then models.dev. The harness keeps running on the catalog published before
 	// this refresh until it finishes.
-	providers, providers_ok := agent.provider_models_refresh(app.catalog_sources, provider_fetch, &app.run.stopping, allocator)
+	providers, providers_ok := agent.provider_models_refresh(app.catalog_sources, &app.run.stopping, provider_fetch, allocator)
 	if !providers_ok {
 		// The listings could not be held: the catalog already published stays.
 		agent.catalog_sources_destroy(&providers, allocator)
@@ -118,7 +122,7 @@ catalog_refresh_with :: proc(app: ^App, provider_fetch: agent.Provider_Models_Fe
 	// produce are the ones the run already holds, and parsing the cached document is
 	// the largest thing one refresh does.
 	if models_dev_read_due(app) {
-		models_dev, models_dev_err := agent.models_dev_sources(models_dev_fetch, &app.run.stopping, names, allocator)
+		models_dev, models_dev_err := agent.models_dev_sources(&app.run.stopping, models_dev_fetch, names, allocator)
 		// A refresh that produced nothing leaves the enrichment already published in
 		// place, so a failed request cannot remove models.dev data from the catalog.
 		if models_dev_err == .None && len(models_dev) > 0 {

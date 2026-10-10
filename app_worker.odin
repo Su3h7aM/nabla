@@ -147,12 +147,13 @@ Listed_Session :: struct {
 // session_listing orders sessions for the /resume menu: each main session, newest activity
 // first, followed by the subagent sessions it started, each with the name its parent's
 // subagent.started gave it. A name that cannot be read leaves the child unnamed. The result
-// and the names live in temporary memory and borrow sessions.
-session_listing :: proc(store: ^journal.Journal, sessions: []journal.Session_Summary) -> []Listed_Session {
-	listed := make([dynamic]Listed_Session, context.temp_allocator)
+// and the names live in temporary memory and borrow sessions. The error is an allocation failure.
+@(require_results)
+session_listing :: proc(store: ^journal.Journal, sessions: []journal.Session_Summary) -> (result: []Listed_Session, err: mem.Allocator_Error) {
+	listed := make([dynamic]Listed_Session, context.temp_allocator) or_return
 	for &entry in sessions {
 		if entry.role != .Main { continue }
-		append(&listed, Listed_Session{summary = &entry})
+		_ = append(&listed, Listed_Session{summary = &entry}) or_return
 		starts: []journal.Record
 		loaded := false
 		for &child in sessions {
@@ -169,10 +170,10 @@ session_listing :: proc(store: ^journal.Journal, sessions: []journal.Session_Sum
 				started: journal.Subagent_Started
 				if journal.payload_decode(start.data, &started, context.temp_allocator) == nil { name = started.name }
 			}
-			append(&listed, Listed_Session{summary = &child, name = name, child = true})
+			_ = append(&listed, Listed_Session{summary = &child, name = name, child = true}) or_return
 		}
 	}
-	return listed[:]
+	return listed[:], nil
 }
 
 // session_row_title is the text a menu row shows for entry: a main session's title, or a
@@ -193,7 +194,11 @@ session_refresh_rows :: proc(app: ^App) {
 	sessions, list_error := journal.list_sessions(app.setup.store, {workspace = app.setup.workspace}, app.run.alloc)
 	if list_error != nil { return }
 	defer journal.session_summaries_destroy(sessions, app.run.alloc)
-	listed := session_listing(app.setup.store, sessions)
+	listed, listing_error := session_listing(app.setup.store, sessions)
+	if listing_error != nil {
+		snap_append(app, .Warning, "the session list could not be refreshed: out of memory")
+		return
+	}
 
 	sync.mutex_guard(&app.run.mu)
 	for &row in app.run.snap.sessions {

@@ -22,21 +22,18 @@ PROVIDER_MODELS_TIMEOUT :: 10 * time.Second
 PROVIDER_MODELS_FRESH :: 5 * time.Minute
 PROVIDER_MODELS_CACHE_PREFIX :: "provider-models"
 
-// Provider_Models_Fetch delivers one provider's model listing, owned by the
-// caller. Production uses provider_models_fetch; a test supplies its own, which
-// is how discovery is exercised without a network.
-Provider_Models_Fetch :: #type proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool)
-
 // discover_provider_models turns each configured provider's listing into one more
-// catalog source. Providers are listed independently, so one that cannot be
-// reached does not hold up the others. The result is owned by the caller and
-// released with catalog_sources_destroy, exactly like the result of the other two
-// stages. ok is false when a source record could not be allocated.
+// catalog source. fetch delivers one provider's listing body, owned by the caller;
+// production passes provider_models_fetch and a test supplies its own. Providers are
+// listed independently, so one that cannot be reached does not hold up the others. The
+// result is owned by the caller and released with catalog_sources_destroy, exactly like
+// the result of the other two stages. ok is false when a source record could not be
+// allocated.
 @(require_results)
 discover_provider_models :: proc(
 	providers: []Catalog_Provider_Source,
-	fetch: Provider_Models_Fetch = provider_models_fetch,
-	user_data: rawptr = nil,
+	user_data: $T,
+	fetch: proc(user_data: T, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
 	allocator := context.allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
@@ -127,22 +124,22 @@ provider_models_add_body :: proc(result: ^[dynamic]Catalog_Provider_Source, id: 
 @(require_results)
 provider_models_refresh :: proc(
 	providers: []Catalog_Provider_Source,
-	fetch: Provider_Models_Fetch = provider_models_fetch,
-	user_data: rawptr = nil,
+	user_data: $T,
+	fetch: proc(user_data: T, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
 	allocator := context.allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
 	bool,
 ) {
-	return provider_models_refresh_at(time.now(), providers, fetch, user_data, allocator)
+	return provider_models_refresh_at(time.now(), providers, user_data, fetch, allocator)
 }
 
 @(private, require_results)
 provider_models_refresh_at :: proc(
 	now: time.Time,
 	providers: []Catalog_Provider_Source,
-	fetch: Provider_Models_Fetch,
-	user_data: rawptr,
+	user_data: $T,
+	fetch: proc(user_data: T, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
 	allocator: mem.Allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
@@ -217,9 +214,12 @@ provider_models_cache_path :: proc(provider: Catalog_Provider_Source, allocator:
 	if directory_err != .None { return "", false }
 	defer delete(directory, allocator)
 	if xdg_directory_create(directory) != .None { return "", false }
-	identity := fmt.aprintf("%s\x00%s", provider.id, provider.base_url.? or_else "", allocator = context.temp_allocator)
+	identity, identity_error := strings.concatenate([]string{provider.id, "\x00", provider.base_url.? or_else ""}, context.temp_allocator)
+	if identity_error != nil { return "", false }
+	defer delete(identity, context.temp_allocator)
 	key := hash.fnv64a(transmute([]byte)identity)
-	name := fmt.aprintf("%s-%016x.json", PROVIDER_MODELS_CACHE_PREFIX, key, allocator = context.temp_allocator)
+	name_buffer: [len(PROVIDER_MODELS_CACHE_PREFIX) + len("-.json") + 16]u8
+	name := fmt.bprintf(name_buffer[:], "%s-%016x.json", PROVIDER_MODELS_CACHE_PREFIX, key)
 	path, join_err := filepath.join([]string{directory, name}, allocator)
 	return path, join_err == nil
 }
@@ -288,17 +288,19 @@ provider_models_id :: proc(entry: json.Value) -> (id: string, present: bool) {
 	return string(text), true
 }
 
-// provider_models_fetch performs the one request this stage needs. The content
-// type is not asserted: the provider is the user's own endpoint, and a body that
-// is not a listing is refused by parsing rather than by a header.
+// provider_models_fetch performs the one request this stage needs. The request ends early
+// when cancel, if not nil, becomes true. The content type is not asserted: the provider is
+// the user's own endpoint, and a body that is not a listing is refused by parsing rather
+// than by a header.
 @(require_results)
-provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
-	url := fmt.aprintf("%s/%s", strings.trim_right(base_url, "/"), PROVIDER_MODELS_SUFFIX, allocator = allocator)
+provider_models_fetch :: proc(cancel: ^bool, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
+	url, url_error := strings.concatenate([]string{strings.trim_right(base_url, "/"), "/", PROVIDER_MODELS_SUFFIX}, allocator)
+	if url_error != nil { return nil, false }
 	defer delete(url, allocator)
 	authorization, authorization_error := strings.concatenate([]string{"Bearer ", api_key}, allocator = allocator)
 	if authorization_error != nil { return nil, false }
 	defer delete(authorization, allocator)
 
 	headers := [1]client.Header{{"authorization", authorization}}
-	return fetch_get({url = url, method = .Get, headers = headers[:], allocator = allocator}, PROVIDER_MODELS_TIMEOUT, cast(^bool)user_data, allocator)
+	return fetch_get({url = url, method = .Get, headers = headers[:], allocator = allocator}, PROVIDER_MODELS_TIMEOUT, cancel, allocator)
 }

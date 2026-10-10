@@ -347,10 +347,10 @@ run_prompt :: proc(
 // --- entry point ------------------------------------------------------------
 
 config_error_display_text :: proc(path: string, err: agent.Config_Error, detail: string, allocator := context.temp_allocator) -> string {
-	if detail != "" {
-		return fmt.aprintf("nabla: %s: %s: %s", path, agent.config_error_text(err), detail, allocator = allocator)
-	}
-	return fmt.aprintf("nabla: %s: %s", path, agent.config_error_text(err), allocator = allocator)
+	parts := [?]string{"nabla: ", path, ": ", agent.config_error_text(err), ": ", detail}
+	text, text_error := strings.concatenate(parts[:] if detail != "" else parts[:4], allocator)
+	if text_error != nil { return "nabla: the configuration error message could not be built: out of memory" }
+	return text
 }
 
 // chat_main runs one invocation and returns its exit code, so main has a single
