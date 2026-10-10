@@ -506,8 +506,8 @@ codemode_lua_log_value :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
 // conversion refuses it: `print` is a diagnostic and never fails the script.
 @(private)
 codemode_lua_log_table :: proc(run: ^Lua_Run, state: ^lua.State, index: c.int) {
-	literal, message, _ := codemode_lua_convert(run, state, index, .Lua, allocator = context.temp_allocator)
-	codemode_lua_log_append(run, message == "" ? literal : "<table>")
+	literal, _, diagnostic := codemode_lua_convert(run, state, index, .Lua, allocator = context.temp_allocator)
+	codemode_lua_log_append(run, diagnostic == .None ? literal : "<table>")
 }
 
 // codemode_lua_log_append adds text to the run's log, which is kept whole. A log that
@@ -728,30 +728,58 @@ codemode_lua_settle_stop :: proc(run: ^Lua_Run) -> Lua_Event {
 codemode_lua_settle_error :: proc(run: ^Lua_Run) -> Lua_Event {
 	context.allocator = run.allocator
 	text, is_text := codemode_lua_stack_string(run.thread, -1)
-	literal, refusal, _ := codemode_lua_convert(run, run.thread, -1, .Lua)
+	literal, refusal, diagnostic := codemode_lua_convert(run, run.thread, -1, .Lua)
 	defer delete(literal)
 	defer delete(refusal)
 	if !is_text {
-		text = refusal == "" ? literal : string(lua.typename(run.thread, lua.type(run.thread, -1)))
+		text = diagnostic == .None ? literal : string(lua.typename(run.thread, lua.type(run.thread, -1)))
 		prefixed, prefix_error := strings.concatenate({"the script raised a non-string error: ", text}, context.temp_allocator)
 		// The error value is still the reason the script failed, so a message that cannot be
 		// prefixed says what it is instead of reading as a failure with no cause.
 		text = prefixed if prefix_error == nil else "the script raised an error whose value could not be written: out of memory"
 	}
-	lua.L_traceback(run.state, run.thread, nil, 0)
-	traceback, _ := codemode_lua_stack_string(run.state, -1)
-	traceback = strings.trim_prefix(traceback, "stack traceback:\n")
-	delete(run.traceback)
-	allocated: bool
-	run.traceback, allocated = strings.replace_all(traceback, "\t", "")
-	// replace_all borrows its input when it replaces nothing, so the run takes its own copy.
-	if !allocated {
-		copied, copy_error := strings.clone(run.traceback)
-		run.traceback = copied
-		if copy_error != nil { text = fmt.tprintf("%s (the traceback could not be kept: out of memory)", text) }
+	traceback, traceback_kept := codemode_lua_traceback(run)
+	if !traceback_kept {
+		noted, note_error := strings.concatenate({text, " (the traceback could not be built)"}, context.temp_allocator)
+		if note_error == nil { text = noted }
 	}
-	lua.pop(run.state, 1)
+	delete(run.traceback)
+	run.traceback = traceback
 	return codemode_lua_settle(run, .Failed, .Runtime, text)
+}
+
+// codemode_lua_traceback_body pushes the traceback of the coroutine passed as its argument.
+@(private)
+codemode_lua_traceback_body :: proc "c" (state: ^lua.State) -> c.int {
+	lua.L_traceback(state, cast(^lua.State)lua.touserdata(state, 1), nil, 0)
+	return 1
+}
+
+// codemode_lua_traceback writes the frames the run's coroutine still holds, one per line
+// without indentation. The text is owned by the run's allocator. Building it allocates inside
+// Lua, so it runs protected; ok is false when it could not be built or kept.
+@(private, require_results)
+codemode_lua_traceback :: proc(run: ^Lua_Run) -> (traceback: string, ok: bool) {
+	lua.pushcfunction(run.state, codemode_lua_traceback_body)
+	lua.pushlightuserdata(run.state, run.thread)
+	if lua.pcall(run.state, 1, 1, 0) != c.int(lua.Status.OK) {
+		lua.pop(run.state, 1)
+		return "", false
+	}
+	defer lua.pop(run.state, 1)
+	frames, _ := codemode_lua_stack_string(run.state, -1)
+	frames = strings.trim_prefix(frames, "stack traceback:\n")
+	builder, builder_error := strings.builder_make(0, len(frames), run.allocator)
+	if builder_error != nil { return "", false }
+	if strings.write_string(&builder, frames) != len(frames) {
+		strings.builder_destroy(&builder)
+		return "", false
+	}
+	if _, replace_error := strings.builder_replace_all(&builder, "\t", ""); replace_error != nil {
+		strings.builder_destroy(&builder)
+		return "", false
+	}
+	return strings.to_string(builder), true
 }
 
 // codemode_lua_settle makes the run terminal with its message.

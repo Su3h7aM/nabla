@@ -51,9 +51,10 @@ Codemode_Walk :: struct {
 }
 
 // codemode_lua_convert writes the value at index in notation. The text, or the message that
-// says what was refused and where, is owned by allocator; out_of_memory says the refusal
-// was a lack of memory rather than the value. A value of any size converts; cycles and values
-// that are not data are refused.
+// says what was refused and where, is owned by allocator. A diagnostic other than .None
+// means no text: .Invalid_Value refuses the value, and .Out_Of_Memory says memory ran out,
+// in which case message is empty when there was no memory left to say so. A value of any
+// size converts; cycles and values that are not data are refused.
 @(require_results)
 codemode_lua_convert :: proc(
 	run: ^Lua_Run,
@@ -64,21 +65,21 @@ codemode_lua_convert :: proc(
 ) -> (
 	text: string,
 	message: string,
-	out_of_memory: bool,
+	diagnostic: Codemode_Diagnostic,
 ) {
 	context.allocator = allocator
 	builder, builder_error := strings.builder_make(allocator)
-	if builder_error != nil { return "", codemode_value_allocation_message(allocator), true }
+	if builder_error != nil { return "", "", .Out_Of_Memory }
 	inside, inside_error := make([dynamic]rawptr, allocator)
 	if inside_error != nil {
 		strings.builder_destroy(&builder)
-		return "", codemode_value_allocation_message(allocator), true
+		return "", "", .Out_Of_Memory
 	}
 	path, path_error := make([dynamic]Codemode_Path_Step, allocator)
 	if path_error != nil {
 		delete(inside)
 		strings.builder_destroy(&builder)
-		return "", codemode_value_allocation_message(allocator), true
+		return "", "", .Out_Of_Memory
 	}
 	walk := Codemode_Walk {
 		run      = run,
@@ -90,11 +91,11 @@ codemode_lua_convert :: proc(
 	}
 	defer delete(walk.inside)
 	defer delete(walk.path)
-	if codemode_walk_value(&walk, lua.absindex(state, index)) { return strings.to_string(walk.builder), "", false }
+	if codemode_walk_value(&walk, lua.absindex(state, index)) { return strings.to_string(walk.builder), "", .None }
 	strings.builder_destroy(&walk.builder)
 	refusal, refusal_error := codemode_walk_message(&walk, allocator)
-	if refusal_error != nil { return "", fmt.aprintf("the %s %s", walk.subject, walk.problem), true }
-	return "", refusal, walk.out_of_memory
+	if refusal_error != nil { return "", "", .Out_Of_Memory }
+	return "", refusal, walk.out_of_memory ? .Out_Of_Memory : .Invalid_Value
 }
 
 // codemode_walk_text writes one part of a refusal message. A builder write that holds fewer
@@ -122,7 +123,10 @@ codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator
 		codemode_walk_text(&builder, " at ") or_return
 		for step, position in walk.path[:walk.failure_count] {
 			if step.index > 0 {
-				fmt.sbprintf(&builder, "[%d]", step.index)
+				digits: [32]u8
+				codemode_walk_text(&builder, "[") or_return
+				codemode_walk_text(&builder, strconv.write_int(digits[:], i64(step.index), 10)) or_return
+				codemode_walk_text(&builder, "]") or_return
 				continue
 			}
 			if position > 0 { codemode_walk_text(&builder, ".") or_return }
@@ -135,57 +139,53 @@ codemode_walk_message :: proc(walk: ^Codemode_Walk, allocator: runtime.Allocator
 	return strings.to_string(builder), nil
 }
 
-// codemode_value_allocation_message is what the value boundary tells a caller when it had no
-// memory to write the text it was asked for. The caller's allocator owns the message, so the
-// caller releases it the way it releases a converted value.
-@(private, require_results)
-codemode_value_allocation_message :: proc(allocator: runtime.Allocator) -> string {
-	return fmt.aprintf("the value could not be written: out of memory", allocator = allocator)
-}
+// CODEMODE_VALUE_OUT_OF_MEMORY is what a caller says when a conversion failed for lack of
+// memory and had none left for a message.
+CODEMODE_VALUE_OUT_OF_MEMORY :: "the value could not be written: out of memory"
 
 // codemode_lua_request_arguments writes the pending request's table as the JSON arguments
 // document the child call is admitted from, exactly like a provider's. A call with no table
 // gets an empty object. The text, or the message that refuses it, is owned by the run's
-// allocator.
+// allocator; the diagnostic is as for codemode_lua_convert.
 @(require_results)
-codemode_lua_request_arguments :: proc(run: ^Lua_Run) -> (text: string, message: string) {
+codemode_lua_request_arguments :: proc(run: ^Lua_Run) -> (text: string, message: string, diagnostic: Codemode_Diagnostic) {
 	context.allocator = run.allocator
 	if run.request.args_ref == lua.NOREF {
 		empty, empty_error := strings.clone("{}")
-		if empty_error != nil { return "", fmt.aprintf("the call's arguments could not be allocated: out of memory", allocator = run.allocator) }
-		return empty, ""
+		if empty_error != nil { return "", "", .Out_Of_Memory }
+		return empty, "", .None
 	}
 	lua.rawgeti(run.thread, lua.REGISTRYINDEX, lua.Integer(run.request.args_ref))
 	defer lua.pop(run.thread, 1)
-	text, message, _ = codemode_lua_convert(run, run.thread, -1, .JSON)
-	if message != "" { return }
+	text, message, diagnostic = codemode_lua_convert(run, run.thread, -1, .JSON)
+	if diagnostic != .None { return }
 	if strings.has_prefix(text, "[") {
 		delete(text)
-		return "", fmt.aprintf("%s takes a table of named arguments, and was given an array", run.request.name)
+		refusal, refusal_error := strings.concatenate({run.request.name, " takes a table of named arguments, and was given an array"})
+		if refusal_error != nil { return "", "", .Out_Of_Memory }
+		return "", refusal, .Invalid_Value
 	}
 	return
 }
 
 // codemode_lua_returned_literal writes the chunk's return value as a Lua literal. No value
 // is nil, and more than one is refused: a script has one answer, and dropping a second would
-// hide the mistake. The literal or the message is owned by the run's allocator.
+// hide the mistake. The literal or the message is owned by the run's allocator; the
+// diagnostic is as for codemode_lua_convert.
 @(require_results)
 codemode_lua_returned_literal :: proc(run: ^Lua_Run) -> (literal: string, message: string, diagnostic: Codemode_Diagnostic) {
 	context.allocator = run.allocator
 	switch {
 	case run.returned_values == 0:
 		none, none_error := strings.clone("nil")
-		if none_error != nil { return "", codemode_value_allocation_message(run.allocator), .Out_Of_Memory }
+		if none_error != nil { return "", "", .Out_Of_Memory }
 		return none, "", .None
 	case run.returned_values > 1:
 		refusal, refusal_error := strings.clone("the chunk returned more than one value; return one table instead")
-		if refusal_error != nil { return "", codemode_value_allocation_message(run.allocator), .Out_Of_Memory }
+		if refusal_error != nil { return "", "", .Out_Of_Memory }
 		return "", refusal, .Invalid_Value
 	}
-	out_of_memory: bool
-	literal, message, out_of_memory = codemode_lua_convert(run, run.thread, -1, .Lua)
-	if message == "" { return literal, "", .None }
-	return "", message, out_of_memory ? .Out_Of_Memory : .Invalid_Value
+	return codemode_lua_convert(run, run.thread, -1, .Lua)
 }
 
 // --- the walk ------------------------------------------------------------------
@@ -466,8 +466,9 @@ codemode_lua_json_encode :: proc "c" (state: ^lua.State) -> c.int {
 	context = codemode_lua_context(run)
 	temp := virtual.arena_temp_begin(&run.scratch)
 	lua.settop(state, 1)
-	text, message, _ := codemode_lua_convert(run, state, 1, .JSON, allocator = context.temp_allocator)
-	if message != "" {
+	text, message, diagnostic := codemode_lua_convert(run, state, 1, .JSON, allocator = context.temp_allocator)
+	if diagnostic == .Out_Of_Memory { return codemode_lua_raise(state, "json.encode refused the value: out of memory", temp) }
+	if diagnostic != .None {
 		refusal, refusal_error := strings.concatenate({"json.encode refused ", message}, context.temp_allocator)
 		if refusal_error != nil { return codemode_lua_raise(state, "json.encode refused the value: out of memory", temp) }
 		return codemode_lua_raise(state, refusal, temp)

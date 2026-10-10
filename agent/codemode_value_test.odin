@@ -3,6 +3,7 @@
 package agent
 
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 import "core:testing"
 
@@ -34,19 +35,56 @@ codemode_value_writes_tool_arguments :: proc(t: ^testing.T) {
 	)
 	defer codemode_lua_destroy(run)
 	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Host_Request)
-	text, message := codemode_lua_request_arguments(run)
+	text, message, diagnostic := codemode_lua_request_arguments(run)
 	defer delete(text)
 	defer delete(message)
-	testing.expect_value(t, message, "")
+	testing.expect_value(t, diagnostic, Codemode_Diagnostic.None)
 	testing.expect_value(t, text, `{"flags":["a","b"],"missing":null,"nested":{"count":3,"ok":true},"path":"README.md","ratio":0.5}`)
 
 	array := codemode_value_test_start(t, `return tools.test_echo({"README.md"})`)
 	defer codemode_lua_destroy(array)
 	testing.expect_value(t, codemode_value_test_settle(array), Lua_Event.Host_Request)
-	refused, refusal := codemode_lua_request_arguments(array)
+	refused, refusal, refused_diagnostic := codemode_lua_request_arguments(array)
 	defer delete(refused)
 	defer delete(refusal)
+	testing.expect_value(t, refused_diagnostic, Codemode_Diagnostic.Invalid_Value)
 	testing.expect_value(t, refusal, "test_echo takes a table of named arguments, and was given an array")
+}
+
+codemode_value_test_refusing_allocator :: proc(
+	data: rawptr,
+	mode: mem.Allocator_Mode,
+	size, alignment: int,
+	old_memory: rawptr,
+	old_size: int,
+	location := #caller_location,
+) -> (
+	[]byte,
+	mem.Allocator_Error,
+) {
+	#partial switch mode {
+	case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+		return nil, .Out_Of_Memory
+	}
+	return nil, nil
+}
+
+// A conversion that runs out of memory reports it as a diagnostic, never as an empty message
+// that reads as success.
+@(test)
+codemode_value_reports_running_out_of_memory :: proc(t: ^testing.T) {
+	run := codemode_value_test_start(t, `return {name = "x"}`)
+	defer codemode_lua_destroy(run)
+	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
+	heap := run.allocator
+	run.allocator = mem.Allocator {
+		procedure = codemode_value_test_refusing_allocator,
+	}
+	literal, message, diagnostic := codemode_lua_returned_literal(run)
+	run.allocator = heap
+	testing.expect_value(t, diagnostic, Codemode_Diagnostic.Out_Of_Memory)
+	testing.expect_value(t, literal, "")
+	testing.expect_value(t, message, "")
 }
 
 @(test)
@@ -127,9 +165,10 @@ codemode_value_refuses_what_it_cannot_carry :: proc(t: ^testing.T) {
 	run := codemode_value_test_start(t, source)
 	defer codemode_lua_destroy(run)
 	testing.expect_value(t, codemode_value_test_settle(run), Lua_Event.Returned)
-	literal, message, _ := codemode_lua_returned_literal(run)
+	literal, message, diagnostic := codemode_lua_returned_literal(run)
 	defer delete(literal)
 	defer delete(message)
+	testing.expect_value(t, diagnostic, Codemode_Diagnostic.Invalid_Value)
 	testing.expect_value(t, message, fmt.aprintf("the function at %s cannot be converted", long_name, allocator = context.temp_allocator))
 }
 

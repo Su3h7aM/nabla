@@ -136,12 +136,22 @@ codemode_job_start_child :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer
 	run := parent.lua
 	name := run.request.name
 	if name == TOOL_CODEMODE_NAME {
-		return 0, fmt.aprintf("%s cannot be called from Lua; run the code directly instead", name, allocator = run.allocator)
+		nested, nested_error := strings.concatenate({name, " cannot be called from Lua; run the code directly instead"}, run.allocator)
+		if nested_error != nil {
+			codemode_job_answer(parent, .Tool_Failed, .Out_Of_Memory, CODEMODE_VALUE_OUT_OF_MEMORY, "out of memory")
+			return
+		}
+		return 0, nested
 	}
 	// The script's table is written once as the call's arguments document, which the child
 	// is admitted from like any provider call, and which its record keeps.
-	arguments, message := codemode_lua_request_arguments(run)
-	if message != "" { return 0, message }
+	arguments, message, diagnostic := codemode_lua_request_arguments(run)
+	if diagnostic == .Out_Of_Memory {
+		delete(message, run.allocator)
+		codemode_job_answer(parent, .Tool_Failed, .Out_Of_Memory, CODEMODE_VALUE_OUT_OF_MEMORY, "out of memory")
+		return
+	}
+	if diagnostic != .None { return 0, message }
 	defer delete(arguments, run.allocator)
 
 	call_id := fmt.tprintf("%s/%d", parent.call_id, len(parent.lua_children) + 1)
@@ -319,7 +329,7 @@ codemode_job_answer_value :: proc(job: ^Tool_Job) {
 	defer delete(value, run.allocator)
 	defer delete(message, run.allocator)
 	if diagnostic != .None {
-		codemode_job_answer(job, .Tool_Failed, diagnostic, message, "invalid return value")
+		codemode_job_answer(job, .Tool_Failed, diagnostic, message if message != "" else CODEMODE_VALUE_OUT_OF_MEMORY, "invalid return value")
 		return
 	}
 	output := Codemode_Output {
