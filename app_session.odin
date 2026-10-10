@@ -130,8 +130,8 @@ App :: struct {
 	conversation_scroll:        widgets.Scroll,
 	generation_seen:            u64,
 	// steer_active is whether the runtime was running when this thread last looked. The
-	// transition back to idle is what returns input the turn never applied to the
-	// prompt. The loop reads and writes it on the front-end's thread only.
+	// transition back to idle is what settles the messages still queued. The loop reads and
+	// writes it on the front-end's thread only.
 	steer_active:               bool,
 	// viewport_reported latches the one warning a terminal that reports no size
 	// produces. The loop reads it on the front-end's thread only.
@@ -155,6 +155,12 @@ App :: struct {
 	// mouse report is in screen cells, so this is what converts one into the
 	// conversation's own coordinates.
 	conversation_rect:          tui.Cell_Rect,
+	// steer is the queues as the last frame drew them, and steer_rect the cells the pending-steer
+	// component took, empty while it is hidden. Only the front-end's thread touches either.
+	steer:                      Steer_View,
+	steer_rect:                 tui.Cell_Rect,
+	// turn_stopped is set when the user stopped the running turn and read when it ends.
+	turn_stopped:               bool,
 	// selecting marks a drag in progress, and the anchor and cursor are the cells
 	// it spans. The selection lives only while the drag does: the release copies
 	// what it covers, so there is no highlight left to drift when the transcript

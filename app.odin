@@ -325,6 +325,10 @@ Runtime :: struct {
 	// them as they arrive and the worker drains them at request boundaries, which
 	// is why it is written from one thread and read from another.
 	steer:                    agent.Steer_Queue,
+	// follow_ups holds the messages queued with Alt+Enter, which are sent one at a time as
+	// turns end. Only the front-end's thread uses it; it is a queue to share the editing
+	// of steer.
+	follow_ups:               agent.Steer_Queue,
 	// control stops the turn the worker runs. The front-end requests; the worker clears it
 	// before each turn it starts.
 	control:                  agent.Turn_Control,
@@ -489,6 +493,7 @@ tui_run :: proc(
 	}
 	app.run.work = work
 	app.run.steer = agent.steer_queue_init(app.run.alloc)
+	app.run.follow_ups = agent.steer_queue_init(app.run.alloc)
 
 	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, mouse = true, input_mode = .Raw}, app.run.alloc)
 	if open_err != nil {
@@ -613,9 +618,9 @@ tui_run :: proc(
 		now := time.tick_now()
 		busy := runtime_busy(app)
 		// A steering line applies at a request boundary inside the turn that was running
-		// when it was typed. Whatever is still queued when the turn stops was never
-		// applied, so it goes back to the prompt as the user's own text.
-		if app.steer_active && !busy { restore_steering(app) }
+		// when it was typed. Whatever is still queued when the turn ends was never applied:
+		// it is sent next, or returned to the prompt when the user stopped the turn.
+		if app.steer_active && !busy { steer_turn_ended(app) }
 		app.steer_active = busy
 		advance_spinner := busy && time.tick_diff(app.spin_lap, now) >= SPINNER_INTERVAL
 		// The lap restarts even when no frame can be drawn, because tui_wait_ms would
@@ -733,15 +738,16 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 		work_destroy(app, queued)
 	}
 	chan.destroy(&app.run.work)
-	// Input the user sent that no request carried. A turn records what it was sent when it
-	// ends, so what is left here reached no turn at all: the process is the last holder, and
-	// saying so is the only report an exiting front-end can give. This is the difference
-	// between input that was pending and input that was dropped.
-	if undelivered, taken := agent.steer_take_all(&app.run.steer); taken && len(undelivered) > 0 {
-		fmt.eprintf("nabla: %d line(s) typed during a turn were never recorded; they were not delivered\n", len(undelivered))
-		agent.steer_taken_destroy(&app.run.steer, undelivered)
+	// The worker is gone, so a line still queued was never recorded and a follow-up never sent.
+	if count := len(app.run.steer.items); count > 0 {
+		fmt.eprintf("nabla: %d line(s) typed during a turn were never recorded; they were not delivered\n", count)
+	}
+	if count := len(app.run.follow_ups.items); count > 0 {
+		fmt.eprintf("nabla: %d follow-up(s) typed during a turn were never sent\n", count)
 	}
 	agent.steer_queue_destroy(&app.run.steer)
+	agent.steer_queue_destroy(&app.run.follow_ups)
+	steer_view_destroy(app)
 	pending_selection_clear(&app.run.pending, app.run.alloc)
 	pending_target_clear(&app.run.pending_target, app.run.alloc)
 	transcript_destroy(app)

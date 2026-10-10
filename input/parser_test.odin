@@ -95,6 +95,8 @@ test_escape_then_key_is_alt_key :: proc(t: ^testing.T) {
 	)
 	// ESC before a control byte is still Escape, then the key.
 	_feed_events(t, "\e\x01", []Event{Key_Event{code = .Escape}, Key_Event{code = .Character, character = 'a', modifiers = {.Control}}})
+	// ESC ESC before a cursor key is how legacy Alt terminals send Alt with it.
+	_feed_events(t, "\e\e[A\e\eOB\e[A", []Event{Key_Event{code = .Up, modifiers = {.Alt}}, Key_Event{code = .Down, modifiers = {.Alt}}, Key_Event{code = .Up}})
 }
 
 @(test)

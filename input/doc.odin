@@ -21,7 +21,7 @@
 //
 // Keys: legacy bytes, CSI and SS3 sequences keep their xterm modifier parameter, and the kitty
 // `CSI code;modifiers:kind u` form is decoded with its event kind. ESC followed by a printable
-// byte, Tab, Enter or Delete is one Alt key event; a lone ESC resolves to Escape after the deadline.
+// byte, Tab, Enter or Delete is one Alt key event, and ESC ESC before a CSI or SS3 key is that key with Alt; a lone ESC resolves to Escape after the deadline.
 // Mouse reports are SGR (DECSET 1006) and carry modifiers and zero-based cell coordinates. A sequence whose parameters do not fit
 // the parser's buffer, or that this package does not decode, is Unknown_Input.
 //

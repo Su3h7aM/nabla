@@ -3808,3 +3808,345 @@ test_a_half_visible_box_takes_focus_and_enter_activates_it :: proc(t: ^testing.T
 		app_render_settle(t, &app, storage)
 	}
 }
+
+// steer_test_app prepares an app that is running a turn with an 80 by 30 screen.
+steer_test_app :: proc(t: ^testing.T, app: ^App) -> string {
+	directory := app_session_begin(t, app)
+	app.run.steer = agent.steer_queue_init(app.run.alloc)
+	app.run.follow_ups = agent.steer_queue_init(app.run.alloc)
+	app.run.work, _ = chan.create_buffered(Work_Chan, WORK_CAPACITY, app.run.alloc)
+	widgets.input_init(&app.input, app.run.alloc)
+	widgets.history_init(&app.history, app.run.alloc)
+	app.columns, app.rows = 80, 30
+	set_running(app, true)
+	return directory
+}
+
+steer_test_end :: proc(app: ^App, directory: string) {
+	steer_view_destroy(app)
+	widgets.history_destroy(&app.history)
+	widgets.input_destroy(&app.input)
+	chan.destroy(&app.run.work)
+	agent.steer_queue_destroy(&app.run.steer)
+	agent.steer_queue_destroy(&app.run.follow_ups)
+	app_session_end(app, directory)
+}
+
+steer_test_render :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage) {
+	free_all(context.temp_allocator)
+	testing.expect_value(t, image_test_frame(app, storage), Render_Status.None)
+}
+
+// A line typed during a turn shows above the prompt for as long as the session has not
+// delivered it, driven through the worker's own steering step and the frame the terminal draws.
+// A click selects a message and a second click expands it.
+@(test)
+test_queued_steering_shows_until_delivered :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	steer := app_steer_context(&app)
+
+	steer_test_render(t, &app, storage)
+	testing.expect_value(t, app_row_with(storage, "Queued"), -1)
+
+	// The prompt's own path queues the line; the worker looks at it while a request is in flight.
+	steer_test_submit(t, &app, "use the other file\nand mind the tests")
+	app.setup.session.state = .Requesting
+	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
+	steer_test_render(t, &app, storage)
+	row := app_row_with(storage, "use the other file")
+	if !testing.expect(t, row >= 0, "the queued line stays above the prompt while a request is in flight") { return }
+	testing.expect(t, app_row_with(storage, "and mind the tests") < 0, "a collapsed message shows its first line only")
+	testing.expect(t, app_row_with(storage, "Queued · 1") < row, "the box title names the queue above its messages")
+	hint_row := app_row_with(storage, "alt+↑ select")
+	testing.expect(t, hint_row > row, "the hint is on the box's bottom border")
+	testing.expect_value(t, app_row_with(storage, "Working for"), hint_row + 1)
+
+	app_click(&app, storage, "use the other file")
+	steer_test_render(t, &app, storage)
+	testing.expect(t, app_row_with(storage, "and mind the tests") < 0, "the first click only selects")
+	app_click(&app, storage, "use the other file")
+	steer_test_render(t, &app, storage)
+	testing.expect(t, app_row_with(storage, "and mind the tests") >= 0, "a click on the selected message shows all of it")
+	app_click(&app, storage, "use the other file")
+	steer_test_render(t, &app, storage)
+	testing.expect(t, app_row_with(storage, "and mind the tests") < 0, "another click collapses it")
+
+	// A message leaves the component when the worker delivers it, at a settled point.
+	app.setup.session.state = .Preparing
+	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
+	testing.expect(t, len(app.run.steer.items) == 0, "the delivered line left the queue")
+	steer_test_render(t, &app, storage)
+	testing.expect_value(t, app_row_with(storage, "Queued"), -1)
+}
+
+// The Alt+Up and Alt+Down encodings terminals send: the CSI form with the Alt modifier and
+// the ESC prefix form.
+ALT_UP :: []string{"\e[1;3A", "\e\e[A"}
+ALT_DOWN :: []string{"\e[1;3B", "\e\e[B"}
+
+// app_type_bytes feeds terminal bytes through the input parser and handles every event it
+// produces, the way the terminal loop does.
+app_type_bytes :: proc(t: ^testing.T, app: ^App, bytes: string) {
+	parser: input.Parser
+	input.parser_init(&parser)
+	defer input.parser_destroy(&parser)
+	events: [dynamic]input.Event
+	defer input.events_destroy(&events)
+	testing.expect(t, input.feed(&parser, transmute([]u8)bytes, &events) == nil, "the bytes could not be parsed")
+	for event in events { handle_event(app, event) }
+}
+
+// steer_test_submit types value into the prompt and presses Enter.
+steer_test_submit :: proc(t: ^testing.T, app: ^App, value: string) {
+	testing.expect(t, widgets.input_replace(&app.input, value) == nil)
+	handle_event(app, input.Key_Event{code = .Enter})
+}
+
+// steer_test_queued is the steering queue as one string, in order, separated by "|".
+steer_test_queued :: proc(t: ^testing.T, app: ^App) -> string {
+	entries, ok := agent.steer_snapshot(&app.run.steer, context.temp_allocator)
+	testing.expect(t, ok)
+	texts := make([dynamic]string, context.temp_allocator)
+	for entry in entries { _, _ = append(&texts, entry.text) }
+	return strings.join(texts[:], "|", context.temp_allocator) or_else ""
+}
+
+// steer_test_edit selects the message that is back presses of Alt+Up from the end of the
+// queue, starts editing it with Enter, types replacement over its text, and saves it.
+steer_test_edit :: proc(t: ^testing.T, app: ^App, alt_up: string, back: int, replacement: string) {
+	for _ in 0 ..< back { app_type_bytes(t, app, alt_up) }
+	handle_event(app, input.Key_Event{code = .Enter})
+	testing.expect(t, widgets.input_replace(&app.input, replacement) == nil)
+	handle_event(app, input.Key_Event{code = .Enter})
+}
+
+// Editing a queued message changes that message in place: the same count, the same order,
+// only its text. Alt+Up selects from the last message, Enter loads the selected one into
+// the prompt, and Enter saves it where it was. Both encodings of Alt+Up take the same path.
+@(test)
+test_editing_a_queued_message_replaces_it_in_place :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	for alt_up in ALT_UP {
+		free_all(context.temp_allocator)
+		steer_test_submit(t, &app, "Good")
+		steer_test_submit(t, &app, "Two")
+		app_type_bytes(t, &app, alt_up)
+		app_type_bytes(t, &app, alt_up)
+		steer_test_render(t, &app, storage)
+		testing.expect(t, app_row_with(storage, "> steer     Good") >= 0, "the selection is marked")
+		handle_event(&app, input.Key_Event{code = .Enter})
+		testing.expect_value(t, widgets.input_text(&app.input), "Good")
+		steer_test_render(t, &app, storage)
+		testing.expect(t, app_row_with(storage, "editing  ") >= 0, "the message being edited is labelled")
+		testing.expect_value(t, steer_test_queued(t, &app), "Good|Two")
+		testing.expect(t, widgets.input_replace(&app.input, "Very Good") == nil)
+		handle_event(&app, input.Key_Event{code = .Enter})
+		testing.expect_value(t, steer_test_queued(t, &app), "Very Good|Two")
+		testing.expect_value(t, widgets.input_text(&app.input), "")
+		testing.expect(t, app.steer.selected == nil && !app.steer.editing)
+
+		// Four messages: the second and then the third change, and nothing else does.
+		handle_event(&app, input.Key_Event{code = .Escape})
+		taken, taken_ok := agent.steer_take_all(&app.run.steer)
+		testing.expect(t, taken_ok)
+		agent.steer_taken_destroy(&app.run.steer, taken)
+		for message in ([]string{"m1", "m2", "m3", "m4"}) { steer_test_submit(t, &app, message) }
+		steer_test_edit(t, &app, alt_up, 3, "m2 edited")
+		testing.expect_value(t, steer_test_queued(t, &app), "m1|m2 edited|m3|m4")
+		steer_test_edit(t, &app, alt_up, 2, "m3 edited")
+		testing.expect_value(t, steer_test_queued(t, &app), "m1|m2 edited|m3 edited|m4")
+		taken, taken_ok = agent.steer_take_all(&app.run.steer)
+		testing.expect(t, taken_ok)
+		agent.steer_taken_destroy(&app.run.steer, taken)
+	}
+}
+
+// Alt+Up and Alt+Down move the selection and stop at the ends, and Escape clears it
+// without stopping the turn.
+@(test)
+test_alt_keys_move_the_selection_and_escape_clears_it :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	for message in ([]string{"a", "b", "c"}) { steer_test_submit(t, &app, message) }
+	app_type_bytes(t, &app, ALT_DOWN[0])
+	testing.expect(t, app.steer.selected == nil, "Alt+Down selects nothing by itself")
+	app_type_bytes(t, &app, ALT_UP[0])
+	app_type_bytes(t, &app, ALT_UP[1])
+	app_type_bytes(t, &app, ALT_UP[0])
+	app_type_bytes(t, &app, ALT_UP[1])
+	steer_test_render(t, &app, storage)
+	testing.expect(t, app_row_with(storage, "> steer     a") >= 0, "Alt+Up stops at the first message")
+	app_type_bytes(t, &app, ALT_DOWN[1])
+	steer_test_render(t, &app, storage)
+	testing.expect(t, app_row_with(storage, "> steer     b") >= 0, "Alt+Down moves to the next message")
+	handle_event(&app, input.Key_Event{code = .Escape})
+	testing.expect(t, app.steer.selected == nil, "Escape clears the selection")
+	testing.expect(t, !app.turn_stopped, "Escape with a selection does not stop the turn")
+	testing.expect_value(t, steer_test_queued(t, &app), "a|b|c")
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+}
+
+// Escape during an edit leaves the message as it was, gives the prompt its draft back, and
+// lets the session deliver the message again. An empty text saved over a message removes it.
+@(test)
+test_cancelling_an_edit_restores_the_draft_and_an_empty_edit_removes_the_message :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+	steer := app_steer_context(&app)
+
+	steer_test_submit(t, &app, "Good")
+	steer_test_submit(t, &app, "Two")
+	testing.expect(t, widgets.input_replace(&app.input, "my draft") == nil)
+	app_type_bytes(t, &app, ALT_UP[0])
+	app_type_bytes(t, &app, ALT_UP[1])
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, widgets.input_text(&app.input), "Good")
+	testing.expect(t, widgets.input_replace(&app.input, "Changed my mind") == nil)
+	handle_event(&app, input.Key_Event{code = .Escape})
+	testing.expect_value(t, widgets.input_text(&app.input), "my draft")
+	testing.expect_value(t, steer_test_queued(t, &app), "Good|Two")
+	testing.expect(t, !app.steer.editing && app.steer.selected == nil)
+	testing.expect(t, !app.turn_stopped, "cancelling an edit does not stop the turn")
+
+	// An empty text removes the message, and the draft is back again.
+	app_type_bytes(t, &app, ALT_UP[1])
+	app_type_bytes(t, &app, ALT_UP[0])
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect(t, widgets.input_replace(&app.input, "") == nil)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, steer_test_queued(t, &app), "Two")
+	testing.expect_value(t, widgets.input_text(&app.input), "my draft")
+
+	// A message released by the cancel is delivered like any other.
+	app.setup.session.state = .Preparing
+	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
+	testing.expect(t, len(app.run.steer.items) == 0)
+}
+
+// While a message is edited the session does not deliver it with its old text or let the
+// messages behind it overtake it. After the edit is saved, the new text and the rest are
+// delivered in order.
+@(test)
+test_delivery_waits_for_the_message_being_edited :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+	steer := app_steer_context(&app)
+
+	for message in ([]string{"a", "b", "c"}) { steer_test_submit(t, &app, message) }
+	app_type_bytes(t, &app, ALT_UP[1])
+	app_type_bytes(t, &app, ALT_UP[1])
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, widgets.input_text(&app.input), "b")
+
+	app.setup.session.state = .Preparing
+	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
+	testing.expect_value(t, steer_test_queued(t, &app), "b|c")
+	testing.expect(t, widgets.input_replace(&app.input, "b edited") == nil)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, steer_test_queued(t, &app), "b edited|c")
+	app.setup.session.state = .Preparing
+	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
+	testing.expect_value(t, steer_test_queued(t, &app), "")
+}
+
+// A turn that ends during an edit saves the edit as the message, so it is sent with the new
+// text once, and the prompt gets its draft back.
+@(test)
+test_a_turn_ending_during_an_edit_sends_the_edited_message :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+
+	steer_test_submit(t, &app, "Good")
+	testing.expect(t, widgets.input_replace(&app.input, "my draft") == nil)
+	app_type_bytes(t, &app, ALT_UP[0])
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect(t, widgets.input_replace(&app.input, "Very Good") == nil)
+	set_running(&app, false)
+	steer_turn_ended(&app)
+	work, has_work := chan.recv(app.run.work)
+	if !testing.expect(t, has_work, "the edited message is sent") { return }
+	testing.expect_value(t, work.text, "Very Good")
+	work_destroy(&app, work)
+	_, has_work = chan.try_recv(app.run.work)
+	testing.expect(t, !has_work, "the message is sent once")
+	testing.expect_value(t, widgets.input_text(&app.input), "my draft")
+	testing.expect(t, !app.steer.editing)
+}
+
+// Alt+Enter queues a follow-up while a turn runs. When the turn ends, leftover steering goes
+// first as one prompt, then follow-ups one at a time; a turn the user stopped sends nothing
+// and returns every queued message to the prompt.
+@(test)
+test_follow_ups_are_sent_as_turns_end :: proc(t: ^testing.T) {
+	app: App
+	directory := steer_test_app(t, &app)
+	defer steer_test_end(&app, directory)
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+
+	type_prompt :: proc(t: ^testing.T, app: ^App, value: string) {
+		testing.expect(t, widgets.input_replace(&app.input, value) == nil)
+	}
+	type_prompt(t, &app, "then run the tests")
+	handle_event(&app, input.Key_Event{code = .Enter, modifiers = {.Alt}})
+	type_prompt(t, &app, "and the linter")
+	handle_event(&app, input.Key_Event{code = .Enter, modifiers = {.Alt}})
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+	testing.expect_value(t, len(app.run.follow_ups.items), 2)
+	testing.expect(t, agent.steer_push(&app.run.steer, "not accepted"))
+	steer_test_render(t, &app, storage)
+
+	// A selected follow-up is edited in place, keeping its place in the queue.
+	app_click(&app, storage, "and the linter")
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, widgets.input_text(&app.input), "and the linter")
+	testing.expect(t, widgets.input_replace(&app.input, "and the linter too") == nil)
+	handle_event(&app, input.Key_Event{code = .Enter})
+	testing.expect_value(t, len(app.run.follow_ups.items), 2)
+	testing.expect_value(t, app.run.follow_ups.items[1].text, "and the linter too")
+	steer_test_render(t, &app, storage)
+	steering_row := app_row_with(storage, "not accepted")
+	testing.expect(t, steering_row >= 0 && steering_row < app_row_with(storage, "then run the tests"), "steering is listed before follow-ups")
+
+	set_running(&app, false)
+	steer_turn_ended(&app)
+	work, has_work := chan.recv(app.run.work)
+	if !testing.expect(t, has_work, "the leftover steering is sent") { return }
+	testing.expect_value(t, work.text, "not accepted")
+	work_destroy(&app, work)
+	testing.expect_value(t, len(app.run.follow_ups.items), 2)
+
+	steer_turn_ended(&app)
+	work, has_work = chan.recv(app.run.work)
+	if !testing.expect(t, has_work, "the first follow-up is sent") { return }
+	testing.expect_value(t, work.text, "then run the tests")
+	work_destroy(&app, work)
+	testing.expect_value(t, len(app.run.follow_ups.items), 1)
+
+	set_running(&app, true)
+	testing.expect(t, agent.steer_push(&app.run.steer, "late line"))
+	type_prompt(t, &app, "draft")
+	stop_turn(&app)
+	set_running(&app, false)
+	steer_turn_ended(&app)
+	_, has_work = chan.try_recv(app.run.work)
+	testing.expect(t, !has_work, "a stopped turn sends nothing")
+	testing.expect_value(t, widgets.input_text(&app.input), "late line\n\nand the linter too\n\ndraft")
+	testing.expect_value(t, len(app.run.follow_ups.items), 0)
+}

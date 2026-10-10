@@ -41,6 +41,9 @@ Parser :: struct {
 	param_count:     int,
 	params_overflow: bool,
 	intermediate:    u8,
+	// alt marks ESC ESC before a CSI or SS3 sequence, which terminals using the legacy Alt
+	// prefix send for Alt with a cursor key. The sequence's key then carries Alt.
+	alt:             bool,
 	// paste is the scratch for a bracketed paste's raw bytes, allocated with
 	// the feed allocator and owned by the parser until parser_destroy. It grows
 	// with the paste it is collecting, however large that paste is.
@@ -111,6 +114,7 @@ parser_reset :: proc(parser: ^Parser) {
 	parser.param_count = 0
 	parser.params_overflow = false
 	parser.intermediate = 0
+	parser.alt = false
 }
 
 @(require_results)
@@ -201,7 +205,7 @@ parser_utf8 :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, al
 parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, allocator: runtime.Allocator) -> (consumed: int, err: Error) {
 	switch input_byte {
 	case 0x1b:
-		// ESC ESC: restart the escape sequence.
+		parser.alt = true
 		return 1, nil
 	case '[':
 		parser_begin_sequence(parser, .Csi)
@@ -212,12 +216,12 @@ parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 	case 0x20 ..= 0x7f, 0x09, 0x0d:
 		key := parser_key_from_byte(input_byte)
 		key.modifiers += {.Alt}
-		parser.state = .Ground
+		parser_reset(parser)
 		return 1, parser_emit(events, key, allocator)
 	case:
 		// ESC before a control or non-ASCII byte: emit Escape, then
 		// reprocess the byte in Ground.
-		parser.state = .Ground
+		parser_reset(parser)
 		if esc_err := parser_emit(events, Key_Event{code = .Escape}, allocator); esc_err != nil {
 			return 0, esc_err
 		}
@@ -226,8 +230,10 @@ parser_escape :: proc(parser: ^Parser, input_byte: u8, events: ^[dynamic]Event, 
 }
 
 parser_begin_sequence :: proc(parser: ^Parser, state: Parser_State) {
+	alt := parser.alt
 	parser_reset(parser)
 	parser.state = state
+	parser.alt = alt
 }
 
 @(require_results)
@@ -292,6 +298,7 @@ parser_sequence_final :: proc(parser: ^Parser, state: Parser_State, final: u8, e
 	if !found {
 		return parser_emit(events, Unknown_Input{}, allocator)
 	}
+	if parser.alt { key.modifiers += {.Alt} }
 	return parser_emit(events, key, allocator)
 }
 

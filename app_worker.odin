@@ -344,12 +344,7 @@ run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
 	agent.turn_control_clear(&app.run.control)
 	set_running(app, true)
 	if runtime_stopping(app) { agent.turn_control_stop(&app.run.control) }
-	steer := agent.Steer_Context {
-		queue      = &app.run.steer,
-		apply      = app_steer_apply,
-		observe    = app_steer_observe,
-		apply_data = app,
-	}
+	steer := app_steer_context(app)
 	// How the turn ended reaches the front-end through the observer, which reports the
 	// terminal status, so the worker has nothing of its own to do with the return.
 	_ = agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
@@ -370,6 +365,12 @@ app_compact_observe :: proc(app: ^App, observer: agent.Chat_Observer) {
 	if !sync.atomic_exchange(&app.run.compact_pending, false) { return }
 	app_command_compact(app, observer)
 	refresh_status(app)
+}
+
+// app_steer_context is the input a turn of the running session consumes: the queue the
+// prompt pushes into and the hooks the front-end installs at the turn's boundaries.
+app_steer_context :: proc(app: ^App) -> agent.Steer_Context {
+	return {queue = &app.run.steer, apply = app_steer_apply, observe = app_steer_observe, apply_data = app}
 }
 
 app_steer_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Observer) {

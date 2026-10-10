@@ -232,6 +232,7 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 		return
 	}
 	if !tui.rect_contains(app.conversation_rect, mouse.x, mouse.y) { return }
+	if steer_wheel(app, mouse, delta) { return }
 	if id := tool_box_entry_id(app, mouse.x, mouse.y); id != 0 {
 		sync.mutex_guard(&app.run.mu)
 		if entry := entry_find(app, id); entry != nil && entry.call in app.transcript.expanded {
@@ -447,6 +448,7 @@ handle_mouse :: proc(app: ^App, mouse: input.Mouse_Event) {
 	case .Wheel_Up, .Wheel_Down, .Wheel_Left, .Wheel_Right:
 		wheel_scroll(app, mouse)
 	case .Left:
+		if steer_press(app, mouse) { return }
 		selection_mouse(app, mouse)
 	}
 }
@@ -486,6 +488,7 @@ stop_turn :: proc(app: ^App) {
 		follower_refuse(app, "cancelling the turn")
 		return
 	}
+	app.turn_stopped = true
 	agent.turn_control_stop(&app.run.control)
 }
 
@@ -544,11 +547,22 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 	#partial switch key.code {
 	case .Enter:
 		if key.modifiers & {.Shift, .Alt} == {} {
-			submit(app)
+			if !steer_enter(app) { submit(app) }
+			return
+		}
+		// Alt+Enter queues a follow-up while a turn runs; otherwise it is a newline.
+		if key.modifiers & {.Shift, .Alt} == {.Alt} && runtime_busy(app) && !runtime_following(app) && !app.steer.editing {
+			submit(app, follow_up = true)
 			return
 		}
 	case .Up, .Down:
 		completion_reset(app)
+		// Alt+Up and Alt+Down move the selection through the queued messages. They never
+		// walk the history, with or without messages queued.
+		if .Alt in key.modifiers {
+			steer_select(app, -1 if key.code == .Up else 1)
+			return
+		}
 		// The caret moves between the rows of a multi-line prompt. With no row
 		// in that direction, the key walks the prompts submitted this run.
 		handled, err := widgets.input_key(&app.input, key, input_content_width(app), text.DEFAULT_WIDTH_PROFILE)
@@ -559,6 +573,7 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 		}
 		return
 	case .Escape:
+		if steer_escape(app) { return }
 		if runtime_busy(app) {
 			stop_turn(app)
 		} else {
@@ -600,8 +615,9 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 // submit sends the prompt line as a turn prompt, a steering line, or a slash command. A
 // line typed while a turn runs is queued for the next request boundary instead of being
 // dropped. A prompt line also enters the history the arrow keys walk; a slash command
-// does not.
-submit :: proc(app: ^App) {
+// does not. With follow_up set, the line is queued to be sent once the running turn ends
+// and a slash command is refused.
+submit :: proc(app: ^App, follow_up := false) {
 	text := strings.trim_space(widgets.input_text(&app.input))
 	if text == "" {
 		prompt_clear(app)
@@ -609,6 +625,10 @@ submit :: proc(app: ^App) {
 		return
 	}
 	if command_shaped(text) {
+		if follow_up {
+			snap_append(app, .Notice, "a command cannot be queued; it runs when sent")
+			return
+		}
 		if !dispatch_command(app, text) {
 			// An unknown command stays in the prompt, so a typo is fixed rather than retyped.
 			completion_reset(app)
@@ -630,16 +650,13 @@ submit :: proc(app: ^App) {
 		if runtime_busy(app) && !runtime_following(app) {
 			// A steering line is not a command: commands keep their own path, which
 			// decides what can happen while a turn is running.
-			transcript_jump_bottom(app)
-			if !agent.steer_push(&app.run.steer, line) {
-				// The line could not be queued, and the prompt still holds it: the text stays
-				// where the user put it rather than being cleared into a warning.
-				snap_append(app, .Warning, "the steering line could not be queued; it is still in the prompt")
+			if !follow_up { transcript_jump_bottom(app) }
+			if !agent.steer_push(&app.run.follow_ups if follow_up else &app.run.steer, line) {
+				// The prompt still holds the text rather than clearing it into a warning.
+				snap_append(app, .Warning, "the message could not be queued; it is still in the prompt")
 				completion_reset(app)
 				return
 			}
-			// The notice that the line is queued comes from the worker once the journal
-			// holds it, so the transcript never claims a line the session does not have.
 		} else {
 			transcript_jump_bottom(app)
 			enqueue(app, .Prompt, line)
@@ -651,40 +668,6 @@ submit :: proc(app: ^App) {
 	}
 	prompt_clear(app)
 	completion_reset(app)
-}
-
-// restore_steering returns input the session never accepted. The turn commits the lines
-// it finds queued as it runs, so what is left here arrived after its last look: the text
-// is still the user's, and it goes back to the prompt for an explicit submit. Nothing here
-// starts a turn, and nothing here reads the text as a command.
-restore_steering :: proc(app: ^App) {
-	taken, taken_ok := agent.steer_take_all(&app.run.steer)
-	defer agent.steer_taken_destroy(&app.run.steer, taken)
-	if !taken_ok {
-		// The lines could not be copied out, so they are still queued rather than lost.
-		snap_append(app, .Warning, "input queued during that turn could not be restored")
-		return
-	}
-	if len(taken) == 0 { return }
-	restored, join_err := strings.join(taken[:], "\n", app.run.alloc)
-	if join_err != nil {
-		snap_append(app, .Warning, "input queued during that turn could not be restored")
-		return
-	}
-	defer delete(restored, app.run.alloc)
-	if widgets.input_insert(&app.input, restored) != nil {
-		snap_append(app, .Warning, "input queued during that turn could not be restored")
-		return
-	}
-	completion_reset(app)
-	// The line is a fresh prompt now, restored text or not: the arrow keys must
-	// treat what it holds as a draft rather than as a recalled entry.
-	widgets.history_reset(&app.history)
-	if len(taken) == 1 {
-		snap_append(app, .Notice, "the line you typed while that turn ran was not sent; it is back in the prompt")
-	} else {
-		snap_append(app, .Notice, fmt.tprintf("%d lines you typed while that turn ran were not sent; they are back in the prompt", len(taken)))
-	}
 }
 
 // dispatch_command routes one slash command. The name comes from the command

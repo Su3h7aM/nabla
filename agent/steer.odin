@@ -9,15 +9,27 @@ import "core:sync"
 import "nabla:agent/journal"
 import "nabla:ai"
 
-// Steering accepts input while a turn is running. A queued line joins the next request
-// the turn builds; a turn that had already answered continues instead of finishing,
-// which is the whole difference from a prompt sent while idle. Nothing here drops a
-// line: it waits in the queue until the journal holds it as a user.input record. The
-// front-end pushes from its own thread, so the queue is guarded; a message is never
-// refused for its size.
+// Steering accepts input while a turn is running. A queued line joins the next request the
+// turn builds; a turn that had already answered continues instead of finishing, which is
+// the difference from a prompt sent while idle. A line waits in the queue, where the
+// front-end can edit it, until a settled point of the turn records it as a user.input
+// record. The front-end pushes from its own thread, so the queue is guarded, and it
+// refuses no message for its size.
+//
+// The queue assigns every entry an id and never reuses it, so the front-end names an entry
+// by id however the queue changes around it. A held entry is being edited: delivery stops
+// in front of it, so it is neither sent with its old text nor overtaken by the entries
+// behind it.
+Steer_Entry :: struct {
+	id:   u64,
+	text: string,
+	held: bool,
+}
+
 Steer_Queue :: struct {
 	mu:        sync.Mutex,
-	items:     [dynamic]string, // owned FIFO
+	items:     [dynamic]Steer_Entry, // owned FIFO; each text is owned
+	next_id:   u64,
 	allocator: mem.Allocator,
 }
 
@@ -31,20 +43,21 @@ steer_queue_init :: proc(allocator := context.allocator) -> Steer_Queue {
 }
 
 steer_queue_destroy :: proc(queue: ^Steer_Queue) {
-	for line in queue.items { delete(line, queue.allocator) }
+	for entry in queue.items { delete(entry.text, queue.allocator) }
 	delete(queue.items)
 	queue^ = {}
 }
 
-// steer_push clones a line into the queue and wakes the owner. False means the line
-// could not be kept.
+// steer_push clones a line into the queue behind the others, gives it the next id, and
+// wakes the owner. False means the line could not be kept.
 @(require_results)
 steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
 	line, clone_error := strings.clone(text, queue.allocator)
 	if clone_error != nil { return false }
 	append_error: mem.Allocator_Error
 	if sync.mutex_guard(&queue.mu) {
-		_, append_error = append(&queue.items, line)
+		queue.next_id += 1
+		_, append_error = append(&queue.items, Steer_Entry{id = queue.next_id, text = line})
 	}
 	if append_error != nil {
 		delete(line, queue.allocator)
@@ -54,48 +67,126 @@ steer_push :: proc(queue: ^Steer_Queue, text: string) -> bool {
 	return true
 }
 
-// steer_pop transfers ownership of the oldest line. False means empty.
+// steer_pop transfers ownership of the oldest line unless it is held. False means nothing
+// can be delivered.
 @(require_results)
 steer_pop :: proc(queue: ^Steer_Queue) -> (string, bool) {
 	sync.mutex_guard(&queue.mu)
-	if len(queue.items) == 0 { return "", false }
-	line := queue.items[0]
+	if len(queue.items) == 0 || queue.items[0].held { return "", false }
+	line := queue.items[0].text
 	ordered_remove(&queue.items, 0)
 	return line, true
 }
 
-// steer_pending reports whether a line is waiting.
-steer_pending :: proc(queue: ^Steer_Queue) -> bool {
+// steer_hold marks the entry with id as being edited and returns a copy of its text, which
+// the caller owns and releases with steer_line_free. False means the queue holds no such
+// entry any more, because the session accepted it first, or it is held already.
+@(require_results)
+steer_hold :: proc(queue: ^Steer_Queue, id: u64) -> (text: string, ok: bool) {
 	sync.mutex_guard(&queue.mu)
-	return len(queue.items) > 0
+	index := steer_index(queue, id)
+	if index < 0 || queue.items[index].held { return "", false }
+	clone_error: mem.Allocator_Error
+	text, clone_error = strings.clone(queue.items[index].text, queue.allocator)
+	if clone_error != nil { return "", false }
+	queue.items[index].held = true
+	return text, true
 }
 
-// steer_requeue puts a popped line back at the front of the queue. False means the
-// queue could not take it back and the line was released.
+// steer_release replaces the text of the entry with id, keeps its place in the queue, and
+// stops holding it. An empty text removes the entry instead. False means the entry is gone
+// or the new text could not be kept, and then the entry stays as it was.
 @(require_results)
-steer_requeue :: proc(queue: ^Steer_Queue, line: string) -> bool {
+steer_release :: proc(queue: ^Steer_Queue, id: u64, text: string) -> bool {
+	line: string
+	if text != "" {
+		clone_error: mem.Allocator_Error
+		line, clone_error = strings.clone(text, queue.allocator)
+		if clone_error != nil { return false }
+	}
 	sync.mutex_guard(&queue.mu)
-	if !inject_at(&queue.items, 0, line) {
+	index := steer_index(queue, id)
+	if index < 0 {
 		delete(line, queue.allocator)
 		return false
 	}
+	delete(queue.items[index].text, queue.allocator)
+	if line == "" {
+		ordered_remove(&queue.items, index)
+	} else {
+		queue.items[index] = Steer_Entry {
+			id   = id,
+			text = line,
+		}
+	}
+	owner_wake_signal()
 	return true
 }
 
-// steer_take_all removes everything queued, oldest first, in one allocation the caller
-// owns, released by steer_taken_destroy. On failure the lines stay queued.
+// steer_unhold stops holding the entry with id and leaves its text as it was.
+steer_unhold :: proc(queue: ^Steer_Queue, id: u64) {
+	sync.mutex_guard(&queue.mu)
+	if index := steer_index(queue, id); index >= 0 { queue.items[index].held = false }
+	owner_wake_signal()
+}
+
+// steer_index returns where the entry with id is queued, or -1. The caller holds the lock.
+@(private)
+steer_index :: proc(queue: ^Steer_Queue, id: u64) -> int {
+	for entry, index in queue.items {
+		if entry.id == id { return index }
+	}
+	return -1
+}
+
+// steer_requeue puts taken lines back at the front of the queue in their order, as new
+// entries, and releases the array. False means the queue could not grow, and then every
+// line is released.
+@(require_results)
+steer_requeue :: proc(queue: ^Steer_Queue, taken: [dynamic]string) -> bool {
+	sync.mutex_guard(&queue.mu)
+	if reserve(&queue.items, len(queue.items) + len(taken)) != nil {
+		steer_taken_destroy(queue, taken)
+		return false
+	}
+	for line, index in taken {
+		queue.next_id += 1
+		// The reserve covers every entry, so this insert cannot allocate.
+		_, _ = inject_at(&queue.items, index, Steer_Entry{id = queue.next_id, text = line})
+	}
+	delete(taken)
+	return true
+}
+
+// steer_take_all removes everything queued, held entries included, oldest first, in one
+// allocation the caller owns, released by steer_taken_destroy. On failure the lines stay
+// queued.
 @(require_results)
 steer_take_all :: proc(queue: ^Steer_Queue) -> (taken: [dynamic]string, ok: bool) {
 	sync.mutex_guard(&queue.mu)
-	lines, allocation_error := make([dynamic]string, 0, len(queue.items), queue.allocator)
+	return steer_take_front(queue, len(queue.items))
+}
+
+// steer_take_ready removes the entries delivery may take, oldest first: those in front of
+// the first held entry. The caller owns the result like steer_take_all's.
+@(require_results)
+steer_take_ready :: proc(queue: ^Steer_Queue) -> (taken: [dynamic]string, ok: bool) {
+	sync.mutex_guard(&queue.mu)
+	count := 0
+	for count < len(queue.items) && !queue.items[count].held { count += 1 }
+	return steer_take_front(queue, count)
+}
+
+// steer_take_front removes the first count entries. The caller holds the lock.
+@(private)
+steer_take_front :: proc(queue: ^Steer_Queue, count: int) -> (taken: [dynamic]string, ok: bool) {
+	lines, allocation_error := make([dynamic]string, 0, count, queue.allocator)
 	if allocation_error != nil { return {}, false }
-	for line in queue.items {
-		if _, append_error := append(&lines, line); append_error != nil {
-			delete(lines)
-			return {}, false
-		}
+	for entry in queue.items[:count] {
+		// The capacity covers every entry, so this append cannot allocate.
+		_, _ = append(&lines, entry.text)
 	}
-	clear(&queue.items)
+	remove_range(&queue.items, 0, count)
 	return lines, true
 }
 
@@ -106,7 +197,35 @@ steer_taken_destroy :: proc(queue: ^Steer_Queue, taken: [dynamic]string) {
 	delete(taken)
 }
 
-// steer_line_free releases a popped line, which belongs to the queue allocator.
+// steer_snapshot copies the queued entries, oldest first, and leaves the queue as it is.
+// The list and every text are allocated with allocator, which the caller releases with
+// steer_snapshot_destroy. False means the copy could not be made.
+@(require_results)
+steer_snapshot :: proc(queue: ^Steer_Queue, allocator: mem.Allocator) -> (entries: [dynamic]Steer_Entry, ok: bool) {
+	sync.mutex_guard(&queue.mu)
+	copied, allocation_error := make([dynamic]Steer_Entry, 0, len(queue.items), allocator)
+	if allocation_error != nil { return {}, false }
+	for entry in queue.items {
+		clone, clone_error := strings.clone(entry.text, allocator)
+		if clone_error != nil {
+			steer_snapshot_destroy(copied)
+			return {}, false
+		}
+		// The capacity covers every entry, so this append cannot allocate.
+		_, _ = append(&copied, Steer_Entry{id = entry.id, text = clone, held = entry.held})
+	}
+	return copied, true
+}
+
+// steer_snapshot_destroy releases what steer_snapshot returned, with the allocator the
+// list carries.
+steer_snapshot_destroy :: proc(entries: [dynamic]Steer_Entry) {
+	for entry in entries { delete(entry.text, entries.allocator) }
+	delete(entries)
+}
+
+// steer_line_free releases a line the queue handed over, which belongs to the queue
+// allocator.
 steer_line_free :: proc(queue: ^Steer_Queue, line: string) {
 	delete(line, queue.allocator)
 }
@@ -126,9 +245,6 @@ Steer_Context :: struct {
 	apply_data: rawptr,
 }
 
-// STEER_ACCEPTED_NOTICE is what the front-end is told for each line once the journal holds it.
-STEER_ACCEPTED_NOTICE :: "queued; the model reads it at the next request"
-
 // chat_steering_accept commits every queued line as one user.input record per line. A
 // commit that fails busy keeps the buffered records for the next commit; any other
 // failure returns the lines to the front of the queue in order.
@@ -137,33 +253,24 @@ chat_steering_accept :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer
 	queue: ^Steer_Queue
 	if steer != nil { queue = steer.queue }
 	taken: [dynamic]string
-	if queue != nil && steer_pending(queue) {
-		lines, taken_ok := steer_take_all(queue)
-		if taken_ok { taken = lines }
-	}
+	// When the lines cannot be copied out they stay queued for the next look.
+	if queue != nil { taken, _ = steer_take_ready(queue) }
 	for line in taken {
 		chat_record(chat, {kind = .User_Input}, journal.User_Input{origin = journal.USER_ORIGIN_NAMES[.Steering]}, transmute([]u8)line)
 	}
 	chat.unacknowledged += len(taken)
 	if chat.unacknowledged == 0 { return }
-	if _, commit_error := journal.commit(chat.store); commit_error != nil {
-		if journal.error_is_busy(commit_error) {
-			if queue != nil { steer_taken_destroy(queue, taken) }
-			return
-		}
+	_, commit_error := journal.commit(chat.store)
+	if commit_error != nil && !journal.error_is_busy(commit_error) {
 		chat_session_record_failure(chat, "the steering line could not be recorded", commit_error)
 		chat.unacknowledged -= len(taken)
-		#reverse for line in taken {
-			if !steer_requeue(queue, line) {
-				_observer_message(observer, .Warning, "a steering line could not stay pending")
-			}
+		if len(taken) > 0 && !steer_requeue(queue, taken) {
+			_observer_message(observer, .Warning, "a steering line could not stay pending")
 		}
-		delete(taken)
 		_observer_message(observer, .Error, chat.last_error)
 		return
 	}
-	for _ in 0 ..< chat.unacknowledged { _observer_message(observer, .Notice, STEER_ACCEPTED_NOTICE) }
-	chat.unacknowledged = 0
+	if commit_error == nil { chat.unacknowledged = 0 }
 	if queue != nil { steer_taken_destroy(queue, taken) }
 }
 
@@ -308,19 +415,20 @@ inbox_last_text :: proc(body: string) -> string {
 }
 
 // chat_steering_observe is the driver's collection step for input that reached the
-// session while the turn ran: the user's queued lines become user.input records, and
-// everything the session accepted and has not delivered becomes User nodes at a settled
-// point of the turn. A delivery for a turn that had finished answering continues that
-// turn: a message is one the model has not answered, so the next request this turn makes
-// is the one that answers it.
+// session while the turn ran. Only at a settled point of the turn do the user's queued
+// lines become user.input records, and everything the session accepted and has not
+// delivered become User nodes; until then a line stays in the queue, where the front-end
+// shows it and can take it back. A delivery for a turn that had finished answering
+// continues that turn: a message is one the model has not answered, so the next request
+// this turn makes is the one that answers it.
 //
 // That is the whole difference between steering and a prompt sent while idle, which starts
 // a turn of its own. A turn that failed or was cancelled keeps its outcome; its input stays
 // pending in the journal, and the next turn delivers it before its prompt.
 chat_steering_observe :: proc(chat: ^Chat_Session, observer: Chat_Observer, steer: ^Steer_Context) {
-	chat_steering_accept(chat, observer, steer)
 	point := chat_session_input_point(chat)
 	if point == .Wait { return }
+	chat_steering_accept(chat, observer, steer)
 	if chat_inbox_deliver(chat, observer) == 0 { return }
 	if point == .After_Answer { chat_session_continue_for_input(chat) }
 }

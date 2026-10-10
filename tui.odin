@@ -321,15 +321,25 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	if input_rows_error != nil {
 		return {}, .Allocation_Failed
 	}
-	heights := [4]int{-1, input_rows + 2, 1, 1}
-	regions: [4]tui.Cell_Rect
+	// The pending-steer component sits above the prompt and takes at most half of what the
+	// prompt and footer leave, so the transcript and the prompt always stay on screen.
+	steer_view_sync(app)
+	steer_body_rows: []Steer_Row
+	steer_rows := 0
+	if !app.menu_open {
+		steer_body_rows = steer_body(app.steer, content.width - 2 * STEER_INSET)
+		steer_rows = steer_height(len(app.steer.lines), len(steer_body_rows), (rows - (input_rows + 2) - 2) / 2)
+	}
+	heights := [5]int{-1, steer_rows, input_rows + 2, 1, 1}
+	regions: [5]tui.Cell_Rect
 	if !tui.rows(content, heights[:], regions[:]) {
 		return {}, .Layout_Failed
 	}
 	conv_rect := regions[0]
-	input_rect := regions[1]
-	cwd_rect := regions[2]
-	status_rect := regions[3]
+	app.steer_rect = regions[1]
+	input_rect := regions[2]
+	cwd_rect := regions[3]
+	status_rect := regions[4]
 	// A mouse report arrives as screen cells, while the frame is solved in the
 	// conversation's own coordinates. Remembering where the conversation landed
 	// is what lets the report be aimed at a tool box inside it.
@@ -351,6 +361,7 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 			return {}, .Allocation_Failed
 		}
 		cursor = drawn_cursor
+		draw_steer(app, storage, app.steer_rect, steer_body_rows)
 	}
 	images_collect(app, storage)
 	draw_footer(app, storage, cwd_rect, status_rect)
