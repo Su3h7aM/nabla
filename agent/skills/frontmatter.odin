@@ -137,6 +137,12 @@ frontmatter_write_string :: proc(builder: ^strings.Builder, text: string) -> boo
 }
 
 @(require_results)
+frontmatter_write_rune :: proc(builder: ^strings.Builder, character: rune) -> bool {
+	encoded, width := utf8.encode_rune(character)
+	return strings.write_bytes(builder, encoded[:width]) == width
+}
+
+@(require_results)
 frontmatter_key_valid :: proc(key: string) -> bool {
 	if key == "" { return false }
 	for character in key {
@@ -265,7 +271,7 @@ frontmatter_double_quoted :: proc(raw: string, next_line, line_number: int, allo
 			if !ok ||
 			   value >= 0xd800 &&
 				   value <= 0xdfff { return {}, error_make(.Unsupported_Metadata, line_number, detail = "invalid Unicode escape", allocator = allocator) }
-			if _, write_error := strings.write_rune(&builder, rune(value)); write_error != nil {
+			if !frontmatter_write_rune(&builder, rune(value)) {
 				return {}, error_make(.Allocation, allocator = allocator)
 			}
 			i += 4
@@ -383,7 +389,7 @@ description_normalize :: proc(text: string, allocator: mem.Allocator) -> (string
 				written = written && frontmatter_write_byte(&builder, ' ')
 				pending_space = false
 			}
-			if _, write_error := strings.write_rune(&builder, character); write_error != nil {
+			if !frontmatter_write_rune(&builder, character) {
 				return "", error_make(.Allocation, allocator = allocator)
 			}
 			runes += 1
