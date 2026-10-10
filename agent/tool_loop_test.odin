@@ -2,6 +2,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem/virtual"
 import "core:os"
 import "core:strings"
@@ -11,6 +12,184 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 import "nabla:db"
+
+@(test)
+test_background_shell_delivers_its_result_after_the_turn :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	tool_loop_background_shell(test, false)
+}
+
+@(test)
+test_turn_cancellation_leaves_background_shell_running :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	tool_loop_background_shell(test, true)
+}
+
+@(test)
+test_live_recovery_keeps_a_running_background_call_open :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	tool_loop_background_shell(test, false, recovery = true)
+}
+
+@(test)
+test_background_completion_busy_failure_reports_and_accepts_next_prompt :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	_test_accept(test, chat, "run a background shell")
+	_test_stage_call(test, chat, "call_background", `{"command":"printf background-result","wait":false}`)
+	testing.expect_value(test, chat_run_tools(chat, {}), 1)
+	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, 1))
+	_test_begin_request(test, chat)
+	testing.expect(test, chat_session_feed_completion(chat, chat_session_event_source(chat)))
+	_test_settle(test, chat)
+	if !testing.expect_value(test, len(chat.background.jobs), 1) { return }
+	if !testing.expect(test, job_wait_published(&chat.background.jobs[0].worker, time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND))) { return }
+	holder := tool_loop_busy_lock(test, &fixture)
+	defer _ = journal.close(holder)
+	defer _ = db.rollback(&holder.connection)
+	testing.expect(test, !chat_background_wait(chat, nil), "a failed completion ends the wait instead of sleeping on a released job")
+	testing.expect(test, chat.active_failed && !chat.storage_failed, "a busy completion fails the current work without latching the store")
+	testing.expect(test, !background_running(chat))
+	testing.expect(test, chat.last_error != "", "the owner has the completion failure to report")
+	if !testing.expect_value(test, db.rollback(&holder.connection), nil) { return }
+	turn_completions := len(_test_records(test, chat, {.Turn_Completed}))
+	log: Chat_Notice_Log
+	observer := chat_notice_log_begin(&log)
+	defer chat_notice_log_destroy(&log)
+	testing.expect(test, chat_background_report_failure(chat, observer), "the idle owner consumes and reports the failure")
+	testing.expect_value(test, len(log.lines), 1)
+	if len(log.lines) == 1 { testing.expect_value(test, log.lines[0], chat.last_error) }
+	testing.expect_value(test, chat.state, Chat_State.Idle)
+	testing.expect(test, !chat.active_failed && !chat.storage_failed)
+	testing.expect(test, !chat_background_report_failure(chat, observer), "the failure is reported once")
+	testing.expect_value(test, len(_test_records(test, chat, {.Turn_Completed})), turn_completions)
+	testing.expect_value(test, chat_session_accept_user(chat, "continue after the busy background completion"), Chat_Accept.Accepted)
+	testing.expect_value(test, len(_test_records(test, chat, {.Turn_Completed})), turn_completions)
+}
+
+@(private)
+tool_loop_background_cancel :: proc(steer: ^Steer_Context, observer: Chat_Observer) {
+	chat := cast(^Chat_Session)steer.apply_data
+	if background_running(chat) && !chat_session_cancelled(chat) { _ = chat_session_request_cancel(chat) }
+}
+
+@(private)
+tool_loop_background_shell :: proc(test: ^testing.T, cancel: bool, recovery := false) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	gate := fmt.tprintf("%s/release", fixture.directory)
+	command := fmt.tprintf("/bin/sh -c 'while [ ! -f \"$1\" ]; do sleep 0.01; done; printf background-ok' sh %q", gate)
+	arguments, encode_error := json.marshal(struct {
+			command: string,
+			wait:    bool,
+		}{command, false}, allocator = context.allocator)
+	if !testing.expect_value(test, encode_error, nil) { return }
+	defer delete(arguments)
+	provider: Agent_Provider
+	if !agent_provider_start(
+		test,
+		&provider,
+		{
+			agent_provider_call(TOOL_SHELL_NAME, string(arguments)),
+			agent_provider_reply("waiting"),
+			agent_provider_reply("received"),
+			agent_provider_reply("received"),
+		},
+	) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = endpoint,
+	}
+	_test_accept(test, chat, "run the command in the background")
+	steer := Steer_Context {
+		observe    = tool_loop_background_cancel,
+		apply_data = chat,
+	}
+	completed := chat_turn_drive(chat, connection, test_retry_policy(), {}, &steer if cancel else nil, nil)
+	testing.expect_value(test, completed, !cancel)
+	testing.expect_value(test, chat.terminal_status, Chat_Terminal_Status.Cancelled if cancel else .Completed)
+	testing.expect(test, background_running(chat), "the command stays blocked after its receipt and the turn end")
+	records := _test_records(test, chat, {.Tool_Admitted, .Tool_Started, .Tool_Completed, .Background_Completed})
+	if !testing.expect_value(test, len(records), 3) { return }
+	testing.expect_value(test, records[0].kind, journal.Record_Kind.Tool_Admitted)
+	testing.expect_value(test, records[1].kind, journal.Record_Kind.Tool_Started)
+	testing.expect_value(test, records[2].kind, journal.Record_Kind.Tool_Completed)
+	admitted: journal.Tool_Admitted
+	if !testing.expect_value(test, journal.payload_decode(records[0].data, &admitted, context.temp_allocator), nil) { return }
+	testing.expect(test, admitted.background)
+	testing.expect_value(test, string(records[0].body), string(arguments))
+	call := records[0].call
+	name := background_job_name(call, context.temp_allocator)
+	receipt := string(records[2].body)
+	testing.expect(test, strings.contains(receipt, fmt.tprintf("job: %s", name)) && strings.contains(receipt, "status: running"), receipt)
+	testing.expect(test, strings.contains(receipt, chat_tool_output_path(chat, call, journal.KEPT_STDOUT_SUFFIX)), receipt)
+	testing.expect(test, strings.contains(receipt, chat_tool_output_path(chat, call, journal.KEPT_STDERR_SUFFIX)), receipt)
+	if !cancel {
+		testing.expect(test, strings.contains(agent_provider_request(&provider, 1), name), "the model saw the receipt before the command finished")
+	}
+	if recovery {
+		_test_accept(test, chat, "a turn whose response commit will be busy")
+		_test_begin_request(test, chat)
+		request := journal.next_request(chat.store)
+		chat.request = request
+		calls := []ai.Provider_Tool_Call{{ID = "call_busy", Name = TOOL_SHELL_NAME, Arguments = `{"command":"printf never-run"}`}}
+		_, feed_error := chat_session_feed_tool_calls(chat, chat_session_event_source(chat), calls)
+		if !testing.expect_value(test, feed_error, nil) { return }
+		usages: [dynamic]Chat_Request_Usage
+		usages.allocator = chat.allocator
+		defer delete(usages)
+		holder := tool_loop_busy_lock(test, &fixture)
+		defer _ = journal.close(holder)
+		testing.expect(test, !chat_commit_response_nodes(chat, request, 1, .Tool_Call, &usages))
+		testing.expect(test, chat.recovery_pending)
+		chat_session_retire_operation(chat)
+		if !testing.expect_value(test, db.rollback(&holder.connection), nil) { return }
+		finish := _test_settle(test, chat)
+		testing.expect_value(test, finish.status, Chat_Terminal_Status.Failed)
+		testing.expect_value(test, chat_session_accept_user(chat, "continue after live recovery"), Chat_Accept.Accepted)
+		testing.expect(test, !chat.recovery_pending && background_running(chat))
+		testing.expect_value(test, len(_test_records(test, chat, {.Background_Completed})), 0)
+		testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil))
+	}
+	if !testing.expect_value(test, os.write_entire_file(gate, nil), nil) { return }
+	if !testing.expect(test, chat_background_wait(chat, nil), "the background completion wakes the idle owner") { return }
+	testing.expect(test, !background_running(chat))
+	finished := _test_records(test, chat, {.Background_Completed})
+	if !testing.expect_value(test, len(finished), 1) { return }
+	testing.expect_value(test, finished[0].call, call)
+	payload: journal.Background_Completed
+	if !testing.expect_value(test, journal.payload_decode(finished[0].data, &payload, context.temp_allocator), nil) { return }
+	testing.expect_value(test, payload.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
+	testing.expect_value(test, payload.tool, TOOL_SHELL_NAME)
+	testing.expect(test, strings.contains(string(finished[0].body), "background-ok"), "the command finished despite its originating turn ending")
+	accepted, had_message := chat_session_accept_agent_message(chat, {})
+	if !testing.expect(test, accepted == .Accepted && had_message) { return }
+	testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil), "the idle report turn completed")
+	report := agent_provider_request(&provider, 3 if recovery else 1 if cancel else 2)
+	testing.expect(test, strings.contains(report, name) && strings.contains(report, "background-ok"), "the report turn gives the model the command's output")
+	ancestry, read_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if !testing.expect_value(test, read_error, nil) { return }
+	reports := 0
+	for node in ancestry {
+		if node.kind != .User { continue }
+		user: journal.User
+		if !testing.expect_value(test, journal.payload_decode(node.data, &user, context.temp_allocator), nil) { return }
+		if user.origin != journal.USER_ORIGIN_NAMES[.Job] { continue }
+		reports += 1
+		testing.expect(test, strings.contains(string(node.body), name) && strings.contains(string(node.body), "background-ok"))
+	}
+	testing.expect_value(test, reports, 1)
+	testing.expect(test, !chat_background_wait(chat, nil), "the completion is delivered only once")
+}
 
 // item_object and item_string read the encoded request body the way a provider
 // would: by item type, role, and field. They exist so a test can assert wire

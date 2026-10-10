@@ -62,6 +62,7 @@ Shell_Args :: struct {
 	command:           string,
 	working_directory: string, // "" means the workspace root
 	timeout:           time.Duration,
+	wait:              bool, // false runs the command in the background
 }
 
 Skills_Args :: struct {

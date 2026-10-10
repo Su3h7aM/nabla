@@ -13,6 +13,7 @@ import "nabla:agent/journal"
 // The field names are the contract a script reads: a Lua parent receives each output
 // as a table keyed by these names, and the model reads them as `key: value` lines.
 Tool_Output :: union {
+	Background_Output,
 	Read_Output,
 	Read_Media_Output,
 	Write_Output,
@@ -26,6 +27,13 @@ Tool_Output :: union {
 	Agent_Output,
 	Agents_Output,
 	Argument_Failure,
+}
+
+Background_Output :: struct {
+	job:         string,
+	status:      string,
+	stdout_file: string,
+	stderr_file: string,
 }
 
 Read_Output :: struct {
@@ -183,6 +191,15 @@ tool_result_render :: proc(
 	render_byte(&head, '\n') or_return
 
 	switch value in output {
+	case Background_Output:
+		render_field(&head, "job", value.job) or_return
+		render_field(&head, "status", value.status) or_return
+		if value.stdout_file != "" { render_field(&head, "stdout_file", value.stdout_file) or_return }
+		if value.stderr_file != "" { render_field(&head, "stderr_file", value.stderr_file) or_return }
+		render_text(
+			&body,
+			"The result arrives as a message when the job ends. Keep working on what does not depend on it; if nothing is left, end your response and you will be resumed. Do not poll.",
+		) or_return
 	case Read_Output:
 		render_field(&head, "path", value.path) or_return
 		render_field(&head, "first_line", value.first_line) or_return
@@ -420,6 +437,17 @@ tool_result_body :: proc(text: string) -> string {
 @(require_results)
 tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (owned: Tool_Output, allocation_error: mem.Allocator_Error) {
 	switch borrowed in output {
+	case Background_Output:
+		value: Background_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
+		value.job = strings.clone(borrowed.job, allocator) or_return
+		value.status = strings.clone(borrowed.status, allocator) or_return
+		value.stdout_file = strings.clone(borrowed.stdout_file, allocator) or_return
+		value.stderr_file = strings.clone(borrowed.stderr_file, allocator) or_return
+		owned = value
 	case Read_Output:
 		value := Read_Output {
 			first_line  = borrowed.first_line,
@@ -590,6 +618,11 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 
 tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 	switch value in output^ {
+	case Background_Output:
+		delete(value.job, allocator)
+		delete(value.status, allocator)
+		delete(value.stdout_file, allocator)
+		delete(value.stderr_file, allocator)
 	case Read_Output:
 		delete(value.path, allocator)
 		delete(value.content, allocator)

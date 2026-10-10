@@ -154,6 +154,7 @@ Tool_Job :: struct {
 	// outcome
 	result:         Maybe(Tool_Result),
 	committed:      bool,
+	background:     bool,
 }
 
 // Tool_Jobs is one batch's table. Only the owner reads and writes it.
@@ -460,7 +461,16 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		job.phase = .Result_Ready
 		return
 	}
-	if _, starts := args.(Agent_Start_Args); starts {
+	#partial switch decoded in args {
+	case Shell_Args:
+		if !decoded.wait && job.nested {
+			field_error := tool_argument_error(.Invalid_Value, "wait", "true; background calls are not available inside codemode yet", job.allocator)
+			job.result = tool_result_refused(&job.exec, &field_error)
+			job.phase = .Result_Ready
+			return
+		}
+		job.background = !decoded.wait
+	case Agent_Start_Args:
 		// A blocking start holds its own worker and lane for the child's whole run.
 		job.placement = .Worker
 		job.lane = job
@@ -594,6 +604,7 @@ tool_jobs_runnable :: proc(jobs: ^Tool_Jobs, now: time.Tick) -> ^Tool_Job {
 			return job
 		}
 		if job.phase != .Queued { continue }
+		if job.background && job.placement == .Worker { return job }
 		if !tool_jobs_lane_free(jobs, job) { continue }
 		if job.placement == .Worker && jobs.active >= jobs.max_active { continue }
 		return job
@@ -712,6 +723,10 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat
 		_ = agent_team_reap(job.exec.agents, chat)
 	}
 	node, parent_call := tool_job_record_placement(chat, job)
+	if job.background && job.placement == .Worker {
+		background_detach(chat, jobs, job, observer, repair_names[:repair_count])
+		return
+	}
 	chat_record(
 		chat,
 		{kind = .Tool_Admitted, node = node, request = chat.request, call = job.call.call, parent_call = parent_call},

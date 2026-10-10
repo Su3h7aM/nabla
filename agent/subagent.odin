@@ -900,11 +900,11 @@ chat_session_role_setup :: proc(chat: ^Chat_Session, base: ^Tool_Registry) -> (p
 subagent_compact_wait :: proc(member: ^Subagent, chat: ^Chat_Session, connection: ai.Provider_Connection) {
 	for {
 		seen := owner_wake_seen()
-		chat_session_observe_stop(chat)
-		if chat_session_cancelled(chat) { return }
+		chat_session_observe_at(chat, time.tick_now())
+		if chat_session_cancelled(chat) || chat.active_failed || chat.storage_failed { return }
 		_ = chat_compact_idle_service(chat, {}, connection)
 		if chat.compact.state == .Idle { return }
-		owner_wake_wait(seen, chat_compact_deadline(chat))
+		owner_wake_wait(seen, chat_background_deadline(chat, chat_compact_deadline(chat)))
 	}
 }
 
@@ -942,34 +942,44 @@ subagent_run :: proc(member: ^Subagent) {
 	// the outcome.
 	defer subagent_keep_answer(member, store)
 
-	chat, init_error := chat_session_init(store, member.session, branch, head, member.workspace, allocator)
+	chat, allocation_error := mem.new(Chat_Session, allocator)
+	if allocation_error != nil {
+		subagent_fail(member, .Failed, "the subagent's session could not be allocated")
+		return
+	}
+	initialized, init_error := chat_session_init(store, member.session, branch, head, member.workspace, allocator)
 	if init_error.kind != .None {
+		mem.free(chat, allocator)
 		subagent_fail(member, .Failed, "the subagent's session could not be initialized")
 		return
 	}
+	chat^ = initialized
 	defer {
-		chat_session_destroy(&chat)
-		if chat_session_workers_outstanding(&chat) {
+		chat_session_destroy(chat)
+		if chat_session_workers_outstanding(chat) {
 			sync.mutex_guard(&member.team.mutex)
 			member.abandoned = true
 			sync.atomic_store(&member.team.abandoned, true)
+		} else {
+			mem.free(chat, allocator)
 		}
 	}
 	chat.member = member
 	chat.stop_parent = &member.stop
+	chat.background_stop.parent = &member.stop
 	chat.disable_project_instructions = member.disable_project_instructions
-	if role_problem := chat_session_role_setup(&chat, &member.tools); role_problem != "" {
+	if role_problem := chat_session_role_setup(chat, &member.tools); role_problem != "" {
 		subagent_fail(member, .Failed, role_problem)
 		return
 	}
-	installed, _ := chat_session_select(&chat, member.selection, member.effort)
+	installed, _ := chat_session_select(chat, member.selection, member.effort)
 	if !installed {
 		subagent_fail(member, .Failed, "the subagent's model could not be held")
 		return
 	}
 	steer := Subagent_Steer {
 		member     = member,
-		chat       = &chat,
+		chat       = chat,
 		connection = member.selection.connection,
 	}
 	defer subagent_control_destroy(&steer.pending)
@@ -980,17 +990,22 @@ subagent_run :: proc(member: ^Subagent) {
 	text, origin, inbox_first := member.prompt, journal.User_Origin.Prompt, false
 	if member.resumed { text, origin, inbox_first = "", .Agent, true }
 	if member.compact {
-		if chat_compact_request(&chat, .User_Command) == .Unavailable {
+		if chat_compact_request(chat, .User_Command) == .Unavailable {
 			subagent_fail(member, .Failed, "the subagent's context could not be compacted")
 			return
 		}
 		if member.prompt == "" {
 			// Nothing was sent to continue it, so it ends once the summary is installed. A
 			// summary may take many minutes, so nothing but a stop ends the wait.
-			subagent_compact_wait(member, &chat, steer.connection)
-			if chat_session_cancelled(
-				&chat,
-			) { subagent_fail(member, .Stopped, "the subagent was stopped before it finished") } else { member.status = .Completed }
+			subagent_compact_wait(member, chat, steer.connection)
+			if chat.active_failed || chat.storage_failed {
+				_ = chat_background_report_failure(chat, {})
+				subagent_fail(member, .Failed, chat.last_error)
+			} else if chat_session_cancelled(chat) {
+				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
+			} else {
+				member.status = .Completed
+			}
 			return
 		}
 	}
@@ -1001,12 +1016,12 @@ subagent_run :: proc(member: ^Subagent) {
 	}
 	for {
 		subagent_steer_service(&steer)
-		accepted := chat_session_accept_message(&chat, text, origin, {}, inbox_first)
+		accepted := chat_session_accept_message(chat, text, origin, {}, inbox_first)
 		if accepted != .Accepted {
 			subagent_fail(member, .Failed, chat.last_error if chat.last_error != "" else "the task could not be recorded")
 			return
 		}
-		if !chat_turn_drive(&chat, steer.connection, chat_retry_policy_default(), {}, &turn_steer, nil) {
+		if !chat_turn_drive(chat, steer.connection, chat_retry_policy_default(), {}, &turn_steer, nil) {
 			if chat.terminal_status == .Cancelled {
 				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
 			} else {
@@ -1016,8 +1031,12 @@ subagent_run :: proc(member: ^Subagent) {
 		}
 		subagent_steer_service(&steer)
 		if chat.compact.state != .Idle {
-			subagent_compact_wait(member, &chat, steer.connection)
-			if chat_session_cancelled(&chat) {
+			subagent_compact_wait(member, chat, steer.connection)
+			if chat_background_report_failure(chat, {}) || chat.active_failed || chat.storage_failed {
+				subagent_fail(member, .Failed, chat.last_error)
+				return
+			}
+			if chat_session_cancelled(chat) {
 				subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
 				return
 			}
@@ -1026,6 +1045,15 @@ subagent_run :: proc(member: ^Subagent) {
 		// Steering answers every message taken before the turn settled. One that arrived
 		// after its last check starts the next turn, which delivers it. One that arrives
 		// after this read is found when the orchestrator reaps the child, which runs it again.
+		_ = chat_background_wait(chat, &member.stop)
+		if chat_background_report_failure(chat, {}) || chat.active_failed || chat.storage_failed {
+			subagent_fail(member, .Failed, chat.last_error)
+			return
+		}
+		if ai.interrupt_requested(&member.stop) || ai.interrupt_requested(&process_interrupt) {
+			subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
+			return
+		}
 		waiting, read_error := journal.read_inbox(store, member.session, chat.delivered, context.temp_allocator)
 		if read_error != nil {
 			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
@@ -1630,34 +1658,6 @@ subagent_unknown :: proc(team: ^Agent_Team, name: string) -> string {
 chat_parent_session :: proc(chat: ^Chat_Session) -> string {
 	if chat.member == nil { return "" }
 	return journal.session_id_to_hex(chat.member.parent_session, chat.member.parent_session_hex[:])
-}
-
-// chat_agents_pending reports whether an agent's report or message waits in the journal or
-// a subagent still runs. It releases finished subagents first, which commits their
-// reports. Owner only.
-@(require_results)
-chat_agents_pending :: proc(chat: ^Chat_Session) -> bool {
-	if chat.team == nil { return false }
-	// Running is read before the reap: a subagent that finishes between the two is still
-	// counted, and its wake brings the owner back to reap it.
-	running := agent_team_running(chat.team)
-	reopened := agent_team_reap(chat.team, chat)
-	return chat_inbox_reports_pending(chat) || running || reopened
-}
-
-// chat_agents_wait blocks until an agent's report or message waits, and reports false
-// instead when no subagent runs any more or stop is requested. Owner only.
-@(require_results)
-chat_agents_wait :: proc(chat: ^Chat_Session, stop: ^ai.Interrupt) -> bool {
-	if chat.team == nil { return false }
-	for {
-		seen := owner_wake_seen()
-		running := agent_team_running(chat.team)
-		reopened := agent_team_reap(chat.team, chat)
-		if chat_inbox_reports_pending(chat) { return true }
-		if !(running || reopened) || ai.interrupt_requested(stop) || ai.interrupt_requested(&process_interrupt) { return false }
-		owner_wake_wait(seen, nil)
-	}
 }
 
 // chat_session_accept_agent_message opens a turn that delivers what the agents sent and

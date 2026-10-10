@@ -59,7 +59,7 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 				}
 				continue
 			}
-			// A background subagent's report, or a line another process sent, that arrived
+			// A background job's report, or a line another process sent, that arrived
 			// while idle starts a turn of its own.
 			if app_agent_report_turn(app, observer) {
 				refresh_status(app)
@@ -68,19 +68,24 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 			}
 			// An outstanding compaction is serviced while idle, so a finished summary does
 			// not wait for the next prompt. Work senders signal the same wake.
-			// While subagents run, the worker waits on the wake instead of the queue, because
+			// While background work runs, the worker waits on the wake instead of the queue, because
 			// their reports arrive through the wake.
-			agents_pending := app.setup.session.store != nil && agent.chat_agents_pending(&app.setup.session)
-			if app_compaction_pending(app) || app.run.pending_target != nil || agents_pending {
+			background_pending := app.setup.session.store != nil && agent.chat_background_pending(&app.setup.session)
+			if agent.chat_background_report_failure(&app.setup.session, observer) {
+				refresh_status(app)
+				free_all(context.temp_allocator)
+				continue
+			}
+			if app_compaction_pending(app) || app.run.pending_target != nil || background_pending {
 				if app_compaction_tick(app, observer) { refresh_status(app) }
 				if app_selection_service(app) { refresh_status(app) }
 				free_all(context.temp_allocator)
-				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&app.setup.session))
+				agent.owner_wake_wait(seen, agent.chat_background_deadline(&app.setup.session, agent.chat_compact_deadline(&app.setup.session)))
 				continue
 			}
 			// Work senders, the session watch, and teardown all signal the owner wake.
 			free_all(context.temp_allocator)
-			agent.owner_wake_wait(seen, nil)
+			agent.owner_wake_wait(seen, agent.chat_background_deadline(&app.setup.session, nil))
 			continue
 		}
 		if runtime_stopping(app) {

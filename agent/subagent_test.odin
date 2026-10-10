@@ -66,7 +66,7 @@ test_agents_status_reads_running_and_finished_children :: proc(test: ^testing.T)
 		running.content,
 	)
 	sync.sema_post(&provider.release)
-	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	if !testing.expect(test, chat_background_wait(chat, nil)) { return }
 	finished := tool_agents_execute(&ctx, Agents_Args{action = .Status, agent = "agent-1"})
 	defer tool_result_destroy(&finished)
 	testing.expect_value(test, finished.outcome, journal.Tool_Outcome.Success)
@@ -115,7 +115,7 @@ test_subagent_switch_at_finish_is_kept_on_resume :: proc(test: ^testing.T) {
 		success,
 	)
 	sync.sema_post(&first.release)
-	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	if !testing.expect(test, chat_background_wait(chat, nil)) { return }
 	applied, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Selection_Applied}}, context.temp_allocator)
 	testing.expect_value(test, read_error, nil)
 	if !testing.expect(test, found) { return }
@@ -442,11 +442,11 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 
 	// The subagent has been waiting on its provider the whole time.
 	agent_provider_serve_now(&delegate)
-	if !testing.expect(test, chat_agents_wait(chat, nil), "the subagent's report arrives") { return }
+	if !testing.expect(test, chat_background_wait(chat, nil), "the subagent's report arrives") { return }
 	accepted, had_message := chat_session_accept_agent_message(chat, {})
 	testing.expect(test, had_message && accepted == .Accepted)
 	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the report's turn completed")
-	testing.expect(test, !chat_agents_wait(chat, nil), "nothing more is pending")
+	testing.expect(test, !chat_background_wait(chat, nil), "nothing more is pending")
 
 	testing.expect(test, strings.contains(agent_provider_request(&delegate, 0), `"reasoning_effort":"medium"`), "the subagent runs one level below")
 	report := agent_provider_request(&orchestrator, 2)
@@ -494,7 +494,7 @@ test_a_script_starts_a_background_subagent_without_waiting :: proc(test: ^testin
 	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed before the subagent answered")
 
 	agent_provider_serve_now(&delegate)
-	if !testing.expect(test, chat_agents_wait(chat, nil), "the subagent's report arrives") { return }
+	if !testing.expect(test, chat_background_wait(chat, nil), "the subagent's report arrives") { return }
 	accepted, had_message := chat_session_accept_agent_message(chat, {})
 	testing.expect(test, had_message && accepted == .Accepted)
 	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the report's turn completed")
@@ -626,13 +626,13 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 	stopped := tool_agent_execute(&tool_context, Agent_Stop_Args{agent = "agent-1"})
 	defer tool_result_destroy(&stopped)
 	testing.expect_value(test, stopped.outcome, journal.Tool_Outcome.Success)
-	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	if !testing.expect(test, chat_background_wait(chat, nil)) { return }
 	records, read_ok := chat_inbox_read(chat)
 	if !testing.expect(test, read_ok && len(records) == 1) { return }
 	message, _ := inbox_text(records[0])
 	testing.expect(test, strings.contains(message, "agent-1 stopped"), message)
 	chat.delivered = records[0].seq
-	testing.expect(test, !chat_agents_wait(chat, nil), "cancellation leaves no running child")
+	testing.expect(test, !chat_background_wait(chat, nil), "cancellation leaves no running child")
 }
 
 // A background child whose provider cuts the stream after part of an answer fails, and its
@@ -669,7 +669,7 @@ test_a_failed_background_subagent_reports_cause_and_partial_text :: proc(test: ^
 		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","prompt":"find the parser"}`),
 		journal.TOOL_OUTCOME_NAMES[.Success],
 	)
-	if !testing.expect(test, chat_agents_wait(chat, nil)) { return }
+	if !testing.expect(test, chat_background_wait(chat, nil)) { return }
 	records, read_ok := chat_inbox_read(chat)
 	if !testing.expect(test, read_ok && len(records) == 1) { return }
 	report, _ := inbox_text(records[0])
@@ -1061,7 +1061,7 @@ subagent_test_parent :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Catalo
 // subagent_test_report waits for the one report a child's end leaves in the orchestrator's
 // inbox, marks it delivered, and returns its text.
 subagent_test_report :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
-	if !chat_agents_wait(chat, nil) { testing.fail_now(test, "no report arrived") }
+	if !chat_background_wait(chat, nil) { testing.fail_now(test, "no report arrived") }
 	records, read_ok := chat_inbox_read(chat)
 	if !read_ok || len(records) != 1 { testing.fail_now(test, "the inbox does not hold exactly one report") }
 	chat.delivered = records[0].seq

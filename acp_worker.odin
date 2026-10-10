@@ -511,10 +511,14 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 			if acp_is_v2(session.conn) && session.app.setup.store != nil {
 				// Reaping commits the reports of finished subagents, which the wanted probe
 				// then sees. Both run unclaimed, so an idle session stays evictable.
-				_ = agent.chat_agents_pending(&session.app.setup.session)
+				_ = agent.chat_background_pending(&session.app.setup.session)
+			}
+			if agent.chat_background_report_failure(&session.app.setup.session, acp_observer(session)) {
+				free_all(context.temp_allocator)
+				continue
 			}
 			if !acp_owner_service_wanted(session) || !acp_owner_service_begin(session) {
-				agent.owner_wake_wait(seen, nil)
+				agent.owner_wake_wait(seen, agent.chat_background_deadline(&session.app.setup.session, nil))
 				continue
 			}
 			if acp_is_v2(session.conn) && session.app.setup.store != nil {
@@ -543,12 +547,15 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 				}
 				acp_owner_service_end(session)
 				free_all(context.temp_allocator)
-				agent.owner_wake_wait(seen, agent.chat_compact_deadline(&session.app.setup.session))
+				agent.owner_wake_wait(
+					seen,
+					agent.chat_background_deadline(&session.app.setup.session, agent.chat_compact_deadline(&session.app.setup.session)),
+				)
 				continue
 			}
 			acp_owner_service_end(session)
 			free_all(context.temp_allocator)
-			agent.owner_wake_wait(seen, nil)
+			agent.owner_wake_wait(seen, agent.chat_background_deadline(&session.app.setup.session, nil))
 			continue
 		}
 		if sync.mutex_guard(&session.conn.table_mu) {

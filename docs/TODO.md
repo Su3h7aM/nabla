@@ -13,3 +13,7 @@ Each limit stays only if a protocol, API, provider, model, or the OS imposes it,
 
 A subagent is a session like any other: the orchestrator can bring it back, inspect it, compact it, switch its model, and continue it.
 
+
+## Ownership
+
+- `session_install` (`app_session.odin`) destroys `setup.session` and then initializes a new session in the same `Chat_Session` memory, even when `chat_session_workers_outstanding` says an abandoned worker may still read that session's stop tokens or catalog. Hold the session by pointer in `Run_Setup`, so a switch leaves a retained session allocated and installs a new one, as `subagent_run` already does for a child.

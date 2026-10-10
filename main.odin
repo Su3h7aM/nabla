@@ -214,7 +214,7 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 	completed := agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
 	// A headless run ends when its work does, so it waits for the subagents it started in the
 	// background and answers each report with a turn of its own.
-	for completed && agent.chat_agents_wait(chat, nil) {
+	for completed && agent.chat_background_wait(chat, nil) {
 		accepted, had_message := agent.chat_session_accept_agent_message(chat, observer)
 		if !had_message {
 			// The report the wait promised was taken elsewhere; there is nothing
@@ -227,6 +227,7 @@ run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> boo
 		}
 		completed = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
 	}
+	if agent.chat_background_report_failure(chat, observer) { return false }
 	if out.write_failed {
 		fmt.eprintln("nabla: the answer could not be written")
 		return false
@@ -303,7 +304,7 @@ run_prompt :: proc(
 ) -> int {
 	app, app_error := new(App)
 	if app_error != nil { return 1 }
-	defer free(app)
+	defer if !app.setup.workers_abandoned && !agent.chat_session_workers_outstanding(&app.setup.session) { free(app) }
 	app.run.alloc = context.allocator
 	// The headless run shows nothing, but a refusal or a selection notice still
 	// reaches the transcript, so it owns its allocator here too.

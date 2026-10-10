@@ -44,7 +44,7 @@ chat_tool_jobs_wait :: proc(chat: ^Chat_Session, seen: u32) {
 	if !chat.tool_jobs_active { return }
 	// An unsettled batch has one deadline of its own, the patience a stopped call is given,
 	// and no other reason to wake on its own: a completion wakes the owner instead.
-	tool_jobs_await(&chat.tool_jobs, tool_jobs_deadline(&chat.tool_jobs), seen)
+	tool_jobs_await(&chat.tool_jobs, chat_background_deadline(chat, tool_jobs_deadline(&chat.tool_jobs)), seen)
 }
 
 // chat_tool_jobs_finish releases a settled batch and applies its committed result
@@ -93,6 +93,19 @@ chat_record_tool_result :: proc(
 	parent_call: journal.Call_Id,
 	result: ^Tool_Result,
 ) -> bool {
+	header := journal.Record {
+		kind        = .Tool_Completed,
+		node        = node,
+		request     = chat.request,
+		call        = call,
+		parent_call = parent_call,
+	}
+	if !chat_stage_tool_result(chat, header, result) { return false }
+	return chat_commit(chat, "the tool result could not be recorded")
+}
+
+@(private, require_results)
+chat_stage_tool_result :: proc(chat: ^Chat_Session, header: journal.Record, result: ^Tool_Result, tool := "") -> bool {
 	// The journal copies the error text, so the temp memory it was built in is released here.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	error_text := ""
@@ -100,13 +113,6 @@ chat_record_tool_result :: proc(
 		text, text_error := tool_argument_error_text(result.error, context.temp_allocator)
 		error_text = text
 		if text_error != nil { error_text = "the argument defect could not be described: out of memory" }
-	}
-	header := journal.Record {
-		kind        = .Tool_Completed,
-		node        = node,
-		request     = chat.request,
-		call        = call,
-		parent_call = parent_call,
 	}
 	attachments, attachments_error := attachments_record(chat.store, result.attachments, context.temp_allocator)
 	if attachments_error != nil {
@@ -118,6 +124,15 @@ chat_record_tool_result :: proc(
 		detail      = error_text,
 		attachments = attachments,
 	}
-	chat_record(chat, header, completed, transmute([]u8)result.content)
-	return chat_commit(chat, "the tool result could not be recorded")
+	if header.kind == .Background_Completed {
+		chat_record(
+			chat,
+			header,
+			journal.Background_Completed{outcome = completed.outcome, detail = completed.detail, tool = tool, attachments = completed.attachments},
+			transmute([]u8)result.content,
+		)
+	} else {
+		chat_record(chat, header, completed, transmute([]u8)result.content)
+	}
+	return true
 }

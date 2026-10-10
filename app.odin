@@ -396,9 +396,12 @@ Session_Start :: union {
 
 run_setup_destroy :: proc(setup: ^Run_Setup) {
 	journal.records_destroy(setup.follow_pending, setup.alloc)
+	setup.follow_pending = nil
 	agent.chat_session_destroy(&setup.session)
 	// The watch only wakes owners, so it stops once the session it woke is gone.
 	agent.session_watch_stop(&setup.watch)
+	setup.workers_abandoned ||= agent.chat_session_workers_outstanding(&setup.session)
+	if setup.workers_abandoned { return }
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)

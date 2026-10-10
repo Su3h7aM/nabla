@@ -252,6 +252,8 @@ Chat_Session :: struct {
 	// session that could not stop them. member is set only in a subagent's own session: the
 	// record its orchestrator keeps of it, which outlives this session.
 	team:                         ^Agent_Team,
+	background:                   Background_Jobs,
+	background_stop:              ai.Interrupt,
 	member:                       ^Subagent,
 	workers_retained:             bool,
 	// acp_agents are the ACP agent programs subagents may run, borrowed from the loaded config.
@@ -306,16 +308,17 @@ chat_session_init :: proc(
 		return {}, Tool_Registry_Error{kind = .Allocation}
 	}
 	chat := Chat_Session {
-		store             = store,
-		session           = session,
-		branch            = branch,
-		head              = head,
-		compact_retry     = chat_retry_policy_default(),
-		allocator         = allocator,
-		next_turn_id      = 1,
+		store = store,
+		session = session,
+		branch = branch,
+		head = head,
+		compact_retry = chat_retry_policy_default(),
+		allocator = allocator,
+		next_turn_id = 1,
 		next_operation_id = 1,
-		workspace         = owned_workspace,
-		tools             = tools,
+		workspace = owned_workspace,
+		background_stop = {parent = &process_interrupt},
+		tools = tools,
 	}
 	// Every table of a new session holds nothing and so allocates nothing; each carries only
 	// the allocator its first entry grows from.
@@ -396,7 +399,13 @@ chat_session_tool_jobs_abandoned :: proc(chat: ^Chat_Session) -> bool {
 // that owns the journal may call it.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
 	job_reclaim(chat)
-	return chat.workers_retained || len(chat.abandoned) > 0 || agent_team_running(chat.team) || (chat.team != nil && sync.atomic_load(&chat.team.abandoned))
+	return(
+		chat.workers_retained ||
+		len(chat.abandoned) > 0 ||
+		background_running(chat) ||
+		agent_team_running(chat.team) ||
+		(chat.team != nil && sync.atomic_load(&chat.team.abandoned)) \
+	)
 }
 
 // Tool_Registry_Replace_Error names why a registry replacement was refused.
@@ -451,18 +460,22 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false
 	}
+	background_destroy(chat)
 	retained := !agent_team_destroy(chat.team, chat, chat_session_tool_jobs_abandoned(chat))
 	chat.team = nil
-	chat.workers_retained = retained
+	chat.workers_retained ||= retained
 	// Compaction's worker borrows this session's id for its logging correlation, so
 	// it is stopped before anything the session owns is released.
 	chat_compact_destroy(chat)
+	chat_chain_release(chat)
 	// A worker that is still running keeps its job, the workspace, and the skill catalog, so
 	// those are left to process exit rather than freed under it.
 	outstanding := chat_session_workers_outstanding(chat)
-	chat_skill_catalog_release(chat)
-	if !outstanding { delete(chat.workspace, chat.allocator) }
-	chat_chain_release(chat)
+	if !outstanding {
+		chat_skill_catalog_release(chat)
+		delete(chat.workspace, chat.allocator)
+		chat.workspace = ""
+	}
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
 	// An abandoned attempt took over the WebSocket it was using, so this one is unshared.
 	if chat.provider_websocket != nil {
@@ -474,24 +487,33 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 	delete(chat.client_instructions, chat.allocator)
 	chat.client_instructions = ""
 	delete(chat.role_instructions, chat.allocator)
+	chat.role_instructions = ""
 	delete(chat.partial_assistant)
+	chat.partial_assistant = {}
 	chat_pending_response_clear(chat)
 	for &call in chat.pending_calls { chat_tool_call_destroy(&call, chat.allocator) }
 	delete(chat.pending_calls)
+	chat.pending_calls = {}
 	delete(chat.last_error, chat.allocator)
+	chat.last_error = ""
 	for level in chat.effort_levels { delete(level, chat.allocator) }
 	delete(chat.effort_levels)
+	chat.effort_levels = {}
 	delete(chat.effort, chat.allocator)
+	chat.effort = ""
 	delete(chat.tool_output_directory, chat.allocator)
+	chat.tool_output_directory = ""
 	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = ""
 	delete(chat.model_id, chat.allocator)
+	chat.model_id = ""
 	// An abandoned job is released only when its worker publishes, which nothing here waits
 	// for: the records stay allocated for the process.
 	delete(chat.abandoned)
+	chat.abandoned = {}
 	tool_registry_destroy(&chat.tools)
-	chat^ = {
-		workers_retained = outstanding,
-	}
+	chat.workers_retained = outstanding
+	if !outstanding { chat^ = {} }
 }
 
 // chat_clone_string copies value with allocator. The caller owns the copy, and a copy that
@@ -744,7 +766,7 @@ chat_session_accept_message :: proc(
 @(private, require_results)
 chat_session_recover_pending :: proc(chat: ^Chat_Session) -> bool {
 	if !chat.recovery_pending { return true }
-	_, recover_error := journal.recover(chat.store, chat.tool_output_directory)
+	_, recover_error := journal.recover(chat.store, chat.tool_output_directory, .Live)
 	if recover_error != nil {
 		chat_session_record_failure(chat, "the previous turn could not be recovered", recover_error)
 		chat.state = .Idle

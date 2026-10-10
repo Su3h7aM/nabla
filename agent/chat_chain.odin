@@ -518,7 +518,7 @@ chat_chain_await :: proc(chat: ^Chat_Session, usages: ^[dynamic]Chat_Request_Usa
 		// deadline, so the wait is open until a stop was seen.
 		deadline: Maybe(time.Tick)
 		if attempt.worker.stop_at != nil { deadline = job_stop_deadline(&attempt.worker) }
-		owner_wake_wait(seen, deadline)
+		owner_wake_wait(seen, chat_background_deadline(chat, deadline))
 	}
 }
 
@@ -670,7 +670,7 @@ chat_chain_wait :: proc(chat: ^Chat_Session, seen: u32) {
 		return
 	}
 	if due, timed := chain.backoff_until.?; !timed || time.tick_diff(time.tick_now(), due) > 0 {
-		owner_wake_wait(seen, chain.backoff_until)
+		owner_wake_wait(seen, chat_background_deadline(chat, chain.backoff_until))
 		return
 	}
 	chat_retry_record_completed(chat, chain.request, chain.attempts + 1, .Response, .Resent)
@@ -700,7 +700,7 @@ chat_chain_repair :: proc(chat: ^Chat_Session, seen: u32) {
 			chat_chain_stop(chat, .Cancelled)
 			return
 		}
-		owner_wake_wait(seen, chat_compact_deadline(chat))
+		owner_wake_wait(seen, chat_background_deadline(chat, chat_compact_deadline(chat)))
 		chat_session_observe_stop(chat)
 		if chat_session_cancelled(chat) { chat_chain_stop(chat, .Cancelled) }
 		return

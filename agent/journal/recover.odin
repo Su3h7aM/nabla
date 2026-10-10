@@ -8,23 +8,31 @@ import "nabla:db"
 
 Recovery :: Session_Recovered
 
+// Recovery_Scope distinguishes a new claim after process death from repair while the
+// session owner still holds its background jobs.
+Recovery_Scope :: enum {
+	Claim,
+	Live,
+}
+
 // KEPT_STDOUT_SUFFIX and KEPT_STDERR_SUFFIX follow a call's id in the names of the files a
 // shell call writes its streams to as they arrive.
 KEPT_STDOUT_SUFFIX :: ".stdout.txt"
 KEPT_STDERR_SUFFIX :: ".stderr.txt"
 
-// recover records an outcome for all work the claimed session left open when
-// its process died, in one transaction, and replays nothing. It records nothing
+// recover settles the claimed session's open durable work in one transaction and
+// replays nothing. Claim assumes the previous process died; Live leaves background
+// calls open for the running owner's completion. It records nothing
 // when nothing was open, so recovering twice changes nothing. A failure after
 // outcomes are staged latches the journal, so none of them is written. A call that was
 // running is settled as Unknown naming the kept stream files that exist for it in
 // kept_directory, with their sizes; "" names none.
 @(require_results)
-recover :: proc(journal: ^Journal, kept_directory := "") -> (recovery: Recovery, error: Error) {
+recover :: proc(journal: ^Journal, kept_directory := "", scope := Recovery_Scope.Claim) -> (recovery: Recovery, error: Error) {
 	assert(journal.claimed != {}, "recover needs a claimed session")
 	_ = commit(journal) or_return
 	defer if error != nil && journal.failure == nil && !error_is_busy(error) { latch(journal, error) }
-	recover_open_work(journal, &recovery, kept_directory) or_return
+	recover_open_work(journal, &recovery, kept_directory, scope) or_return
 	recover_results(journal, &recovery) or_return
 	if recovery == {} { return }
 	append_record(journal, Record{kind = .Session_Recovered, session = journal.claimed}, recovery)
@@ -49,7 +57,7 @@ Recovery_Rule :: enum {
 }
 
 @(private, require_results)
-recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory: string) -> (error: Error) {
+recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory: string, scope: Recovery_Scope) -> (error: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
@@ -75,6 +83,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 		header.subagent = Session_Id(row_id(&row))
 		data := row_view(&row)
 		if row.error != nil || rule > max(Recovery_Rule) { return corrupt(journal, Journal_Error.Corrupt, journal.claimed, 0) }
+		if scope == .Live && rule == .Background_Call { continue }
 
 		unknown := Call_Completed {
 			outcome = TOOL_OUTCOME_NAMES[.Unknown],

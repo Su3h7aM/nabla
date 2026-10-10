@@ -18,7 +18,9 @@ TOOL_READ_DESCRIPTION :: `Read a text file and return a window of its lines. Use
 
 offset is the first line, counting from 1 (default 1), and limit is the number of lines (default 2000). The result starts with path, first_line, line_count (lines returned), total_lines, and truncated, which is true when lines remain after the window; the text of the lines follows after a blank line. At most %d KiB of one result is shown to you. When the window is longer, the text is cut at a line break and a notice gives the number of complete lines shown and the offset to continue from; call read again with that offset and a smaller limit. The notice also names a file that holds the whole result.`
 
-TOOL_READ_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"offset":{"type":["integer","null"],"description":"First line to read, counting from 1. Default: 1."},"limit":{"type":["integer","null"],"description":"Maximum number of lines to read. Default: 2000."}},"required":["path"],"additionalProperties":false}`
+TOOL_READ_SCHEMA ::
+	`{"type":"object","properties":{` +
+	`"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"offset":{"type":["integer","null"],"description":"First line to read, counting from 1. Default: 1."},"limit":{"type":["integer","null"],"description":"Maximum number of lines to read. Default: 2000."}},"required":["path"],"additionalProperties":false}`
 
 TOOL_READ_FIELDS :: []string{"path", "offset", "limit"}
 
@@ -186,7 +188,9 @@ TOOL_WRITE_NAME :: "write"
 
 TOOL_WRITE_DESCRIPTION :: `Write a whole text file, creating it or replacing what it held. Use it for a new file or a complete rewrite, including a script you would otherwise create with a shell heredoc; to change part of an existing file use edit, which sends only the changed lines. Relative paths start at the session workspace, and absolute paths are used as given. The parent directory must already exist; edit with Add File creates directories. The write is atomic: a reader sees the old file or the whole new one, and a replaced file keeps its permissions. A symbolic link or a path that is not a regular file is refused. The result gives path and the number of bytes written.`
 
-TOOL_WRITE_SCHEMA :: `{"type":"object","properties":{"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"content":{"type":"string","description":"The complete new contents of the file; whatever the file held is replaced."}},"required":["path","content"],"additionalProperties":false}`
+TOOL_WRITE_SCHEMA ::
+	`{"type":"object","properties":{` +
+	`"path":{"type":"string","description":"File path. Relative paths start at the session workspace; absolute paths are used as given."},"content":{"type":"string","description":"The complete new contents of the file; whatever the file held is replaced."}},"required":["path","content"],"additionalProperties":false}`
 
 TOOL_WRITE_FIELDS :: []string{"path", "content"}
 

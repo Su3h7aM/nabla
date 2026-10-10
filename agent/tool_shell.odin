@@ -14,7 +14,7 @@ TOOL_SHELL_NAME :: "shell"
 // MiB, and the default timeout in seconds.
 TOOL_SHELL_BODY :: `The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with write or patch, not with a heredoc or echo redirection. This is not a terminal.
 
-The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
+The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds for a waiting call and none for a background call unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
 
 // TOOL_SHELL_FISH_NOTES follows the body when the shell is fish, whose syntax models most
 // often get wrong because they write bash.
@@ -33,9 +33,11 @@ tool_shell_preferred :: proc() -> string {
 	return shell
 }
 
-TOOL_SHELL_SCHEMA :: `{"type":"object","properties":{"command":{"type":"string","description":"The command, written in the syntax of the shell the tool description names."},"working_directory":{"type":["string","null"],"description":"Directory in which to run the command. Relative paths start at the session workspace. Leave out or pass null for the workspace itself."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds, with no maximum. Leave out or pass null for the default the tool description states."}},"required":["command"],"additionalProperties":false}`
+TOOL_SHELL_SCHEMA ::
+	`{"type":"object","properties":{` +
+	`"wait":{"type":["boolean","null"],"description":"False runs the command in the background, answers at once with a job id, and delivers the result as a message when it ends. Use it for long work such as builds, test suites, or servers. A background command has no timeout unless you set timeout_ms. Default: true."},"command":{"type":"string","description":"The command, written in the syntax of the shell the tool description names."},"working_directory":{"type":["string","null"],"description":"Directory in which to run the command. Relative paths start at the session workspace. Leave out or pass null for the workspace itself."},"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds, with no maximum. Leave out or pass null for the default the tool description states."}},"required":["command"],"additionalProperties":false}`
 
-TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms"}
+TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms", "wait"}
 
 // TOOL_SHELL_DEFAULT_TIMEOUT applies when the model gives no timeout. There is no maximum.
 TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
@@ -92,16 +94,22 @@ tool_shell_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: Sh
 	if strings.contains_rune(working_directory, 0) {
 		return {}, tool_argument_error(.Invalid_Value, "working_directory", "a path without a NUL byte", ctx.allocator)
 	}
+	wait := true
+	if value, given := arguments["wait"]; given {
+		if _, is_null := value.(json.Null); !is_null { wait = tool_field_optional_bool(arguments, "wait", allocator = ctx.allocator) or_return }
+	}
+	// A background command has no timeout unless the model gives one.
+	default_timeout := ctx.timeout if wait else 0
 	timeout_ms := tool_field_optional_int(
 		arguments,
 		"timeout_ms",
-		int(ctx.timeout / time.Millisecond),
+		int(default_timeout / time.Millisecond),
 		1,
 		int(max(time.Duration) / time.Millisecond),
 		&ctx.repairs,
 		allocator = ctx.allocator,
 	) or_return
-	return {command = command, working_directory = working_directory, timeout = time.Duration(timeout_ms) * time.Millisecond}, nil
+	return {command = command, working_directory = working_directory, timeout = time.Duration(timeout_ms) * time.Millisecond, wait = wait}, nil
 }
 
 // tool_shell_start runs a command with the shell this process was started from,
