@@ -962,6 +962,43 @@ test_wheel_down_at_the_bottom_does_not_focus_the_transcript :: proc(t: ^testing.
 	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
 }
 
+// In the transcript, a downward scroll that does not reach the bottom stays there, and the next attempt at the
+// bottom returns the keyboard to the prompt, for the wheel and for every scroll-down key.
+@(test)
+test_scrolling_down_at_the_bottom_returns_to_the_prompt :: proc(t: ^testing.T) {
+	app := selection_app(t)
+	defer selection_app_destroy(app)
+	widgets.scroll_set_range(&app.conversation_scroll, 100)
+	row := conversation_row_with(app.storage, "alpha")
+	if !testing.expect(t, row >= 0, "the entry must be drawn") { return }
+	column := app.conversation_rect.x + 1
+	wheel_down := input.Mouse_Event {
+		button = .Wheel_Down,
+		x      = column,
+		y      = row,
+	}
+
+	scroll_back(app, 2 * MOUSE_WHEEL_LINES)
+	wheel_scroll(app, wheel_down)
+	testing.expect_value(t, scrolled_back(app), MOUSE_WHEEL_LINES)
+	testing.expect(t, app.transcript.focused, "wheel down above the bottom must stay in the transcript")
+	wheel_scroll(app, wheel_down)
+	testing.expect_value(t, scrolled_back(app), 0)
+	testing.expect(t, app.transcript.focused, "reaching the bottom must not leave the transcript")
+	wheel_scroll(app, wheel_down)
+	testing.expect(t, !app.transcript.focused, "wheel down at the bottom must return to the prompt")
+
+	for code in ([]input.Key_Code{.Down, .Page_Down}) {
+		scroll_back(app, 1)
+		app.transcript.focused = true
+		handle_key(app, input.Key_Event{code = code})
+		testing.expect_value(t, scrolled_back(app), 0)
+		testing.expect(t, app.transcript.focused, "reaching the bottom by key must not leave the transcript")
+		handle_key(app, input.Key_Event{code = code})
+		testing.expect(t, !app.transcript.focused, "a down key at the bottom must return to the prompt")
+	}
+}
+
 // selection_report builds a mouse report for a screen cell.
 selection_report :: proc(button: input.Mouse_Button, column, row: int, motion := false, release := false) -> input.Mouse_Event {
 	return {button = button, x = column, y = row, motion = motion, release = release}

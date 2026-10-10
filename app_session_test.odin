@@ -3399,7 +3399,7 @@ test_keyboard_navigation_reaches_every_transcript_block_at_the_bottom :: proc(t:
 	handle_event(&app, input.Key_Event{code = .Up})
 	handle_event(&app, input.Key_Event{code = .Down})
 	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, lower_call)), 1)
-	for _ in 0 ..= app_tool_scroll(t, &app, lower_call).range { handle_event(&app, input.Key_Event{code = .Down}) }
+	for _ in 1 ..< app_tool_scroll(t, &app, lower_call).range { handle_event(&app, input.Key_Event{code = .Down}) }
 	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, lower_call)), app_tool_scroll(t, &app, lower_call).range)
 	testing.expect_value(t, widgets.scroll_offset(app.conversation_scroll), view_top)
 	handle_event(&app, input.Key_Event{code = .Escape})

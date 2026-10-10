@@ -775,14 +775,21 @@ transcript_reselect :: proc(app: ^App) {
 }
 
 // transcript_tool_scroll moves the window of the active box by delta rows. The wheel and the arrow keys
-// share this step. It scrolls the selected entry itself, and reports false when that entry is not the
-// active box, so the caller can drop the activation. The caller holds the runtime mutex.
+// share this step. It scrolls the selected entry itself, and reports false for active when that entry is not the
+// active box, so the caller can drop the activation. moved says the box had room. The caller holds the runtime mutex.
 @(require_results)
-transcript_tool_scroll :: proc(app: ^App, delta: int) -> bool {
+transcript_tool_scroll :: proc(app: ^App, delta: int) -> (active, moved: bool) {
 	transcript := &app.transcript
 	entry := entry_find(app, transcript.selected_entry)
-	if entry == nil || transcript.active_call == 0 || entry.call != transcript.active_call { return false }
-	_ = widgets.scroll_by(&entry.tool_scroll, delta)
+	if entry == nil || transcript.active_call == 0 || entry.call != transcript.active_call { return false, false }
+	return true, widgets.scroll_by(&entry.tool_scroll, delta)
+}
+
+// transcript_leave_at_bottom returns the keyboard to the prompt when the transcript has the keyboard and a
+// scroll down meets the end of the whole history. It reports whether it did.
+transcript_leave_at_bottom :: proc(app: ^App, delta: int) -> bool {
+	if delta <= 0 || !app.transcript.focused || !transcript_at_bottom(app) { return false }
+	transcript_blur(app)
 	return true
 }
 
@@ -870,7 +877,11 @@ transcript_arrow :: proc(app: ^App, delta: int) {
 	transcript := &app.transcript
 	order := transcript_order(app)
 	if transcript.active_call != 0 {
-		if transcript_tool_scroll(app, delta) { return }
+		active, moved := transcript_tool_scroll(app, delta)
+		if active {
+			if !moved { _ = transcript_leave_at_bottom(app, delta) }
+			return
+		}
 		transcript.active_call = 0
 	}
 	if transcript.selection_step == 0 && transcript_move(app, order, delta) { return }
@@ -880,6 +891,7 @@ transcript_arrow :: proc(app: ^App, delta: int) {
 	   (transcript.selection_step < 0 && transcript.first == 0) ||
 	   (transcript.selection_step > 0 && transcript.end == len(transcript.path)) {
 		transcript.selection_step = 0
+		_ = transcript_leave_at_bottom(app, delta)
 		return
 	}
 	transcript_scroll_to(app, 0 if transcript.selection_step < 0 else app.conversation_scroll.range)

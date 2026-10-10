@@ -220,7 +220,7 @@ tool_box_entry_id :: proc(app: ^App, x, y: int) -> u64 {
 // box under the pointer takes it, becomes the target, and consumes the report even at its first
 // or last row, as the arrow keys do. Anywhere else the transcript scrolls, drops any active box,
 // and focus moves to the box nearest the middle of the view, if any. Scrolling down at the
-// bottom of the history does nothing.
+// bottom of the history does nothing in the prompt, and returns the keyboard to it from the transcript.
 wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	delta: int
 	#partial switch mouse.button {
@@ -233,17 +233,25 @@ wheel_scroll :: proc(app: ^App, mouse: input.Mouse_Event) {
 	}
 	if !tui.rect_contains(app.conversation_rect, mouse.x, mouse.y) { return }
 	if steer_wheel(app, mouse, delta) { return }
+	focused := app.transcript.focused
 	if id := tool_box_entry_id(app, mouse.x, mouse.y); id != 0 {
 		sync.mutex_guard(&app.run.mu)
 		if entry := entry_find(app, id); entry != nil && entry.call in app.transcript.expanded {
 			transcript_target(app, entry)
 			app.transcript.selection_step = 0
 			app.transcript.active_call = entry.call
-			if transcript_tool_scroll(app, delta) { return }
+			active, moved := transcript_tool_scroll(app, delta)
+			if active {
+				if !moved && focused { _ = transcript_leave_at_bottom(app, delta) }
+				return
+			}
 			app.transcript.active_call = 0
 		}
 	}
-	if delta > 0 && transcript_at_bottom(app) { return }
+	if delta > 0 && transcript_at_bottom(app) {
+		if focused { transcript_blur(app) }
+		return
+	}
 	transcript_scroll_by(app, delta)
 	transcript_reselect(app)
 }
@@ -507,6 +515,7 @@ interrupt :: proc(app: ^App) {
 // scroll_page scrolls the transcript by the height of its viewport.
 scroll_page :: proc(app: ^App, up: bool) {
 	page := app.conversation_rect.height
+	if !up && transcript_leave_at_bottom(app, page) { return }
 	if app.transcript.active_call == 0 { app.transcript.selected_entry, app.transcript.selection_step = 0, 0 }
 	transcript_scroll_by(app, -page if up else page)
 }
