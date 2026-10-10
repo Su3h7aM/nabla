@@ -939,6 +939,11 @@ snap_report_dropped_locked :: proc(app: ^App) {
 
 snap_push_locked :: proc(app: ^App, entry: Entry) {
 	entry := entry // a parameter is not addressable, and the refused entry is destroyed
+	// Whatever follows a streaming response ends it: its text is final, and the
+	// transcript may cover it as soon as the journal shows the response.
+	if count := len(app.run.snap.entries); count > 0 && app.run.snap.entries[count - 1].kind == .Assistant {
+		app.run.snap.entries[count - 1].complete = true
+	}
 	if _, append_error := append(&app.run.snap.entries, entry); append_error != nil {
 		app.run.snap.image_bytes -= entry.image.bytes
 		// Nothing holds the buffer now: the array did not take the entry. A
@@ -1040,9 +1045,10 @@ observer_assistant_end :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
 	if app.run.snap.status.following { return }
-	count := len(app.run.snap.entries)
-	if count > 0 {
-		app.run.snap.entries[count - 1].complete = true
+	#reverse for &entry in app.run.snap.entries {
+		if entry.kind != .Assistant { continue }
+		entry.complete = true
+		break
 	}
 	snap_publish_locked(app)
 }

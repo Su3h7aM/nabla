@@ -1083,6 +1083,40 @@ test_live_entries_give_way_to_their_committed_form :: proc(t: ^testing.T) {
 	testing.expect_value(t, widgets.scroll_offset(app_tool_scroll(t, &app, call)), selected_offset)
 }
 
+// The turn closes its response only at the end, so a response followed by a call is already complete
+// when its node commits, and the committed text must not be shown twice.
+@(test)
+test_a_response_followed_by_a_call_is_shown_once :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	chat := &app.setup.session
+	store := app.setup.store
+
+	prompt := app_history_node(&app, 0, .User, "list files")
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the prompt could not be committed") }
+	head_publish(&app)
+	observer_assistant_begin(&app)
+	observer_assistant_text(&app, "streaming")
+
+	assistant := app_history_node(&app, prompt, .Assistant, "streaming")
+	call := journal.next_call(store)
+	arguments := `{"command":"ls"}`
+	journal.append_record(
+		store,
+		{kind = .Tool_Proposed, session = chat.session, branch = chat.branch, node = assistant, turn = chat.turn, call = call},
+		journal.Tool_Proposed{provider_id = "call_1", name = "shell"},
+		transmute([]u8)arguments,
+	)
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "the answer could not be committed") }
+	head_publish(&app)
+	app_observe_call(&app, call, 0, "shell", arguments)
+
+	entries := app_entries(&app)
+	testing.expect_value(t, app_entries_count(&app, "streaming"), 1)
+	testing.expect_value(t, len(entries), 3)
+}
+
 // app_history_shell appends an assistant node that ran a shell call whose result has lines numbered lines, and returns the results node.
 app_history_shell :: proc(app: ^App, parent: journal.Node_Id, lines: int) -> journal.Node_Id {
 	store := app.setup.store
