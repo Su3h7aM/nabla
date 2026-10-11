@@ -1078,13 +1078,13 @@ acp_prompt_text :: proc(
 		delete(collected)
 	}
 	for block, index in blocks {
-		switch block.type {
-		case acp.CONTENT_TEXT:
-			if !acp_prompt_append(&builder, block.text) {
+		switch kind in block.variant {
+		case acp.Content_Text:
+			if !acp_prompt_append(&builder, kind.text) {
 				return "", nil, "the prompt could not be allocated", false
 			}
-		case acp.CONTENT_IMAGE:
-			switch acp_prompt_attach(&collected, block.data, block.uri, allocator) {
+		case acp.Content_Image:
+			switch acp_prompt_attach(&collected, kind.data, kind.uri, allocator) {
 			case .Attached:
 			case .Unrecognized:
 				return "", nil, fmt.tprintf("prompt block %d: the image is not a PNG, JPEG, GIF, or WebP file", index + 1), false
@@ -1093,22 +1093,23 @@ acp_prompt_text :: proc(
 			case .Allocation:
 				return "", nil, "the prompt could not be allocated", false
 			}
-		case acp.CONTENT_RESOURCE_LINK:
-			if block.uri == "" { continue }
-			path, path_ok := acp_resource_path(block.uri, context.temp_allocator)
+		case acp.Content_Resource_Link:
+			if kind.uri == "" { continue }
+			path, path_ok := acp_resource_path(kind.uri, context.temp_allocator)
 			defer delete(path, context.temp_allocator)
 			if !path_ok || !acp_prompt_append(&builder, path) {
 				return "", nil, "the resource path could not be allocated", false
 			}
-		case acp.CONTENT_RESOURCE:
-			resource := block.resource.? or_else acp.Embedded_Resource{}
-			if resource.text != "" {
-				if !acp_prompt_append(&builder, resource.text) {
+		case acp.Content_Resource:
+			resource := kind.resource
+			text_resource, is_text := resource.variant.(acp.Resource_Text)
+			if is_text && text_resource.text != "" {
+				if !acp_prompt_append(&builder, text_resource.text) {
 					return "", nil, "the prompt could not be allocated", false
 				}
 			}
-			if resource.blob_present {
-				switch acp_prompt_attach(&collected, resource.blob, resource.uri, allocator) {
+			if blob_resource, is_blob := resource.variant.(acp.Resource_Blob); is_blob {
+				switch acp_prompt_attach(&collected, blob_resource.blob, resource.uri, allocator) {
 				case .Attached:
 				case .Unrecognized:
 					if !acp_prompt_append_binary_resource(&builder, resource) {
@@ -1119,15 +1120,19 @@ acp_prompt_text :: proc(
 				case .Allocation:
 					return "", nil, "the prompt could not be allocated", false
 				}
-			} else if resource.text == "" && resource.uri != "" {
+			} else if text_resource.text == "" && resource.uri != "" {
 				path, path_ok := acp_resource_path(resource.uri, context.temp_allocator)
 				defer delete(path, context.temp_allocator)
 				if !path_ok || !acp_prompt_append(&builder, path) {
 					return "", nil, "the resource path could not be allocated", false
 				}
 			}
-		case:
-			return "", nil, fmt.tprintf("prompt content of type %q is not supported", block.type), false
+		case acp.Content_Audio:
+			return "", nil, fmt.tprintf("prompt content of type %q is not supported", acp.CONTENT_AUDIO), false
+		case acp.Content_Other:
+			return "", nil, fmt.tprintf("prompt content of type %q is not supported", kind.type), false
+		case nil:
+			return "", nil, fmt.tprintf("prompt block %d has no content", index + 1), false
 		}
 	}
 	text = strings.to_string(builder)
@@ -1201,7 +1206,7 @@ acp_prompt_append :: proc(builder: ^strings.Builder, text: string) -> bool {
 }
 
 @(private, require_results)
-acp_prompt_append_binary_resource :: proc(builder: ^strings.Builder, resource: acp.Embedded_Resource) -> bool {
+acp_prompt_append_binary_resource :: proc(builder: ^strings.Builder, resource: acp.Resource_Contents) -> bool {
 	BINARY_RESOURCE_PREFIX :: "[binary resource "
 	BINARY_RESOURCE_MIME_PREFIX :: " ("
 	BINARY_RESOURCE_SUFFIX :: ") was attached; its bytes are not included]"

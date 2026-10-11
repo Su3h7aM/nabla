@@ -195,7 +195,7 @@ Request_Envelope :: struct($P: typeid) {
 write_submit :: proc(writer: ^Writer, envelope: $E, response: bool) -> Write_Error {
 	state := writer.state
 	if state == nil { return .Closed }
-	body, marshal_error := json.marshal(envelope, allocator = context.temp_allocator)
+	body, marshal_error := json.marshal(envelope, {sort_maps_by_key = true}, allocator = context.temp_allocator)
 	if marshal_error != nil {
 		err := write_encode_error(marshal_error)
 		if response { writer_latch_failure(state) }

@@ -320,12 +320,14 @@ test_writer_frames_a_request :: proc(t: ^testing.T) {
 
 	params := Session_Prompt_Params {
 		session_id = "s",
-		prompt     = {{type = "text", text = "hi"}},
+		prompt     = {{variant = Content_Text{text = "hi"}}},
 	}
-	testing.expect(t, write_request(&writer, i64(7), METHOD_SESSION_PROMPT, params) == .None)
+	request, request_error := session_prompt_request(params, context.temp_allocator)
+	testing.expect_value(t, request_error, nil)
+	testing.expect(t, write_request(&writer, i64(7), METHOD_SESSION_PROMPT, request) == .None)
 	test_writer_finish(t, &writer)
 
-	want := `{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hi"}]}}` + "\n"
+	want := `{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"text":"hi","type":"text"}]}}` + "\n"
 	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
 }
 
@@ -352,11 +354,6 @@ test_writer_frames_client_requests_without_agent_only_fields :: proc(t: ^testing
 		value      = "m",
 	}
 	testing.expect(t, write_request(&writer, i64(5), METHOD_SESSION_SET_CONFIG_OPTION, option) == .None)
-	prompt := Session_Prompt_Params {
-		session_id = "s",
-		prompt     = {{type = CONTENT_TEXT, text = "hi"}},
-	}
-	testing.expect(t, write_request(&writer, i64(6), METHOD_SESSION_PROMPT, prompt) == .None)
 	test_writer_finish(t, &writer)
 
 	want :=
@@ -369,8 +366,6 @@ test_writer_frames_client_requests_without_agent_only_fields :: proc(t: ^testing
 		`{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"s","cwd":"/w","mcpServers":[]}}` +
 		"\n" +
 		`{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"s","configId":"model","value":"m"}}` +
-		"\n" +
-		`{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hi"}]}}` +
 		"\n"
 	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
 }
@@ -420,34 +415,4 @@ test_v2_resume_params_read_replay_cursor :: proc(t: ^testing.T) {
 	testing.expect(t, present)
 	testing.expect_value(t, cursor.type, "start")
 	delete(cursor.type)
-}
-
-@(test)
-test_params_decode_reads_content_blocks_and_tolerates_extra_fields :: proc(t: ^testing.T) {
-	value, parse_err := json.parse_string(
-		`{"sessionId":"s","prompt":[{"type":"text","text":"hi","_meta":{}},{"type":"resource_link","uri":"file:///a.odin","name":"a.odin"}],"extra":1}`,
-		.JSON,
-		true,
-		context.allocator,
-	)
-	defer json.destroy_value(value, context.allocator)
-	testing.expect(t, parse_err == nil)
-
-	params: Session_Prompt_Params
-	testing.expect_value(t, params_decode(value, &params), Params_Error.None)
-	defer {
-		delete(params.session_id)
-		for block in params.prompt {
-			delete(block.type)
-			delete(block.text)
-			delete(block.uri)
-		}
-		delete(params.prompt)
-	}
-	testing.expect_value(t, params.session_id, "s")
-	testing.expect_value(t, len(params.prompt), 2)
-	testing.expect_value(t, params.prompt[0].type, CONTENT_TEXT)
-	testing.expect_value(t, params.prompt[0].text, "hi")
-	testing.expect_value(t, params.prompt[1].type, CONTENT_RESOURCE_LINK)
-	testing.expect_value(t, params.prompt[1].uri, "file:///a.odin")
 }

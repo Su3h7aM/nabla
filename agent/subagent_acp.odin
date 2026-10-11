@@ -990,12 +990,13 @@ acp_options_replace :: proc(connection: ^ACP_Connection, options: []ACP_Config_O
 // acp_prompt_send acknowledges additional version 2 input without waiting for idle.
 @(private, require_results)
 acp_prompt_send :: proc(connection: ^ACP_Connection, text: string) -> string {
-	return acp_send(
-		connection,
-		nil,
-		acp.METHOD_SESSION_PROMPT,
-		acp.Session_Prompt_Params{session_id = connection.session_id, prompt = {{type = acp.CONTENT_TEXT, text = text}}},
-	)
+	params := acp.Session_Prompt_Params {
+		session_id = connection.session_id,
+		prompt     = {{variant = acp.Content_Text{text = text}}},
+	}
+	request, request_error := acp.session_prompt_request(params, context.temp_allocator)
+	if request_error != nil { return "the prompt could not be allocated" }
+	return acp_send(connection, nil, acp.METHOD_SESSION_PROMPT, request)
 }
 
 @(private, require_results)

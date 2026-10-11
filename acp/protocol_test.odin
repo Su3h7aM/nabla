@@ -89,11 +89,12 @@ test_prompt_params_decode_reads_blob_metadata_without_copying_payload :: proc(t:
 	defer delete(params.prompt, context.allocator)
 	testing.expect_value(t, params.session_id, "s")
 	if !testing.expect_value(t, len(params.prompt), 1) { return }
-	resource, has_resource := params.prompt[0].resource.?
-	testing.expect(t, has_resource)
-	testing.expect(t, resource.blob_present)
-	testing.expect_value(t, resource.uri, "file:///a.bin")
-	testing.expect_value(t, resource.mime_type, "application/octet-stream")
+	content, is_resource := params.prompt[0].variant.(Content_Resource)
+	testing.expect(t, is_resource)
+	_, is_blob := content.resource.variant.(Resource_Blob)
+	testing.expect(t, is_blob)
+	testing.expect_value(t, content.resource.uri, "file:///a.bin")
+	testing.expect_value(t, content.resource.mime_type, "application/octet-stream")
 }
 
 @(test)

@@ -14,10 +14,10 @@ import "nabla:ai"
 @(test)
 test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^testing.T) {
 	blocks := []acp.Content_Block {
-		{type = acp.CONTENT_TEXT, text = "explain this"},
-		{type = acp.CONTENT_RESOURCE_LINK, uri = "file:///tmp/example.odin"},
-		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/inlined.txt", text = "inlined text"}},
-		{type = acp.CONTENT_TEXT, text = "and this"},
+		{variant = acp.Content_Text{text = "explain this"}},
+		{variant = acp.Content_Resource_Link{uri = "file:///tmp/example.odin"}},
+		{variant = acp.Content_Resource{resource = {uri = "file:///tmp/inlined.txt", variant = acp.Resource_Text{text = "inlined text"}}}},
+		{variant = acp.Content_Text{text = "and this"}},
 	}
 	text, _, reason, ok := acp_prompt_text(blocks, context.temp_allocator)
 	testing.expectf(t, ok, "the prompt was refused: %s", reason)
@@ -25,23 +25,27 @@ test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^test
 
 	// Content the agent does not accept is refused rather than dropped: a client must be
 	// told that part of what it sent never reached the model.
-	unsupported := []acp.Content_Block{{type = acp.CONTENT_AUDIO}}
+	unsupported := []acp.Content_Block{{variant = acp.Content_Audio{}}}
 	_, _, image_reason, image_ok := acp_prompt_text(unsupported, context.temp_allocator)
 	testing.expect(t, !image_ok)
 	testing.expect(t, image_reason != "")
-	not_an_image := []acp.Content_Block{{type = acp.CONTENT_IMAGE, data = "aGVsbG8=", mime_type = "image/png"}}
+	not_an_image := []acp.Content_Block{{variant = acp.Content_Image{data = "aGVsbG8=", mime_type = "image/png"}}}
 	_, _, not_image_reason, not_image_ok := acp_prompt_text(not_an_image, context.temp_allocator)
 	testing.expect(t, !not_image_ok)
 	testing.expect(t, not_image_reason != "")
-	bad_base64 := []acp.Content_Block{{type = acp.CONTENT_IMAGE, data = "!!!"}}
+	bad_base64 := []acp.Content_Block{{variant = acp.Content_Image{data = "!!!"}}}
 	_, _, bad_reason, bad_ok := acp_prompt_text(bad_base64, context.temp_allocator)
 	testing.expect(t, !bad_ok)
 	testing.expect(t, bad_reason != "")
 
 	// The signature decides: a PDF sent as a blob resource is a document attachment, and an image block without a uri is named by its position and format.
 	files := []acp.Content_Block {
-		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/paper.pdf", mime_type = "text/plain", blob = "JVBERi0xLjQK", blob_present = true}},
-		{type = acp.CONTENT_IMAGE, data = "iVBORw0KGgo="},
+		{
+			variant = acp.Content_Resource {
+				resource = {uri = "file:///tmp/paper.pdf", mime_type = "text/plain", variant = acp.Resource_Blob{blob = "JVBERi0xLjQK"}},
+			},
+		},
+		{variant = acp.Content_Image{data = "iVBORw0KGgo="}},
 	}
 	file_text, attachments, file_reason, file_ok := acp_prompt_text(files, context.temp_allocator)
 	testing.expectf(t, file_ok, "the files were refused: %s", file_reason)
@@ -54,12 +58,12 @@ test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^test
 	}
 
 	binary := []acp.Content_Block {
-		{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/archive.bin", mime_type = "application/octet-stream", blob_present = true}},
+		{variant = acp.Content_Resource{resource = {uri = "file:///tmp/archive.bin", mime_type = "application/octet-stream", variant = acp.Resource_Blob{}}}},
 	}
 	binary_text, _, binary_reason, binary_ok := acp_prompt_text(binary, context.temp_allocator)
 	testing.expectf(t, binary_ok, "the binary prompt was refused: %s", binary_reason)
 	testing.expect_value(t, binary_text, "[binary resource file:///tmp/archive.bin (application/octet-stream) was attached; its bytes are not included]")
-	unknown_type := []acp.Content_Block{{type = acp.CONTENT_RESOURCE, resource = {uri = "file:///tmp/data", blob_present = true}}}
+	unknown_type := []acp.Content_Block{{variant = acp.Content_Resource{resource = {uri = "file:///tmp/data", variant = acp.Resource_Blob{}}}}}
 	unknown_text, _, _, unknown_ok := acp_prompt_text(unknown_type, context.temp_allocator)
 	testing.expect(t, unknown_ok)
 	testing.expect_value(t, unknown_text, "[binary resource file:///tmp/data (unknown type) was attached; its bytes are not included]")

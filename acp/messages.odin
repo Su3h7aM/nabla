@@ -1,6 +1,7 @@
 package acp
 
 import "core:encoding/json"
+import "core:mem"
 
 // Protocol facts for the Agent Client Protocol.
 //
@@ -285,28 +286,86 @@ Session_Close_Params :: struct {
 	session_id: string `json:"sessionId"`,
 }
 
-// Embedded_Resource is a resource the client inlined into the prompt. Text travels with
-// the message; a binary resource keeps its base64 text in blob, borrowed from the decoded JSON value, and blob_present reports whether the field was there at
-// all.
-Embedded_Resource :: struct {
-	uri:          string `json:"uri"`,
-	text:         string `json:"text"`,
-	mime_type:    string `json:"mimeType,omitempty"`,
-	blob:         string `json:"-"`,
-	blob_present: bool `json:"-"`,
+// Content_Block is one element of a prompt or message. `_meta` and `annotations` are shared by every
+// kind and nil when absent; variant holds the fields of the kind the wire `type` names. An empty string
+// stands for an absent optional string where the schema allows absence.
+Content_Block :: struct {
+	meta:        json.Value,
+	annotations: json.Value,
+	variant:     union {
+		Content_Text,
+		Content_Image,
+		Content_Audio,
+		Content_Resource_Link,
+		Content_Resource,
+		Content_Other,
+	},
 }
 
-// Content_Block is one element of a prompt. The union is by `type`, and every kind's
-// fields live side by side rather than in a tagged union, because the JSON decoder fills
-// the shape the document has and a block carries whichever fields its type names. An image block keeps its base64 text in data, borrowed from the decoded JSON
-// value.
-Content_Block :: struct {
-	type:      string `json:"type"`,
-	text:      string `json:"text"`,
-	uri:       string `json:"uri,omitempty"`,
-	data:      string `json:"data,omitempty"`,
-	mime_type: string `json:"mimeType,omitempty"`,
-	resource:  Maybe(Embedded_Resource) `json:"resource,omitempty"`,
+Content_Text :: struct {
+	text: string,
+}
+
+// Content_Image and Content_Audio hold base64 text in data, borrowed from the decoded JSON value.
+Content_Image :: struct {
+	data:      string,
+	mime_type: string,
+	uri:       string,
+}
+
+Content_Audio :: struct {
+	data:      string,
+	mime_type: string,
+}
+
+// Content_Resource_Link has a size of Maybe because zero is a real size.
+Content_Resource_Link :: struct {
+	uri:         string,
+	name:        string,
+	mime_type:   string,
+	title:       string,
+	description: string,
+	size:        Maybe(i64),
+	icons:       []Icon,
+}
+
+// Icon is v2 only. An empty sizes means any size.
+Icon :: struct {
+	src:       string,
+	mime_type: string,
+	sizes:     []string,
+	theme:     string,
+}
+
+Content_Resource :: struct {
+	resource: Resource_Contents,
+}
+
+// Resource_Contents is a resource a client inlined. A binary resource keeps its base64 text in blob,
+// borrowed from the decoded JSON value.
+Resource_Contents :: struct {
+	meta:      json.Value,
+	uri:       string,
+	mime_type: string,
+	variant:   union {
+		Resource_Text,
+		Resource_Blob,
+	},
+}
+
+Resource_Text :: struct {
+	text: string,
+}
+
+Resource_Blob :: struct {
+	blob: string,
+}
+
+// Content_Other is a kind this package does not know. raw is the whole block, so encoding it writes
+// the payload back unchanged.
+Content_Other :: struct {
+	type: string,
+	raw:  json.Value,
 }
 
 Session_Prompt_Params :: struct {
@@ -314,9 +373,256 @@ Session_Prompt_Params :: struct {
 	prompt:     []Content_Block `json:"prompt"`,
 }
 
+// Session_Prompt_Request is Session_Prompt_Params in wire form, built by session_prompt_request.
+Session_Prompt_Request :: struct {
+	session_id: string `json:"sessionId"`,
+	prompt:     []json.Value `json:"prompt"`,
+}
+
+// content_block_decode reads one block from its JSON value. Its strings, meta, annotations and raw
+// payload borrow from value, so value must outlive the block; only a resource link's icons are
+// allocated with allocator, and content_block_destroy releases them. It returns Invalid for a
+// mismatched shape and Allocation when the icons cannot be allocated. An unknown `type` is not an
+// error: it becomes Content_Other.
+@(require_results)
+content_block_decode :: proc(value: json.Value, allocator := context.allocator) -> (block: Content_Block, err: Params_Error) {
+	object, is_object := value.(json.Object)
+	if !is_object { return {}, .Invalid }
+	ok := true
+	kind := content_string(object, "type", true, &ok)
+	if !ok { return {}, .Invalid }
+	block.meta = content_optional(object, "_meta")
+	block.annotations = content_optional(object, "annotations")
+	switch kind {
+	case CONTENT_TEXT:
+		block.variant = Content_Text {
+			text = content_string(object, "text", true, &ok),
+		}
+	case CONTENT_IMAGE:
+		block.variant = Content_Image {
+			data      = content_string(object, "data", true, &ok),
+			mime_type = content_string(object, "mimeType", false, &ok),
+			uri       = content_string(object, "uri", false, &ok),
+		}
+	case CONTENT_AUDIO:
+		block.variant = Content_Audio {
+			data      = content_string(object, "data", true, &ok),
+			mime_type = content_string(object, "mimeType", false, &ok),
+		}
+	case CONTENT_RESOURCE_LINK:
+		link := Content_Resource_Link {
+			uri         = content_string(object, "uri", true, &ok),
+			name        = content_string(object, "name", false, &ok),
+			mime_type   = content_string(object, "mimeType", false, &ok),
+			title       = content_string(object, "title", false, &ok),
+			description = content_string(object, "description", false, &ok),
+		}
+		switch size in object["size"] {
+		case json.Integer:
+			link.size = size
+		case json.Null, nil:
+		case json.Float, json.Boolean, json.String, json.Array, json.Object:
+			ok = false
+		}
+		if !ok { return {}, .Invalid }
+		link.icons = content_icons_decode(object["icons"], allocator) or_return
+		block.variant = link
+	case CONTENT_RESOURCE:
+		resource_object, resource_is_object := object["resource"].(json.Object)
+		if !resource_is_object { return {}, .Invalid }
+		contents := Resource_Contents {
+			meta      = content_optional(resource_object, "_meta"),
+			uri       = content_string(resource_object, "uri", true, &ok),
+			mime_type = content_string(resource_object, "mimeType", false, &ok),
+		}
+		if _, has_blob := resource_object["blob"]; has_blob {
+			contents.variant = Resource_Blob {
+				blob = content_string(resource_object, "blob", true, &ok),
+			}
+		} else {
+			contents.variant = Resource_Text {
+				text = content_string(resource_object, "text", true, &ok),
+			}
+		}
+		block.variant = Content_Resource {
+			resource = contents,
+		}
+	case:
+		block.variant = Content_Other {
+			type = kind,
+			raw  = value,
+		}
+	}
+	if !ok { return {}, .Invalid }
+	return block, .None
+}
+
+// content_block_destroy releases what content_block_decode allocated with allocator.
+content_block_destroy :: proc(block: Content_Block, allocator := context.allocator) {
+	if link, is_link := block.variant.(Content_Resource_Link); is_link {
+		content_icons_destroy(link.icons, allocator)
+	}
+}
+
+// content_string reads a string field. A missing or null field is empty, and a field of another type
+// clears ok; a required field that is missing or null clears ok too.
+@(private)
+content_string :: proc(object: json.Object, key: string, required: bool, ok: ^bool) -> string {
+	#partial switch text in object[key] {
+	case json.String:
+		return string(text)
+	case json.Null, nil:
+		if required { ok^ = false }
+	case:
+		ok^ = false
+	}
+	return ""
+}
+
+@(private)
+content_optional :: proc(object: json.Object, key: string) -> json.Value {
+	value := object[key]
+	if _, is_null := value.(json.Null); is_null { return nil }
+	return value
+}
+
+@(private)
+content_icons_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (icons: []Icon, err: Params_Error) {
+	if _, is_null := value.(json.Null); is_null || value == nil { return nil, .None }
+	items, is_array := value.(json.Array)
+	if !is_array { return nil, .Invalid }
+	made, make_error := make([]Icon, len(items), allocator)
+	if make_error != nil { return nil, .Allocation }
+	defer if err != .None { content_icons_destroy(made, allocator) }
+	for item, index in items {
+		object, is_object := item.(json.Object)
+		if !is_object { return nil, .Invalid }
+		ok := true
+		made[index] = Icon {
+			src       = content_string(object, "src", true, &ok),
+			mime_type = content_string(object, "mimeType", false, &ok),
+			theme     = content_string(object, "theme", false, &ok),
+		}
+		if !ok { return nil, .Invalid }
+		sizes_value, has_sizes := object["sizes"]
+		if !has_sizes { continue }
+		if _, is_null := sizes_value.(json.Null); is_null { continue }
+		sizes_array, sizes_is_array := sizes_value.(json.Array)
+		if !sizes_is_array { return nil, .Invalid }
+		sizes, sizes_error := make([]string, len(sizes_array), allocator)
+		if sizes_error != nil { return nil, .Allocation }
+		made[index].sizes = sizes
+		for size_value, size_index in sizes_array {
+			size, is_string := size_value.(json.String)
+			if !is_string { return nil, .Invalid }
+			sizes[size_index] = string(size)
+		}
+	}
+	return made, .None
+}
+
+@(private)
+content_icons_destroy :: proc(icons: []Icon, allocator: mem.Allocator) {
+	for icon in icons { delete(icon.sizes, allocator) }
+	delete(icons, allocator)
+}
+
+// content_block_encode builds the wire object of a block, with the `type` key added. The result
+// borrows every string, meta, annotations and raw payload from block and owns only its objects and
+// arrays, which it allocates with allocator; it is not releasable with json.destroy_value, so pass
+// context.temp_allocator or an arena and free everything at once. A block with no variant encodes
+// as null. It returns the allocator's error when an object cannot be allocated, leaving what was
+// allocated to the allocator.
+@(require_results)
+content_block_encode :: proc(block: Content_Block, allocator := context.allocator) -> (value: json.Value, err: mem.Allocator_Error) {
+	if other, is_other := block.variant.(Content_Other); is_other { return other.raw, nil }
+	if block.variant == nil { return json.Null{}, nil }
+	object := make(json.Object, 8, allocator) or_return
+	if block.meta != nil { content_put(&object, "_meta", block.meta) or_return }
+	if block.annotations != nil { content_put(&object, "annotations", block.annotations) or_return }
+	switch kind in block.variant {
+	case Content_Text:
+		content_put(&object, "type", CONTENT_TEXT) or_return
+		content_put(&object, "text", kind.text) or_return
+	case Content_Image:
+		content_put(&object, "type", CONTENT_IMAGE) or_return
+		content_put(&object, "data", kind.data) or_return
+		content_put(&object, "mimeType", kind.mime_type) or_return
+		content_put_text(&object, "uri", kind.uri) or_return
+	case Content_Audio:
+		content_put(&object, "type", CONTENT_AUDIO) or_return
+		content_put(&object, "data", kind.data) or_return
+		content_put(&object, "mimeType", kind.mime_type) or_return
+	case Content_Resource_Link:
+		content_put(&object, "type", CONTENT_RESOURCE_LINK) or_return
+		content_put(&object, "uri", kind.uri) or_return
+		content_put(&object, "name", kind.name) or_return
+		content_put_text(&object, "mimeType", kind.mime_type) or_return
+		content_put_text(&object, "title", kind.title) or_return
+		content_put_text(&object, "description", kind.description) or_return
+		if size, has_size := kind.size.?; has_size { content_put(&object, "size", json.Integer(size)) or_return }
+		if len(kind.icons) > 0 {
+			icons := make(json.Array, 0, len(kind.icons), allocator) or_return
+			for icon in kind.icons {
+				icon_object := make(json.Object, 4, allocator) or_return
+				content_put(&icon_object, "src", icon.src) or_return
+				content_put_text(&icon_object, "mimeType", icon.mime_type) or_return
+				content_put_text(&icon_object, "theme", icon.theme) or_return
+				if len(icon.sizes) > 0 {
+					sizes := make(json.Array, 0, len(icon.sizes), allocator) or_return
+					for size in icon.sizes { _ = append(&sizes, json.String(size)) or_return }
+					content_put(&icon_object, "sizes", sizes) or_return
+				}
+				_ = append(&icons, icon_object) or_return
+			}
+			content_put(&object, "icons", icons) or_return
+		}
+	case Content_Resource:
+		content_put(&object, "type", CONTENT_RESOURCE) or_return
+		contents := make(json.Object, 4, allocator) or_return
+		if kind.resource.meta != nil { content_put(&contents, "_meta", kind.resource.meta) or_return }
+		content_put(&contents, "uri", kind.resource.uri) or_return
+		content_put_text(&contents, "mimeType", kind.resource.mime_type) or_return
+		switch resource in kind.resource.variant {
+		case Resource_Text:
+			content_put(&contents, "text", resource.text) or_return
+		case Resource_Blob:
+			content_put(&contents, "blob", resource.blob) or_return
+		}
+		content_put(&object, "resource", contents) or_return
+	case Content_Other:
+	}
+	return object, nil
+}
+
+@(private)
+content_put :: proc(object: ^json.Object, key: string, value: json.Value) -> mem.Allocator_Error {
+	if map_insert(object, key, value) == nil { return .Out_Of_Memory }
+	return nil
+}
+
+@(private)
+content_put_text :: proc(object: ^json.Object, key: string, text: string) -> mem.Allocator_Error {
+	if text == "" { return nil }
+	return content_put(object, key, json.String(text))
+}
+
+// session_prompt_request builds the wire form of params for the client role, since json.marshal
+// cannot write a Content_Block. Its blocks follow content_block_encode: pass context.temp_allocator
+// or an arena. It returns the allocator's error when the blocks cannot be allocated.
+@(require_results)
+session_prompt_request :: proc(params: Session_Prompt_Params, allocator := context.allocator) -> (request: Session_Prompt_Request, err: mem.Allocator_Error) {
+	prompt := make([]json.Value, len(params.prompt), allocator) or_return
+	for block, index in params.prompt {
+		prompt[index] = content_block_encode(block, allocator) or_return
+	}
+	return {session_id = params.session_id, prompt = prompt}, nil
+}
+
 // session_prompt_params_decode reads the prompt's needed fields from its JSON value.
 // Its strings borrow from value and its block slice is owned by allocator, so value
 // must outlive the returned params, including the base64 text of images and blobs.
+// Release the blocks with content_block_destroy and then delete the slice.
 // It returns Invalid for a mismatched shape and Allocation when the block slice cannot
 // be allocated.
 @(require_results)
@@ -333,67 +639,15 @@ session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_
 
 	blocks, allocation_error := make([]Content_Block, len(prompt), allocator)
 	if allocation_error != nil { return .Allocation }
+	decoded := 0
 	transferred := false
-	defer if !transferred { delete(blocks, allocator) }
+	defer if !transferred {
+		for block in blocks[:decoded] { content_block_destroy(block, allocator) }
+		delete(blocks, allocator)
+	}
 	for block_value, index in prompt {
-		block_object, block_is_object := block_value.(json.Object)
-		if !block_is_object { return .Invalid }
-		type_value, type_present := block_object["type"]
-		block_type, type_is_string := type_value.(json.String)
-		if !type_present || !type_is_string { return .Invalid }
-		block := Content_Block {
-			type = string(block_type),
-		}
-		if text_value, present := block_object["text"]; present {
-			text, text_is_string := text_value.(json.String)
-			if !text_is_string { return .Invalid }
-			block.text = string(text)
-		}
-		if uri_value, present := block_object["uri"]; present {
-			uri, uri_is_string := uri_value.(json.String)
-			if !uri_is_string { return .Invalid }
-			block.uri = string(uri)
-		}
-		if data_value, present := block_object["data"]; present {
-			data, data_is_string := data_value.(json.String)
-			if !data_is_string { return .Invalid }
-			block.data = string(data)
-		}
-		if mime_value, present := block_object["mimeType"]; present {
-			mime, mime_is_string := mime_value.(json.String)
-			if !mime_is_string { return .Invalid }
-			block.mime_type = string(mime)
-		}
-		if resource_value, present := block_object["resource"]; present {
-			resource_object, resource_is_object := resource_value.(json.Object)
-			if !resource_is_object { return .Invalid }
-			resource: Embedded_Resource
-			if uri_value, has_uri := resource_object["uri"]; has_uri {
-				uri, uri_is_string := uri_value.(json.String)
-				if !uri_is_string { return .Invalid }
-				resource.uri = string(uri)
-			}
-			if text_value, has_text := resource_object["text"]; has_text {
-				text, text_is_string := text_value.(json.String)
-				if !text_is_string { return .Invalid }
-				resource.text = string(text)
-			}
-			if mime_value, has_mime := resource_object["mimeType"]; has_mime {
-				if mime, is_mime_string := mime_value.(json.String); is_mime_string {
-					resource.mime_type = string(mime)
-				} else if _, is_null := mime_value.(json.Null); !is_null {
-					return .Invalid
-				}
-			}
-			if blob_value, has_blob := resource_object["blob"]; has_blob {
-				blob, is_blob_string := blob_value.(json.String)
-				if !is_blob_string { return .Invalid }
-				resource.blob = string(blob)
-				resource.blob_present = true
-			}
-			block.resource = resource
-		}
-		blocks[index] = block
+		blocks[index] = content_block_decode(block_value, allocator) or_return
+		decoded += 1
 	}
 
 	target.session_id = string(session_id)
