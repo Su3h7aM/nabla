@@ -1532,6 +1532,11 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_
 		`{"jsonrpc":"2.0","id":9,"method":"session/set_config_option","params":{"sessionId":"s","configId":"model","type":"boolean","value":true}}` + "\n"
 	acp_test_client_send(&client, boolean)
 	acp_test_client_expect(t, &client, `needs a session, config id, and value`, "a boolean config value was not refused")
+
+	// An extension notification is ignored without a reply, and an extension request is not found.
+	acp_test_client_send(&client, `{"jsonrpc":"2.0","method":"_vendor/ping","params":{}}` + "\n")
+	acp_test_client_send(&client, `{"jsonrpc":"2.0","id":10,"method":"_vendor/call","params":{}}` + "\n")
+	acp_test_client_expect(t, &client, `"id":10,"error":{"code":-32601`, "an extension request was not answered as not found")
 }
 
 acp_test_model_change_message :: proc(builder: ^strings.Builder, id: int, session_id, value: string, kind: ACP_Model_Kind) {

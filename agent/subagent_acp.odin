@@ -1340,8 +1340,19 @@ acp_opened_decode :: proc(value: json.Value, opened: ^ACP_Session_Opened) -> acp
 	}
 	acp.params_decode(value, &wire, context.temp_allocator) or_return
 	decoded := acp.config_options_decode(wire.config_options, context.temp_allocator) or_return
+	selects := acp_select_options(decoded) or_return
+	opened.session_id = wire.session_id
+	opened.config_options = selects
+	return .None
+}
+
+// acp_select_options keeps the select options of decoded, the only kind the harness acts on,
+// with a grouped option's groups flattened into one list of choices. The result is temp-allocated
+// and borrows from decoded.
+@(private, require_results)
+acp_select_options :: proc(decoded: []acp.Config_Option) -> (options: []ACP_Config_Option, err: acp.Params_Error) {
 	selects, selects_error := make([dynamic]ACP_Config_Option, 0, len(decoded), context.temp_allocator)
-	if selects_error != nil { return .Allocation }
+	if selects_error != nil { return nil, .Allocation }
 	for option in decoded {
 		select, is_select := option.variant.(acp.Config_Select)
 		if !is_select { continue }
@@ -1351,16 +1362,14 @@ acp_opened_decode :: proc(value: json.Value, opened: ^ACP_Session_Opened) -> acp
 			choices = options
 		case []acp.Config_Group:
 			flat, flat_error := make([dynamic]acp.Config_Value, context.temp_allocator)
-			if flat_error != nil { return .Allocation }
+			if flat_error != nil { return nil, .Allocation }
 			for group in options { append(&flat, ..group.options) }
 			choices = flat[:]
 		case nil:
 		}
 		append(&selects, ACP_Config_Option{id = option.id, category = option.category, current_value = select.current_value, options = choices})
 	}
-	opened.session_id = wire.session_id
-	opened.config_options = selects[:]
-	return .None
+	return selects[:], .None
 }
 
 @(private, require_results)
@@ -1529,6 +1538,26 @@ acp_notification :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) ->
 			if block.type != acp.CONTENT_TEXT { continue }
 			if _, append_error := append(&connection.answer, block.text); append_error != nil { return false }
 		}
+	case acp.UPDATE_CONFIG_OPTION:
+		// The update lists every option, as an answer to set_config_option does, and is installed the same way.
+		update: acp.Session_Notification(acp.Config_Option_Update)
+		switch acp.params_decode(envelope.params, &update, context.temp_allocator) {
+		case .None:
+		case .Invalid:
+			return true
+		case .Allocation:
+			return false
+		}
+		decoded, decode_error := acp.config_options_decode_values(update.update.config_options, context.temp_allocator)
+		if decode_error != .None { return decode_error == .Invalid }
+		options, select_error := acp_select_options(decoded)
+		if select_error != .None { return false }
+		if len(options) > 0 {
+			if acp_option_install(connection, options, "", "") != "" { return false }
+		} else if !acp_options_replace(connection, options) {
+			return false
+		}
+		return acp_selection_apply(connection)
 	case acp.UPDATE_STATE:
 		state: acp.Session_Notification(acp.State_Update)
 		switch acp.params_decode(envelope.params, &state, context.temp_allocator) {

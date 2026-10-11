@@ -28,6 +28,17 @@ METHOD_SESSION_SET_CONFIG_OPTION :: "session/set_config_option"
 METHOD_AUTH_LOGIN :: "auth/login"
 METHOD_AUTH_LOGOUT :: "auth/logout"
 METHOD_SESSION_PROMPT :: "session/prompt"
+METHOD_SESSION_DELETE :: "session/delete"
+METHOD_SESSION_SET_MODE :: "session/set_mode"
+METHOD_LOGOUT :: "logout"
+METHOD_ELICITATION_CREATE :: "elicitation/create"
+METHOD_FS_READ_TEXT_FILE :: "fs/read_text_file"
+METHOD_FS_WRITE_TEXT_FILE :: "fs/write_text_file"
+METHOD_TERMINAL_CREATE :: "terminal/create"
+METHOD_TERMINAL_KILL :: "terminal/kill"
+METHOD_TERMINAL_OUTPUT :: "terminal/output"
+METHOD_TERMINAL_RELEASE :: "terminal/release"
+METHOD_TERMINAL_WAIT_FOR_EXIT :: "terminal/wait_for_exit"
 // An agent calls this on its client: one tool call needs the user's answer before it runs.
 METHOD_SESSION_REQUEST_PERMISSION :: "session/request_permission"
 
@@ -38,13 +49,23 @@ METHOD_SESSION_REQUEST_PERMISSION :: "session/request_permission"
 // keeps cancellation draining.
 METHOD_SESSION_CANCEL :: "session/cancel"
 METHOD_SESSION_UPDATE :: "session/update"
+METHOD_ELICITATION_COMPLETE :: "elicitation/complete"
+// METHOD_CANCEL_REQUEST cancels an earlier request by its id, in either direction.
+METHOD_CANCEL_REQUEST :: "$/cancel_request"
 
-// JSON-RPC error codes: the specification's four, then the code ACP defines.
+// A method whose name starts with an underscore is an extension. A request for one this side does not
+// know is answered with ERROR_METHOD_NOT_FOUND like any other unknown request, and an unknown
+// notification is ignored.
+
+// JSON-RPC error codes: the specification's five, then the codes ACP defines.
 ERROR_PARSE :: -32700
 ERROR_INVALID_REQUEST :: -32600
 ERROR_METHOD_NOT_FOUND :: -32601
 ERROR_INVALID_PARAMS :: -32602
 ERROR_INTERNAL :: -32603
+ERROR_REQUEST_CANCELLED :: -32800
+ERROR_AUTH_REQUIRED :: -32000
+ERROR_RESOURCE_NOT_FOUND :: -32002
 
 // Session update kinds, as they appear in the `sessionUpdate` field.
 UPDATE_USER_MESSAGE_CHUNK :: "user_message_chunk"
@@ -59,6 +80,16 @@ UPDATE_TOOL_CALL_CONTENT_CHUNK :: "tool_call_content_chunk"
 UPDATE_SESSION_INFO :: "session_info_update"
 UPDATE_USAGE :: "usage_update"
 UPDATE_AVAILABLE_COMMANDS :: "available_commands_update"
+UPDATE_AGENT_THOUGHT_CHUNK :: "agent_thought_chunk"
+UPDATE_PLAN :: "plan"
+UPDATE_PLAN_UPDATE :: "plan_update"
+UPDATE_CURRENT_MODE :: "current_mode_update"
+UPDATE_CONFIG_OPTION :: "config_option_update"
+UPDATE_NOTICE :: "notice"
+UPDATE_COMPACTION :: "compaction_update"
+UPDATE_COMPACTION_SUMMARY_CHUNK :: "compaction_summary_chunk"
+UPDATE_TERMINAL :: "terminal_update"
+UPDATE_TERMINAL_OUTPUT_CHUNK :: "terminal_output_chunk"
 
 // Content block kinds, as they appear in the `type` field.
 CONTENT_TEXT :: "text"
@@ -173,62 +204,76 @@ Implementation :: struct {
 	name:    string `json:"name"`,
 	title:   string `json:"title,omitempty"`,
 	version: string `json:"version"`,
+	meta:    json.Value `json:"_meta,omitempty"`,
 }
 
 V1_Fs_Capabilities :: struct {
 	read_text_file:  bool `json:"readTextFile"`,
 	write_text_file: bool `json:"writeTextFile"`,
+	meta:            json.Value `json:"_meta,omitempty"`,
 }
 
 V1_Client_Capabilities :: struct {
 	fs:       V1_Fs_Capabilities `json:"fs"`,
 	terminal: bool `json:"terminal"`,
+	meta:     json.Value `json:"_meta,omitempty"`,
 }
 
 V1_Initialize_Params :: struct {
 	protocol_version:    int `json:"protocolVersion"`,
 	client_capabilities: Maybe(V1_Client_Capabilities) `json:"clientCapabilities,omitempty"`,
 	client_info:         Maybe(Implementation) `json:"clientInfo,omitempty"`,
+	meta:                json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Initialize_Params :: struct {
 	protocol_version: int `json:"protocolVersion"`,
 	capabilities:     V2_Client_Capabilities `json:"capabilities"`,
 	info:             Implementation `json:"info"`,
+	meta:             json.Value `json:"_meta,omitempty"`,
 }
 
 // V2_Client_Capabilities is deliberately limited to the v2 fields Nabla needs to
 // recognize. Unknown client capabilities remain forward-compatible and are ignored.
 V2_Client_Capabilities :: struct {
 	auth: Maybe(V2_Client_Auth_Capabilities) `json:"auth,omitempty"`,
+	meta: json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Client_Auth_Capabilities :: struct {
 	terminal: bool `json:"terminal"`,
+	meta:     json.Value `json:"_meta,omitempty"`,
 }
 
-V2_Support :: struct {}
+V2_Support :: struct {
+	meta: json.Value `json:"_meta,omitempty"`,
+}
 
 V1_Session_List_Capabilities :: struct {
 	list: V2_Support `json:"list"`,
+	meta: json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Prompt_Capabilities :: struct {
 	image:            Maybe(V2_Support) `json:"image,omitempty"`,
 	embedded_context: V2_Support `json:"embeddedContext"`,
+	meta:             json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Mcp_Capabilities :: struct {
 	stdio: V2_Support `json:"stdio"`,
+	meta:  json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Session_Capabilities :: struct {
 	prompt: V2_Prompt_Capabilities `json:"prompt"`,
 	mcp:    V2_Mcp_Capabilities `json:"mcp"`,
+	meta:   json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Agent_Capabilities :: struct {
 	session: V2_Session_Capabilities `json:"session"`,
+	meta:    json.Value `json:"_meta,omitempty"`,
 }
 
 V2_Initialize_Result :: struct {
@@ -236,11 +281,13 @@ V2_Initialize_Result :: struct {
 	info:             Implementation `json:"info"`,
 	capabilities:     V2_Agent_Capabilities `json:"capabilities"`,
 	auth_methods:     []json.Value `json:"authMethods"`,
+	meta:             json.Value `json:"_meta,omitempty"`,
 }
 
 MCP_Environment :: struct {
 	name:  string `json:"name"`,
 	value: string `json:"value"`,
+	meta:  json.Value `json:"_meta,omitempty"`,
 }
 
 // MCP_Server is the stdio MCP server configuration carried by ACP. The optional
@@ -252,6 +299,7 @@ MCP_Server :: struct {
 	command: string `json:"command"`,
 	args:    []string `json:"args"`,
 	env:     []MCP_Environment `json:"env"`,
+	meta:    json.Value `json:"_meta,omitempty"`,
 }
 
 Session_New_Params :: struct {
@@ -270,6 +318,7 @@ Session_Load_Params :: struct {
 
 Replay_From :: struct {
 	type: string `json:"type"`,
+	meta: json.Value `json:"_meta,omitempty"`,
 }
 
 Session_Resume_Params :: struct {
@@ -284,10 +333,12 @@ Session_Resume_Params :: struct {
 Session_List_Params :: struct {
 	cursor: string `json:"cursor"`,
 	cwd:    string `json:"cwd"`,
+	meta:   json.Value `json:"_meta,omitempty"`,
 }
 
 Session_Close_Params :: struct {
 	session_id: string `json:"sessionId"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 // Content_Block is one element of a prompt or message. `_meta` and `annotations` are shared by every
@@ -375,12 +426,14 @@ Content_Other :: struct {
 Session_Prompt_Params :: struct {
 	session_id: string `json:"sessionId"`,
 	prompt:     []Content_Block `json:"prompt"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 // Session_Prompt_Request is Session_Prompt_Params in wire form, built by session_prompt_request.
 Session_Prompt_Request :: struct {
 	session_id: string `json:"sessionId"`,
 	prompt:     []json.Value `json:"prompt"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 // content_block_decode reads one block from its JSON value. Its strings, meta, annotations and raw
@@ -620,7 +673,7 @@ session_prompt_request :: proc(params: Session_Prompt_Params, allocator := conte
 	for block, index in params.prompt {
 		prompt[index] = content_block_encode(block, allocator) or_return
 	}
-	return {session_id = params.session_id, prompt = prompt}, nil
+	return {session_id = params.session_id, prompt = prompt, meta = params.meta}, nil
 }
 
 // session_prompt_params_decode reads the prompt's needed fields from its JSON value.
@@ -655,13 +708,43 @@ session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_
 	}
 
 	target.session_id = string(session_id)
+	target.meta = field_value(object, "_meta")
 	target.prompt = blocks
 	transferred = true
 	return .None
 }
 
+Session_Delete_Params :: struct {
+	session_id: string `json:"sessionId"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
+}
+
+Session_Set_Mode_Params :: struct {
+	session_id: string `json:"sessionId"`,
+	mode_id:    string `json:"modeId"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
+}
+
+// Authenticate_Params is the request of `authenticate` (version 1) and `auth/login` (version 2).
+Authenticate_Params :: struct {
+	method_id: string `json:"methodId"`,
+	meta:      json.Value `json:"_meta,omitempty"`,
+}
+
+// Logout_Params is the request of `logout` (version 1) and `auth/logout` (version 2).
+Logout_Params :: struct {
+	meta: json.Value `json:"_meta,omitempty"`,
+}
+
+// Cancel_Request_Params names the request to cancel; request_id is a JSON number or string.
+Cancel_Request_Params :: struct {
+	request_id: json.Value `json:"requestId"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
+}
+
 Session_Cancel_Params :: struct {
 	session_id: string `json:"sessionId"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 // --- what an agent answers ---------------------------------------------------
@@ -670,11 +753,13 @@ V1_Prompt_Capabilities :: struct {
 	image:            bool `json:"image"`,
 	audio:            bool `json:"audio"`,
 	embedded_context: bool `json:"embeddedContext"`,
+	meta:             json.Value `json:"_meta,omitempty"`,
 }
 
 V1_MCP_Capabilities :: struct {
 	http: bool `json:"http"`,
 	sse:  bool `json:"sse"`,
+	meta: json.Value `json:"_meta,omitempty"`,
 }
 
 V1_Agent_Capabilities :: struct {
@@ -682,6 +767,7 @@ V1_Agent_Capabilities :: struct {
 	session_capabilities: V1_Session_List_Capabilities `json:"sessionCapabilities"`,
 	prompt_capabilities:  V1_Prompt_Capabilities `json:"promptCapabilities"`,
 	mcp_capabilities:     V1_MCP_Capabilities `json:"mcpCapabilities"`,
+	meta:                 json.Value `json:"_meta,omitempty"`,
 }
 
 V1_Initialize_Result :: struct {
@@ -689,11 +775,13 @@ V1_Initialize_Result :: struct {
 	agent_capabilities: V1_Agent_Capabilities `json:"agentCapabilities"`,
 	auth_methods:       []json.Value `json:"authMethods"`,
 	agent_info:         Implementation `json:"agentInfo"`,
+	meta:               json.Value `json:"_meta,omitempty"`,
 }
 
 Session_New_Result :: struct {
 	session_id:     string `json:"sessionId"`,
 	config_options: []json.Value `json:"configOptions,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 CONFIG_TYPE_SELECT :: "select"
@@ -814,6 +902,13 @@ config_options_decode :: proc(value: json.Value, allocator := context.allocator)
 	if _, is_null := value.(json.Null); is_null || value == nil { return nil, .None }
 	items, is_array := value.(json.Array)
 	if !is_array { return nil, .Invalid }
+	return config_options_decode_values(items[:], allocator)
+}
+
+// config_options_decode_values reads a list of options already split into values, as an update
+// or result struct holds them. Release the result with config_options_destroy.
+@(require_results)
+config_options_decode_values :: proc(items: []json.Value, allocator := context.allocator) -> (options: []Config_Option, err: Params_Error) {
 	made, make_error := make([]Config_Option, len(items), allocator)
 	if make_error != nil { return nil, .Allocation }
 	for item, index in items {
@@ -981,13 +1076,17 @@ V2_Session_New_Result :: struct {
 	session_id:         string `json:"sessionId"`,
 	config_options:     []json.Value `json:"configOptions"`,
 	available_commands: []Available_Command `json:"availableCommands,omitempty"`,
+	meta:               json.Value `json:"_meta,omitempty"`,
 }
 
 // Empty_Result is the answer of a method that reports success by returning.
-Empty_Result :: struct {}
+Empty_Result :: struct {
+	meta: json.Value `json:"_meta,omitempty"`,
+}
 
 Prompt_Result :: struct {
 	stop_reason: string `json:"stopReason"`,
+	meta:        json.Value `json:"_meta,omitempty"`,
 }
 
 // Session_Set_Config_Option_Params is a request to change one option. The value kinds share
@@ -1095,11 +1194,13 @@ session_set_config_option_params_decode :: proc(value: json.Value, version: int,
 
 Session_Set_Config_Option_Result :: struct {
 	config_options: []json.Value `json:"configOptions"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 Session_Resume_Result :: struct {
 	config_options:     []json.Value `json:"configOptions,omitempty"`,
 	available_commands: []Available_Command `json:"availableCommands,omitempty"`,
+	meta:               json.Value `json:"_meta,omitempty"`,
 }
 
 Session_Info :: struct {
@@ -1107,21 +1208,25 @@ Session_Info :: struct {
 	cwd:        string `json:"cwd"`,
 	title:      string `json:"title,omitempty"`,
 	updated_at: string `json:"updatedAt,omitempty"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 Session_List_Result :: struct {
 	sessions:    []Session_Info `json:"sessions"`,
 	next_cursor: string `json:"nextCursor,omitempty"`,
+	meta:        json.Value `json:"_meta,omitempty"`,
 }
 
 Prompt_Accepted_Result :: struct {
 	message_id: string `json:"messageId"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 Message_Update :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	message_id:     string `json:"messageId"`,
 	content:        []Text_Content `json:"content"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 // Available_Command_Input describes text input. V2 uses type = "text"; V1 omits type.
@@ -1150,6 +1255,7 @@ State_Update :: struct {
 	state:          string `json:"state"`,
 	stop_reason:    string `json:"stopReason,omitempty"`,
 	error:          Maybe(RPC_Error) `json:"error,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 Tool_Call_Update_V2 :: struct {
@@ -1161,22 +1267,26 @@ Tool_Call_Update_V2 :: struct {
 	status:         string `json:"status,omitempty"`,
 	raw_input:      json.Value `json:"rawInput,omitempty"`,
 	content:        []Tool_Call_Content `json:"content,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 Tool_Call_Content_Chunk :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	tool_call_id:   string `json:"toolCallId"`,
 	content:        Tool_Call_Content `json:"content"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 Session_Info_Update :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	title:          string `json:"title,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 Text_Content :: struct {
 	type: string `json:"type"`,
 	text: string `json:"text"`,
+	meta: json.Value `json:"_meta,omitempty"`,
 }
 
 // Session_Notification is the params of one session/update notification, carrying one
@@ -1184,6 +1294,7 @@ Text_Content :: struct {
 Session_Notification :: struct($T: typeid) {
 	session_id: string `json:"sessionId"`,
 	update:     T `json:"update"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 // Message_Chunk is one streamed fragment of a message. Chunks that share a message_id
@@ -1192,6 +1303,7 @@ Message_Chunk :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	content:        Text_Content `json:"content"`,
 	message_id:     string `json:"messageId,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 // Tool_Call is the first update about one tool call: what it is called, the state it is
@@ -1206,6 +1318,7 @@ Tool_Call :: struct {
 	status:         string `json:"status"`,
 	raw_input:      json.Value `json:"rawInput,omitempty"`,
 	content:        []Tool_Call_Content `json:"content,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 // Tool_Call_Content is one item of a tool call's output. Only inlined text is used
@@ -1213,6 +1326,7 @@ Tool_Call :: struct {
 Tool_Call_Content :: struct {
 	type:    string `json:"type"`,
 	content: Text_Content `json:"content"`,
+	meta:    json.Value `json:"_meta,omitempty"`,
 }
 
 TOOL_CALL_CONTENT_INLINE :: "content"
@@ -1224,6 +1338,7 @@ Tool_Call_Update :: struct {
 	tool_call_id:   string `json:"toolCallId"`,
 	status:         string `json:"status"`,
 	content:        []Tool_Call_Content `json:"content,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 // Usage_Update reports how much of the model's context the session holds and how large
@@ -1232,9 +1347,71 @@ Usage_Update :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	used:           i64 `json:"used"`,
 	size:           i64 `json:"size"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
+}
+
+// Config_Option_Update replaces the whole option list of a session. Decode config_options with
+// config_options_decode_values and build them with config_options_encode.
+Config_Option_Update :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	config_options: []json.Value `json:"configOptions"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
+}
+
+// Current_Mode_Update reports a change of session mode (version 1).
+Current_Mode_Update :: struct {
+	session_update:  string `json:"sessionUpdate"`,
+	current_mode_id: string `json:"currentModeId"`,
+	meta:            json.Value `json:"_meta,omitempty"`,
+}
+
+// Plan_Entry is one step of a plan. priority is high, medium or low and status is pending,
+// in_progress or completed.
+Plan_Entry :: struct {
+	content:  string `json:"content"`,
+	priority: string `json:"priority"`,
+	status:   string `json:"status"`,
+	meta:     json.Value `json:"_meta,omitempty"`,
+}
+
+// Plan is the version 1 plan update; it replaces the whole plan. Version 2 sends plan_update,
+// whose content is a union this package does not model.
+Plan :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	entries:        []Plan_Entry `json:"entries"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
+}
+
+// Notice is information for the user that needs no answer. severity is info, warning or error.
+Notice :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	severity:       string `json:"severity"`,
+	title:          string `json:"title"`,
+	description:    string `json:"description,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
+}
+
+// Compaction_Update reports the state of one context compaction. status is running,
+// completed or failed, and error explains a failure.
+Compaction_Update :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	compaction_id:  string `json:"compactionId"`,
+	status:         string `json:"status"`,
+	error:          string `json:"error,omitempty"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
+}
+
+// Compaction_Summary_Chunk appends one content block to a compaction's summary. content is the
+// wire form of a block: build it with content_block_encode and read it with content_block_decode.
+Compaction_Summary_Chunk :: struct {
+	session_update: string `json:"sessionUpdate"`,
+	compaction_id:  string `json:"compactionId"`,
+	content:        json.Value `json:"content"`,
+	meta:           json.Value `json:"_meta,omitempty"`,
 }
 
 // --- the client role ---------------------------------------------------------
+
 
 // Permission_Option is one answer an agent offers for a tool call. kind is one of
 // allow_once, allow_always, reject_once, or reject_always.
@@ -1242,6 +1419,7 @@ Permission_Option :: struct {
 	option_id: string `json:"optionId"`,
 	name:      string `json:"name"`,
 	kind:      string `json:"kind"`,
+	meta:      json.Value `json:"_meta,omitempty"`,
 }
 
 // Request_Permission_Params is what an agent sends with METHOD_SESSION_REQUEST_PERMISSION.
@@ -1249,6 +1427,7 @@ Permission_Option :: struct {
 Request_Permission_Params :: struct {
 	session_id: string `json:"sessionId"`,
 	options:    []Permission_Option `json:"options"`,
+	meta:       json.Value `json:"_meta,omitempty"`,
 }
 
 // Permission_Outcome is the client's answer. outcome is "selected" or "cancelled", and
@@ -1256,10 +1435,12 @@ Request_Permission_Params :: struct {
 Permission_Outcome :: struct {
 	outcome:   string `json:"outcome"`,
 	option_id: string `json:"optionId,omitempty"`,
+	meta:      json.Value `json:"_meta,omitempty"`,
 }
 
 Request_Permission_Result :: struct {
 	outcome: Permission_Outcome `json:"outcome"`,
+	meta:    json.Value `json:"_meta,omitempty"`,
 }
 
 // Update_Kind is the part of a session update that names its kind. A client decodes

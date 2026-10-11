@@ -9,6 +9,7 @@ import "core:sync"
 import "core:testing"
 import "core:time"
 
+import "nabla:acp"
 import "nabla:agent/journal"
 import "nabla:ai"
 
@@ -808,6 +809,43 @@ test_acp_next_reports_a_malformed_json_rpc_frame :: proc(test: ^testing.T) {
 	_, problem := acp_next(&connection)
 	testing.expect(test, strings.contains(problem, "could not be parsed as JSON-RPC"), problem)
 	testing.expect(test, strings.contains(problem, "does not declare JSON-RPC 2.0"), problem)
+}
+
+// An agent that changes its options between requests tells the client with config_option_update, and the
+// client holds the new choices as it holds an answer to set_config_option: selects replace the list, other
+// kinds are skipped, and the model and effort the member runs with follow.
+@(test)
+test_acp_config_option_update_replaces_the_held_options :: proc(test: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	team: Agent_Team
+	member := Subagent {
+		allocator = context.allocator,
+		team      = &team,
+	}
+	connection := ACP_Connection {
+		member     = &member,
+		session_id = "s1",
+		version    = 2,
+	}
+	defer {
+		acp_options_destroy(connection.config_options, context.allocator)
+		delete(member.program.model, context.allocator)
+		delete(member.effort, context.allocator)
+	}
+	envelope, envelope_error := acp.parse_envelope(
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"mute","type":"boolean","name":"Mute","currentValue":true},{"id":"model","type":"select","category":"model","name":"Model","currentValue":"model-b","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","type":"select","category":"thought_level","name":"Effort","currentValue":"high","options":[{"group":"g","name":"G","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}]}}}`,
+		context.allocator,
+	)
+	if envelope_error != .None { testing.fail_now(test, "the notification could not be parsed") }
+	defer acp.destroy_envelope(&envelope, context.allocator)
+
+	testing.expect(test, acp_notification(&connection, envelope))
+	if !testing.expect_value(test, len(connection.config_options), 2) { return }
+	testing.expect_value(test, connection.config_options[0].id, "model")
+	testing.expect_value(test, connection.config_options[0].current_value, "model-b")
+	testing.expect_value(test, len(connection.config_options[1].options), 2)
+	testing.expect_value(test, member.program.model, "model-b")
+	testing.expect_value(test, member.effort, "high")
 }
 
 // SUBAGENT_TEST_ACP_AGENT is an ACP version 2 agent. It answers each request by its method,

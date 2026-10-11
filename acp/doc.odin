@@ -34,6 +34,10 @@
 // writer_failed reports the closure and later sends fail. writer_destroy drains
 // queued frames for the
 // caller's shutdown patience, then abandons a writer thread still blocked in I/O.
+// A method whose name starts with an underscore is an extension: an unknown extension request
+// is answered with ERROR_METHOD_NOT_FOUND like any other unknown request, and an unknown
+// notification is ignored. Every wire struct carries the `_meta` the specification gives its
+// object as a json.Value, nil when absent.
 // A refusal is a value instead: a frame or a message a peer's answer cannot be built
 // from is reported as Frame_Error or Envelope_Error, with the sentence a client reads
 // from frame_error_text or envelope_error_text.

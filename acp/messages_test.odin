@@ -274,3 +274,74 @@ test_set_config_option_params_decode_and_encode_per_version :: proc(t: ^testing.
 		testing.expectf(t, session_set_config_option_params_decode(value, 2, &params) == .Invalid, "%s was accepted", document)
 	}
 }
+
+// A config_option_update carries the full option list; the update and the notification around it
+// keep their _meta, and the options read back as they were sent.
+@(test)
+test_config_option_update_decodes_with_meta_and_round_trips :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	document := `{"sessionId":"s","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","type":"select","name":"Model","category":"model","currentValue":"a","options":[{"name":"A","value":"a"}]},{"id":"mute","type":"boolean","name":"Mute","currentValue":false},{"id":"x","type":"_future"}],"_meta":{"k":1}},"_meta":{"n":2}}`
+	value, parse_error := json.parse_string(document, .JSON, true, context.allocator)
+	testing.expect_value(t, parse_error, nil)
+	defer json.destroy_value(value, context.allocator)
+
+	notification: Session_Notification(Config_Option_Update)
+	testing.expect_value(t, params_decode(value, &notification, context.temp_allocator), Params_Error.None)
+	testing.expect_value(t, notification.update.session_update, UPDATE_CONFIG_OPTION)
+	testing.expect(t, notification.meta != nil)
+	testing.expect(t, notification.update.meta != nil)
+	options, decode_error := config_options_decode_values(notification.update.config_options, context.temp_allocator)
+	testing.expect_value(t, decode_error, Params_Error.None)
+	testing.expect_value(t, len(options), 3)
+
+	encoded, encode_error := config_options_encode(options, PROTOCOL_VERSION, context.temp_allocator)
+	testing.expect_value(t, encode_error, nil)
+	again := Session_Notification(Config_Option_Update) {
+		session_id = notification.session_id,
+		update = {session_update = UPDATE_CONFIG_OPTION, config_options = encoded, meta = notification.update.meta},
+		meta = notification.meta,
+	}
+	sorted := json.Marshal_Options {
+		sort_maps_by_key = true,
+	}
+	written, write_error := json.marshal(again, sorted, context.temp_allocator)
+	testing.expect_value(t, write_error, nil)
+	reread, reread_error := json.parse_string(string(written), .JSON, true, context.temp_allocator)
+	testing.expect_value(t, reread_error, nil)
+	want, _ := json.marshal(value, sorted, context.temp_allocator)
+	got, _ := json.marshal(reread, sorted, context.temp_allocator)
+	testing.expect_value(t, string(got), string(want))
+}
+
+expect_marshaled :: proc(t: ^testing.T, value: $T, want: string, loc := #caller_location) {
+	got, marshal_error := json.marshal(value, {sort_maps_by_key = true}, context.temp_allocator)
+	testing.expect_value(t, marshal_error, nil, loc)
+	testing.expect_value(t, string(got), want, loc)
+}
+
+// The payloads of the messages that follow the specification but that Nabla never sends are plain
+// structs, so json.marshal writes the wire names, omits what is absent, and carries _meta.
+@(test)
+test_protocol_payloads_marshal_to_their_wire_names :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	meta := json.Value(json.Object{})
+	expect_marshaled(t, Current_Mode_Update{session_update = UPDATE_CURRENT_MODE, current_mode_id = "m"}, `{"sessionUpdate":"current_mode_update","currentModeId":"m"}`)
+	expect_marshaled(
+		t,
+		Plan{session_update = UPDATE_PLAN, entries = {{content = "c", priority = "high", status = "pending"}}},
+		`{"sessionUpdate":"plan","entries":[{"content":"c","priority":"high","status":"pending"}]}`,
+	)
+	expect_marshaled(t, Notice{session_update = UPDATE_NOTICE, severity = "info", title = "t"}, `{"sessionUpdate":"notice","severity":"info","title":"t"}`)
+	expect_marshaled(
+		t,
+		Compaction_Update{session_update = UPDATE_COMPACTION, compaction_id = "c1", status = "failed", error = "e", meta = meta},
+		`{"sessionUpdate":"compaction_update","compactionId":"c1","status":"failed","error":"e","_meta":{}}`,
+	)
+	expect_marshaled(t, Cancel_Request_Params{request_id = json.Integer(3)}, `{"requestId":3}`)
+	expect_marshaled(t, Session_Set_Mode_Params{session_id = "s", mode_id = "ask"}, `{"sessionId":"s","modeId":"ask"}`)
+	expect_marshaled(t, Session_Delete_Params{session_id = "s"}, `{"sessionId":"s"}`)
+	expect_marshaled(t, Authenticate_Params{method_id = "key"}, `{"methodId":"key"}`)
+	expect_marshaled(t, Logout_Params{meta = meta}, `{"_meta":{}}`)
+	expect_marshaled(t, Empty_Result{meta = meta}, `{"_meta":{}}`)
+	expect_marshaled(t, Empty_Result{}, `{}`)
+}
