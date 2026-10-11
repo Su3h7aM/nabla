@@ -7,8 +7,7 @@ import "core:sys/linux"
 // The parent may die before prctl, so check its identity after installing the signal.
 @(private)
 child_bind_parent :: proc "contextless" (parent_pid: linux.Pid) -> bool {
-	PR_SET_PDEATHSIG :: 1
-	return linux.prctl(PR_SET_PDEATHSIG, uint(linux.Signal.SIGKILL), 0, 0, 0) == .NONE && linux.getppid() == parent_pid
+	return linux.prctl(linux.PR_SET_PDEATHSIG, uint(linux.Signal.SIGKILL)) == .NONE && linux.getppid() == parent_pid
 }
 
 // fork_exec forks and runs exec in a new process group, returning the child's pid.

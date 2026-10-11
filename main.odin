@@ -3,7 +3,6 @@ package main
 import "core:fmt"
 import "core:io"
 import "core:os"
-import "core:path/filepath"
 import "core:strings"
 
 import "nabla:agent"
@@ -370,26 +369,12 @@ subagent_launch_options :: proc(options: ^agent.Harness_Options, config: string)
 		options.nabla_executable = ""
 	}
 	if config != "" {
-		if os.is_absolute_path(config) {
-			absolute, path_error := strings.clone(config, context.allocator)
-			if path_error != nil {
-				fmt.eprintf("nabla: cannot copy the explicit configuration path: %v\n", path_error)
-				return false
-			}
-			options.nabla_config = absolute
-		} else {
-			directory, directory_error := os.get_working_directory(context.temp_allocator)
-			if directory_error != nil {
-				fmt.eprintf("nabla: cannot resolve the explicit configuration directory: %v\n", directory_error)
-				return false
-			}
-			absolute, path_error := filepath.join({directory, config}, context.allocator)
-			if path_error != nil {
-				fmt.eprintf("nabla: cannot resolve the explicit configuration path: %v\n", path_error)
-				return false
-			}
-			options.nabla_config = absolute
+		absolute, path_error := os.get_absolute_path_lexical(config, context.allocator)
+		if path_error != nil {
+			fmt.eprintf("nabla: cannot resolve the explicit configuration path: %v\n", path_error)
+			return false
 		}
+		options.nabla_config = absolute
 	}
 	complete = true
 	return true
@@ -472,7 +457,9 @@ chat_main :: proc() -> int {
 }
 
 main :: proc() {
-	if err := signal_catch_pipe(); err != nil {
+	// An unsupported platform has no SIGPIPE to catch, which is the old
+	// signal_catch_pipe no-op; only a real failure stops the launch.
+	if err := os.pipe_errors_on_broken(); err != nil && err != .Unsupported {
 		fmt.eprintf("nabla: SIGPIPE could not be caught: %s\n", os.error_string(err))
 		os.exit(1)
 	}
