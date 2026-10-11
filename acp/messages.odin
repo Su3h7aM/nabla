@@ -30,10 +30,6 @@ METHOD_SESSION_PROMPT :: "session/prompt"
 // An agent calls this on its client: one tool call needs the user's answer before it runs.
 METHOD_SESSION_REQUEST_PERMISSION :: "session/request_permission"
 
-// Buzz's model selector uses this pre-standard ACP method when an agent advertises
-// its model catalog. It is harmless for other ACP clients to ignore.
-METHOD_SESSION_SET_MODEL :: "session/set_model"
-
 // Methods an agent calls on its client. A session update is the agent's only
 // streaming channel: everything a turn produces arrives as one of the update kinds
 // below. Cancellation travels on the same name in both directions: ACP defines it as
@@ -253,25 +249,18 @@ MCP_Server :: struct {
 	env:     []MCP_Environment `json:"env"`,
 }
 
-Session_Meta :: struct {
-	session_title: string `json:"sessionTitle"`,
-	system_prompt: json.Value `json:"systemPrompt"`,
-}
-
 Session_New_Params :: struct {
 	cwd:                    string `json:"cwd"`,
 	additional_directories: []string `json:"additionalDirectories,omitempty"`,
 	mcp_servers:            []MCP_Server `json:"mcpServers"`,
-	system_prompt:          string `json:"systemPrompt,omitempty"`,
-	meta:                   Maybe(Session_Meta) `json:"_meta,omitempty"`,
+	meta:                   json.Value `json:"_meta,omitempty"`,
 }
 
 Session_Load_Params :: struct {
-	session_id:    string `json:"sessionId"`,
-	cwd:           string `json:"cwd"`,
-	mcp_servers:   []MCP_Server `json:"mcpServers"`,
-	system_prompt: string `json:"systemPrompt,omitempty"`,
-	meta:          Maybe(Session_Meta) `json:"_meta,omitempty"`,
+	session_id:  string `json:"sessionId"`,
+	cwd:         string `json:"cwd"`,
+	mcp_servers: []MCP_Server `json:"mcpServers"`,
+	meta:        json.Value `json:"_meta,omitempty"`,
 }
 
 Replay_From :: struct {
@@ -283,8 +272,7 @@ Session_Resume_Params :: struct {
 	cwd:                    string `json:"cwd"`,
 	mcp_servers:            []MCP_Server `json:"mcpServers"`,
 	additional_directories: []string `json:"additionalDirectories,omitempty"`,
-	system_prompt:          string `json:"systemPrompt,omitempty"`,
-	meta:                   Maybe(Session_Meta) `json:"_meta,omitempty"`,
+	meta:                   json.Value `json:"_meta,omitempty"`,
 	replay_from:            Maybe(Replay_From) `json:"replayFrom,omitempty"`,
 }
 
@@ -448,19 +436,6 @@ Initialize_Result :: struct {
 Session_New_Result :: struct {
 	session_id:     string `json:"sessionId"`,
 	config_options: []V1_Config_Option `json:"configOptions,omitempty"`,
-	models:         Models_State `json:"models"`,
-}
-
-Model_Info :: struct {
-	model_id: string `json:"modelId"`,
-	name:     string `json:"name"`,
-}
-
-// Models_State is Buzz's pre-standard model catalog: the selected model and every
-// model the client may switch to. It travels beside the stable config options.
-Models_State :: struct {
-	current_model_id: string `json:"currentModelId"`,
-	available_models: []Model_Info `json:"availableModels"`,
 }
 
 // Config_Value is one choice of a model selector. v1 and v2 options share it; only
@@ -499,16 +474,6 @@ Empty_Result :: struct {}
 
 Prompt_Result :: struct {
 	stop_reason: string `json:"stopReason"`,
-}
-
-Session_Set_Model_Params :: struct {
-	session_id: string `json:"sessionId"`,
-	model_id:   string `json:"modelId"`,
-}
-
-Session_Set_Model_Result :: struct {
-	session_id: string `json:"sessionId"`,
-	model_id:   string `json:"modelId"`,
 }
 
 Session_Set_Config_Option_Params :: struct {

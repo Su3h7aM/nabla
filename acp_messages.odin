@@ -122,7 +122,7 @@ acp_handle_batch_frame :: proc(server: ^ACP_Server, frame: string) {
 		     acp.METHOD_SESSION_LIST,
 		     acp.METHOD_SESSION_CLOSE,
 		     acp.METHOD_SESSION_PROMPT,
-		     acp.METHOD_SESSION_SET_MODEL,
+		     ACP_METHOD_SESSION_SET_MODEL,
 		     acp.METHOD_SESSION_SET_CONFIG_OPTION:
 			_ = acp.write_error(&server.writer, envelope.id, acp.ERROR_INVALID_REQUEST, "lifecycle requests must not be sent in a JSON-RPC batch")
 			return
@@ -177,7 +177,7 @@ acp_handle_request :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "nabla advertises no authentication methods")
 	case acp.METHOD_SESSION_PROMPT:
 		acp_request_prompt(server, envelope)
-	case acp.METHOD_SESSION_SET_MODEL:
+	case ACP_METHOD_SESSION_SET_MODEL:
 		acp_request_set_model(server, envelope)
 	case acp.METHOD_SESSION_CANCEL:
 		acp_request_cancel(server, envelope)
@@ -329,18 +329,8 @@ acp_request_session_new :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the working directory does not exist: %s", params.cwd))
 		return
 	}
-	meta := params.meta.? or_else acp.Session_Meta{}
-	acp_enqueue_open_session(
-		server,
-		envelope,
-		false,
-		params.cwd,
-		"",
-		acp_session_prompt_text(params.system_prompt, &meta),
-		meta.session_title,
-		params.mcp_servers,
-		false,
-	)
+	session_title, meta_prompt := acp_session_meta(params.meta)
+	acp_enqueue_open_session(server, envelope, false, params.cwd, "", meta_prompt, session_title, params.mcp_servers, false)
 }
 
 acp_request_session_load :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
@@ -367,18 +357,8 @@ acp_request_session_load :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the load working directory does not match the session")
 		return
 	}
-	meta := params.meta.? or_else acp.Session_Meta{}
-	acp_enqueue_open_session(
-		server,
-		envelope,
-		true,
-		"",
-		params.session_id,
-		acp_session_prompt_text(params.system_prompt, &meta),
-		meta.session_title,
-		params.mcp_servers,
-		true,
-	)
+	session_title, meta_prompt := acp_session_meta(params.meta)
+	acp_enqueue_open_session(server, envelope, true, "", params.session_id, meta_prompt, session_title, params.mcp_servers, true)
 }
 
 acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
@@ -417,18 +397,8 @@ acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope)
 		}
 		replay = true
 	}
-	meta := params.meta.? or_else acp.Session_Meta{}
-	acp_enqueue_open_session(
-		server,
-		envelope,
-		true,
-		"",
-		params.session_id,
-		acp_session_prompt_text(params.system_prompt, &meta),
-		meta.session_title,
-		params.mcp_servers,
-		replay,
-	)
+	session_title, meta_prompt := acp_session_meta(params.meta)
+	acp_enqueue_open_session(server, envelope, true, "", params.session_id, meta_prompt, session_title, params.mcp_servers, replay)
 }
 
 acp_request_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
@@ -644,14 +614,6 @@ acp_request_set_config_option :: proc(server: ^ACP_Server, envelope: ^acp.Envelo
 	}
 }
 
-// acp_session_prompt_text reads the system prompt an open request carries: the
-// top-level field first, then the `_meta` forms clients use to append or replace
-// standing instructions.
-acp_session_prompt_text :: proc(field: string, meta: ^acp.Session_Meta) -> string {
-	if field != "" { return field }
-	return acp_session_meta_system_prompt(meta)
-}
-
 // acp_clone_open_strings copies the owned strings one Open_Session work item carries.
 // A failure releases whatever was already copied, so the caller answers and returns.
 @(require_results)
@@ -807,19 +769,20 @@ acp_enqueue_open_session :: proc(
 	}
 }
 
-// acp_session_meta_system_prompt reads the two systemPrompt forms used by ACP
-// clients. The object form appends to the agent's own instructions instead of
-// replacing them.
-acp_session_meta_system_prompt :: proc(meta: ^acp.Session_Meta) -> string {
-	#partial switch prompt in meta.system_prompt {
+// acp_session_meta reads the keys Nabla and its clients put in a session request's `_meta`:
+// sessionTitle, and systemPrompt as plain text or as an object whose "append" text is added to
+// the agent's own instructions instead of replacing them. The strings borrow meta.
+acp_session_meta :: proc(meta: json.Value) -> (session_title, system_prompt: string) {
+	object, is_object := meta.(json.Object)
+	if !is_object { return }
+	if title, is_text := object["sessionTitle"].(json.String); is_text { session_title = string(title) }
+	#partial switch prompt in object["systemPrompt"] {
 	case json.String:
-		return string(prompt)
+		system_prompt = string(prompt)
 	case json.Object:
-		if append_value, present := prompt["append"]; present {
-			if text, is_text := append_value.(json.String); is_text { return string(text) }
-		}
+		if text, is_text := prompt["append"].(json.String); is_text { system_prompt = string(text) }
 	}
-	return ""
+	return
 }
 
 // acp_session_params_reason reports a named capability that Nabla cannot honor.
@@ -975,6 +938,41 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	}
 }
 
+// Buzz's model selector predates model config options in ACP. A version 1 agent lists its
+// catalog as `models` in the session/new result and the client switches with session/set_model.
+// ACP no longer defines either, since it removed its unstable session model API in favor of
+// config options, so they are Nabla's own extension and live here, not in package acp.
+ACP_METHOD_SESSION_SET_MODEL :: "session/set_model"
+
+ACP_Model_Info :: struct {
+	model_id: string `json:"modelId"`,
+	name:     string `json:"name"`,
+}
+
+// ACP_Models_State is the model the session uses and every model the client may switch to.
+// It travels beside the config options.
+ACP_Models_State :: struct {
+	current_model_id: string `json:"currentModelId"`,
+	available_models: []ACP_Model_Info `json:"availableModels"`,
+}
+
+// ACP_Session_New_Result is the version 1 session/new result with the Buzz model list.
+ACP_Session_New_Result :: struct {
+	session_id:     string `json:"sessionId"`,
+	config_options: []acp.V1_Config_Option `json:"configOptions,omitempty"`,
+	models:         ACP_Models_State `json:"models"`,
+}
+
+ACP_Set_Model_Params :: struct {
+	session_id: string `json:"sessionId"`,
+	model_id:   string `json:"modelId"`,
+}
+
+ACP_Set_Model_Result :: struct {
+	session_id: string `json:"sessionId"`,
+	model_id:   string `json:"modelId"`,
+}
+
 acp_request_set_model :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	if acp_is_v2(server) {
 		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, "session/set_model is a Buzz v1 extension; use session/set_config_option")
@@ -984,7 +982,7 @@ acp_request_set_model :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_REQUEST, "initialize must be answered before a model can be selected")
 		return
 	}
-	params: acp.Session_Set_Model_Params
+	params: ACP_Set_Model_Params
 	if !acp_request_params_decode(server, envelope, &params, "session/set_model needs a session id and model id") {
 		return
 	}

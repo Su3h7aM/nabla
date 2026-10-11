@@ -58,7 +58,7 @@ ACP_Work_Compact :: struct {
 	text: string,
 }
 
-// ACP_Work_Set_Model is Buzz's v1 model-selection RPC. Model selection runs on the
+// ACP_Work_Set_Model is Buzz's v1 model-selection RPC, session/set_model. Model selection runs on the
 // session owner through ACP_Model_Request, so the worker only refuses it.
 ACP_Work_Set_Model :: struct {}
 
@@ -365,11 +365,7 @@ acp_model_selection_service :: proc(session: ^ACP_Session) -> ai.Provider_Connec
 			if value_error != nil { return acp_model_selection_config_failed(session, selection) }
 			acp_sent(
 				session,
-				acp.write_response(
-					&session.conn.writer,
-					selection.id,
-					acp.Session_Set_Model_Result{session_id = acp_session_id(session), model_id = model_id},
-				),
+				acp.write_response(&session.conn.writer, selection.id, ACP_Set_Model_Result{session_id = acp_session_id(session), model_id = model_id}),
 			)
 		} else if acp_is_v2(session.conn) {
 			v2_options, options_ok := acp_model_config_options_v2(session)
@@ -870,7 +866,7 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 			}
 		}
 	}
-	models: acp.Models_State
+	models: ACP_Models_State
 	resume_open := false
 	switch _ in work.start {
 	case Start_Resume_Id:
@@ -947,7 +943,7 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 		} else {
 			acp_sent(
 				session,
-				acp.write_response(&session.conn.writer, id, acp.Session_New_Result{session_id = session_id, config_options = v1_options, models = models}),
+				acp.write_response(&session.conn.writer, id, ACP_Session_New_Result{session_id = session_id, config_options = v1_options, models = models}),
 			)
 		}
 	}
@@ -1347,20 +1343,20 @@ acp_report_turn :: proc(session: ^ACP_Session) -> bool {
 }
 
 @(require_results)
-acp_models_state :: proc(session: ^ACP_Session) -> (acp.Models_State, bool) {
+acp_models_state :: proc(session: ^ACP_Session) -> (ACP_Models_State, bool) {
 	if len(session.app.setup.catalog.models) == 0 { return {}, true }
-	result: acp.Models_State
+	result: ACP_Models_State
 	current, current_error := acp_model_value(session.app.setup.provider_id, session.app.setup.model_id)
 	if current_error != nil { return {}, false }
 	result.current_model_id = current
-	available, available_error := make([]acp.Model_Info, len(session.app.setup.catalog.models), context.temp_allocator)
+	available, available_error := make([]ACP_Model_Info, len(session.app.setup.catalog.models), context.temp_allocator)
 	if available_error != nil { return {}, false }
 	for model, index in session.app.setup.catalog.models {
 		name := model.id
 		if name_value, ok := model.display_name.?; ok && name_value != "" { name = name_value }
 		value, value_error := acp_model_value(model.provider_id, model.id)
 		if value_error != nil { return {}, false }
-		available[index] = acp.Model_Info {
+		available[index] = ACP_Model_Info {
 			model_id = value,
 			name     = name,
 		}

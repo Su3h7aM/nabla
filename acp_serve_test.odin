@@ -57,15 +57,22 @@ test_request_params_decode_errors_use_json_rpc_internal_for_allocation :: proc(t
 }
 
 @(test)
-test_acp_session_meta_reads_client_system_prompt_extensions :: proc(t: ^testing.T) {
-	meta: acp.Session_Meta
-	object: json.Object
-	object["append"] = json.String("client standing context")
-	meta.system_prompt = object
-	testing.expect_value(t, acp_session_meta_system_prompt(&meta), "client standing context")
-	delete(object)
-	meta.system_prompt = json.String("plain context")
-	testing.expect_value(t, acp_session_meta_system_prompt(&meta), "plain context")
+test_acp_session_meta_reads_client_title_and_system_prompt_extensions :: proc(t: ^testing.T) {
+	appended: json.Object
+	appended["append"] = json.String("client standing context")
+	defer delete(appended)
+	meta: json.Object
+	defer delete(meta)
+	meta["sessionTitle"] = json.String("a title")
+	meta["systemPrompt"] = appended
+	title, prompt := acp_session_meta(meta)
+	testing.expect_value(t, title, "a title")
+	testing.expect_value(t, prompt, "client standing context")
+	meta["systemPrompt"] = json.String("plain context")
+	_, prompt = acp_session_meta(meta)
+	testing.expect_value(t, prompt, "plain context")
+	_, prompt = acp_session_meta(nil)
+	testing.expect_value(t, prompt, "")
 }
 
 // --- messages on the wire ----------------------------------------------------

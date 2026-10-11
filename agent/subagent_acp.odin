@@ -1267,24 +1267,10 @@ acp_session_configure :: proc(
 	member := connection.member
 
 	if model != "" {
-		option, value, listed := acp_model_find(opened.config_options, opened.models, model)
-		switch {
-		case value != "":
-			if value != option.current_value {
-				if problem = acp_set_option(connection, option, value); problem != "" { return }
-			}
-		case listed:
-			set: acp.Session_Set_Model_Result
-			if model != opened.models.current_model_id {
-				if problem = acp_call(
-					connection,
-					acp.METHOD_SESSION_SET_MODEL,
-					acp.Session_Set_Model_Params{session_id = connection.session_id, model_id = model},
-					&set,
-				); problem != "" { return }
-			}
-		case:
-			return acp_model_unavailable(opened, model)
+		option, value := acp_model_find(opened.config_options, model)
+		if value == "" { return acp_model_unavailable(opened, model) }
+		if value != option.current_value {
+			if problem = acp_set_option(connection, option, value); problem != "" { return }
 		}
 	}
 	// An effort the agent does not offer is treated as one left out, as for a native subagent.
@@ -1316,21 +1302,10 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> string {
 	defer acp_configure_destroy(&configuration)
 	if configuration.switching {
 		if configuration.model != "" {
-			option, value, listed := acp_model_find(connection.config_options, connection.opened.models, configuration.model)
-			switch {
-			case value != "":
-				if problem := acp_option_send(connection, ACP_Model_Reply{model = value, effort = configuration.effort}, option, value);
-				   problem != "" { return problem }
-			case listed:
-				if problem := acp_send(
-					connection,
-					ACP_Model_Reply{model = configuration.model, effort = configuration.effort},
-					acp.METHOD_SESSION_SET_MODEL,
-					acp.Session_Set_Model_Params{session_id = connection.session_id, model_id = configuration.model},
-				); problem != "" { return problem }
-			case:
-				return acp_configure_refusal(connection, acp_model_unavailable(connection.opened, configuration.model))
-			}
+			option, value := acp_model_find(connection.config_options, configuration.model)
+			if value == "" { return acp_configure_refusal(connection, acp_model_unavailable(connection.opened, configuration.model)) }
+			if problem := acp_option_send(connection, ACP_Model_Reply{model = value, effort = configuration.effort}, option, value);
+			   problem != "" { return problem }
 		} else if problem := acp_effort_send(connection, configuration.effort); problem != "" { return problem }
 	}
 	if configuration.compact { return acp_prompt_send(connection, "/compact") }
@@ -1349,12 +1324,11 @@ ACP_Config_Option :: struct {
 }
 
 // ACP_Session_Opened is the configuration returned by session/new, session/resume, or session/load.
-// Only session/new returns session_id. models is the pre-standard list some version 1 agents send.
+// Only session/new returns session_id.
 @(private)
 ACP_Session_Opened :: struct {
 	session_id:     string `json:"sessionId"`,
 	config_options: []ACP_Config_Option `json:"configOptions"`,
-	models:         acp.Models_State `json:"models"`,
 }
 
 @(private, require_results)
@@ -1383,24 +1357,14 @@ acp_option_value :: proc(option: ACP_Config_Option, wanted: string) -> string {
 	return ""
 }
 
-@(private, require_results)
-acp_model_offered :: proc(models: acp.Models_State, model: string) -> bool {
-	for offered in models.available_models {
-		if offered.model_id == model { return true }
-	}
-	return false
-}
-
-// acp_model_find looks model up among what an agent offers: a config option that names it, or
-// else the pre-standard model list. value is the option's own spelling of model, and is empty
-// when no option offers it; listed says the model list offers it. A model neither offers is
-// unavailable. options and models must outlive the results.
+// acp_model_find looks model up among the agent's model config option. value is the option's
+// own spelling of model, or "" when the agent offers no such model. options must outlive the
+// results.
 @(private)
-acp_model_find :: proc(options: []ACP_Config_Option, models: acp.Models_State, model: string) -> (option: ACP_Config_Option, value: string, listed: bool) {
-	if found, is_found := acp_option(options, ACP_OPTION_CATEGORY_MODEL); is_found {
-		if value = acp_option_value(found, model); value != "" { return found, value, false }
-	}
-	return {}, "", acp_model_offered(models, model)
+acp_model_find :: proc(options: []ACP_Config_Option, model: string) -> (option: ACP_Config_Option, value: string) {
+	found, is_found := acp_option(options, ACP_OPTION_CATEGORY_MODEL)
+	if !is_found { return {}, "" }
+	return found, acp_option_value(found, model)
 }
 
 // acp_model_unavailable says that opened offers no model, with what it does offer. The
@@ -1419,7 +1383,6 @@ acp_models_text :: proc(opened: ACP_Session_Opened) -> string {
 	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_MODEL); found {
 		for choice in option.options { append(&names, choice.value) }
 	}
-	for offered in opened.models.available_models { append(&names, offered.model_id) }
 	if len(names) == 0 { return "no choice of model" }
 	joined, join_error := strings.join(names[:], ", ", context.temp_allocator)
 	if join_error != nil { return "the model list could not be held" }

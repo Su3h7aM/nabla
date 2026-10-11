@@ -259,56 +259,13 @@ test_writer_frames_response_error_and_notification :: proc(t: ^testing.T) {
 	test_writer_finish(t, &writer)
 
 	want :=
-		`{"jsonrpc":"2.0","id":7,"result":{"sessionId":"sess_1","models":{"currentModelId":"","availableModels":[]}}}` +
+		`{"jsonrpc":"2.0","id":7,"result":{"sessionId":"sess_1"}}` +
 		"\n" +
 		`{"jsonrpc":"2.0","id":"req-1","error":{"code":-32602,"message":"no such session"}}` +
 		"\n" +
 		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_1","update":{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"read src/main.odin","kind":"read","status":"pending"}}}` +
 		"\n"
 	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
-}
-
-@(test)
-test_writer_includes_buzz_model_metadata :: proc(t: ^testing.T) {
-	buffer: bytes.Buffer
-	bytes.buffer_init_allocator(&buffer, 0, 0, context.allocator)
-	defer bytes.buffer_destroy(&buffer)
-	writer, writer_err := writer_init(test_writer_stream(&buffer))
-	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
-	defer test_writer_cleanup(&writer)
-
-	models := []Model_Info{{model_id = "test-model", name = "Test Model"}}
-	state := Models_State {
-		current_model_id = "test-model",
-		available_models = models,
-	}
-	config := []V1_Config_Option {
-		{
-			id = "model",
-			name = "Model",
-			category = "model",
-			type = "select",
-			current_value = "test-model",
-			options = []Config_Value{{value = "test-model", name = "Test Model"}},
-		},
-	}
-	result := Session_New_Result {
-		session_id     = "sess_models",
-		config_options = config,
-		models         = state,
-	}
-	testing.expect(t, write_response(&writer, i64(8), result) == .None)
-	test_writer_finish(t, &writer)
-	frame := bytes.buffer_to_string(&buffer)
-	testing.expect(
-		t,
-		strings.contains(
-			frame,
-			`"configOptions":[{"id":"model","name":"Model","category":"model","type":"select","currentValue":"test-model","options":[{"value":"test-model","name":"Test Model"}]}`,
-		),
-	)
-	testing.expect(t, strings.contains(frame, `"value":"test-model"`))
-	testing.expect(t, strings.contains(frame, `"models":{"currentModelId":"test-model","availableModels":[{"modelId":"test-model","name":"Test Model"}]}`))
 }
 
 @(test)
@@ -345,7 +302,7 @@ test_writer_batches_responses_and_keeps_notifications_as_own_frames :: proc(t: ^
 	want :=
 		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_1","update":{"sessionUpdate":"session_info_update","title":"kept"}}}` +
 		"\n" +
-		`[{"jsonrpc":"2.0","id":1,"result":{"sessionId":"sess_1","models":{"currentModelId":"","availableModels":[]}}},{"jsonrpc":"2.0","id":"two","error":{"code":-32602,"message":"bad request"}}]` +
+		`[{"jsonrpc":"2.0","id":1,"result":{"sessionId":"sess_1"}},{"jsonrpc":"2.0","id":"two","error":{"code":-32602,"message":"bad request"}}]` +
 		"\n" +
 		`[{"jsonrpc":"2.0","id":3,"result":{}}]` +
 		"\n"
@@ -458,7 +415,6 @@ test_v2_resume_params_read_replay_cursor :: proc(t: ^testing.T) {
 		delete(params.cwd)
 		delete(params.mcp_servers)
 		delete(params.additional_directories)
-		delete(params.system_prompt)
 	}
 	cursor, present := params.replay_from.?
 	testing.expect(t, present)
