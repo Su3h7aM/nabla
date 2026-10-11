@@ -65,13 +65,12 @@ tool_spawn_grouped :: proc(
 }
 
 // tool_spawn_command starts an argv in a private process group with this process's environment. A nil
-// input closes stdin. parent_death binds the child's lifetime to this supervising thread on Linux.
+// input closes stdin.
 @(require_results)
 tool_spawn_command :: proc(
 	arguments: []string,
 	directory: string,
 	input, stdout_write, stderr_write: ^os.File,
-	parent_death := false,
 ) -> (
 	child: subprocess.Child,
 	spawn: subprocess.Spawn,
@@ -82,17 +81,7 @@ tool_spawn_command :: proc(
 	// user can run is a tool the command has to be able to run.
 	environment, environment_error := os.environ(context.temp_allocator)
 	if environment_error != nil { return {}, .Failed, environment_error }
-	return subprocess.start(
-		{
-			argv = arguments,
-			environment = environment,
-			directory = directory,
-			stdin = input,
-			stdout = stdout_write,
-			stderr = stderr_write,
-			parent_death = parent_death,
-		},
-	)
+	return subprocess.start({argv = arguments, environment = environment, directory = directory, stdin = input, stdout = stdout_write, stderr = stderr_write})
 }
 
 // tool_control_fds appends the descriptors a stop wakes to fds: the call's wake,

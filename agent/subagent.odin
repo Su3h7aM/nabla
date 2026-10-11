@@ -3,7 +3,6 @@ package agent
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
-import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -77,10 +76,8 @@ Subagent :: struct {
 	// stop ends the subagent's work. It chains to the call that waits for it, or to the
 	// process interrupt for a background subagent.
 	stop:                         ai.Interrupt,
-	// wake is signalled with stop, so a subagent asleep in poll sees it; parent_wake is the
-	// wake of the call a blocking subagent runs for, borrowed.
-	wake:                         Tool_Wake,
-	parent_wake:                  ^os.File,
+	// wake retains notifications from the ACP readers and stop requests.
+	wake:                         sync.Sema,
 	acp_after:                    journal.Journal_Seq,
 	acp_session:                  string, // the ACP agent's own session id; "" for a native subagent, whose session is session
 	status:                       Subagent_Status,
@@ -494,7 +491,6 @@ subagent_destroy :: proc(member: ^Subagent) {
 	for &retired in member.retired { model_selection_destroy(&retired, allocator) }
 	delete(member.retired)
 	subagent_program_destroy(&member.program, allocator)
-	tool_wake_close(&member.wake)
 	delete(member.effort, allocator)
 	tool_registry_destroy(&member.tools)
 	delete(member.workspace, allocator)
@@ -624,11 +620,6 @@ subagent_start :: proc(
 		created.acp_session = strings.clone(resume.acp_session, allocator) or_else ""
 		if resume.acp_session != "" && created.acp_session == "" { return nil, "the agent's session id could not be held" }
 		created.acp_after = resume.after
-		wake, wake_error := tool_wake_open()
-		if wake_error != nil {
-			return nil, "the subagent's stop signal could not be created"
-		}
-		created.wake = wake
 	}
 
 	{
@@ -1674,8 +1665,18 @@ subagent_stop_waiting :: proc(team: ^Agent_Team) {
 @(private)
 subagent_request_stop :: proc(member: ^Subagent) {
 	ai.interrupt_request(&member.stop)
-	tool_wake_signal(&member.wake)
+	sync.sema_post(&member.wake)
 	job_note_stop(&member.worker, true, time.tick_now())
+}
+
+// subagent_wake_call_stop wakes a blocking subagent whose parent call was interrupted.
+@(private)
+subagent_wake_call_stop :: proc(team: ^Agent_Team, interrupt: ^ai.Interrupt) {
+	if team == nil { return }
+	sync.mutex_guard(&team.mutex)
+	for member in team.members {
+		if !member.background && member.stop.parent == interrupt { sync.sema_post(&member.wake) }
+	}
 }
 
 // subagent_unknown names the running subagents for a name that is not one. The caller holds

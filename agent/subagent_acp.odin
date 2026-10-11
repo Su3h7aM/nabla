@@ -8,12 +8,13 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 import "nabla:acp"
 import "nabla:agent/journal"
 import "nabla:ai"
-import "nabla:subprocess"
+
 
 // An ACP subagent is another agent program, driven over the Agent Client Protocol on its
 // stdin and stdout. The subagent's thread is the only one using the connection: it sends one
@@ -39,6 +40,9 @@ Subagent_Program :: struct {
 SUBAGENT_ACP_STDERR_TAIL_BYTES :: 32 * 1024
 
 SUBAGENT_ACP_READ_BYTES :: 16 * 1024
+
+// SUBAGENT_ACP_CLOSE_GRACE gives EOF and exited readers time to finish before abandonment.
+SUBAGENT_ACP_CLOSE_GRACE :: 500 * time.Millisecond
 
 // ACP_OPTION_CATEGORY_MODEL and ACP_OPTION_CATEGORY_EFFORT are the session config option
 // categories that choose a model and its reasoning effort.
@@ -139,9 +143,8 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 // ACP_Input is the agent's stdin. Its descriptor pair comes from acp_input_open.
 @(private)
 ACP_Input :: struct {
-	ours:   subprocess.Fd,
+	ours:   ^os.File,
 	theirs: ^os.File, // for the child's stdin; closed once the child has it
-	open:   bool,
 }
 
 @(private)
@@ -163,17 +166,151 @@ acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, o
 	return 0, .Unsupported
 }
 
+@(private, require_results)
+acp_input_open :: proc() -> (input: ACP_Input, ok: bool) {
+	read, write, err := os.pipe()
+	if err != nil { return {}, false }
+	return {ours = write, theirs = read}, true
+}
+
+@(private)
+acp_input_close :: proc(input: ^ACP_Input) {
+	if input.theirs != nil { _ = os.close(input.theirs) }
+	if input.ours != nil { _ = os.close(input.ours) }
+	input^ = {}
+}
+
+@(private, require_results)
+acp_input_send :: proc(input: ^ACP_Input, data: []u8) -> (sent: int, ok: bool) {
+	for sent < len(data) {
+		taken, err := os.write(input.ours, data[sent:])
+		if err != nil || taken == 0 { return sent, false }
+		sent += taken
+	}
+	return sent, true
+}
+
+@(private, require_results)
+subagent_executable :: proc(path: string) -> bool {
+	return os.exists(path) && !os.is_dir(path)
+}
+
+@(private)
+ACP_Worker :: enum {
+	Output,
+	Errors,
+	Process,
+}
+
+// ACP_Readers owns the three blocking workers and their shared observations. The connection
+// releases it after all workers finish, or leaks it after detaching its borrowed wake.
+@(private)
+ACP_Readers :: struct {
+	allocator:   mem.Allocator,
+	mutex:       sync.Mutex,
+	wake:        ^sync.Sema,
+	completion:  sync.Sema,
+	output:      ^os.File,
+	errors:      ^os.File,
+	process:     os.Process,
+	threads:     [ACP_Worker]^thread.Thread,
+	done:        [ACP_Worker]bool,
+	decoder:     acp.Frame_Decoder,
+	frames:      [dynamic]string,
+	frame_error: acp.Frame_Error,
+	read_error:  os.Error,
+	wait_error:  os.Error,
+	state:       os.Process_State,
+	stderr_tail: [dynamic]u8,
+}
+
+// acp_readers_signal posts observations while the caller holds readers.mutex, so wake
+// cannot be detached between the check and the post.
+@(private)
+acp_readers_signal :: proc(readers: ^ACP_Readers) {
+	if readers.wake != nil { sync.sema_post(readers.wake) }
+	sync.sema_post(&readers.completion)
+}
+
+@(private)
+acp_output_read :: proc(worker: ^thread.Thread) {
+	readers := cast(^ACP_Readers)worker.data
+	context.allocator = readers.allocator
+	defer {
+		_ = os.close(readers.output)
+		sync.mutex_guard(&readers.mutex)
+		readers.done[.Output] = true
+		acp_readers_signal(readers)
+	}
+	buffer: [SUBAGENT_ACP_READ_BYTES]u8
+	for {
+		taken, err := os.read(readers.output, buffer[:])
+		if err != nil || taken == 0 {
+			sync.mutex_guard(&readers.mutex)
+			if err != io.Error.EOF { readers.read_error = err }
+			return
+		}
+		frames: [dynamic]string
+		frames.allocator = readers.allocator
+		frame_error := acp.frame_decoder_feed(&readers.decoder, buffer[:taken], &frames)
+		{
+			sync.mutex_guard(&readers.mutex)
+			if _, append_error := append(&readers.frames, ..frames[:]); append_error != nil {
+				for frame in frames { delete(frame, readers.allocator) }
+				frame_error = .Allocation
+			}
+			if frame_error != .None && frame_error != .Empty_Frame { readers.frame_error = frame_error }
+			acp_readers_signal(readers)
+		}
+		delete(frames)
+		if frame_error != .None && frame_error != .Empty_Frame { return }
+	}
+}
+
+@(private)
+acp_errors_read :: proc(worker: ^thread.Thread) {
+	readers := cast(^ACP_Readers)worker.data
+	context.allocator = readers.allocator
+	defer {
+		_ = os.close(readers.errors)
+		sync.mutex_guard(&readers.mutex)
+		readers.done[.Errors] = true
+		acp_readers_signal(readers)
+	}
+	buffer: [SUBAGENT_ACP_READ_BYTES]u8
+	for {
+		taken, err := os.read(readers.errors, buffer[:])
+		if err != nil || taken == 0 { return }
+		{
+			sync.mutex_guard(&readers.mutex)
+			acp_stderr_retain(&readers.stderr_tail, buffer[:taken])
+		}
+	}
+}
+
+@(private)
+acp_process_wait :: proc(worker: ^thread.Thread) {
+	readers := cast(^ACP_Readers)worker.data
+	context.allocator = readers.allocator
+	state, err := os.process_wait(readers.process)
+	{
+		sync.mutex_guard(&readers.mutex)
+		readers.state = state
+		readers.wait_error = err
+		readers.done[.Process] = true
+		acp_readers_signal(readers)
+	}
+}
+
 // ACP_Connection is one running agent program and the client state of its session.
 @(private)
 ACP_Connection :: struct {
 	member:        ^Subagent,
-	child:         subprocess.Child,
+	child:         os.Process,
 	started:       bool,
 	input:         ^ACP_Input,
-	output:        ^os.File, // read end of the agent's stdout
-	errors:        ^os.File, // read end of the agent's stderr; nil once it ends
+	readers:       ^ACP_Readers,
 	writer:        acp.Writer,
-	decoder:       acp.Frame_Decoder,
 	frames:        [dynamic]string,
 	next_frame:    int,
 	next_id:       i64,
@@ -185,7 +322,6 @@ ACP_Connection :: struct {
 	message_id:    string, // the latest message's id, owned; "" when the agent sends none
 	idle:          bool, // version 2: the agent reported its turn over
 	stop_reason:   string, // why the turn ended, owned
-	stderr_tail:   [dynamic]u8,
 	cancel_sent:   bool,
 	stop_deadline: time.Tick,
 }
@@ -201,14 +337,12 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
 	frames, frames_error := make([dynamic]string, allocator)
 	answer_buffer, answer_error := make([dynamic]u8, allocator)
-	tail, tail_error := make([dynamic]u8, allocator)
-	if frames_error != nil || answer_error != nil || tail_error != nil {
+	if frames_error != nil || answer_error != nil {
 		subagent_fail(member, .Failed, "the agent's connection could not be held")
 		return
 	}
 	connection.frames = frames
 	connection.answer = answer_buffer
-	connection.stderr_tail = tail
 	if problem := acp_connection_open(&connection); problem != "" {
 		subagent_fail(member, .Failed, problem)
 		return
@@ -379,70 +513,140 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	}
 	input^ = opened_input
 	connection.input = input
+	readers, readers_error := new(ACP_Readers, member.allocator)
+	if readers_error != nil { return "the agent's readers could not be held; nothing ran" }
+	connection.readers = readers
+	readers.allocator = member.allocator
+	readers.wake = &member.wake
+	readers.frames.allocator = member.allocator
+	readers.stderr_tail.allocator = member.allocator
 	output_read, output_write, output_error := os.pipe()
 	if output_error != nil { return "the agent's output pipe could not be created; nothing ran" }
-	// The child holds the write ends; the parent's copies are abandoned here.
 	defer _ = os.close(output_write)
-	connection.output = output_read
+	readers.output = output_read
 	errors_read, errors_write, errors_error := os.pipe()
 	if errors_error != nil { return "the agent's error pipe could not be created; nothing ran" }
 	defer _ = os.close(errors_write)
-	connection.errors = errors_read
-
+	readers.errors = errors_read
 	argv, argv_error := make([]string, len(member.program.arguments) + 1, context.temp_allocator)
 	if argv_error != nil { return "the agent's arguments could not be held; nothing ran" }
 	argv[0] = member.program.command
 	copy(argv[1:], member.program.arguments)
-	child, spawn, spawn_error := tool_spawn_command(argv, member.workspace, connection.input.theirs, output_write, errors_write, parent_death = true)
-	switch spawn {
-	case .Started:
-	case .Exec_Failed:
-		return fmt.tprintf("%s could not be executed: %v; nothing ran", member.program.command, spawn_error)
-	case .Failed:
-		return fmt.tprintf("%s could not be started: %v; nothing ran", member.program.command, spawn_error)
-	}
+	child, spawn_error := os.process_start(
+		{command = argv, working_dir = member.workspace, stdin = input.theirs, stdout = output_write, stderr = errors_write},
+	)
+	if spawn_error != nil { return fmt.tprintf("%s could not be started: %v; nothing ran", member.program.command, spawn_error) }
 	connection.child = child
 	connection.started = true
-	// The child holds the read end of its input from here on.
-	_ = os.close(connection.input.theirs)
-	connection.input.theirs = nil
-
-	writer, writer_error := acp.writer_init(acp_input_writer(connection.input), member.allocator)
-	decoder, decoder_error := acp.frame_decoder_init(allocator = member.allocator)
+	readers.process = child
+	_ = os.close(input.theirs)
+	input.theirs = nil
+	writer, writer_error := acp.writer_init(acp_input_writer(input), member.allocator)
 	connection.writer = writer
-	connection.decoder = decoder
+	decoder, decoder_error := acp.frame_decoder_init(allocator = member.allocator)
+	readers.decoder = decoder
 	if writer_error != nil || decoder_error != nil { return "the agent's connection could not be allocated" }
+	procedures := [ACP_Worker]thread.Thread_Proc {
+		.Output  = acp_output_read,
+		.Errors  = acp_errors_read,
+		.Process = acp_process_wait,
+	}
+	previous_allocator := context.allocator
+	context.allocator = member.allocator
+	defer context.allocator = previous_allocator
+	for procedure, index in procedures {
+		worker := thread.create(procedure)
+		if worker == nil { return "the agent's reader thread could not be created" }
+		readers.threads[index] = worker
+		worker.data = readers
+		thread.start(worker)
+	}
 	return ""
 }
 
-// acp_connection_close stops the child before draining the writer, so a blocked send sees its
-// peer close. The agent keeps its own session; nothing here waits for it to save.
+// acp_readers_wait waits only for the stated teardown deadline, never for an inherited pipe.
+@(private, require_results)
+acp_readers_wait :: proc(readers: ^ACP_Readers, process_only: bool, deadline: time.Tick) -> bool {
+	for {
+		{
+			sync.mutex_guard(&readers.mutex)
+			complete := true
+			for worker, index in readers.threads {
+				if worker != nil && !readers.done[index] && (!process_only || index == .Process) { complete = false }
+			}
+			if complete { return true }
+		}
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 { return false }
+		_ = sync.sema_wait_with_timeout(&readers.completion, remaining)
+	}
+}
+
+// acp_connection_close ends stdin, lets the child exit, then kills it if necessary. A
+// worker held by a descendant is detached and its state retained, never killed or freed.
 @(private)
 acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duration) {
-	if connection.started {
-		subprocess.terminate_group(&connection.child)
-		subprocess.child_close(&connection.child)
-	}
-	// The agent's pipes are abandoned here: its process is gone or going.
-	if connection.output != nil { _ = os.close(connection.output) }
-	if connection.errors != nil { _ = os.close(connection.errors) }
-	writer_retired := acp.writer_destroy(&connection.writer, patience)
-	if writer_retired {
-		if connection.input != nil {
-			acp_input_close(connection.input)
-			free(connection.input, connection.member.allocator)
+	readers := connection.readers
+	writer_retired := acp.writer_destroy(&connection.writer, min(patience, SUBAGENT_ACP_CLOSE_GRACE))
+	if !writer_retired && connection.started {
+		process_finished: bool
+		{
+			sync.mutex_guard(&readers.mutex)
+			process_finished = readers.done[.Process]
 		}
-	} else {
-		// The writer may still dereference its transport state after a timed-out write.
+		if !process_finished { _ = os.process_kill(connection.child) }
+		writer_retired = acp.writer_destroy(&connection.writer, SUBAGENT_ACP_CLOSE_GRACE)
+	}
+	if writer_retired && connection.input != nil && connection.input.ours != nil {
+		_ = os.close(connection.input.ours)
+		connection.input.ours = nil
+	}
+	if connection.started {
+		if readers.threads[.Process] == nil {
+			_ = os.process_kill(connection.child)
+			_, wait_error := os.process_wait(connection.child, SUBAGENT_ACP_CLOSE_GRACE)
+			if wait_error != nil {
+				message := fmt.tprintf("the agent could not be reaped: %v; its outcome is unknown", wait_error)
+				subagent_fail(connection.member, .Failed, message)
+			}
+		} else if !acp_readers_wait(readers, true, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE)) {
+			_ = os.process_kill(connection.child)
+			_ = acp_readers_wait(readers, true, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
+		}
+	}
+	if writer_retired && connection.input != nil {
+		acp_input_close(connection.input)
+		free(connection.input, connection.member.allocator)
+	} else if !writer_retired {
+		subagent_fail(connection.member, .Failed, "the agent's writer did not retire; its outcome is unknown and its resources were retained")
+	}
+	if readers != nil {
+		retired := acp_readers_wait(readers, false, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
+		{
+			sync.mutex_guard(&readers.mutex)
+			readers.wake = nil
+		}
+		if retired {
+			for worker in readers.threads {
+				if worker != nil { thread.join(worker); thread.destroy(worker) }
+			}
+			if readers.threads[.Output] == nil && readers.output != nil { _ = os.close(readers.output) }
+			if readers.threads[.Errors] == nil && readers.errors != nil { _ = os.close(readers.errors) }
+			for frame in readers.frames { delete(frame, readers.allocator) }
+			delete(readers.frames)
+			delete(readers.stderr_tail)
+			acp.frame_decoder_destroy(&readers.decoder)
+			free(readers, connection.member.allocator)
+		} else {
+			subagent_fail(connection.member, .Failed, "the agent's transport worker did not retire; its outcome is unknown and its resources were retained")
+		}
 	}
 	for frame in connection.frames { delete(frame, connection.member.allocator) }
 	delete(connection.frames)
-	acp.frame_decoder_destroy(&connection.decoder)
 	delete(connection.session_id, connection.member.allocator)
 	delete(connection.message_id, connection.member.allocator)
 	delete(connection.stop_reason, connection.member.allocator)
 	delete(connection.answer)
-	delete(connection.stderr_tail)
 	connection^ = {}
 }
 
@@ -889,90 +1093,48 @@ acp_next :: proc(connection: ^ACP_Connection) -> (envelope: acp.Envelope, proble
 @(private, require_results)
 acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
-	if ai.interrupt_requested(&member.stop) && !connection.cancel_sent {
-		connection.cancel_sent = true
-		connection.stop_deadline = time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
-		if connection.session_id == "" { return "the subagent was stopped before its session opened" }
-		// A cancel that cannot be written is what the stop patience below covers.
-		_ = acp.writer_write_notification(&connection.writer, acp.SESSION_CANCEL, acp.Session_Cancel_Params{session_id = connection.session_id})
-	}
-	// The agent's exit is watched beside its output, because a descendant that inherited
-	// stdout can keep it open after the agent itself is gone.
-	fds: [5]subprocess.Poll
-	fds[0] = {
-		fd = subprocess.fd(connection.output),
-	}
-	fds[1] = {
-		fd = connection.child.exit,
-	}
-	count := 2
-	errors_index := -1
-	if connection.errors != nil {
-		errors_index = count
-		fds[count] = {
-			fd = subprocess.fd(connection.errors),
+	readers := connection.readers
+	for {
+		if ai.interrupt_requested(&member.stop) && !connection.cancel_sent {
+			connection.cancel_sent = true
+			connection.stop_deadline = time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
+			if connection.session_id == "" { return "the subagent was stopped before its session opened" }
+			_ = acp.writer_write_notification(&connection.writer, acp.SESSION_CANCEL, acp.Session_Cancel_Params{session_id = connection.session_id})
 		}
-		count += 1
-	}
-	if !connection.cancel_sent {
-		fds[count] = {
-			fd = subprocess.fd(member.wake.read),
-		}
-		count += 1
-		if member.parent_wake != nil {
-			fds[count] = {
-				fd = subprocess.fd(member.parent_wake),
+		ended: bool
+		what := "exited"
+		{
+			sync.mutex_guard(&readers.mutex)
+			if len(readers.frames) > 0 {
+				connection.frames, readers.frames = readers.frames, connection.frames
+				return ""
 			}
-			count += 1
+			if readers.frame_error != .None {
+				return fmt.tprintf("the agent sent a message that could not be read: %s", acp.frame_error_text(readers.frame_error))
+			}
+			ended = readers.done[.Output] || readers.done[.Process]
+			if readers.read_error != nil { what = "could not be read" }
+			if readers.wait_error != nil { return fmt.tprintf("the agent could not be waited on: %v", readers.wait_error) }
+		}
+		if ended {
+			_ = acp_readers_wait(readers, false, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
+			{
+				sync.mutex_guard(&readers.mutex)
+				if len(readers.frames) > 0 {
+					connection.frames, readers.frames = readers.frames, connection.frames
+					return ""
+				}
+			}
+			return acp_ended(connection, what)
+		}
+		if connection.cancel_sent {
+			remaining := time.tick_diff(time.tick_now(), connection.stop_deadline)
+			if remaining <= 0 { return "the agent did not stop in time and was ended" }
+			_ = sync.sema_wait_with_timeout(&member.wake, remaining)
+		} else {
+			sync.sema_wait(&member.wake)
 		}
 	}
-	if poll_error := subprocess.poll(fds[:count], connection.stop_deadline, connection.cancel_sent); poll_error != nil {
-		return fmt.tprintf("the agent could not be waited on: %v", poll_error)
-	}
-	if connection.cancel_sent && time.tick_diff(time.tick_now(), connection.stop_deadline) <= 0 {
-		return "the agent did not stop in time and was ended"
-	}
-	buffer: [SUBAGENT_ACP_READ_BYTES]u8
-	if errors_index >= 0 && fds[errors_index].ready { acp_stderr_read(connection, buffer[:]) }
-	// What the agent wrote before it exited is read first; its exit counts once nothing is
-	// waiting, whoever still holds its pipes.
-	if !fds[0].ready {
-		stderr_waiting := errors_index >= 0 && fds[errors_index].ready
-		if fds[1].ready && !stderr_waiting { return acp_ended(connection, "exited") }
-		return ""
-	}
-	read, status := subprocess.read(connection.output, buffer[:])
-	switch status {
-	case .Again:
-		return ""
-	case .Failed:
-		return acp_ended(connection, "could not be read")
-	case .Ok:
-	}
-	if read == 0 { return acp_ended(connection, "exited") }
-	// A dropped frame could be the answer this connection waits for, so it ends the
-	// connection; a blank line carries nothing.
-	switch frame_error := acp.frame_decoder_feed(&connection.decoder, buffer[:read], &connection.frames); frame_error {
-	case .None, .Empty_Frame:
-	case .Invalid_UTF8, .Allocation:
-		return fmt.tprintf("the agent sent a message that could not be read: %s", acp.frame_error_text(frame_error))
-	}
-	return ""
-}
-
-// acp_stderr_read reads one chunk of the agent's stderr into the tail, and closes the pipe at
-// its end. It returns false when nothing more is ready.
-@(private)
-acp_stderr_read :: proc(connection: ^ACP_Connection, buffer: []u8) -> bool {
-	taken, status := subprocess.read(connection.errors, buffer)
-	if status == .Failed || (status == .Ok && taken == 0) {
-		_ = os.close(connection.errors)
-		connection.errors = nil
-		return false
-	}
-	if status == .Again { return false }
-	acp_stderr_retain(&connection.stderr_tail, buffer[:taken])
-	return true
 }
 
 // acp_stderr_retain adds what the agent just wrote and keeps only the most recent
@@ -993,15 +1155,9 @@ acp_stderr_retain :: proc(tail: ^[dynamic]u8, data: []u8) {
 // acp_ended says the agent went away, with the end of what it wrote to stderr.
 @(private)
 acp_ended :: proc(connection: ^ACP_Connection, what: string) -> string {
-	// What the agent wrote to stderr before it went away can still be in the pipe. Only what is
-	// ready is read, so a descendant that holds the pipe open cannot hold up the report.
-	buffer: [SUBAGENT_ACP_READ_BYTES]u8
-	for connection.errors != nil {
-		ready := [1]subprocess.Poll{{fd = subprocess.fd(connection.errors)}}
-		if subprocess.poll(ready[:], time.tick_now(), true) != nil || !ready[0].ready { break }
-		if !acp_stderr_read(connection, buffer[:]) { break }
-	}
-	tail := strings.trim_space(string(connection.stderr_tail[:]))
+	readers := connection.readers
+	sync.mutex_guard(&readers.mutex)
+	tail := strings.trim_space(string(readers.stderr_tail[:]))
 	if tail == "" { return fmt.tprintf("the agent %s before it answered", what) }
 	return fmt.tprintf("the agent %s before it answered. The end of its stderr:\n%s", what, tail)
 }

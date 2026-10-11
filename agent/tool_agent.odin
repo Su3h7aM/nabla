@@ -376,8 +376,10 @@ tool_agent_start_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 
 	// A blocking subagent stops with this call.
 	subagent_take_slot(member)
-	member.stop.parent = ctx.control.interrupt
-	member.parent_wake = ctx.control.wake
+	{
+		sync.mutex_guard(&member.team.mutex)
+		member.stop.parent = ctx.control.interrupt
+	}
 	subagent_run(member)
 	output.status = subagent_status_names[member.status]
 	output.acp_session = member.acp_session

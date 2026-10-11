@@ -1604,7 +1604,6 @@ test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
 	}
 	connection.frames.allocator = member.allocator
 	connection.answer.allocator = member.allocator
-	connection.stderr_tail.allocator = member.allocator
 	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
 	if problem = acp_connection_open(&connection); !testing.expect_value(test, problem, "") { return }
 	if problem = acp_session_open(&connection); !testing.expect_value(test, problem, "") { return }

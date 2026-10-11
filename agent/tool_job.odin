@@ -1079,6 +1079,7 @@ tool_job_launch :: proc(job: ^Tool_Job) -> os.Error {
 tool_job_request_stop :: proc(job: ^Tool_Job) {
 	ai.interrupt_request(&job.interrupt)
 	tool_wake_signal(&job.wake)
+	subagent_wake_call_stop(job.exec.agents, &job.interrupt)
 }
 
 // tool_job_run executes one call on the job's thread. job_main publishes after it returns.
