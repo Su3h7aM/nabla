@@ -618,6 +618,8 @@ acp_run_start :: proc(connection: ^ACP_Connection) -> (started: bool) {
 		return false
 	}
 	for len(connection.pending) > 0 || !connection.idle {
+		// Each receive releases the temp memory its message was decoded into; its problem is consumed before the scope ends.
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 		if problem := acp_receive(connection); problem != "" {
 			subagent_fail(member, .Failed, problem)
 			return false
@@ -857,7 +859,6 @@ acp_configure_refusal :: proc(connection: ^ACP_Connection, reason: string) -> st
 // acp_receive is the live exchange's only receive step. Service paths only send.
 @(private, require_results)
 acp_receive :: proc(connection: ^ACP_Connection) -> string {
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	envelope, problem := acp_next(connection)
 	if problem != "" { return problem }
 	defer acp.destroy_envelope(&envelope, connection.member.allocator)
@@ -1084,7 +1085,9 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	if argv_error != nil { return "the agent's arguments could not be held; nothing ran" }
 	argv[0] = member.program.command
 	copy(argv[1:], member.program.arguments)
-	child, spawn_error := os.process_start({command = argv, working_dir = member.workspace, stdin = input_read, stdout = output_write, stderr = errors_write})
+	child, spawn_error := os.process_start(
+		{command = argv, working_dir = member.workspace, stdin = input_read, stdout = output_write, stderr = errors_write, new_group = true},
+	)
 	if spawn_error != nil { return fmt.tprintf("%s could not be started: %v; nothing ran", member.program.command, spawn_error) }
 	connection.child = child
 	connection.started = true
@@ -1128,6 +1131,19 @@ acp_readers_wait :: proc(readers: ^ACP_Readers, process_only: bool, deadline: ti
 	}
 }
 
+// acp_child_kill_group kills the agent child together with the descendants that stayed
+// in its process group. The child must have been started with new_group, since a group
+// kill on a leader without one signals the caller's own group. Where a group kill is
+// unsupported it kills just the leader.
+@(private)
+acp_child_kill_group :: proc(child: os.Process) {
+	group_error := os.process_kill_group(child)
+	if group_error == nil { return }
+	if unsupported, ok := group_error.(io.Error); ok && unsupported == .Unsupported {
+		_ = os.process_kill(child)
+	}
+}
+
 // acp_connection_close ends stdin, lets the child exit, then kills it if necessary. A
 // worker held by a descendant is detached and its state retained, never killed or freed.
 @(private)
@@ -1140,7 +1156,7 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 			sync.mutex_guard(&readers.mutex)
 			process_finished = readers.done[.Process]
 		}
-		if !process_finished { _ = os.process_kill(connection.child) }
+		if !process_finished { acp_child_kill_group(connection.child) }
 		writer_retired = acp.writer_destroy(&connection.writer, SUBAGENT_ACP_CLOSE_GRACE)
 	}
 	if writer_retired && connection.input != nil {
@@ -1149,14 +1165,14 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 	}
 	if connection.started {
 		if readers.threads[.Process] == nil {
-			_ = os.process_kill(connection.child)
+			acp_child_kill_group(connection.child)
 			_, wait_error := os.process_wait(connection.child, SUBAGENT_ACP_CLOSE_GRACE)
 			if wait_error != nil {
 				message := fmt.tprintf("the agent could not be reaped: %v; its outcome is unknown", wait_error)
 				subagent_fail(connection.member, .Failed, message)
 			}
 		} else if !acp_readers_wait(readers, true, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE)) {
-			_ = os.process_kill(connection.child)
+			acp_child_kill_group(connection.child)
 			_ = acp_readers_wait(readers, true, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
 		}
 	}
