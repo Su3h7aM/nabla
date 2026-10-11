@@ -1,9 +1,7 @@
 package web
 
 import "base:runtime"
-import "core:encoding/entity"
 import "core:strings"
-import "core:unicode/utf8"
 
 import "nabla:html"
 import "nabla:http/client"
@@ -11,10 +9,6 @@ import "nabla:http/client"
 // The URL is the one every DuckDuckGo client uses for the no-JavaScript results page.
 @(private)
 DUCKDUCKGO_URL :: "https://html.duckduckgo.com/html/"
-
-// DuckDuckGo answers a client without a browser's headers with a bot challenge.
-@(private)
-DUCKDUCKGO_USER_AGENT :: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 // Result links point at this host. Its /l/ path is the redirect whose uddg
 // parameter holds the real URL, and its /y.js path is the sponsored-result tracker.
@@ -24,11 +18,6 @@ DUCKDUCKGO_HOST :: "duckduckgo.com"
 // DUCKDUCKGO_CHALLENGE_FORM is the id of the form on the bot challenge page.
 @(private)
 DUCKDUCKGO_CHALLENGE_FORM :: "challenge-form"
-
-// DUCKDUCKGO_ENTITY_MAX is the longest character reference body (between & and ;)
-// a decoder needs: "#x10FFFF".
-@(private)
-DUCKDUCKGO_ENTITY_MAX :: 8
 
 // Page accumulates the results of one decode pass.
 @(private)
@@ -67,8 +56,9 @@ duckduckgo_request :: proc(endpoint: Endpoint, query: Query) -> (request: client
 	request.method = .Post
 	request.body = form.buf[:]
 	request.headers, err = headers_make(
-		{"User-Agent", DUCKDUCKGO_USER_AGENT},
+		{"User-Agent", BROWSER_USER_AGENT},
 		{"Accept", "text/html"},
+		{"Accept-Language", "en-US,en;q=0.9"},
 		{"Referer", DUCKDUCKGO_URL},
 		{"Content-Type", "application/x-www-form-urlencoded"},
 	)
@@ -77,13 +67,12 @@ duckduckgo_request :: proc(endpoint: Endpoint, query: Query) -> (request: client
 
 // duckduckgo_decode reads the results page. The bot challenge page, which
 // DuckDuckGo serves in place of results when it suspects automation, is
-// Rate_Limited: a later retry or another provider can succeed. A page with an
+// Challenged: a later retry or another provider can succeed. A page with an
 // empty list is a search without results, and a page with neither is
-// Invalid_Response. At most count
-// results are kept when count is positive.
+// Invalid_Response.
 @(private)
 @(require_results)
-duckduckgo_decode :: proc(body: []u8, count: int) -> (response: Response, err: Error) {
+duckduckgo_decode :: proc(body: []u8) -> (response: Response, err: Error) {
 	page: Duckduckgo_Page
 	page.results.allocator = context.temp_allocator
 	tokenizer: html.Tokenizer
@@ -91,7 +80,7 @@ duckduckgo_decode :: proc(body: []u8, count: int) -> (response: Response, err: E
 	for token in html.next(&tokenizer) {
 		if token.kind != .Start_Tag { continue }
 		switch {
-		case duckduckgo_id_is(token, DUCKDUCKGO_CHALLENGE_FORM):
+		case duckduckgo_id_is(token, DUCKDUCKGO_CHALLENGE_FORM), duckduckgo_class_has(token, "anomaly-modal__title"):
 			page.challenge = true
 		case duckduckgo_class_has(token, "results"), duckduckgo_class_has(token, "no-results"):
 			page.container = true
@@ -115,22 +104,20 @@ duckduckgo_decode :: proc(body: []u8, count: int) -> (response: Response, err: E
 	if duckduckgo_flush(&page) != nil { return {}, OUT_OF_MEMORY }
 	if !page.container {
 		if page.challenge {
-			return {}, {kind = .Rate_Limited, detail = "duckduckgo: the page is a bot challenge; retry later or use another provider"}
+			return {}, {kind = .Challenged, detail = "duckduckgo: the page is a bot challenge; retry later or use another provider"}
 		}
 		return {}, {kind = .Invalid_Response, detail = "duckduckgo: the page has neither results nor a challenge"}
 	}
-	kept := len(page.results)
-	if count > 0 { kept = min(kept, count) }
-	response.results = page.results[:kept]
+	response.results = page.results[:]
 	return
 }
 
-// duckduckgo_flush ends the open result, keeping it when it is a titled organic result.
+// duckduckgo_flush ends the open result, keeping it when it is an organic result with a URL.
 @(private)
 @(require_results)
 duckduckgo_flush :: proc(page: ^Duckduckgo_Page) -> runtime.Allocator_Error {
 	result := page.current
-	keep := page.open && !page.ad && result.title != "" && result.url != ""
+	keep := page.open && !page.ad && result.url != ""
 	page.current = {}
 	page.open = false
 	page.ad = false
@@ -189,67 +176,6 @@ duckduckgo_link :: proc(href: string) -> (link: string, err: runtime.Allocator_E
 	}
 	if scheme_relative { return "", nil }
 	return decoded, nil
-}
-
-// percent_decode_write writes text with its %XX escapes decoded. A malformed
-// escape is kept as written.
-@(private)
-@(require_results)
-percent_decode_write :: proc(builder: ^strings.Builder, text: string) -> bool {
-	for i := 0; i < len(text); i += 1 {
-		if text[i] == '%' && i + 2 < len(text) {
-			high, high_ok := hex_value(text[i + 1])
-			low, low_ok := hex_value(text[i + 2])
-			if high_ok && low_ok {
-				if strings.write_byte(builder, high << 4 | low) != 1 { return false }
-				i += 2
-				continue
-			}
-		}
-		if strings.write_byte(builder, text[i]) != 1 { return false }
-	}
-	return true
-}
-
-@(private)
-hex_value :: proc(digit: u8) -> (value: u8, ok: bool) {
-	switch digit {
-	case '0' ..= '9':
-		return digit - '0', true
-	case 'a' ..= 'f':
-		return digit - 'a' + 10, true
-	case 'A' ..= 'F':
-		return digit - 'A' + 10, true
-	}
-	return 0, false
-}
-
-// entities_write writes text with its character references decoded. A reference
-// that does not decode is kept as written.
-@(private)
-@(require_results)
-entities_write :: proc(builder: ^strings.Builder, text: string) -> bool {
-	rest := text
-	for len(rest) > 0 {
-		ampersand := strings.index_byte(rest, '&')
-		if ampersand < 0 { return write(builder, rest) }
-		if !write(builder, rest[:ampersand]) { return false }
-		rest = rest[ampersand:]
-		semicolon := strings.index_byte(rest, ';')
-		if semicolon > 1 && semicolon <= DUCKDUCKGO_ENTITY_MAX + 1 {
-			if decoded, count, ok := entity.xml_decode_entity(rest[1:semicolon]); ok {
-				for i in 0 ..< count {
-					bytes, size := utf8.encode_rune(decoded[i])
-					if !write(builder, string(bytes[:size])) { return false }
-				}
-				rest = rest[semicolon + 1:]
-				continue
-			}
-		}
-		if !write(builder, "&") { return false }
-		rest = rest[1:]
-	}
-	return true
 }
 
 // duckduckgo_id_is reports whether a start tag has the given id.

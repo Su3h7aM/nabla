@@ -63,7 +63,7 @@ test_duckduckgo_search_tells_challenge_from_no_results_from_garbage :: proc(t: ^
 		body:   string,
 		kind:   Error_Kind,
 	}
-	cases := []Case{{202, CHALLENGE_PAGE, .Rate_Limited}, {200, EMPTY_PAGE, .None}, {200, "<html><body>hello</body></html>", .Invalid_Response}}
+	cases := []Case{{202, CHALLENGE_PAGE, .Challenged}, {200, EMPTY_PAGE, .None}, {200, "<html><body>hello</body></html>", .Invalid_Response}}
 	for test_case in cases {
 		server: Server
 		if !server_start(t, &server, []string{reply(test_case.status, HTML_HEADERS, test_case.body)}) { return }

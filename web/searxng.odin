@@ -42,18 +42,15 @@ searxng_request :: proc(endpoint: Endpoint, query: Query) -> (request: client.Re
 	return
 }
 
-// searxng_decode keeps at most count results; an instance returns a whole page and has no count parameter.
 @(private)
 @(require_results)
-searxng_decode :: proc(body: []u8, count: int) -> (response: Response, err: Error) {
+searxng_decode :: proc(body: []u8) -> (response: Response, err: Error) {
 	wire: Searxng_Wire
 	if err = json_decode(body, &wire, "searxng"); err.kind != .None { return }
 	results, present := wire.results.?
 	if !present { return {}, {kind = .Invalid_Response, detail = "searxng: the response has no results list"} }
-	kept := len(results)
-	if count > 0 { kept = min(kept, count) }
-	if response.results, err = results_make(kept); err.kind != .None { return }
-	for result, i in results[:kept] {
+	if response.results, err = results_make(len(results)); err.kind != .None { return }
+	for result, i in results {
 		response.results[i] = {
 			title     = result.title,
 			url       = result.url,

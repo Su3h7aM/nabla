@@ -11,6 +11,10 @@ import "core:time"
 import "nabla:http"
 import "nabla:http/client"
 
+// BROWSER_USER_AGENT identifies browser-compatible requests to public sites.
+@(private)
+BROWSER_USER_AGENT :: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
 Provider :: enum {
 	DuckDuckGo, // zero value: needs no key
 	Brave,
@@ -47,7 +51,7 @@ Endpoint :: struct {
 }
 
 Result :: struct {
-	title:     string,
+	title:     string, // provider's title, or the URL host and port without userinfo when empty
 	url:       string,
 	snippet:   string,
 	published: string, // as the provider wrote it; "" when absent
@@ -63,6 +67,7 @@ Error_Kind :: enum {
 	None,
 	Missing_Credential, // the provider needs api_key or base_url
 	Unauthorized, // 401, 403
+	Challenged, // Cloudflare's documented cf-mitigated: challenge response, or a search engine's bot challenge page
 	Quota, // 402
 	Rate_Limited, // 429; retry_after when the response stated one
 	Rejected, // other statuses outside 2xx below 500, or an error the provider reported in a 2xx reply
@@ -71,6 +76,7 @@ Error_Kind :: enum {
 	Timed_Out,
 	Cancelled,
 	Invalid_Response, // the body did not decode into results
+	Unsupported_Content, // the media type, character encoding, or content coding cannot be converted
 	Out_Of_Memory,
 }
 
@@ -78,10 +84,10 @@ Error :: struct {
 	kind:        Error_Kind,
 	status:      int, // the HTTP status, 0 when none was received
 	retry_after: time.Duration, // from Retry-After on any HTTP refusal, 0 when absent
-	detail:      string, // "" when kind and status say it all; owned by the allocator passed to search; never holds the API key
+	detail:      string, // "" when kind and status say it all; owned by the allocator passed to search or fetch; never holds the API key
 }
 
-// error_destroy releases the detail of an Error returned by search.
+// error_destroy releases the detail of an Error returned by search or fetch.
 error_destroy :: proc(err: ^Error, allocator := context.allocator) {
 	if err.detail != "" { delete(err.detail, allocator) }
 	err^ = {}
@@ -150,12 +156,18 @@ search_scratch :: proc(endpoint: Endpoint, query: Query, options: client.Options
 	if err.kind != .None { return }
 
 	body: []u8
-	body, err = exchange(endpoint.provider, request, options)
+	body, err = exchange(request, options)
+	// Tavily documents 432 and 433 as plan and pay-as-you-go quota refusals.
+	if endpoint.provider == .Tavily && err.kind == .Rejected && (err.status == 432 || err.status == 433) { err.kind = .Quota }
+	// A SearXNG instance answers 403 when its settings do not list json under search.formats.
+	if endpoint.provider == .SearXNG && err.kind == .Unauthorized && err.status == 403 {
+		err.detail = "the instance refused the request; it may not enable the json format"
+	}
 	if err.kind != .None { return }
 
 	switch endpoint.provider {
 	case .DuckDuckGo:
-		response, err = duckduckgo_decode(body, query.count)
+		response, err = duckduckgo_decode(body)
 	case .Brave:
 		response, err = brave_decode(body)
 	case .Tavily:
@@ -165,9 +177,17 @@ search_scratch :: proc(endpoint: Endpoint, query: Query, options: client.Options
 	case .Exa_MCP:
 		response, err = exa_mcp_decode(body)
 	case .SearXNG:
-		response, err = searxng_decode(body, query.count)
+		response, err = searxng_decode(body)
 	}
 	if err.kind != .None { return {}, err }
+	response.results = results_unique(response.results)
+	if query.count > 0 { response.results = response.results[:min(len(response.results), query.count)] }
+	for &result in response.results {
+		if result.title != "" { continue }
+		host := http.url_parse(result.url).host
+		if separator := strings.last_index_byte(host, '@'); separator >= 0 { host = host[separator + 1:] }
+		result.title = host
+	}
 	response.count_clamped_to = clamped_to
 	return response, {}
 }
@@ -217,6 +237,21 @@ results_make :: proc(count: int) -> (results: []Result, err: Error) {
 	made, make_err := make([]Result, count, context.temp_allocator)
 	if make_err != nil { return nil, OUT_OF_MEMORY }
 	return made, {}
+}
+
+// results_unique drops, in place, every result whose URL an earlier result has,
+// and returns the shortened slice.
+@(private)
+results_unique :: proc(results: []Result) -> []Result {
+	kept := 0
+	outer: for result in results {
+		for earlier in results[:kept] {
+			if earlier.url == result.url { continue outer }
+		}
+		results[kept] = result
+		kept += 1
+	}
+	return results[:kept]
 }
 
 // clamp_count returns the count to send for a provider whose documented maximum
@@ -344,9 +379,15 @@ json_decode :: proc(body: []u8, wire: ^$T, provider: string) -> (err: Error) {
 // Exchange collects one response body and what the head said about retrying.
 @(private)
 Exchange :: struct {
-	body:        [dynamic]u8,
-	retry_after: time.Duration,
-	failed:      bool,
+	body:           [dynamic]u8,
+	retry_after:    time.Duration,
+	status:         int,
+	content_type:   string,
+	content_coding: string,
+	location:       Maybe(string),
+	stop_redirects: bool,
+	challenged:     bool,
+	failed:         bool,
 }
 
 @(private)
@@ -355,13 +396,39 @@ exchange_collect :: proc(state: ^Exchange, chunk: []u8) {
 	if _, append_err := append(&state.body, ..chunk); append_err != nil { state.failed = true }
 }
 
+// exchange_header returns a header value cloned into scratch memory. An
+// allocation failure marks the exchange failed.
 @(private)
-exchange_head :: proc(user_data: rawptr, head: client.Response_Head, headers: http.Headers) {
+exchange_header :: proc(state: ^Exchange, headers: http.Headers, name: string) -> (value: string, found: bool) {
+	borrowed := http.headers_get_unsafe(headers, name) or_return
+	cloned, clone_err := strings.clone(borrowed, context.temp_allocator)
+	if clone_err != nil {
+		state.failed = true
+		return "", false
+	}
+	return cloned, true
+}
+
+@(private)
+exchange_head :: proc(user_data: rawptr, head: client.Response_Head, headers: http.Headers) -> client.Response_Head_Action {
 	state := cast(^Exchange)user_data
-	if head.usable { return }
+	state.status = head.status
+	// Cloudflare documents this header as the marker for every challenge response.
+	if value, found := http.headers_get_unsafe(headers, "cf-mitigated"); found {
+		state.challenged = strings.equal_fold(strings.trim_space(value), "challenge")
+	}
+	state.content_type, _ = exchange_header(state, headers, "content-type")
+	state.content_coding, _ = exchange_header(state, headers, "content-encoding")
+	if value, found := exchange_header(state, headers, "location"); found { state.location = value }
+	if state.failed { return .Stop }
+	if state.stop_redirects && redirect_status(head.status) {
+		if _, present := state.location.?; present { return .Stop }
+	}
+	if head.usable && !state.challenged { return .Continue }
 	if value, found := http.headers_get_unsafe(headers, "retry-after"); found {
 		state.retry_after = retry_after_parse(value)
 	}
+	return .Continue
 }
 
 // retry_after_parse reads a Retry-After value, which RFC 9110 10.2.3 makes either
@@ -378,32 +445,57 @@ retry_after_parse :: proc(value: string) -> time.Duration {
 // memory. Every other outcome is an Error decided from the status, with the
 // Retry-After of any refusal. A cancellation or deadline that ended the transfer
 // wins over the status of the refusal it interrupted.
+// With stop_redirects, a redirect with a Location header returns success and an
+// empty body immediately after its head; metadata retains the status and location.
 @(private)
 @(require_results)
-exchange :: proc(provider: Provider, request: client.Request, options: client.Options) -> (body: []u8, err: Error) {
+exchange :: proc(request: client.Request, options: client.Options, metadata: ^Exchange = nil, stop_redirects: bool = false) -> (body: []u8, err: Error) {
 	request := request
 	request.allocator = context.temp_allocator
+	headers, headers_err := make([]client.Header, len(request.headers) + 1, context.temp_allocator)
+	if headers_err != nil { return nil, OUT_OF_MEMORY }
+	copy(headers, request.headers)
+	headers[len(request.headers)] = {"Accept-Encoding", "gzip, deflate"}
+	request.headers = headers
 	state: Exchange
+	state.stop_redirects = stop_redirects
 	state.body.allocator = context.temp_allocator
+	defer if err.kind != .None { delete(state.body) }
 	options := options
 	options.response_head = {
 		user_data = &state,
 		observed  = exchange_head,
 	}
 	failure := client.stream_request(request, options, &state, exchange_collect)
-	if failure.kind == .None {
-		if state.failed { return nil, OUT_OF_MEMORY }
-		return state.body[:], {}
+	if metadata != nil {
+		metadata^ = state
+		metadata.body = nil
 	}
-	err.status = failure.status
+	if state.failed { return nil, OUT_OF_MEMORY }
+	err.status = failure.status if failure.status != 0 else state.status
 	err.detail = failure.detail
 	switch {
 	case failure.kind == .Cancelled, failure.cause == .Cancelled:
 		err.kind = .Cancelled
 	case failure.kind == .Timed_Out, failure.cause == .Timed_Out:
 		err.kind = .Timed_Out
+	case failure.cause != .None:
+		err.kind = .Transport
+	case state.challenged && (failure.kind == .None || failure.kind == .HTTP_Status):
+		err.kind = .Challenged
+		err.retry_after = state.retry_after
+		err.detail = "the site answered with a bot challenge instead of the page"
+	case failure.kind == .None:
+		if !stop_redirects || !redirect_status(state.status) {
+			err = content_decode(&state)
+			if err.kind != .None {
+				err.status = state.status
+				return nil, err
+			}
+		}
+		return state.body[:], {}
 	case failure.kind == .HTTP_Status:
-		err.kind = error_kind_from_status(provider, failure.status)
+		err.kind = error_kind_from_status(failure.status)
 		err.retry_after = state.retry_after
 		// The client's detail only restates the status, which err.status carries.
 		err.detail = ""
@@ -414,15 +506,13 @@ exchange :: proc(provider: Provider, request: client.Request, options: client.Op
 }
 
 // error_kind_from_status is the one mapping from an HTTP status outside 2xx to an
-// Error_Kind. Tavily documents 432 and 433 as plan and pay-as-you-go limits.
+// Error_Kind.
 @(private)
-error_kind_from_status :: proc(provider: Provider, status: int) -> Error_Kind {
+error_kind_from_status :: proc(status: int) -> Error_Kind {
 	switch {
 	case status == 401, status == 403:
 		return .Unauthorized
 	case status == 402:
-		return .Quota
-	case provider == .Tavily && (status == 432 || status == 433):
 		return .Quota
 	case status == 429:
 		return .Rate_Limited

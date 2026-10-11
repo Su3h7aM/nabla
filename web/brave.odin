@@ -63,10 +63,13 @@ brave_decode :: proc(body: []u8) -> (response: Response, err: Error) {
 	}
 	if response.results, err = results_make(len(wire.web.results)); err.kind != .None { return }
 	for result, i in wire.web.results {
+		title, title_err := markup_strip(result.title)
+		snippet, snippet_err := markup_strip(result.description)
+		if title_err != nil || snippet_err != nil { return {}, OUT_OF_MEMORY }
 		response.results[i] = {
-			title     = result.title,
+			title     = title,
 			url       = result.url,
-			snippet   = result.description,
+			snippet   = snippet,
 			published = result.age,
 		}
 	}
