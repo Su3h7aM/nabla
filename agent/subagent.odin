@@ -236,9 +236,10 @@ agent_team_launch_ready :: proc(team: ^Agent_Team) {
 }
 
 // agent_team_reap launches ready members, then releases every finished subagent and, given the orchestrator's
-// session, commits each one's subagent.completed there first. A background child that
-// completed while a parent message waits unread is run again before its completion is recorded.
-// A pending configure first commits the old completion, then opens another delegation.
+// session, commits each one's subagent.completed there first. A configure accepted while a
+// child ran, or a parent message it never read, then opens another delegation on the same
+// session after the original outcome is committed. A failed or stopped child continues only for
+// a configure; its unread messages wait in the journal for the orchestrator's next message to it.
 // Abandoned clients leave the table but remain allocated until shared reclaim.
 // Owner only.
 agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bool) {
@@ -265,28 +266,19 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 	if chat != nil && chat.store != nil {
 		for index := 0; index < len(finished); {
 			member := finished[index]
-			pending := false
-			{
-				sync.mutex_guard(&team.mutex)
-				pending = member.configuration.switching || member.configuration.compact
-			}
-			if pending && member.worker.phase != .Abandoned {
-				subagent_record_completion(chat, member)
-				if chat_commit(chat, "the subagent's outcome before configuration could not be recorded") {
-					if problem := acp_resume_configure(chat, member); problem != "" { chat_runtime_message(chat, .Error, problem) }
-				}
-				ordered_remove(&finished, index)
-				if member.worker.thread != nil { job_retire(&member.worker) }
-				subagent_destroy(member)
-				reopened = true
+			call, continued := subagent_continuation(chat, member)
+			if !continued {
+				index += 1
 				continue
 			}
-			if acp_resume_pending(chat, member) {
-				ordered_remove(&finished, index)
-				reopened = true
-				continue
+			subagent_record_completion(chat, member)
+			if chat_commit(chat, "the subagent's outcome before its continuation could not be recorded") {
+				if problem := acp_resume_continue(chat, member, call); problem != "" { chat_runtime_message(chat, .Error, problem) }
 			}
-			index += 1
+			ordered_remove(&finished, index)
+			if member.worker.thread != nil { job_retire(&member.worker) }
+			subagent_destroy(member)
+			reopened = true
 		}
 		if len(finished) > 0 {
 			for member in finished {
@@ -305,43 +297,32 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 	return reopened
 }
 
-// acp_resume_pending runs member again, on the same record, when it completed in the
-// background while a parent message waits unread: it arrived after the run's last read.
-// It reports whether it reopened the child. A failed, stopped, blocking, or abandoned child
-// is not reopened; its message stays in the journal for its next resume. Owner only.
-@(private, require_results)
-acp_resume_pending :: proc(chat: ^Chat_Session, member: ^Subagent) -> bool {
-	if member.status != .Completed || !member.background || member.worker.phase == .Abandoned { return false }
-	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	delivered := member.acp_after
-
-	waiting, read_error := acp_inbox(chat.store, member, delivered, context.temp_allocator)
-	if read_error != nil || len(waiting) == 0 { return false }
-	team := member.team
+// subagent_continuation says whether a finished member continues as a new delegation, and the
+// tool call that asks for it: the call of a configure accepted while it ran, or else of the newest
+// parent message it never read because it arrived after the run's last read. Only a completed
+// member takes a message. A stopped one keeps the orchestrator's stop, and a failed one may have
+// failed before it read anything, so continuing it would fail again without end; their unread
+// messages stay in the journal behind the consumed sequence and are delivered when the
+// orchestrator next messages the child. An abandoned member continues nothing. Owner only.
+@(private)
+subagent_continuation :: proc(chat: ^Chat_Session, member: ^Subagent) -> (call: journal.Call_Id, continued: bool) {
+	if member.worker.phase == .Abandoned { return 0, false }
 	{
-		sync.mutex_guard(&team.mutex)
-		if _, append_error := append(&team.members, member); append_error != nil { return false }
-		member.tabled = true
+		sync.mutex_guard(&member.team.mutex)
+		if member.configuration.switching || member.configuration.compact { return member.configuration.call, true }
 	}
-	if member.worker.thread != nil { job_retire(&member.worker) }
-	delete(member.answer, member.allocator)
-	member.answer = ""
-	delete(member.prompt, member.allocator)
-	member.prompt = ""
-	member.resumed = true
-	member.stop = {}
-	member.status = .Running
-	sync.atomic_store(&member.finished, false)
-	if _, launched := subagent_launch(member); !launched {
-		subagent_fail(member, .Failed, "its thread could not be created")
-		subagent_finish(member)
-	}
-	return true
+	if member.status != .Completed { return 0, false }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	unread, read_error := acp_inbox(chat.store, member, member.acp_after, context.temp_allocator)
+	if read_error != nil || len(unread) == 0 { return 0, false }
+	return unread[len(unread) - 1].call, true
 }
 
-// acp_resume_configure starts a new delegation for the accepted configure after the old outcome is committed.
+// acp_resume_continue starts a new delegation on previous's session under call, after the old
+// outcome is committed. It carries the configure previous accepted, if any, and the child's first
+// step delivers the parent messages it has not read.
 @(private, require_results)
-acp_resume_configure :: proc(chat: ^Chat_Session, previous: ^Subagent) -> string {
+acp_resume_continue :: proc(chat: ^Chat_Session, previous: ^Subagent, call: journal.Call_Id) -> string {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	configuration := previous.configuration
 	update := Agent_Message_Args {
@@ -355,7 +336,7 @@ acp_resume_configure :: proc(chat: ^Chat_Session, previous: ^Subagent) -> string
 	if problem != "" { return problem }
 	chat_record(
 		chat,
-		{kind = .Subagent_Started, call = configuration.call, subagent = session},
+		{kind = .Subagent_Started, call = call, subagent = session},
 		journal.Subagent_Started {
 			name = previous.name,
 			program = update.resume.program,
@@ -371,11 +352,11 @@ acp_resume_configure :: proc(chat: ^Chat_Session, previous: ^Subagent) -> string
 		acp_agent   = update.resume.program,
 	}
 	if start.acp_agent != "" { start.model, start.effort = update.resume.model_id, update.resume.effort }
-	member, start_problem := subagent_start(previous.team, start, configuration.call, session, previous.allocator, update.resume)
+	member, start_problem := subagent_start(previous.team, start, call, session, previous.allocator, update.resume)
 	if member == nil {
 		chat_record(
 			chat,
-			{kind = .Subagent_Completed, call = configuration.call, subagent = session},
+			{kind = .Subagent_Completed, call = call, subagent = session},
 			journal.Subagent_Completed{outcome = journal.TOOL_OUTCOME_NAMES[.Tool_Failed], detail = start_problem},
 		)
 		_ = chat_commit(chat, "the configuration startup failure could not be recorded")

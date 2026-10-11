@@ -804,7 +804,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat
 // tool_job_stage_message buffers the subagent.message record of an agent message/configure call, so it
 // commits in the barrier of the call's admission and the recipient is woken only after it.
 // A message to a running child needs nothing more: the child reads it at a settled point, or
-// the reap that finds it unread runs the child again; the switch or compaction the call asks
+// the reap that finds it unread after the child completed continues it as a new delegation; the switch or compaction the call asks
 // of it is resolved here, so a refused one records nothing, and queued by the executor. A
 // message to a child that has finished
 // continues it: a new subagent.started that opens the delegation is buffered first, and
