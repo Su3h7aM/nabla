@@ -67,6 +67,8 @@ ACP_Session :: struct {
 	steer:             agent.Steer_Queue,
 	turn_running:      bool,
 	steer_requests:    [dynamic]ACP_Work,
+	compact_pending:   bool, // guarded by steer_mu; coalesced owner intent
+	compact_requests:  [dynamic]ACP_Work, // guarded by steer_mu; each RPC is answered
 	steer_after:       journal.Journal_Seq, // owner only
 	user_occurrences:  int, // owner only; stable live/replay user message ids
 	// model_mu guards only the single pending reader-to-owner handoff.
@@ -266,6 +268,7 @@ acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP
 	made.work = channel
 	made.steer = agent.steer_queue_init(conn.alloc)
 	made.steer_requests.allocator = conn.alloc
+	made.compact_requests.allocator = conn.alloc
 	shared := &conn.app.setup
 	setup := &made.app.setup
 	setup.harness_options = shared.harness_options
@@ -291,6 +294,7 @@ acp_session_free :: proc(session: ^ACP_Session) {
 	if session.work != {} { chan.destroy(&session.work) }
 	agent.steer_queue_destroy(&session.steer)
 	delete(session.steer_requests)
+	delete(session.compact_requests)
 	delete(session.id, alloc)
 	delete(session.title, alloc)
 	delete(session.workspace, alloc)
@@ -445,6 +449,7 @@ acp_session_shutdown :: proc(session: ^ACP_Session) {
 		acp_work_destroy(&queued, alloc)
 	}
 	acp_steer_cancel(session, "the session closed before the request could run")
+	acp_compact_cancel(session, "the session closed before the request could run")
 	request := acp_model_request_take(session)
 	if request.active {
 		_ = acp.writer_write_error(

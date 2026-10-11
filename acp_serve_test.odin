@@ -600,15 +600,17 @@ acp_test_client_hang_up :: proc(client: ^ACP_Test_Client) {
 // acp_test_client_receive reads one whole message. It returns "" when the run stopped
 // writing or did not answer within the bound, so a failure is reported by the expectation
 // that wanted the message rather than by aborting the test.
-acp_test_client_receive :: proc(client: ^ACP_Test_Client, allocator := context.temp_allocator) -> string {
+acp_test_client_receive :: proc(client: ^ACP_Test_Client, allocator := context.temp_allocator, include_commands := false) -> string {
 	sync.mutex_lock(&client.mu)
 	defer sync.mutex_unlock(&client.mu)
 	for {
 		pending := string(client.output[client.read_at:])
 		if newline := strings.index_byte(pending, '\n'); newline >= 0 {
-			frame := strings.clone(pending[:newline], allocator)
+			frame := pending[:newline]
 			client.read_at += newline + 1
-			return frame
+			// Command advertisements are setup metadata, separate from a prompt's frames.
+			if !include_commands && strings.contains(frame, `"sessionUpdate":"available_commands_update"`) { continue }
+			return strings.clone(frame, allocator)
 		}
 		if client.output_closed { return "" }
 		if !sync.cond_wait_with_timeout(&client.cond, &client.mu, ACP_TEST_BOUND) { return "" }
@@ -1950,4 +1952,203 @@ test_acp_v2_running_prompt_is_inserted_as_steering :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, steering_count, 1)
 	testing.expect_value(t, turns, 1)
+}
+
+@(test)
+test_acp_v2_compact_command_starts_compaction_without_user_input :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-prompt-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		_ = os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		_ = os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	replies: [7]string
+	for &reply in replies {
+		reply = acp_test_stream_reply(
+			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
+		)
+	}
+
+	defer for reply in replies { delete(reply, context.allocator) }
+	provider: ACP_Test_Provider
+	if !acp_test_provider_start(t, &provider, replies[:]) { return }
+	defer acp_test_provider_stop(t, &provider)
+
+	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	defer delete(sources, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	defer delete(models, context.allocator)
+	models[0] = {
+		id                = "v2model",
+		context_window    = 100000,
+		max_output_tokens = 4096,
+		tools             = true,
+	}
+	sources[0] = {
+		id       = "v2provider",
+		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
+	}
+	defer delete(sources[0].base_url.?, context.allocator)
+
+	client: ACP_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := ACP_Test_Run {
+		client  = &client,
+		sources = sources,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-prompt-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(
+		&handshake,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
+	)
+	strings.write_byte(&handshake, '\n')
+	acp_test_client_send(&client, strings.to_string(handshake))
+	v2_hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
+	if v2_hello == "" { return }
+	testing.expectf(t, strings.contains(v2_hello, `"image":{}`), "v2 initialize did not announce image prompts: %s", v2_hello)
+
+	opening := strings.builder_make(context.temp_allocator)
+	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
+	strings.write_string(&opening, workspace)
+	strings.write_string(&opening, `","mcpServers":[]}}`)
+	strings.write_byte(&opening, '\n')
+	acp_test_client_send(&client, strings.to_string(opening))
+	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
+	if opening_frame == "" { return }
+	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2model"`) {
+		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
+		return
+	}
+	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+	commands := acp_test_client_receive(&client, include_commands = true)
+	if !testing.expectf(
+		t,
+		strings.contains(commands, `"sessionUpdate":"available_commands_update"`),
+		"the session did not advertise commands: %s",
+		commands,
+	) { return }
+	advertised: struct {
+		params: acp.Session_Notification(acp.Available_Commands_Update) `json:"params"`,
+	}
+	if !testing.expect_value(t, json.unmarshal(transmute([]u8)commands, &advertised, allocator = context.temp_allocator), nil) { return }
+	if !testing.expect_value(t, len(advertised.params.update.available_commands), 1) { return }
+	testing.expect_value(t, advertised.params.update.available_commands[0].name, "compact")
+	testing.expect(t, strings.contains(opening_frame, `"availableCommands":[{"name":"compact"`), "the V2 setup result omitted compact")
+
+	// Twelve history entries leave a prefix beyond the ten messages kept verbatim.
+	for index in 0 ..< 6 {
+		prompting := strings.builder_make(context.temp_allocator)
+		acp_test_prompt_message(&prompting, 3 + index, session_id, "say hello")
+		acp_test_client_send(&client, strings.to_string(prompting))
+		if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the history prompt was not reported") == "" { return }
+		if acp_test_client_expect(t, &client, `"result":{"messageId"`, "the history prompt was not inserted") == "" { return }
+		if acp_test_client_expect(t, &client, `"state":"running"`, "the history turn did not start") == "" { return }
+		if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "the history answer did not stream") == "" { return }
+		if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the history request did not report usage") == "" { return }
+		if acp_test_client_expect(t, &client, `"state":"idle","stopReason":"end_turn"`, "the history turn did not finish") == "" { return }
+	}
+
+	compacting := strings.builder_make(context.temp_allocator)
+	acp_test_prompt_message(&compacting, 9, session_id, " /CoMpAcT ignored ")
+	acp_test_client_send(&client, strings.to_string(compacting))
+	command_frame := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the command was not reported as live-only input")
+	if !testing.expect(t, strings.contains(command_frame, " /CoMpAcT ignored ")) { return }
+	accepted_frame := acp_test_client_expect(t, &client, `"id":9,"result":{"messageId"`, "the command was not accepted")
+	if accepted_frame == "" { return }
+	accepted: struct {
+		result: acp.Prompt_Accepted_Result `json:"result"`,
+	}
+	if !testing.expect_value(t, json.unmarshal(transmute([]u8)accepted_frame, &accepted, allocator = context.temp_allocator), nil) { return }
+	testing.expect(
+		t,
+		accepted.result.message_id != "" && strings.contains(command_frame, accepted.result.message_id),
+		"the live command and acceptance must share a message id",
+	)
+	if acp_test_client_expect(t, &client, `"state":"running"`, "the command did not report running state") == "" { return }
+	if acp_test_client_expect(t, &client, "background compaction started: requested", "the command did not start background compaction") == "" { return }
+	if acp_test_client_expect(t, &client, `"state":"idle","stopReason":"end_turn"`, "the command did not complete independently of compaction") ==
+	   "" { return }
+	if sync.mutex_guard(&provider.lock) {
+		for provider.served < len(replies) {
+			if !testing.expect(
+				t,
+				sync.cond_wait_with_timeout(&provider.request_ready, &provider.lock, ACP_TEST_BOUND),
+				"the compaction request did not reach the provider",
+			) { return }
+		}
+	}
+
+	directory, directory_error := agent.xdg_directory(.State, context.allocator)
+	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
+	defer delete(directory, context.allocator)
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
+	defer delete(locks, context.allocator)
+	reader, open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
+	if !testing.expect_value(t, open_error, nil) { return }
+	defer _ = journal.close(reader)
+	session, session_ok := journal.session_id_parse(session_id)
+	if !testing.expect(t, session_ok) { return }
+	records, _, read_error := journal.read_records(reader, {session = session, kinds = {.User_Input, .Compaction_Started}}, 0, 0, context.temp_allocator)
+	if !testing.expect_value(t, read_error, nil) { return }
+	defer journal.records_destroy(records, context.temp_allocator)
+	inputs, compactions := 0, 0
+	for record in records {
+		if record.kind == .User_Input {
+			inputs += 1
+			testing.expect_value(t, string(record.body), "say hello")
+		} else {
+			compactions += 1
+			started: journal.Compaction_Started
+			if !testing.expect_value(t, journal.payload_decode(record.data, &started, context.temp_allocator), nil) { return }
+			testing.expect_value(t, started.trigger, "user_command")
+		}
+	}
+	testing.expect_value(t, inputs, 0)
+	testing.expect_value(t, compactions, 1)
+	node, found, node_error := journal.read_last_node(reader, session, .User, context.temp_allocator)
+	if !testing.expect_value(t, node_error, nil) { return }
+	if !testing.expect(t, found) { return }
+	defer journal.node_destroy(&node, context.temp_allocator)
+	testing.expect(t, string(node.body) == "say hello", "the command must not become a conversation node")
 }

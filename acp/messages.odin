@@ -60,6 +60,7 @@ UPDATE_TOOL_CALL_UPDATE :: "tool_call_update"
 UPDATE_TOOL_CALL_CONTENT_CHUNK :: "tool_call_content_chunk"
 UPDATE_SESSION_INFO :: "session_info_update"
 UPDATE_USAGE :: "usage_update"
+UPDATE_AVAILABLE_COMMANDS :: "available_commands_update"
 
 // Content block kinds, as they appear in the `type` field.
 CONTENT_TEXT :: "text"
@@ -482,8 +483,9 @@ V2_Config_Option :: struct {
 }
 
 V2_Session_New_Result :: struct {
-	session_id:     string `json:"sessionId"`,
-	config_options: []V2_Config_Option `json:"configOptions"`,
+	session_id:         string `json:"sessionId"`,
+	config_options:     []V2_Config_Option `json:"configOptions"`,
+	available_commands: []Available_Command `json:"availableCommands,omitempty"`,
 }
 
 // Empty_Result is the answer of a method that reports success by returning.
@@ -519,7 +521,8 @@ V2_Session_Set_Config_Option_Result :: struct {
 }
 
 Session_Resume_Result :: struct {
-	config_options: []V2_Config_Option `json:"configOptions,omitempty"`,
+	config_options:     []V2_Config_Option `json:"configOptions,omitempty"`,
+	available_commands: []Available_Command `json:"availableCommands,omitempty"`,
 }
 
 Session_Info :: struct {
@@ -542,6 +545,27 @@ Message_Update :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	message_id:     string `json:"messageId"`,
 	content:        []Text_Content `json:"content"`,
+}
+
+// Available_Command_Input describes text input. V2 uses type = "text"; V1 omits type.
+Available_Command_Input :: struct {
+	type: string `json:"type,omitempty"`,
+	hint: string `json:"hint"`,
+	meta: json.Value `json:"_meta,omitempty"`,
+}
+
+Available_Command :: struct {
+	name:        string `json:"name"`,
+	description: string `json:"description"`,
+	input:       Maybe(Available_Command_Input) `json:"input,omitempty"`,
+	meta:        json.Value `json:"_meta,omitempty"`,
+}
+
+// Available_Commands_Update replaces the entire command list. An empty list clears it.
+Available_Commands_Update :: struct {
+	session_update:     string `json:"sessionUpdate"`,
+	available_commands: []Available_Command `json:"availableCommands"`,
+	meta:               json.Value `json:"_meta,omitempty"`,
 }
 
 State_Update :: struct {

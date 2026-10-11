@@ -53,6 +53,11 @@ ACP_Work_Prompt :: struct {
 	attachments: []ai.Provider_Attachment,
 }
 
+// ACP_Work_Compact owns the command text for its live-only V2 user message.
+ACP_Work_Compact :: struct {
+	text: string,
+}
+
 // ACP_Work_Set_Model is Buzz's v1 model-selection RPC. Model selection runs on the
 // session owner through ACP_Model_Request, so the worker only refuses it.
 ACP_Work_Set_Model :: struct {}
@@ -74,6 +79,7 @@ ACP_Work :: struct {
 	variant: union {
 		ACP_Work_Open_Session,
 		ACP_Work_Prompt,
+		ACP_Work_Compact,
 		ACP_Work_Set_Model,
 		ACP_Work_Set_Config_Option,
 		ACP_Work_Close_Session,
@@ -414,7 +420,7 @@ acp_work_session_valid :: proc(session: ^ACP_Session, work: ACP_Work) -> bool {
 	switch _ in work.variant {
 	case ACP_Work_Open_Session:
 		return !closing
-	case ACP_Work_Prompt, ACP_Work_Set_Model, ACP_Work_Set_Config_Option:
+	case ACP_Work_Prompt, ACP_Work_Compact, ACP_Work_Set_Model, ACP_Work_Set_Config_Option:
 		return !closing && session.app.setup.store != nil
 	case ACP_Work_Close_Session:
 		return session.app.setup.store != nil
@@ -438,6 +444,8 @@ acp_work_destroy :: proc(work: ^ACP_Work, allocator: mem.Allocator) {
 	case ACP_Work_Prompt:
 		delete(item.text, allocator)
 		acp_attachments_destroy(item.attachments, allocator)
+	case ACP_Work_Compact:
+		delete(item.text, allocator)
 	case ACP_Work_Set_Model:
 	case ACP_Work_Set_Config_Option:
 		delete(item.config_id, allocator)
@@ -470,6 +478,109 @@ acp_work_id :: proc(id: acp.JSONRPC_Id, allocator: mem.Allocator) -> (acp.JSONRP
 		return id, true
 	}
 	return id, true
+}
+
+@(require_results)
+acp_available_commands :: proc() -> [1]acp.Available_Command {
+	command, _ := command_find("/compact")
+	return {acp.Available_Command{name = "compact", description = command.summary}}
+}
+
+// acp_compact_submit transfers a command to the running turn's collection hook.
+@(require_results)
+acp_compact_submit :: proc(session: ^ACP_Session, work: ACP_Work) -> (submitted, kept: bool) {
+	if sync.mutex_guard(&session.steer_mu) {
+		if !session.turn_running { return false, false }
+		submitted = true
+		_, append_error := append(&session.compact_requests, work)
+		kept = append_error == nil
+		if kept { session.compact_pending = true }
+	}
+	if !kept {
+		owned := work
+		acp_work_destroy(&owned, session.conn.alloc)
+	}
+	acp_session_touch(session)
+	agent.owner_wake_signal()
+	return
+}
+
+@(require_results)
+acp_compact_pending :: proc(session: ^ACP_Session) -> bool {
+	sync.mutex_guard(&session.steer_mu)
+	return session.compact_pending
+}
+
+// acp_compact_take hands every coalesced command to the owner. The caller destroys
+// each work item and deletes the array, which carries the connection allocator.
+@(require_results)
+acp_compact_take :: proc(session: ^ACP_Session) -> [dynamic]ACP_Work {
+	sync.mutex_guard(&session.steer_mu)
+	requests := session.compact_requests
+	session.compact_requests = {}
+	session.compact_requests.allocator = session.conn.alloc
+	session.compact_pending = false
+	return requests
+}
+
+acp_compact_cancel :: proc(session: ^ACP_Session, message: string) {
+	requests := acp_compact_take(session)
+	defer delete(requests)
+	for &work in requests {
+		acp_sent(session, acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_REQUEST, message))
+		acp_work_destroy(&work, session.conn.alloc)
+	}
+}
+
+// acp_compact_run handles commands locally. Their V2 user messages are live-only:
+// neither command text nor its synthetic message id is written to the journal.
+acp_compact_run :: proc(session: ^ACP_Session, requests: []ACP_Work, running: bool) {
+	if app_following(&session.app) {
+		for work in requests {
+			acp_sent(
+				session,
+				acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_REQUEST, "compaction is not available while following a session"),
+			)
+		}
+		return
+	}
+	if acp_is_v2(session.conn) {
+		for work in requests {
+			command := work.variant.(ACP_Work_Compact)
+			message_id := acp_next_message_id(session)
+			acp_sent(session, acp_send_user_message(session, message_id, command.text))
+			acp_sent(session, acp.writer_write_response(&session.conn.writer, work.id, acp.Prompt_Accepted_Result{message_id = message_id}))
+		}
+		if !running { acp_sent(session, acp_send_state(session, "running", "")) }
+	}
+	app_command_compact(&session.app, acp_observer(session))
+	if agent.chat_session_storage_failed(&session.app.setup.session) {
+		acp_obs_message(session, .Error, agent.chat_session_last_error(&session.app.setup.session))
+	}
+	if acp_is_v2(session.conn) {
+		if !running { acp_sent(session, acp_send_state(session, "idle", acp.stop_reason_name(.End_Turn))) }
+	} else {
+		for work in requests {
+			acp_sent(session, acp.writer_write_response(&session.conn.writer, work.id, acp.Prompt_Result{stop_reason = acp.stop_reason_name(.End_Turn)}))
+		}
+	}
+}
+
+acp_compact_service :: proc(session: ^ACP_Session, running: bool) {
+	if !acp_compact_pending(session) { return }
+	if agent.turn_control_stop_requested(&session.app.run.control) || !acp_session_live(session) {
+		acp_compact_cancel(session, "the turn ended before the request could run")
+		return
+	}
+	requests := acp_compact_take(session)
+	defer delete(requests)
+	defer for &work in requests { acp_work_destroy(&work, session.conn.alloc) }
+	acp_compact_run(session, requests[:], running)
+}
+
+acp_work_compact :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, command: ACP_Work_Compact) {
+	requests := [1]ACP_Work{{id = id, variant = command}}
+	acp_compact_run(session, requests[:], false)
 }
 
 // acp_steer_submit transfers work only when a turn is running. The ACP lock precedes
@@ -537,6 +648,9 @@ acp_steer_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Obse
 		agent.turn_control_stop(&session.app.run.control)
 	} else if agent.turn_control_stop_requested(&session.app.run.control) || !acp_session_live(session) {
 		acp_steer_cancel(session, "the turn ended before the request could run")
+		acp_compact_cancel(session, "the turn ended before the request could run")
+	} else {
+		acp_compact_service(session, true)
 	}
 }
 
@@ -568,7 +682,7 @@ acp_steer_cancel :: proc(session: ^ACP_Session, message: string) {
 // selection, or a compaction for the owner to service.
 @(require_results)
 acp_owner_service_pending :: proc(session: ^ACP_Session) -> bool {
-	if acp_model_owner_work_pending(session) || session.model_selection.active { return true }
+	if acp_compact_pending(session) || acp_model_owner_work_pending(session) || session.model_selection.active { return true }
 	return session.app.setup.session.store != nil && session.app.setup.session.compact.state != agent.Compact_State.Idle
 }
 
@@ -609,6 +723,12 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 			}
 			if !acp_owner_service_wanted(session) || !acp_owner_service_begin(session) {
 				agent.owner_wake_wait(seen, agent.chat_background_deadline(&session.app.setup.session, nil))
+				continue
+			}
+			if acp_compact_pending(session) {
+				acp_compact_service(session, false)
+				acp_owner_service_end(session)
+				free_all(context.temp_allocator)
 				continue
 			}
 			if acp_is_v2(session.conn) && session.app.setup.store != nil {
@@ -659,7 +779,7 @@ acp_worker :: proc(thread_handle: ^thread.Thread) {
 			retiring = true
 		case ACP_Work_Open_Session:
 			retiring = !session.opened
-		case ACP_Work_Prompt, ACP_Work_Set_Model, ACP_Work_Set_Config_Option:
+		case ACP_Work_Prompt, ACP_Work_Compact, ACP_Work_Set_Model, ACP_Work_Set_Config_Option:
 		}
 		acp_work_destroy(&work, session.conn.alloc)
 		// Temp scratch belongs to one request: the worker is long-lived, so its pool is
@@ -684,6 +804,8 @@ acp_run_work :: proc(session: ^ACP_Session, work: ACP_Work) {
 			acp_work_open_session(session, work.id, item)
 		case ACP_Work_Prompt:
 			acp_work_prompt(session, work.id, item)
+		case ACP_Work_Compact:
+			acp_work_compact(session, work.id, item)
 		case ACP_Work_Set_Model:
 			acp_sent(
 				session,
@@ -811,15 +933,24 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 	switch _ in work.start {
 	case Start_Resume_Id:
 		if acp_is_v2(session.conn) {
-			acp_sent(session, acp.writer_write_response(&session.conn.writer, id, acp.Session_Resume_Result{config_options = v2_options}))
+			commands := acp_available_commands()
+			acp_sent(
+				session,
+				acp.writer_write_response(&session.conn.writer, id, acp.Session_Resume_Result{config_options = v2_options, available_commands = commands[:]}),
+			)
 		} else {
 			acp_sent(session, acp.writer_write_response(&session.conn.writer, id, acp.Empty_Result{}))
 		}
 	case Start_Fresh, Start_Resume_Latest, nil:
 		if acp_is_v2(session.conn) {
+			commands := acp_available_commands()
 			acp_sent(
 				session,
-				acp.writer_write_response(&session.conn.writer, id, acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options}),
+				acp.writer_write_response(
+					&session.conn.writer,
+					id,
+					acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options, available_commands = commands[:]},
+				),
 			)
 		} else {
 			acp_sent(
@@ -832,6 +963,8 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 			)
 		}
 	}
+	commands := acp_available_commands()
+	acp_sent(session, acp_notify(session, acp.Available_Commands_Update{session_update = acp.UPDATE_AVAILABLE_COMMANDS, available_commands = commands[:]}))
 }
 
 acp_restore_base_runtime :: proc(session: ^ACP_Session) {
@@ -1177,8 +1310,10 @@ acp_run_steered_turn :: proc(session: ^ACP_Session, chat: ^agent.Chat_Session) -
 		   !acp_session_live(session) ||
 		   agent.turn_control_stop_requested(&session.app.run.control) {
 			acp_steer_cancel(session, "the turn ended before the request could run")
+			acp_compact_cancel(session, "the turn ended before the request could run")
 			return completed
 		}
+		acp_compact_service(session, true)
 		work: ACP_Work
 		has_prompt := false
 		if sync.mutex_guard(&session.steer_mu) {
@@ -1198,6 +1333,7 @@ acp_run_steered_turn :: proc(session: ^ACP_Session, chat: ^agent.Chat_Session) -
 		acp_work_destroy(&work, session.conn.alloc)
 		if !accepted {
 			acp_steer_cancel(session, "the turn ended before the request could run")
+			acp_compact_cancel(session, "the turn ended before the request could run")
 			return false
 		}
 	}

@@ -947,7 +947,10 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the prompt is empty")
 		return
 	}
-	if session.app.setup.model_id == "" {
+	name, _ := command_split(text)
+	command, found := command_find(name)
+	compact := found && command.id == .Compact
+	if !compact && session.app.setup.model_id == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "no model is selected; configure a provider in nabla's config.lua")
 		return
 	}
@@ -960,8 +963,21 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		id = id,
 		variant = ACP_Work_Prompt{text = text, attachments = attachments},
 	}
+	if compact {
+		acp_attachments_destroy(attachments, server.alloc)
+		work.variant = ACP_Work_Compact {
+			text = text,
+		}
+	}
 	queued = true
-	if acp_is_v2(server) && len(attachments) == 0 {
+	if compact {
+		submitted, kept := acp_compact_submit(session, work)
+		if submitted {
+			if !kept { acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the compaction request could not be queued") }
+			return
+		}
+	}
+	if !compact && acp_is_v2(server) && len(attachments) == 0 {
 		steered, kept := acp_steer_submit(session, work)
 		if steered {
 			if !kept { acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the steering request could not be queued") }
