@@ -106,10 +106,11 @@ HTTP_Relay :: struct {
 }
 
 @(private)
-http_relay_head :: proc(user_data: rawptr, head: client.Response_Head, headers: http.Headers) {
+http_relay_head :: proc(user_data: rawptr, head: client.Response_Head, headers: http.Headers) -> client.Response_Head_Action {
 	relay := cast(^HTTP_Relay)user_data
-	if relay == nil || relay.facts.head == nil { return }
+	if relay == nil || relay.facts.head == nil { return .Continue }
 	relay.facts.head(relay.facts.user_data, head, headers)
+	return .Continue
 }
 
 // http_relay_transfer turns the transport's own account of a request into this

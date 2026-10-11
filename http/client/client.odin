@@ -71,6 +71,8 @@ Request :: struct {
 // use still carries the peer's own account of what went wrong, and HTTP places no
 // limit on a body (RFC 9110 5.4), so no size is invented here and the caller
 // decides how much of it to keep.
+// A response_head observer returning Stop instead closes the connection and
+// returns success after the head, without delivering any body bytes.
 @(require_results)
 stream_request :: proc(request: Request, options: Options, state: $T, callback: proc(_: T, _: []u8)) -> (failure: Failure) {
 	// One observation per request, reported on every path once validation has
@@ -117,7 +119,10 @@ stream_request :: proc(request: Request, options: Options, state: $T, callback: 
 			status = status,
 			usable = status_usable && content_type_usable,
 		}
-		options.response_head.observed(options.response_head.user_data, head, headers)
+		if options.response_head.observed(options.response_head.user_data, head, headers) == .Stop {
+			phase = .Complete
+			return {}
+		}
 	}
 
 	refusal: Failure

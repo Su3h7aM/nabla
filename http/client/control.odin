@@ -62,16 +62,25 @@ Response_Head :: struct {
 	usable: bool,
 }
 
-// Response_Head_Observer is told what a response head said. It is separate from
-// Transfer_Observer because it answers a different question: not how the transfer
-// ended, but what the peer had already said while its body was still ahead.
+// Response_Head_Action decides whether to read the response body. Stop closes the
+// connection and returns success, regardless of status, without delivering body
+// bytes or an upgraded connection. The connection is never reused.
+Response_Head_Action :: enum {
+	Continue,
+	Stop,
+}
+
+// Response_Head_Observer is told what a response head said and decides whether
+// the request continues. The headers are borrowed only for this call.
 Response_Head_Observer :: struct {
 	user_data: rawptr,
-	observed:  proc(user_data: rawptr, head: Response_Head, headers: http.Headers),
+	observed:  proc(user_data: rawptr, head: Response_Head, headers: http.Headers) -> Response_Head_Action,
 }
 
 // Transfer_Phase is where a request stopped. Complete means the response body
-// framing finished without a transport error.
+// framing finished without a transport error, a connection was upgraded, or the
+// head observer returned Stop. Stop consumes only the head and reports no error;
+// buffered body bytes, if any, are discarded when the connection is closed.
 Transfer_Phase :: enum {
 	Validate,
 	Resolve,

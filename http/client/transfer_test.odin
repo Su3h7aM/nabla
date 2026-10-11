@@ -7,6 +7,9 @@ import "core:mem"
 import "core:net"
 import "core:testing"
 import "core:thread"
+import "core:time"
+
+import "nabla:http"
 
 // The transport's own account of a request is the one observation a caller cannot
 // make for itself: a truncated stream and a request that was never written both
@@ -182,4 +185,44 @@ test_a_zero_observer_is_no_observer :: proc(t: ^testing.T) {
 	failure := stream_request({url = "ftp://api.example.com", method = .Post, allocator = context.allocator}, {}, Transfer_Discard{}, transfer_discard)
 	defer failure_destroy(&failure, context.allocator)
 	testing.expect_value(t, failure.kind, Failure_Kind.Invalid_URL)
+}
+
+head_stop :: proc(_: rawptr, _: Response_Head, _: http.Headers) -> Response_Head_Action {
+	return .Stop
+}
+
+@(test)
+test_head_stop_closes_an_unfinished_response :: proc(t: ^testing.T) {
+	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if !testing.expect_value(t, listen_err, nil) { return }
+	defer net.close(listener)
+	endpoint, endpoint_err := net.bound_endpoint(listener)
+	if !testing.expect_value(t, endpoint_err, nil) { return }
+	server := Refusal_Body_Server {
+		listener = listener,
+	}
+	worker := thread.create(refusal_body_serve, name = "nabla-http-head-stop-test")
+	if worker == nil { testing.fail_now(t, "the test server thread could not be created") }
+	worker.data = &server
+	thread.start(worker)
+	defer {
+		thread.join(worker)
+		thread.destroy(worker)
+	}
+	log: Transfer_Log
+	options := transfer_log_options(&log)
+	options.response_head.observed = head_stop
+	options.idle_timeout = 2 * time.Second
+	url := fmt.tprintf("http://127.0.0.1:%d/", endpoint.port)
+	state: Body_Cancel_State
+	started := time.now()
+	failure := stream_request({url = url, method = .Get, allocator = context.allocator}, options, &state, body_cancel_collect)
+	defer failure_destroy(&failure, context.allocator)
+	testing.expect_value(t, failure.kind, Failure_Kind.None)
+	testing.expect_value(t, state.bytes, 0)
+	testing.expect_value(t, log.calls, 1)
+	testing.expect_value(t, log.summary.stopped_at, Transfer_Phase.Complete)
+	testing.expect_value(t, log.summary.error, Error.None)
+	testing.expect_value(t, log.summary.status, 404)
+	testing.expect(t, time.since(started) < time.Second, "stopping after the head must not wait for the unfinished body")
 }

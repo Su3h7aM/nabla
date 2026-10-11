@@ -11,6 +11,8 @@ import "core:strings"
 // malformed-response failures use their corresponding Failure kinds. The result
 // and any failure detail are owned by allocator. The caller releases a response
 // with upgraded_destroy and a failure with failure_destroy.
+// When the head observer returns Stop, the connection is closed and both results
+// are zero, with no tunnel handed to the caller.
 @(require_results)
 connect_request :: proc(
 	authority: string,
@@ -48,7 +50,10 @@ connect_request :: proc(
 			status = status,
 			usable = status_usable,
 		}
-		options.response_head.observed(options.response_head.user_data, observed_head, exchange.headers)
+		if options.response_head.observed(options.response_head.user_data, observed_head, exchange.headers) == .Stop {
+			phase = .Complete
+			return nil, {}
+		}
 	}
 
 	// RFC 9110 9.3.6 switches every successful CONNECT response to tunnel mode

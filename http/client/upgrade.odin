@@ -35,6 +35,8 @@ Upgraded :: struct {
 // Anything the peer sent before its response head was read stays with the handle,
 // since the upgraded protocol's first bytes can arrive in the same segment as the
 // head. The caller owns the handle and releases it with upgraded_destroy.
+// When the head observer returns Stop, the connection is closed and both results
+// are zero, with no upgraded connection handed to the caller.
 @(require_results)
 upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgraded, failure: Failure) {
 	summary: Transfer_Summary
@@ -54,7 +56,10 @@ upgrade_request :: proc(request: Request, options: Options) -> (upgraded: ^Upgra
 			status = status,
 			usable = status == 101,
 		}
-		options.response_head.observed(options.response_head.user_data, head, exchange.headers)
+		if options.response_head.observed(options.response_head.user_data, head, exchange.headers) == .Stop {
+			phase = .Complete
+			return nil, {}
+		}
 	}
 	if status != 101 {
 		detail := fmt.aprintf("HTTP %d: the response did not upgrade the connection", status, allocator = request.allocator)
