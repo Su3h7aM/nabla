@@ -13,7 +13,7 @@ JSONRPC_Id :: union {
 RPC_Error :: struct {
 	code:    i64,
 	message: string,
-	data:    json.Value,
+	data:    json.Value `json:"data,omitempty"`,
 }
 Envelope_Kind :: enum {
 	Invalid,

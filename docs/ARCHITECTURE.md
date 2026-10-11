@@ -1073,6 +1073,8 @@ A failed child's partial text is committed and reported with the failure, but pr
 
 - ACP model identity: the `model` configuration option advertises opaque, exact-match values `<provider>/<model id>` in both profiles, with the same qualified `currentValue`; `name` remains the readable model name. V1's `models` list, `currentModelId`, `session/set_model` request, and its response use those same qualified ids. `session/set_config_option` with `configId: model` selects the provider and model named by the full advertised value, including model ids containing slashes. Bare ids, changed case, and other unadvertised values are refused rather than resolved to a default provider.
 
+- ACP V2 foreground failure after user-message insertion ends with `session/update` carrying `sessionUpdate:"state_update"`, `state:"idle"`, `stopReason:"error"`, and a JSON-RPC `error` object rather than a diagnostic agent message; failure before insertion remains an error response to `session/prompt`, and V1 is unchanged.
+
 ## 23. Context, capacity, compaction
 
 ### 23.1 Capacity

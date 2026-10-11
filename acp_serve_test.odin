@@ -1133,6 +1133,14 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 		acp_test_stream_reply(
 			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
 		),
+		acp_test_stream_reply(
+			acp_test_sse_body(
+				{
+					`{"choices":[{"delta":{"content":"partial answer"},"finish_reason":null}]}`,
+					`{"error":{"code":"insufficient_quota","message":"provider failure after partial answer"}}`,
+				},
+			),
+		),
 	}
 	defer for reply in replies { delete(reply, context.allocator) }
 	provider: ACP_Test_Provider
@@ -1254,6 +1262,26 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	strings.write_byte(&plain_resume, '\n')
 	acp_test_client_send(&client, strings.to_string(plain_resume))
 	if acp_test_client_expect(t, &client, `"id":5,"result"`, "v2 plain resume did not answer") == "" { return }
+	failing_prompt := strings.builder_make(context.temp_allocator)
+	acp_test_prompt_message(&failing_prompt, 6, session_id, "answer before failing")
+	acp_test_client_send(&client, strings.to_string(failing_prompt))
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "v2 did not insert the failing prompt") == "" { return }
+	if acp_test_client_expect(t, &client, `"id":6,"result":{"messageId":`, "v2 did not accept the failing prompt") == "" { return }
+	if acp_test_client_expect(t, &client, `"state":"running"`, "v2 did not start the failing turn") == "" { return }
+	partial_frame := acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "v2 did not stream the partial answer")
+	if partial_frame == "" { return }
+	testing.expect(t, strings.contains(partial_frame, `"text":"partial answer"`))
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the failed request did not report usage") == "" { return }
+	failure_frame := acp_test_client_expect(
+		t,
+		&client,
+		`"sessionUpdate":"state_update","state":"idle","stopReason":"error"`,
+		"v2 did not report the failed turn",
+	)
+	if failure_frame == "" { return }
+	testing.expectf(t, strings.contains(failure_frame, `"error":{"code":-32603,"message":`), "v2 did not report an internal error: %s", failure_frame)
+	testing.expectf(t, strings.contains(failure_frame, "provider failure after partial answer"), "v2 omitted the failure text: %s", failure_frame)
+	testing.expectf(t, !strings.contains(failure_frame, `"data"`), "v2 sent absent error data: %s", failure_frame)
 }
 
 // A prompt with an image block reaches the session as a user message carrying one PNG attachment, whatever mimeType said.

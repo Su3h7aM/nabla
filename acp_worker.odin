@@ -1279,11 +1279,7 @@ acp_v2_turn_end :: proc(session: ^ACP_Session, turn_completed: bool) {
 	case .Failed, .None:
 		message := agent.chat_session_last_error(chat)
 		if message == "" { message = "the turn did not complete" }
-		message_id := acp_notice_message_id(session)
-		acp_sent(session, acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, message, message_id))
-		// A failed turn is not a refusal: the transcript carries the reason, and the
-		// state only says the agent is idle again.
-		acp_sent(session, acp_send_state(session, "idle", ""))
+		acp_sent(session, acp_send_state(session, "idle", acp.stop_reason_name(.Error), acp.RPC_Error{code = acp.ERROR_INTERNAL, message = message}))
 	}
 }
 
@@ -1542,9 +1538,9 @@ acp_send_user_message :: proc(session: ^ACP_Session, message_id, text: string) -
 }
 
 @(require_results)
-acp_send_state :: proc(session: ^ACP_Session, state, stop_reason: string) -> bool {
+acp_send_state :: proc(session: ^ACP_Session, state, stop_reason: string, error: Maybe(acp.RPC_Error) = nil) -> bool {
 	if !acp_is_v2(session.conn) { return false }
-	return acp_notify(session, acp.State_Update{session_update = acp.UPDATE_STATE, state = state, stop_reason = stop_reason})
+	return acp_notify(session, acp.State_Update{session_update = acp.UPDATE_STATE, state = state, stop_reason = stop_reason, error = error})
 }
 
 @(require_results)
@@ -1773,12 +1769,11 @@ acp_obs_assistant_text :: proc(user_data: rawptr, text: string) {
 	acp_sent(session, acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, text, acp_current_message_id(session)))
 }
 
-// acp_obs_message reports the harness's own lines. They are the only place a client
-// learns that a turn is retrying, that a tool call was repaired, or that a turn failed:
-// the transcript is the protocol's only channel, so they are sent as a message of their
-// own rather than folded into the model's answer.
+// acp_obs_message reports the harness's own lines separately from the model's answer.
+// V2 terminal failures belong to the idle state update, not an agent message.
 acp_obs_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
 	session := cast(^ACP_Session)user_data
+	if acp_is_v2(session.conn) && kind == .Error && session.app.setup.session.terminal_status == .Failed { return }
 	message_id := acp_next_message_id(session)
 	if acp_is_v2(session.conn) { message_id = acp_notice_message_id(session) }
 	acp_sent(session, acp_send_message(session, acp.UPDATE_AGENT_MESSAGE_CHUNK, text, message_id))

@@ -77,6 +77,7 @@ Stop_Reason :: enum {
 	Max_Turn_Requests,
 	Refusal,
 	Cancelled,
+	Error,
 }
 
 stop_reason_name :: proc(reason: Stop_Reason) -> string {
@@ -91,6 +92,8 @@ stop_reason_name :: proc(reason: Stop_Reason) -> string {
 		return "refusal"
 	case .Cancelled:
 		return "cancelled"
+	case .Error:
+		return "error"
 	}
 	return "end_turn"
 }
@@ -572,6 +575,7 @@ State_Update :: struct {
 	session_update: string `json:"sessionUpdate"`,
 	state:          string `json:"state"`,
 	stop_reason:    string `json:"stopReason,omitempty"`,
+	error:          Maybe(RPC_Error) `json:"error,omitempty"`,
 }
 
 Tool_Call_Update_V2 :: struct {
