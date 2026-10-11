@@ -6,7 +6,6 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
-import "core:thread"
 import "core:time"
 
 import "nabla:agent/journal"
@@ -37,12 +36,13 @@ subagent_status_names := [Subagent_Status]string {
 // The shared harness instructions precede this role and the caller-provided instruction.
 SUBAGENT_ROLE :: "You are a subagent. An orchestrator agent started you for one task, stated in the first message, and it reads only your final answer. You do not see the orchestrator's conversation: the task message and what your tools find are all you have.\n\nStay inside the task. Do what it asks and return what it asks for; do not fix, refactor, or investigate beyond it, even when you notice something nearby, and mention such things in one line of your answer instead. Work with your tools until the task is done, then answer concisely with exactly what the task asked you to return: findings, decisions, and exact paths, line numbers, and identifiers. Do not narrate your process or paste file contents the task did not ask for.\n\nThe orchestrator may message you while you work. Its messages start with \"orchestrator says\" and override the original task where they conflict. Use agent with action message, leaving agent out, to reach the orchestrator before you finish when information you need is missing or ambiguous, when the task rests on a wrong premise, or when you find something it should act on now. Ask rather than guess on a decision that would change the result. After sending, keep working on what does not depend on the reply; the reply arrives as a message between your steps. If nothing is left that you can do without it, finish with an answer that states what you found and what is missing. You cannot start subagents or reach other subagents; the orchestrator relays between you when needed.\n\nYou share the workspace with the orchestrator and possibly other subagents working at the same time. Edit only the files your task covers. Do not revert, reformat, or overwrite changes you did not make, and do not run commands that discard work you did not do, such as resetting version control, checking out files, or deleting files you did not create. If a change you did not make is in your way, or your task needs a file outside its scope, ask the orchestrator with agent action message instead of acting."
 
-// Subagent is the orchestrator's record of one running or just finished subagent. Everything
-// above admitted is fixed before the subagent starts and owned by allocator. The subagent's
-// thread writes the outcome fields and then done; the orchestrator reads them only after it
-// sees done, and then frees the record, joining the thread first when there is one, or runs
+// Subagent is the orchestrator's record of one running or just finished subagent. Its inputs
+// are owned by allocator, and its Job lifecycle belongs to the orchestrator. The subagent's
+// worker writes the outcome fields and publishes; the orchestrator reads them only after it
+// sees publication, and then frees the record, retiring the worker first, or runs
 // the same record again when a message arrived too late for the run that just ended.
 Subagent :: struct {
+	worker:                       Job,
 	name:                         string,
 	instruction:                  string,
 	prompt:                       string,
@@ -71,7 +71,9 @@ Subagent :: struct {
 	control:                      Subagent_Control,
 	retired:                      [dynamic]Model_Selection,
 	admitted:                     bool, // holds one of team.running's slots; guarded by team.mutex
-	abandoned:                    bool,
+	ready:                        bool, // its slot was handed over; the owner must launch it; guarded by team.mutex
+	abandoned:                    bool, // its own session left workers outstanding, so the member cannot be released
+	tabled:                       bool, // team.members holds it; shared reclaim waits until it leaves the table
 	// stop ends the subagent's work. It chains to the call that waits for it, or to the
 	// process interrupt for a background subagent.
 	stop:                         ai.Interrupt,
@@ -79,13 +81,12 @@ Subagent :: struct {
 	// wake of the call a blocking subagent runs for, borrowed.
 	wake:                         Tool_Wake,
 	parent_wake:                  ^os.File,
-	thread:                       ^thread.Thread, // background only
 	acp_after:                    journal.Journal_Seq,
 	acp_session:                  string, // the ACP agent's own session id; "" for a native subagent, whose session is session
 	status:                       Subagent_Status,
 	cause:                        string, // why the subagent did not complete; "" once it completed
 	answer:                       string, // the text of its last committed answer, partial when it failed or was stopped mid-answer
-	done:                         bool, // atomic; set last
+	finished:                     bool, // atomic; blocking or unstarted members only, which have no launched Job
 }
 
 // Subagent_Control is the newest thing the orchestrator asked of a running child: a switch of
@@ -113,17 +114,18 @@ subagent_control_destroy :: proc(control: ^Subagent_Control) {
 // Agent_Team is an orchestrator's subagents. It is heap-allocated apart from its session,
 // because a subagent that does not stop keeps using it.
 Agent_Team :: struct {
-	mutex:     sync.Mutex,
-	members:   [dynamic]^Subagent,
-	starting:  int,
-	running:   int, // slots in use: running children, which a blocking child may take past the configured bound
-	waiting:   [dynamic]^Subagent, // background children queued for a slot, oldest first
-	closing:   bool,
-	abandoned: bool,
-	allocator: mem.Allocator,
+	mutex:            sync.Mutex,
+	members:          [dynamic]^Subagent,
+	starting:         int,
+	running:          int, // slots in use: running children, which a blocking child may take past the configured bound
+	waiting:          [dynamic]^Subagent, // background children queued for a slot, oldest first
+	closing:          bool,
+	retained:         bool, // owner-only: a child Job was abandoned, so the team stays allocated
+	workers_retained: bool, // atomic: a child session left its own workers outstanding
+	allocator:        mem.Allocator,
 	// parent is what a start copies from the orchestrator. The owner writes it under mutex
 	// when it admits a start; tools is the orchestrator's registry, frozen while a turn runs.
-	parent:    Agent_Parent,
+	parent:           Agent_Parent,
 }
 
 Agent_Parent :: struct {
@@ -239,7 +241,35 @@ agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -
 	return copied, nil
 }
 
-// agent_team_reap releases every subagent that is done and, given the orchestrator's
+// agent_team_launch_ready launches the queued members that a finishing child handed a slot.
+// Both member and waiting tables keep admission order. Owner only; thread creation is outside
+// the mutex, so a child finishing its own slot never waits on it.
+@(private)
+agent_team_launch_ready :: proc(team: ^Agent_Team) {
+	for {
+		member: ^Subagent
+		{
+			sync.mutex_guard(&team.mutex)
+			for pending in team.members {
+				if !pending.ready { continue }
+				pending.ready = false
+				member = pending
+				break
+			}
+		}
+		if member == nil { return }
+		if team.closing {
+			subagent_end_unstarted(member)
+			continue
+		}
+		if !job_launch(&member.worker) {
+			subagent_fail(member, .Failed, "its thread could not be created")
+			subagent_finish(member)
+		}
+	}
+}
+
+// agent_team_reap launches ready members, then releases every finished subagent and, given the orchestrator's
 // session, commits each one's subagent.completed there first. A background child that
 // completed while a message to it still waits unread is run again instead, with no
 // completion (see subagent_reopen), and reopened says so. A child whose workers are still
@@ -247,13 +277,14 @@ agent_parent_temp_copy :: proc(parent: Agent_Parent, allocator: mem.Allocator) -
 // Owner only.
 agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bool) {
 	if team == nil { return false }
+	agent_team_launch_ready(team)
 	finished: [dynamic]^Subagent
 	finished.allocator = context.temp_allocator
 	{
 		sync.mutex_guard(&team.mutex)
 		for index := 0; index < len(team.members); {
 			member := team.members[index]
-			if !sync.atomic_load(&member.done) {
+			if !subagent_finished(member) {
 				index += 1
 				continue
 			}
@@ -261,6 +292,7 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 				// The list of finished members could not grow; they are reaped next time.
 				break
 			}
+			member.tabled = false
 			ordered_remove(&team.members, index)
 		}
 	}
@@ -274,17 +306,17 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 			index += 1
 		}
 		if len(finished) > 0 {
-			for member in finished { subagent_record_completion(chat, member) }
+			for member in finished {
+				if member.worker.phase != .Abandoned { subagent_record_completion(chat, member) }
+			}
 			// A commit that fails records the failure on the session, which is what the next
 			// turn reports; there is nothing this reap can do with it here.
 			_ = chat_commit(chat, "a subagent's outcome could not be recorded")
 		}
 	}
 	for member in finished {
-		if member.thread != nil {
-			thread.destroy(member.thread)
-			member.thread = nil
-		}
+		if member.worker.phase == .Abandoned { continue }
+		if member.worker.thread != nil { job_retire(&member.worker) }
 		if !member.abandoned { subagent_destroy(member) }
 	}
 	return reopened
@@ -298,7 +330,7 @@ agent_team_reap :: proc(team: ^Agent_Team, chat: ^Chat_Session) -> (reopened: bo
 // for its next resume. Owner only.
 @(private, require_results)
 subagent_reopen :: proc(chat: ^Chat_Session, member: ^Subagent) -> bool {
-	if member.status != .Completed || !member.background || member.abandoned { return false }
+	if member.status != .Completed || !member.background || member.abandoned || member.worker.phase == .Abandoned { return false }
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	delivered := member.acp_after
 	if member.program.name == "" {
@@ -312,17 +344,15 @@ subagent_reopen :: proc(chat: ^Chat_Session, member: ^Subagent) -> bool {
 	{
 		sync.mutex_guard(&team.mutex)
 		if _, append_error := append(&team.members, member); append_error != nil { return false }
+		member.tabled = true
 	}
-	if member.thread != nil {
-		thread.destroy(member.thread)
-		member.thread = nil
-	}
+	if member.worker.thread != nil { job_retire(&member.worker) }
 	delete(member.answer, member.allocator)
 	member.answer = ""
 	member.resumed = true
 	member.stop = {}
 	member.status = .Running
-	sync.atomic_store(&member.done, false)
+	sync.atomic_store(&member.finished, false)
 	if _, launched := subagent_launch(member); !launched {
 		subagent_fail(member, .Failed, "its thread could not be created")
 		subagent_finish(member)
@@ -360,35 +390,73 @@ subagent_record_completion :: proc(chat: ^Chat_Session, member: ^Subagent) {
 	)
 }
 
-// agent_team_destroy stops every subagent, waits for them within the stop patience, and
-// releases the team. A subagent that does not stop keeps the team: both leak, and the
-// session is released anyway. Each such subagent is recorded as abandoned in chat's
-// journal, so the owner of that journal is the only caller.
+// agent_team_destroy closes admission, requests every stop, and waits the worker stop patience.
+// Abandoned child Jobs keep the team allocated but are tracked by chat.abandoned. It returns
+// false when untracked workers still reach the team or its bindings. Owner only.
 agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := false) -> bool {
 	if team == nil { return true }
+	retain := retain
+	began := time.tick_now()
+	deadline := time.tick_add(began, TOOL_JOBS_STOP_PATIENCE)
 	{
 		sync.mutex_guard(&team.mutex)
 		team.closing = true
-		for member in team.members { subagent_request_stop(member) }
+		for member in team.members {
+			subagent_request_stop(member)
+			job_note_stop(&member.worker, true, began)
+		}
 	}
 	subagent_stop_waiting(team)
 	owner_wake_signal()
-	began := time.tick_now()
-	deadline := time.tick_add(began, TOOL_JOBS_STOP_PATIENCE)
 	for {
 		seen := owner_wake_seen()
-		// Observe completion before the reap so exiting cannot leave an unreaped member.
-		running := agent_team_running(team)
-		// Teardown commits nothing more; recovery closes what this leaves open.
+		// Teardown commits no completions; recovery closes what it leaves open.
 		agent_team_reap(team, nil)
-		if !running { break }
+		member: ^Subagent
+		starting: bool
+		member_index: int
+		{
+			sync.mutex_guard(&team.mutex)
+			starting = team.starting > 0
+			if len(team.members) > 0 { member = team.members[0] }
+			for pending, index in team.members {
+				if pending.worker.thread != nil {
+					member = pending
+					member_index = index
+					break
+				}
+			}
+		}
+		if member == nil && !starting { break }
+		if member != nil && member.worker.thread != nil {
+			worker := &member.worker
+			job_note_stop(worker, true, time.tick_now())
+			if job_wait_published(worker, job_stop_deadline(worker)) { continue }
+			if !job_overdue(worker, time.tick_now()) { continue }
+			listed := len(chat.abandoned)
+			job_abandon(chat, worker)
+			if len(chat.abandoned) == listed { retain = true }
+			{
+				sync.mutex_guard(&team.mutex)
+				ordered_remove(&team.members, member_index)
+				member.tabled = false
+			}
+			team.retained = true
+			continue
+		}
+		// A blocking child borrows its caller's worker, and a start may not yet have a
+		// member at all. Neither has a Job of its own to wait for or abandon.
 		if time.tick_diff(time.tick_now(), deadline) <= 0 {
-			subagent_record_abandoned(team, chat, time.tick_since(began))
+			for pending in team.members {
+				if subagent_finished(pending) { continue }
+				chat_record_job_abandoned(chat, {call = pending.parent_call, subagent = pending.session}, .Subagent, time.tick_since(began))
+			}
 			return false
 		}
 		owner_wake_wait(seen, deadline)
 	}
-	if retain || sync.atomic_load(&team.abandoned) { return false }
+	if retain || sync.atomic_load(&team.workers_retained) { return false }
+	if team.retained { return true }
 	delete(team.members)
 	delete(team.waiting)
 	agent_parent_destroy(&team.parent, team.allocator)
@@ -396,35 +464,22 @@ agent_team_destroy :: proc(team: ^Agent_Team, chat: ^Chat_Session, retain := fal
 	return true
 }
 
-// subagent_record_abandoned buffers job.abandoned for every subagent still running, named
-// by its parent's call and its own session. Owner only.
-@(private)
-subagent_record_abandoned :: proc(team: ^Agent_Team, chat: ^Chat_Session, waited: time.Duration) {
-	Running :: struct {
-		parent_call: journal.Call_Id,
-		session:     journal.Session_Id,
-	}
-	running := make([dynamic]Running, context.temp_allocator)
-	{
-		sync.mutex_guard(&team.mutex)
-		for member in team.members {
-			if sync.atomic_load(&member.done) { continue }
-			append(&running, Running{parent_call = member.parent_call, session = member.session})
-		}
-	}
-	for member in running {
-		chat_record_job_abandoned(chat, {call = member.parent_call, subagent = member.session}, .Subagent, waited)
-	}
+// subagent_finished reports publication for a launched Job, or completion of a blocking or
+// unstarted member that has no worker of its own. Owner only.
+@(private, require_results)
+subagent_finished :: proc(member: ^Subagent) -> bool {
+	if member.worker.thread != nil { return job_published(&member.worker) }
+	return sync.atomic_load(&member.finished)
 }
 
-// agent_team_running reports whether a subagent the team started is not yet released.
+// agent_team_running reports whether a subagent the team started is not yet released. Owner only.
 @(require_results)
 agent_team_running :: proc(team: ^Agent_Team) -> bool {
 	if team == nil { return false }
 	sync.mutex_guard(&team.mutex)
 	if team.starting > 0 { return true }
 	for member in team.members {
-		if !sync.atomic_load(&member.done) { return true }
+		if !subagent_finished(member) { return true }
 	}
 	return false
 }
@@ -542,19 +597,20 @@ subagent_start :: proc(
 		return nil, "the subagent could not be allocated"
 	}
 	created^ = {
-		selection                    = selection,
-		program                      = program,
-		tools                        = tools,
-		parent_session               = parent.session,
-		parent_call                  = call,
-		session                      = session,
-		run                          = parent.run,
+		worker = {kind = .Subagent, run = subagent_worker_run, allocator = allocator, record = {call = call, subagent = session}},
+		selection = selection,
+		program = program,
+		tools = tools,
+		parent_session = parent.session,
+		parent_call = call,
+		session = session,
+		run = parent.run,
 		disable_project_instructions = parent.disable_project_instructions,
-		background                   = !args.wait,
-		resumed                      = resume.name != "",
-		compact                      = resume.compact,
-		team                         = team,
-		allocator                    = allocator,
+		background = !args.wait,
+		resumed = resume.name != "",
+		compact = resume.compact,
+		team = team,
+		allocator = allocator,
 	}
 	tools = {}
 	// The record's own texts are copied now that it exists, so a copy that fails releases
@@ -581,6 +637,7 @@ subagent_start :: proc(
 		if _, append_error := append(&team.members, created); append_error != nil {
 			return nil, "the subagent could not be allocated"
 		}
+		created.tabled = true
 	}
 	failed = false
 	member = created
@@ -686,7 +743,7 @@ subagent_select :: proc(
 // the configured number of slots are in use. It returns false when the subagent neither started
 // nor queued; a failed thread creation leaves the slot held, which subagent_finish releases.
 // queued says the subagent waits for a slot: it may start, finish, and be released at any
-// moment after, so the caller must not touch member again.
+// moment after, so the caller must not touch member again. Owner only.
 @(require_results)
 subagent_launch :: proc(member: ^Subagent) -> (queued, ok: bool) {
 	team := member.team
@@ -703,7 +760,7 @@ subagent_launch :: proc(member: ^Subagent) -> (queued, ok: bool) {
 		team.running += 1
 		member.admitted = true
 	}
-	return false, subagent_thread_start(member)
+	return false, job_launch(&member.worker)
 }
 
 // subagent_take_slot counts a blocking subagent among the running ones, past the bound if need
@@ -715,49 +772,26 @@ subagent_take_slot :: proc(member: ^Subagent) {
 	member.admitted = true
 }
 
-// subagent_thread_start runs a subagent on a thread of its own. The watched signals are
-// blocked across creation, so the process handler never runs there. The thread is allocated
-// with the member's allocator because the caller may be a worker whose own allocator is
-// short-lived.
-@(private, require_results)
-subagent_thread_start :: proc(member: ^Subagent) -> bool {
-	context.allocator = member.allocator
-	previous := chat_signal_block_watched()
-	worker := thread.create(subagent_thread, name = "nabla-subagent")
-	chat_signal_restore(previous)
-	if worker == nil { return false }
-	worker.data = member
-	member.thread = worker
-	thread.start(worker)
-	return true
-}
-
+// subagent_worker_run runs the child and hands its slot to the queue before job_main publishes.
 @(private)
-subagent_thread :: proc(worker: ^thread.Thread) {
-	member := cast(^Subagent)worker.data
-	context.allocator = member.allocator
+subagent_worker_run :: proc(worker: ^Job) {
+	member := container_of(worker, Subagent, "worker")
 	subagent_run(member)
-	subagent_finish(member)
+	subagent_conclude(member)
 }
 
-// subagent_finish releases the subagent's slot and marks it done, which wakes the
-// orchestrator to reap it: the reap commits the outcome the orchestrator reads from its
-// journal. It then starts the queued subagents the slot admits. A queued subagent
-// whose thread cannot be created fails and is finished the same way. It touches nothing of
-// member after done.
+// subagent_finish concludes a blocking or unstarted member, which has no launched Job.
+// Nothing touches the member after the finished store.
 subagent_finish :: proc(member: ^Subagent) {
-	next := subagent_conclude(member)
-	for next != nil {
-		if subagent_thread_start(next) { return }
-		subagent_fail(next, .Failed, "its thread could not be created")
-		next = subagent_conclude(next)
-	}
+	subagent_conclude(member)
+	sync.atomic_store(&member.finished, true)
+	owner_wake_signal()
 }
 
-// subagent_conclude is subagent_finish without starting anything. It returns the queued
-// subagent the released slot now belongs to, or nil when there is none or the team is closing.
+// subagent_conclude hands the slot to the oldest queued member and wakes the owner to
+// launch it. It touches only the team-mutex-protected scheduling state, never the Job.
 @(private)
-subagent_conclude :: proc(member: ^Subagent) -> (next: ^Subagent) {
+subagent_conclude :: proc(member: ^Subagent) {
 	team := member.team
 	{
 		sync.mutex_guard(&team.mutex)
@@ -765,17 +799,16 @@ subagent_conclude :: proc(member: ^Subagent) -> (next: ^Subagent) {
 			member.admitted = false
 			team.running -= 1
 			if len(team.waiting) > 0 && !team.closing {
-				next = team.waiting[0]
+				next := team.waiting[0]
 				ordered_remove(&team.waiting, 0)
 				next.status = .Running
 				next.admitted = true
+				next.ready = true
 				team.running += 1
 			}
 		}
 	}
-	sync.atomic_store(&member.done, true)
 	owner_wake_signal()
-	return next
 }
 
 // subagent_fail records why a subagent ended. The status is the outcome either way; a reason
@@ -959,7 +992,7 @@ subagent_run :: proc(member: ^Subagent) {
 		if chat_session_workers_outstanding(chat) {
 			sync.mutex_guard(&member.team.mutex)
 			member.abandoned = true
-			sync.atomic_store(&member.team.abandoned, true)
+			sync.atomic_store(&member.team.workers_retained, true)
 		} else {
 			mem.free(chat, allocator)
 		}
@@ -1577,7 +1610,7 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 }
 
 // subagent_stop asks a subagent to stop. Its outcome reaches the orchestrator like any other.
-// A queued subagent never starts: it is reported stopped at once.
+// A queued subagent never starts: it is reported stopped at once. Owner only.
 @(require_results)
 subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 	defer owner_wake_signal()
@@ -1587,7 +1620,7 @@ subagent_stop :: proc(team: ^Agent_Team, name: string) -> (problem: string) {
 		sync.mutex_guard(&team.mutex)
 		member = subagent_find(team, name)
 		if member == nil { return subagent_unknown(team, name) }
-		if sync.atomic_load(&member.done) { return fmt.tprintf("%s has already finished", name) }
+		if subagent_finished(member) { return fmt.tprintf("%s has already finished", name) }
 		queued = member.status == .Queued
 		if queued { subagent_unqueue(team, member) } else { subagent_request_stop(member) }
 	}
@@ -1632,11 +1665,12 @@ subagent_stop_waiting :: proc(team: ^Agent_Team) {
 	}
 }
 
-// subagent_request_stop asks a subagent to stop and wakes it. The caller holds team.mutex.
+// subagent_request_stop asks a subagent to stop and wakes it. Owner only, with team.mutex held.
 @(private)
 subagent_request_stop :: proc(member: ^Subagent) {
 	ai.interrupt_request(&member.stop)
 	tool_wake_signal(&member.wake)
+	job_note_stop(&member.worker, true, time.tick_now())
 }
 
 // subagent_unknown names the running subagents for a name that is not one. The caller holds

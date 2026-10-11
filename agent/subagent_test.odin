@@ -732,19 +732,22 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 		testing.expect(test, strings.contains(started.content, "queued"), started.content)
 	}
 	first, second := team.members[0], team.members[1]
-	testing.expect(test, first.status == .Queued && first.thread == nil && second.status == .Queued && second.thread == nil)
+	testing.expect(test, first.status == .Queued && first.worker.thread == nil && second.status == .Queued && second.worker.thread == nil)
 
 	holder := Subagent {
 		team     = team,
 		admitted = true,
 	}
 	subagent_finish(&holder)
-	testing.expect(test, first.status == .Running && first.thread != nil, "the oldest queued child takes the freed slot")
-	testing.expect(test, second.status == .Queued && second.thread == nil, "the next one keeps waiting")
+	testing.expect(test, first.worker.thread == nil, "slot handoff does not launch a worker")
+	_ = agent_team_reap(team, chat)
+	testing.expect(test, first.status == .Running && first.worker.thread != nil, "the oldest queued child takes the freed slot")
+	testing.expect(test, second.status == .Queued && second.worker.thread == nil, "the next one keeps waiting")
 	testing.expect_value(test, team.running, SUBAGENT_TEST_MAX_RUNNING)
 	holder.admitted = true
 	subagent_finish(&holder)
-	testing.expect(test, second.status == .Running && second.thread != nil, "the next freed slot admits the next child")
+	_ = agent_team_reap(team, chat)
+	testing.expect(test, second.status == .Running && second.worker.thread != nil, "the next freed slot admits the next child")
 }
 
 // A queued subagent that is stopped is reported stopped and never gets a thread.
@@ -778,7 +781,7 @@ test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	defer tool_result_destroy(&stopped)
 	testing.expect_value(test, stopped.outcome, journal.Tool_Outcome.Success)
 	member := chat.team.members[0]
-	testing.expect(test, member.status == .Stopped && member.thread == nil && len(chat.team.waiting) == 0)
+	testing.expect(test, member.status == .Stopped && member.worker.thread == nil && len(chat.team.waiting) == 0)
 	testing.expect_value(test, member.cause, "stopped before it started; not executed")
 	agent_team_reap(chat.team, chat)
 	records, read_ok := chat_inbox_read(chat)
@@ -1643,4 +1646,75 @@ test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
 	testing.expect_value(test, string(connection.answer[:]), "configured")
 	testing.expect_value(test, member.program.model, "model-b")
 	testing.expect_value(test, member.effort, "high")
+}
+
+// The member is first because shared reclaim frees that address. The hold uses the heap
+// because its worker can keep it after the test has abandoned it.
+Subagent_Hold :: struct {
+	member:  Subagent,
+	release: sync.Sema,
+}
+
+#assert(offset_of(Subagent_Hold, member) == 0)
+
+subagent_hold_run :: proc(worker: ^Job) {
+	hold := container_of(container_of(worker, Subagent, "worker"), Subagent_Hold, "member")
+	_ = sync.sema_wait_with_timeout(&hold.release, CHAIN_HOLD_BOUND)
+	subagent_conclude(&hold.member)
+}
+
+@(test)
+test_an_abandoned_subagent_is_reclaimed_after_publication :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	team := chat.team
+	allocator := os.heap_allocator()
+	hold, alloc_error := new(Subagent_Hold, allocator)
+	if alloc_error != nil { testing.fail_now(test, "the held child could not be allocated") }
+	member := &hold.member
+	child := journal.session_id_create()
+	call := journal.next_call(chat.store)
+	member^ = {
+		worker = {kind = .Subagent, run = subagent_hold_run, allocator = allocator, record = {call = call, subagent = child}},
+		allocator = allocator,
+		team = team,
+		parent_call = call,
+		session = child,
+		admitted = true,
+		tabled = true,
+	}
+	if _, append_error := append(&team.members, member); append_error != nil {
+		subagent_destroy(member)
+		testing.fail_now(test, "the held child could not be listed")
+	}
+	team.running += 1
+	chat_record(chat, {kind = .Subagent_Started, call = call, subagent = child}, journal.Subagent_Started{background = true})
+	_test_commit(test, chat)
+	if !job_launch(&member.worker) {
+		subagent_finish(member)
+		testing.fail_now(test, "the held child's worker could not be started")
+	}
+	released := false
+	defer if !released { sync.sema_post(&hold.release) }
+	job_note_stop(&member.worker, true, time.tick_add(time.tick_now(), -(TOOL_JOBS_STOP_PATIENCE + time.Millisecond)))
+	testing.expect(test, agent_team_destroy(team, chat), "the abandoned child is tracked by the shared list")
+	testing.expect(test, chat_session_workers_outstanding(chat), "the child can still reach shared bindings")
+	_test_commit(test, chat)
+	abandoned := _test_records(test, chat, {.Job_Abandoned})
+	if !testing.expect_value(test, len(abandoned), 1) { return }
+	testing.expect_value(test, abandoned[0].call, call)
+	testing.expect_value(test, abandoned[0].subagent, child)
+
+	sync.sema_post(&hold.release)
+	released = true
+	if !testing.expect(test, job_wait_published(&member.worker, time.tick_add(time.tick_now(), SHELL_TEST_BOUND))) { return }
+	testing.expect(test, !chat_session_workers_outstanding(chat), "a retained team without workers does not retain the session")
+	_test_commit(test, chat)
+	reclaimed := _test_records(test, chat, {.Job_Reclaimed})
+	if !testing.expect_value(test, len(reclaimed), 1) { return }
+	testing.expect_value(test, reclaimed[0].call, call)
+	testing.expect_value(test, reclaimed[0].subagent, child)
+	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Completed})), 0)
 }

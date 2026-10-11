@@ -22,7 +22,7 @@ TOOL_AGENT_DEFINITION :: Tool_Definition {
 	description = TOOL_AGENT_DESCRIPTION,
 	input_schema = TOOL_AGENT_SCHEMA,
 	hints = {read_only = .No, destructive = .Unknown, idempotent = .No, open_world = .Yes},
-	placement = .Owner, // start is placed on a worker after argument decoding
+	placement = .Owner, // a blocking start is placed on a worker after argument decoding
 	kind = .Agent,
 	execute = tool_agent_execute,
 }

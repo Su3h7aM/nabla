@@ -404,7 +404,7 @@ chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
 		len(chat.abandoned) > 0 ||
 		background_running(chat) ||
 		agent_team_running(chat.team) ||
-		(chat.team != nil && sync.atomic_load(&chat.team.abandoned)) \
+		(chat.team != nil && sync.atomic_load(&chat.team.workers_retained)) \
 	)
 }
 

@@ -471,10 +471,12 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		}
 		job.background = !decoded.wait
 	case Agent_Start_Args:
-		// A blocking start holds its own worker and lane for the child's whole run.
-		job.placement = .Worker
-		job.lane = job
-		job.exec.compact = nil
+		if decoded.wait {
+			// A blocking start holds its own worker and lane for the child's whole run.
+			job.placement = .Worker
+			job.lane = job
+			job.exec.compact = nil
+		}
 	}
 	if job.exec.repairs != {} {
 		// A field was rewritten while it was read, so the recorded arguments are written
