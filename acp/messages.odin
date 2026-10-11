@@ -922,6 +922,9 @@ config_options_decode_values :: proc(items: []json.Value, allocator := context.a
 	return made, .None
 }
 
+// config_options_destroy releases what config_options_decode or config_options_decode_values
+// allocated with allocator: each option's choice slices, then the slice itself. Strings, meta
+// and raw payloads borrow the decoded document and are not released. It is safe to call with nil.
 config_options_destroy :: proc(options: []Config_Option, allocator := context.allocator) {
 	for option in options { config_option_destroy(option, allocator) }
 	delete(options, allocator)

@@ -526,7 +526,6 @@ ACP_Connection :: struct {
 	next_id:        i64,
 	version:        int, // the ACP version the agent agreed to
 	session_id:     string,
-	opened:         ACP_Session_Opened, // borrowed from the thread's scratch memory
 	replaying:      bool,
 	answer:         [dynamic]u8, // the text of the agent's latest message since its last tool call
 	message_id:     string, // the latest message's id, owned; "" when the agent sends none
@@ -944,6 +943,8 @@ acp_selection_apply :: proc(connection: ^ACP_Connection) -> bool {
 	return true
 }
 
+// acp_options_destroy releases the owned strings of options, which acp_options_replace
+// cloned with allocator, and then the slice itself. It is safe to call with nil.
 @(private)
 acp_options_destroy :: proc(options: []ACP_Config_Option, allocator: mem.Allocator) {
 	for option in options {
@@ -956,6 +957,9 @@ acp_options_destroy :: proc(options: []ACP_Config_Option, allocator: mem.Allocat
 	delete(options, allocator)
 }
 
+// acp_options_replace holds a copy of options in connection, cloning every string with the
+// member allocator. The source may borrow temp or scratch memory. It reports false when a
+// clone cannot be allocated, leaving the held options unchanged.
 @(private, require_results)
 acp_options_replace :: proc(connection: ^ACP_Connection, options: []ACP_Config_Option) -> bool {
 	allocator := connection.member.allocator
@@ -1250,25 +1254,17 @@ acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") ->
 	}
 	connection.session_id = strings.clone(session_id, member.allocator) or_else ""
 	if connection.session_id == "" { return "the agent's session id could not be held" }
-	connection.opened = opened
 	if !acp_options_replace(connection, opened.config_options) { return "the agent's config options could not be held" }
-	return acp_session_configure(connection, opened, member.program.model, member.effort)
+	return acp_session_configure(connection, member.program.model, member.effort)
 }
 
 @(private, require_results)
-acp_session_configure :: proc(
-	connection: ^ACP_Connection,
-	opened: ACP_Session_Opened,
-	model, requested_effort: string,
-	default_effort := true,
-) -> (
-	problem: string,
-) {
+acp_session_configure :: proc(connection: ^ACP_Connection, model, requested_effort: string, default_effort := true) -> (problem: string) {
 	member := connection.member
 
 	if model != "" {
-		option, value := acp_model_find(opened.config_options, model)
-		if value == "" { return acp_model_unavailable(opened, model) }
+		option, value := acp_model_find(connection.config_options, model)
+		if value == "" { return acp_model_unavailable(connection.config_options, model) }
 		if value != option.current_value {
 			if problem = acp_set_option(connection, option, value); problem != "" { return }
 		}
@@ -1303,7 +1299,7 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> string {
 	if configuration.switching {
 		if configuration.model != "" {
 			option, value := acp_model_find(connection.config_options, configuration.model)
-			if value == "" { return acp_configure_refusal(connection, acp_model_unavailable(connection.opened, configuration.model)) }
+			if value == "" { return acp_configure_refusal(connection, acp_model_unavailable(connection.config_options, configuration.model)) }
 			if problem := acp_option_send(connection, ACP_Model_Reply{model = value, effort = configuration.effort}, option, value);
 			   problem != "" { return problem }
 		} else if problem := acp_effort_send(connection, configuration.effort); problem != "" { return problem }
@@ -1408,20 +1404,20 @@ acp_model_find :: proc(options: []ACP_Config_Option, model: string) -> (option: 
 	return found, acp_option_value(found, model)
 }
 
-// acp_model_unavailable says that opened offers no model, with what it does offer. The
+// acp_model_unavailable says that options offers no model, with what it does offer. The
 // text is temp-allocated.
 @(private)
-acp_model_unavailable :: proc(opened: ACP_Session_Opened, model: string) -> string {
-	return fmt.tprintf("the agent offers no model %q; it offers: %s", model, acp_models_text(opened))
+acp_model_unavailable :: proc(options: []ACP_Config_Option, model: string) -> string {
+	return fmt.tprintf("the agent offers no model %q; it offers: %s", model, acp_models_text(options))
 }
 
 // acp_models_text lists the models a session offers, temp-allocated. A list that cannot be
 // held says so rather than reading as an agent that offers no model.
 @(private)
-acp_models_text :: proc(opened: ACP_Session_Opened) -> string {
+acp_models_text :: proc(options: []ACP_Config_Option) -> string {
 	names, names_error := make([dynamic]string, context.temp_allocator)
 	if names_error != nil { return "the model list could not be held" }
-	if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_MODEL); found {
+	if option, found := acp_option(options, ACP_OPTION_CATEGORY_MODEL); found {
 		for choice in option.options { append(&names, choice.value) }
 	}
 	if len(names) == 0 { return "no choice of model" }
@@ -1450,6 +1446,8 @@ acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result
 		if failed, has_error := envelope.rpc_error.?; has_error { return fmt.tprintf("the agent refused %s: %s", method, failed.message) }
 		if _, is_null := envelope.result.(json.Null); is_null { return "" }
 		decoded: acp.Params_Error
+		// Only a session answer carries content blocks and config options, whose
+		// variants params_decode cannot read; every other result decodes as a plain struct.
 		when R == ACP_Session_Opened {
 			decoded = acp_opened_decode(envelope.result, result)
 		} else {

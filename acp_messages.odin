@@ -246,10 +246,9 @@ acp_request_params_error_code :: proc(params_error: acp.Params_Error) -> i64 {
 
 acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	// The version is inside the params, so the request is read as v2 first. A v2 request is
-	// valid only when it carries the v2 info object. Buzz currently asks for version 2
-	// while sending the v1 field names, so it deliberately receives the v1 surface instead
-	// of being forced through a lifecycle it does not implement; that request is then read
-	// as v1.
+	// valid only when it carries the v2 info object. A request that names version 2 while
+	// sending the v1 field names receives the v1 surface instead of being forced through a
+	// lifecycle it does not implement; that request is then read as v1.
 	params: acp.V2_Initialize_Params
 	if !acp_request_params_decode(server, envelope, &params, "initialize needs a protocol version") { return }
 	if params.protocol_version < 1 {

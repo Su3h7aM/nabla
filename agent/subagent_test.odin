@@ -848,6 +848,64 @@ test_acp_config_option_update_replaces_the_held_options :: proc(test: ^testing.T
 	testing.expect_value(test, member.effort, "high")
 }
 
+// An update with no options clears the held list, as an empty available-commands list does.
+@(test)
+test_acp_config_option_update_with_no_options_clears_the_held_options :: proc(test: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	team: Agent_Team
+	member := Subagent {
+		allocator = context.allocator,
+		team      = &team,
+	}
+	connection := ACP_Connection {
+		member     = &member,
+		session_id = "s1",
+		version    = 2,
+	}
+	defer {
+		acp_options_destroy(connection.config_options, context.allocator)
+		delete(member.program.model, context.allocator)
+		delete(member.effort, context.allocator)
+	}
+	seed := []ACP_Config_Option{{id = "model", category = "model", current_value = "model-a", options = {{value = "model-a", name = "A"}}}}
+	if !acp_options_replace(&connection, seed) { testing.fail_now(test, "the seed options could not be held") }
+	if !testing.expect_value(test, len(connection.config_options), 1) { return }
+	envelope, envelope_error := acp.parse_envelope(
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"config_option_update","configOptions":[]}}}`,
+		context.allocator,
+	)
+	if envelope_error != .None { testing.fail_now(test, "the notification could not be parsed") }
+	defer acp.destroy_envelope(&envelope, context.allocator)
+
+	testing.expect(test, acp_notification(&connection, envelope))
+	testing.expect_value(test, len(connection.config_options), 0)
+}
+
+// An answer with no options keeps the held list and records the value just set as current.
+@(test)
+test_acp_option_install_with_no_answer_records_the_set_value :: proc(test: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	team: Agent_Team
+	member := Subagent {
+		allocator = context.allocator,
+		team      = &team,
+	}
+	connection := ACP_Connection {
+		member     = &member,
+		session_id = "s1",
+		version    = 2,
+	}
+	defer acp_options_destroy(connection.config_options, context.allocator)
+	seed := []ACP_Config_Option {
+		{id = "model", category = "model", current_value = "model-a", options = {{value = "model-a", name = "A"}, {value = "model-b", name = "B"}}},
+	}
+	if !acp_options_replace(&connection, seed) { testing.fail_now(test, "the seed options could not be held") }
+
+	testing.expect_value(test, acp_option_install(&connection, nil, "model", "model-b"), "")
+	if !testing.expect_value(test, len(connection.config_options), 1) { return }
+	testing.expect_value(test, connection.config_options[0].current_value, "model-b")
+}
+
 // SUBAGENT_TEST_ACP_AGENT is an ACP version 2 agent. It answers each request by its method,
 // narrates before a tool call, asks permission for the call, and fails when its prompt lacks
 // the instruction or the task, flooding standard error before it does.

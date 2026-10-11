@@ -1474,9 +1474,9 @@ test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing
 }
 
 @(test)
-test_acp_buzz_v2_request_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_refused :: proc(t: ^testing.T) {
+test_acp_v2_version_with_v1_fields_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_refused :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
-	state, state_err := os.make_directory_temp("", "nabla-acp-buzz-state-*", context.allocator)
+	state, state_err := os.make_directory_temp("", "nabla-acp-v1-fallback-state-*", context.allocator)
 	if state_err != nil {
 		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
 		return
@@ -1497,7 +1497,7 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_
 	run := ACP_Test_Run {
 		client = &client,
 	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-buzz-run")
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v1-fallback-run")
 	if run_thread == nil {
 		testing.expect(t, false, "the run thread could not be started")
 		return
@@ -1513,15 +1513,15 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_
 	}
 
 	// A request that is not v2 is read as v1, so a malformed client description is refused.
-	malformed := `{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":1,"clientInfo":"buzz-acp"}}` + "\n"
+	malformed := `{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":1,"clientInfo":"v1-client"}}` + "\n"
 	acp_test_client_send(&client, malformed)
 	if acp_test_client_expect(t, &client, `"code":-32602`, "a malformed clientInfo was not refused as invalid params") == "" { return }
 
 	message :=
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientCapabilities":{},"clientInfo":{"name":"buzz-acp","version":"test"}}}` +
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientCapabilities":{},"clientInfo":{"name":"v1-client","version":"test"}}}` +
 		"\n"
 	acp_test_client_send(&client, message)
-	frame := acp_test_client_expect(t, &client, `"protocolVersion":1`, "Buzz did not receive the v1 profile")
+	frame := acp_test_client_expect(t, &client, `"protocolVersion":1`, "a version 2 request with v1 fields did not receive the v1 profile")
 	if frame == "" { return }
 	testing.expect(t, strings.contains(frame, `"agentCapabilities"`))
 	testing.expect(t, strings.contains(frame, `"agentInfo"`))
