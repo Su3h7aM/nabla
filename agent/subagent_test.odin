@@ -822,11 +822,11 @@ while IFS= read -r line; do
 	*'"method":"initialize"'*)
 		printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"info":{"name":"fake","version":"1"},"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}\n' "$id" ;;
 	*'"method":"session/new"'*)
-		printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1","configOptions":[{"id":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}\n' "$id" ;;
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1","configOptions":[{"id":"mute","type":"boolean","name":"Mute","currentValue":false},{"id":"ui","type":"_future","name":"UI"},{"id":"model","type":"select","category":"model","currentValue":"model-a","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","type":"select","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}\n' "$id" ;;
 	*'"method":"session/resume"'*)
 		case "$line" in *'"sessionId":"s1"'*) ;; *) echo "wrong resumed session" >&2; exit 1 ;; esac
 		resumed=yes
-		printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}\n' "$id" ;;
+		printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"mute","type":"boolean","name":"Mute","currentValue":false},{"id":"ui","type":"_future","name":"UI"},{"id":"model","type":"select","category":"model","currentValue":"model-a","options":[{"value":"model-a","name":"A"},{"value":"model-b","name":"B"}]},{"id":"effort","type":"select","category":"thought_level","currentValue":"low","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]}]}}\n' "$id" ;;
 	*'"method":"session/set_config_option"'*)
 		case "$line" in *'"configId":"model"'*'"value":"model-b"'*) model_switched=yes ;; *'"configId":"effort"'*'"value":"high"'*) effort_switched=yes ;; esac
 		printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;

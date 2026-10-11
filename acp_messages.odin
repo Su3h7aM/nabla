@@ -577,10 +577,18 @@ acp_request_set_config_option :: proc(server: ^ACP_Server, envelope: ^acp.Envelo
 		return
 	}
 	params: acp.Session_Set_Config_Option_Params
-	if !acp_request_params_decode(server, envelope, &params, "session/set_config_option needs a session, config id, and value") {
+	version := acp.PROTOCOL_VERSION_V2 if acp_is_v2(server) else acp.PROTOCOL_VERSION
+	if !acp_request_params_result(
+		server,
+		envelope,
+		acp.session_set_config_option_params_decode(envelope.params, version, &params),
+		"session/set_config_option needs a session, config id, and value",
+	) {
 		return
 	}
-	if params.session_id == "" || params.config_id == "" || params.value == "" {
+	// The options this agent offers are choices among values, so only an id value can set one.
+	choice, is_choice := params.variant.(acp.Config_Set_Id)
+	if params.session_id == "" || params.config_id == "" || !is_choice || choice.value == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "session/set_config_option needs a session, config id, and value")
 		return
 	}
@@ -590,7 +598,7 @@ acp_request_set_config_option :: proc(server: ^ACP_Server, envelope: ^acp.Envelo
 		return
 	}
 	if params.config_id == "model" {
-		acp_request_model_change(server, envelope, session, .Set_Config_Option, params.value)
+		acp_request_model_change(server, envelope, session, .Set_Config_Option, choice.value)
 		return
 	}
 	config_id, config_id_error := strings.clone(params.config_id, server.alloc)
@@ -598,7 +606,7 @@ acp_request_set_config_option :: proc(server: ^ACP_Server, envelope: ^acp.Envelo
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the config id could not be allocated")
 		return
 	}
-	value, value_error := strings.clone(params.value, server.alloc)
+	value, value_error := strings.clone(choice.value, server.alloc)
 	if value_error != nil {
 		delete(config_id, server.alloc)
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the config value could not be allocated")
@@ -965,7 +973,7 @@ ACP_Models_State :: struct {
 // ACP_Session_New_Result is the version 1 session/new result with the Buzz model list.
 ACP_Session_New_Result :: struct {
 	session_id:     string `json:"sessionId"`,
-	config_options: []acp.V1_Config_Option `json:"configOptions,omitempty"`,
+	config_options: []json.Value `json:"configOptions,omitempty"`,
 	models:         ACP_Models_State `json:"models"`,
 }
 

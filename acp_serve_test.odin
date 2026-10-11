@@ -1526,6 +1526,12 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_
 	testing.expect(t, strings.contains(frame, `"agentCapabilities"`))
 	testing.expect(t, strings.contains(frame, `"agentInfo"`))
 	testing.expect(t, !strings.contains(frame, `"capabilities":{"session"`))
+
+	// The options this agent offers take an id, so a boolean value is refused before any session is looked up.
+	boolean :=
+		`{"jsonrpc":"2.0","id":9,"method":"session/set_config_option","params":{"sessionId":"s","configId":"model","type":"boolean","value":true}}` + "\n"
+	acp_test_client_send(&client, boolean)
+	acp_test_client_expect(t, &client, `needs a session, config id, and value`, "a boolean config value was not refused")
 }
 
 acp_test_model_change_message :: proc(builder: ^strings.Builder, id: int, session_id, value: string, kind: ACP_Model_Kind) {
@@ -1539,7 +1545,7 @@ acp_test_model_change_message :: proc(builder: ^strings.Builder, id: int, sessio
 	if kind == .Set_Model {
 		strings.write_string(builder, `","modelId":"`)
 	} else {
-		strings.write_string(builder, `","configId":"model","type":"select","value":"`)
+		strings.write_string(builder, `","configId":"model","type":"id","value":"`)
 	}
 	strings.write_string(builder, value)
 	strings.write_string(builder, `"}}`)
@@ -1638,8 +1644,8 @@ acp_test_qualified_model_selection :: proc(t: ^testing.T, profile: ACP_Wire_Prof
 		opened,
 		{
 			`"currentValue":"buzzprovider/vendor/shared"`,
-			`"value":"buzzprovider/vendor/shared","name":"Shared Model"`,
-			`"value":"otherprovider/vendor/shared","name":"Shared Model"`,
+			`"name":"Shared Model","value":"buzzprovider/vendor/shared"`,
+			`"name":"Shared Model","value":"otherprovider/vendor/shared"`,
 		},
 		"the qualified model option",
 	) { return }

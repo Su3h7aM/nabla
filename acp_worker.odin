@@ -367,14 +367,10 @@ acp_model_selection_service :: proc(session: ^ACP_Session) -> ai.Provider_Connec
 				session,
 				acp.write_response(&session.conn.writer, selection.id, ACP_Set_Model_Result{session_id = acp_session_id(session), model_id = model_id}),
 			)
-		} else if acp_is_v2(session.conn) {
-			v2_options, options_ok := acp_model_config_options_v2(session)
-			if !options_ok { return acp_model_selection_config_failed(session, selection) }
-			acp_sent(session, acp.write_response(&session.conn.writer, selection.id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options}))
 		} else {
-			v1_options, options_ok := acp_model_config_options_v1(session)
+			options, options_ok := acp_model_config_options(session)
 			if !options_ok { return acp_model_selection_config_failed(session, selection) }
-			acp_sent(session, acp.write_response(&session.conn.writer, selection.id, acp.V1_Session_Set_Config_Option_Result{config_options = v1_options}))
+			acp_sent(session, acp.write_response(&session.conn.writer, selection.id, acp.Session_Set_Config_Option_Result{config_options = options}))
 		}
 		acp_model_selection_destroy(session, selection)
 	}
@@ -843,13 +839,11 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 
 	// Allocate every value that can fail before publishing the new session id. A
 	// response must not advertise a session that failed partway through setup.
-	v1_options: []acp.V1_Config_Option
-	v1_options_ok: bool
-	v2_options: []acp.V2_Config_Option
-	v2_options_ok: bool
+	options: []json.Value
+	options_ok: bool
 	if acp_is_v2(session.conn) {
-		v2_options, v2_options_ok = acp_model_config_options_v2(session)
-		if !v2_options_ok {
+		options, options_ok = acp_model_config_options(session)
+		if !options_ok {
 			acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the model configuration could not be allocated"))
 			return
 		}
@@ -859,8 +853,8 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 		switch _ in work.start {
 		case Start_Resume_Id:
 		case Start_Fresh, Start_Resume_Latest, nil:
-			v1_options, v1_options_ok = acp_model_config_options_v1(session)
-			if !v1_options_ok {
+			options, options_ok = acp_model_config_options(session)
+			if !options_ok {
 				acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the model configuration could not be allocated"))
 				return
 			}
@@ -924,7 +918,7 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 			commands := acp_available_commands()
 			acp_sent(
 				session,
-				acp.write_response(&session.conn.writer, id, acp.Session_Resume_Result{config_options = v2_options, available_commands = commands[:]}),
+				acp.write_response(&session.conn.writer, id, acp.Session_Resume_Result{config_options = options, available_commands = commands[:]}),
 			)
 		} else {
 			acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Empty_Result{}))
@@ -937,13 +931,13 @@ acp_work_open_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: A
 				acp.write_response(
 					&session.conn.writer,
 					id,
-					acp.V2_Session_New_Result{session_id = session_id, config_options = v2_options, available_commands = commands[:]},
+					acp.V2_Session_New_Result{session_id = session_id, config_options = options, available_commands = commands[:]},
 				),
 			)
 		} else {
 			acp_sent(
 				session,
-				acp.write_response(&session.conn.writer, id, ACP_Session_New_Result{session_id = session_id, config_options = v1_options, models = models}),
+				acp.write_response(&session.conn.writer, id, ACP_Session_New_Result{session_id = session_id, config_options = options, models = models}),
 			)
 		}
 	}
@@ -1144,21 +1138,12 @@ acp_work_set_config_option :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, wo
 		)
 		return
 	}
-	options, options_ok := acp_model_config_options_v1(session)
+	options, options_ok := acp_model_config_options(session)
 	if !options_ok {
 		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the model configuration could not be allocated"))
 		return
 	}
-	if acp_is_v2(session.conn) {
-		v2_options, v2_options_ok := acp_model_config_options_v2(session)
-		if !v2_options_ok {
-			acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the model configuration could not be allocated"))
-			return
-		}
-		acp_sent(session, acp.write_response(&session.conn.writer, id, acp.V2_Session_Set_Config_Option_Result{config_options = v2_options}))
-		return
-	}
-	acp_sent(session, acp.write_response(&session.conn.writer, id, acp.V1_Session_Set_Config_Option_Result{config_options = options}))
+	acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Session_Set_Config_Option_Result{config_options = options}))
 }
 
 acp_session_timestamp :: proc(at_ms: i64) -> string {
@@ -1406,45 +1391,12 @@ acp_config_option_counts :: proc(session: ^ACP_Session) -> (model_count, effort_
 	return model_count, effort_count
 }
 
-acp_model_config_options_v1 :: proc(session: ^ACP_Session) -> ([]acp.V1_Config_Option, bool) {
-	model_count, effort_count := acp_config_option_counts(session)
-	options, options_error := make([]acp.V1_Config_Option, model_count + effort_count, context.temp_allocator)
-	if options_error != nil { return nil, false }
-	index := 0
-	if model_count == 1 {
-		values, values_ok := acp_model_config_values(session)
-		if !values_ok { return nil, false }
-		current, current_error := acp_model_value(session.app.setup.provider_id, session.app.setup.model_id)
-		if current_error != nil { return nil, false }
-		options[index] = acp.V1_Config_Option {
-			id            = "model",
-			name          = "Model",
-			category      = "model",
-			type          = "select",
-			current_value = current,
-			options       = values,
-		}
-		index += 1
-	}
-	if effort_count == 1 {
-		levels, levels_ok := acp_effort_config_values(session)
-		if !levels_ok { return nil, false }
-		options[index] = acp.V1_Config_Option {
-			id            = "effort",
-			name          = "Effort",
-			category      = "thought_level",
-			type          = "select",
-			current_value = session.app.setup.session.effort,
-			options       = levels,
-		}
-	}
-	return options, true
-}
-
+// acp_model_config_options is the model and effort options of the open session in the wire
+// form of the connection's protocol version, temp-allocated.
 @(require_results)
-acp_model_config_options_v2 :: proc(session: ^ACP_Session) -> ([]acp.V2_Config_Option, bool) {
+acp_model_config_options :: proc(session: ^ACP_Session) -> ([]json.Value, bool) {
 	model_count, effort_count := acp_config_option_counts(session)
-	options, options_error := make([]acp.V2_Config_Option, model_count + effort_count, context.temp_allocator)
+	options, options_error := make([]acp.Config_Option, model_count + effort_count, context.temp_allocator)
 	if options_error != nil { return nil, false }
 	index := 0
 	if model_count == 1 {
@@ -1452,29 +1404,27 @@ acp_model_config_options_v2 :: proc(session: ^ACP_Session) -> ([]acp.V2_Config_O
 		if !values_ok { return nil, false }
 		current, current_error := acp_model_value(session.app.setup.provider_id, session.app.setup.model_id)
 		if current_error != nil { return nil, false }
-		options[index] = acp.V2_Config_Option {
-			config_id     = "model",
-			name          = "Model",
-			category      = "model",
-			type          = "select",
-			current_value = current,
-			options       = values,
+		options[index] = acp.Config_Option {
+			id = "model",
+			name = "Model",
+			category = "model",
+			variant = acp.Config_Select{current_value = current, options = values},
 		}
 		index += 1
 	}
 	if effort_count == 1 {
 		levels, levels_ok := acp_effort_config_values(session)
 		if !levels_ok { return nil, false }
-		options[index] = acp.V2_Config_Option {
-			config_id     = "effort",
-			name          = "Effort",
-			category      = "thought_level",
-			type          = "select",
-			current_value = session.app.setup.session.effort,
-			options       = levels,
+		options[index] = acp.Config_Option {
+			id = "effort",
+			name = "Effort",
+			category = "thought_level",
+			variant = acp.Config_Select{current_value = session.app.setup.session.effort, options = levels},
 		}
 	}
-	return options, true
+	version := acp.PROTOCOL_VERSION_V2 if acp_is_v2(session.conn) else acp.PROTOCOL_VERSION
+	encoded, encode_error := acp.config_options_encode(options, version, context.temp_allocator)
+	return encoded, encode_error == nil
 }
 
 // acp_sent ends the turn of session when a frame was not queued. The writer has

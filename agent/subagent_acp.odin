@@ -809,13 +809,13 @@ acp_option_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, option: A
 // requires the value's type; version 1 reads a missing type as an id. The strings borrow
 // connection and option.
 @(private)
-acp_option_request :: proc(connection: ^ACP_Connection, option: ACP_Config_Option, value: string) -> acp.Session_Set_Config_Option_Params {
-	return {
+acp_option_request :: proc(connection: ^ACP_Connection, option: ACP_Config_Option, value: string) -> acp.Session_Set_Config_Option_Request {
+	params := acp.Session_Set_Config_Option_Params {
 		session_id = connection.session_id,
-		config_id = option.config_id if option.config_id != "" else option.id,
-		type = "id" if connection.version == 2 else "",
-		value = value,
+		config_id = option.id,
+		variant = acp.Config_Set_Id{value = value},
 	}
+	return acp.session_set_config_option_request(params, connection.version)
 }
 
 // acp_option_install records the agent's answer to a set_config_option for the option of
@@ -886,7 +886,7 @@ acp_receive :: proc(connection: ^ACP_Connection) -> string {
 		return ""
 	}
 	configured: ACP_Session_Opened
-	if acp.params_decode(envelope.result, &configured, context.temp_allocator) != .None { return "the agent's configuration answer is not what ACP defines" }
+	if acp_opened_decode(envelope.result, &configured) != .None { return "the agent's configuration answer is not what ACP defines" }
 	category, value := ACP_OPTION_CATEGORY_EFFORT, ""
 	switch reply in request.variant {
 	case ACP_Model_Reply:
@@ -948,7 +948,6 @@ acp_selection_apply :: proc(connection: ^ACP_Connection) -> bool {
 acp_options_destroy :: proc(options: []ACP_Config_Option, allocator: mem.Allocator) {
 	for option in options {
 		delete(option.id, allocator)
-		delete(option.config_id, allocator)
 		delete(option.category, allocator)
 		delete(option.current_value, allocator)
 		for choice in option.options { delete(choice.value, allocator); delete(choice.name, allocator) }
@@ -968,7 +967,7 @@ acp_options_replace :: proc(connection: ^ACP_Connection, options: []ACP_Config_O
 		for pair in ([]struct {
 				out:  ^string,
 				text: string,
-			}{{&copied[index].id, option.id}, {&copied[index].config_id, option.config_id}, {&copied[index].category, option.category}, {&copied[index].current_value, option.current_value}}) {
+			}{{&copied[index].id, option.id}, {&copied[index].category, option.category}, {&copied[index].current_value, option.current_value}}) {
 			pair.out^ = strings.clone(pair.text, allocator) or_else ""
 			if pair.text != "" && pair.out^ == "" { return false }
 		}
@@ -1313,23 +1312,55 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> string {
 	return ""
 }
 
-// ACP_Config_Option is a session config option of either version: version 1 names it by id and
-// version 2 by configId.
+// ACP_Config_Option is a select config option of either version, the only kind the harness
+// acts on. Its choices are flat: a grouped option lists the choices of all its groups.
 @(private)
 ACP_Config_Option :: struct {
-	id:            string `json:"id"`,
-	config_id:     string `json:"configId"`,
-	category:      string `json:"category"`,
-	current_value: string `json:"currentValue"`,
-	options:       []acp.Config_Value `json:"options"`,
+	id:            string,
+	category:      string,
+	current_value: string,
+	options:       []acp.Config_Value,
 }
 
 // ACP_Session_Opened is the configuration returned by session/new, session/resume, or session/load.
 // Only session/new returns session_id.
 @(private)
 ACP_Session_Opened :: struct {
-	session_id:     string `json:"sessionId"`,
-	config_options: []ACP_Config_Option `json:"configOptions"`,
+	session_id:     string,
+	config_options: []ACP_Config_Option,
+}
+
+// acp_opened_decode reads a session answer with the temp allocator. Boolean options and options
+// of a kind ACP does not define are skipped, since the harness has nothing to do with them.
+@(private, require_results)
+acp_opened_decode :: proc(value: json.Value, opened: ^ACP_Session_Opened) -> acp.Params_Error {
+	wire: struct {
+		session_id:     string `json:"sessionId"`,
+		config_options: json.Value `json:"configOptions"`,
+	}
+	acp.params_decode(value, &wire, context.temp_allocator) or_return
+	decoded := acp.config_options_decode(wire.config_options, context.temp_allocator) or_return
+	selects, selects_error := make([dynamic]ACP_Config_Option, 0, len(decoded), context.temp_allocator)
+	if selects_error != nil { return .Allocation }
+	for option in decoded {
+		select, is_select := option.variant.(acp.Config_Select)
+		if !is_select { continue }
+		choices: []acp.Config_Value
+		switch options in select.options {
+		case []acp.Config_Value:
+			choices = options
+		case []acp.Config_Group:
+			flat, flat_error := make([dynamic]acp.Config_Value, context.temp_allocator)
+			if flat_error != nil { return .Allocation }
+			for group in options { append(&flat, ..group.options) }
+			choices = flat[:]
+		case nil:
+		}
+		append(&selects, ACP_Config_Option{id = option.id, category = option.category, current_value = select.current_value, options = choices})
+	}
+	opened.session_id = wire.session_id
+	opened.config_options = selects[:]
+	return .None
 }
 
 @(private, require_results)
@@ -1409,7 +1440,13 @@ acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result
 		if !is_number || answered != id { continue }
 		if failed, has_error := envelope.rpc_error.?; has_error { return fmt.tprintf("the agent refused %s: %s", method, failed.message) }
 		if _, is_null := envelope.result.(json.Null); is_null { return "" }
-		switch acp.params_decode(envelope.result, result, context.temp_allocator) {
+		decoded: acp.Params_Error
+		when R == ACP_Session_Opened {
+			decoded = acp_opened_decode(envelope.result, result)
+		} else {
+			decoded = acp.params_decode(envelope.result, result, context.temp_allocator)
+		}
+		switch decoded {
 		case .None:
 			return ""
 		case .Invalid:

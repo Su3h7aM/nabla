@@ -350,10 +350,13 @@ test_writer_frames_client_requests_without_agent_only_fields :: proc(t: ^testing
 	testing.expect(t, write_request(&writer, i64(4), METHOD_SESSION_LOAD, Session_Load_Params{session_id = "s", cwd = "/w"}) == .None)
 	option := Session_Set_Config_Option_Params {
 		session_id = "s",
-		config_id  = "model",
-		value      = "m",
+		config_id = "model",
+		variant = Config_Set_Id{value = "m"},
 	}
-	testing.expect(t, write_request(&writer, i64(5), METHOD_SESSION_SET_CONFIG_OPTION, option) == .None)
+	testing.expect(
+		t,
+		write_request(&writer, i64(5), METHOD_SESSION_SET_CONFIG_OPTION, session_set_config_option_request(option, PROTOCOL_VERSION_V2)) == .None,
+	)
 	test_writer_finish(t, &writer)
 
 	want :=
@@ -365,7 +368,7 @@ test_writer_frames_client_requests_without_agent_only_fields :: proc(t: ^testing
 		"\n" +
 		`{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"s","cwd":"/w","mcpServers":[]}}` +
 		"\n" +
-		`{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"s","configId":"model","value":"m"}}` +
+		`{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"s","configId":"model","type":"id","value":"m"}}` +
 		"\n"
 	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
 }

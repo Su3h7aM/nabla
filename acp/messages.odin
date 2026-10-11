@@ -393,33 +393,33 @@ content_block_decode :: proc(value: json.Value, allocator := context.allocator) 
 	object, is_object := value.(json.Object)
 	if !is_object { return {}, .Invalid }
 	ok := true
-	kind := content_string(object, "type", true, &ok)
+	kind := field_string(object, "type", true, &ok)
 	if !ok { return {}, .Invalid }
-	block.meta = content_optional(object, "_meta")
-	block.annotations = content_optional(object, "annotations")
+	block.meta = field_value(object, "_meta")
+	block.annotations = field_value(object, "annotations")
 	switch kind {
 	case CONTENT_TEXT:
 		block.variant = Content_Text {
-			text = content_string(object, "text", true, &ok),
+			text = field_string(object, "text", true, &ok),
 		}
 	case CONTENT_IMAGE:
 		block.variant = Content_Image {
-			data      = content_string(object, "data", true, &ok),
-			mime_type = content_string(object, "mimeType", false, &ok),
-			uri       = content_string(object, "uri", false, &ok),
+			data      = field_string(object, "data", true, &ok),
+			mime_type = field_string(object, "mimeType", false, &ok),
+			uri       = field_string(object, "uri", false, &ok),
 		}
 	case CONTENT_AUDIO:
 		block.variant = Content_Audio {
-			data      = content_string(object, "data", true, &ok),
-			mime_type = content_string(object, "mimeType", false, &ok),
+			data      = field_string(object, "data", true, &ok),
+			mime_type = field_string(object, "mimeType", false, &ok),
 		}
 	case CONTENT_RESOURCE_LINK:
 		link := Content_Resource_Link {
-			uri         = content_string(object, "uri", true, &ok),
-			name        = content_string(object, "name", false, &ok),
-			mime_type   = content_string(object, "mimeType", false, &ok),
-			title       = content_string(object, "title", false, &ok),
-			description = content_string(object, "description", false, &ok),
+			uri         = field_string(object, "uri", true, &ok),
+			name        = field_string(object, "name", false, &ok),
+			mime_type   = field_string(object, "mimeType", false, &ok),
+			title       = field_string(object, "title", false, &ok),
+			description = field_string(object, "description", false, &ok),
 		}
 		switch size in object["size"] {
 		case json.Integer:
@@ -435,17 +435,17 @@ content_block_decode :: proc(value: json.Value, allocator := context.allocator) 
 		resource_object, resource_is_object := object["resource"].(json.Object)
 		if !resource_is_object { return {}, .Invalid }
 		contents := Resource_Contents {
-			meta      = content_optional(resource_object, "_meta"),
-			uri       = content_string(resource_object, "uri", true, &ok),
-			mime_type = content_string(resource_object, "mimeType", false, &ok),
+			meta      = field_value(resource_object, "_meta"),
+			uri       = field_string(resource_object, "uri", true, &ok),
+			mime_type = field_string(resource_object, "mimeType", false, &ok),
 		}
 		if _, has_blob := resource_object["blob"]; has_blob {
 			contents.variant = Resource_Blob {
-				blob = content_string(resource_object, "blob", true, &ok),
+				blob = field_string(resource_object, "blob", true, &ok),
 			}
 		} else {
 			contents.variant = Resource_Text {
-				text = content_string(resource_object, "text", true, &ok),
+				text = field_string(resource_object, "text", true, &ok),
 			}
 		}
 		block.variant = Content_Resource {
@@ -468,10 +468,10 @@ content_block_destroy :: proc(block: Content_Block, allocator := context.allocat
 	}
 }
 
-// content_string reads a string field. A missing or null field is empty, and a field of another type
+// field_string reads a string field. A missing or null field is empty, and a field of another type
 // clears ok; a required field that is missing or null clears ok too.
 @(private)
-content_string :: proc(object: json.Object, key: string, required: bool, ok: ^bool) -> string {
+field_string :: proc(object: json.Object, key: string, required: bool, ok: ^bool) -> string {
 	#partial switch text in object[key] {
 	case json.String:
 		return string(text)
@@ -484,7 +484,7 @@ content_string :: proc(object: json.Object, key: string, required: bool, ok: ^bo
 }
 
 @(private)
-content_optional :: proc(object: json.Object, key: string) -> json.Value {
+field_value :: proc(object: json.Object, key: string) -> json.Value {
 	value := object[key]
 	if _, is_null := value.(json.Null); is_null { return nil }
 	return value
@@ -503,9 +503,9 @@ content_icons_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (ic
 		if !is_object { return nil, .Invalid }
 		ok := true
 		made[index] = Icon {
-			src       = content_string(object, "src", true, &ok),
-			mime_type = content_string(object, "mimeType", false, &ok),
-			theme     = content_string(object, "theme", false, &ok),
+			src       = field_string(object, "src", true, &ok),
+			mime_type = field_string(object, "mimeType", false, &ok),
+			theme     = field_string(object, "theme", false, &ok),
 		}
 		if !ok { return nil, .Invalid }
 		sizes_value, has_sizes := object["sizes"]
@@ -542,73 +542,73 @@ content_block_encode :: proc(block: Content_Block, allocator := context.allocato
 	if other, is_other := block.variant.(Content_Other); is_other { return other.raw, nil }
 	if block.variant == nil { return json.Null{}, nil }
 	object := make(json.Object, 8, allocator) or_return
-	if block.meta != nil { content_put(&object, "_meta", block.meta) or_return }
-	if block.annotations != nil { content_put(&object, "annotations", block.annotations) or_return }
+	if block.meta != nil { field_put(&object, "_meta", block.meta) or_return }
+	if block.annotations != nil { field_put(&object, "annotations", block.annotations) or_return }
 	switch kind in block.variant {
 	case Content_Text:
-		content_put(&object, "type", CONTENT_TEXT) or_return
-		content_put(&object, "text", kind.text) or_return
+		field_put(&object, "type", CONTENT_TEXT) or_return
+		field_put(&object, "text", kind.text) or_return
 	case Content_Image:
-		content_put(&object, "type", CONTENT_IMAGE) or_return
-		content_put(&object, "data", kind.data) or_return
-		content_put(&object, "mimeType", kind.mime_type) or_return
-		content_put_text(&object, "uri", kind.uri) or_return
+		field_put(&object, "type", CONTENT_IMAGE) or_return
+		field_put(&object, "data", kind.data) or_return
+		field_put(&object, "mimeType", kind.mime_type) or_return
+		field_put_text(&object, "uri", kind.uri) or_return
 	case Content_Audio:
-		content_put(&object, "type", CONTENT_AUDIO) or_return
-		content_put(&object, "data", kind.data) or_return
-		content_put(&object, "mimeType", kind.mime_type) or_return
+		field_put(&object, "type", CONTENT_AUDIO) or_return
+		field_put(&object, "data", kind.data) or_return
+		field_put(&object, "mimeType", kind.mime_type) or_return
 	case Content_Resource_Link:
-		content_put(&object, "type", CONTENT_RESOURCE_LINK) or_return
-		content_put(&object, "uri", kind.uri) or_return
-		content_put(&object, "name", kind.name) or_return
-		content_put_text(&object, "mimeType", kind.mime_type) or_return
-		content_put_text(&object, "title", kind.title) or_return
-		content_put_text(&object, "description", kind.description) or_return
-		if size, has_size := kind.size.?; has_size { content_put(&object, "size", json.Integer(size)) or_return }
+		field_put(&object, "type", CONTENT_RESOURCE_LINK) or_return
+		field_put(&object, "uri", kind.uri) or_return
+		field_put(&object, "name", kind.name) or_return
+		field_put_text(&object, "mimeType", kind.mime_type) or_return
+		field_put_text(&object, "title", kind.title) or_return
+		field_put_text(&object, "description", kind.description) or_return
+		if size, has_size := kind.size.?; has_size { field_put(&object, "size", json.Integer(size)) or_return }
 		if len(kind.icons) > 0 {
 			icons := make(json.Array, 0, len(kind.icons), allocator) or_return
 			for icon in kind.icons {
 				icon_object := make(json.Object, 4, allocator) or_return
-				content_put(&icon_object, "src", icon.src) or_return
-				content_put_text(&icon_object, "mimeType", icon.mime_type) or_return
-				content_put_text(&icon_object, "theme", icon.theme) or_return
+				field_put(&icon_object, "src", icon.src) or_return
+				field_put_text(&icon_object, "mimeType", icon.mime_type) or_return
+				field_put_text(&icon_object, "theme", icon.theme) or_return
 				if len(icon.sizes) > 0 {
 					sizes := make(json.Array, 0, len(icon.sizes), allocator) or_return
 					for size in icon.sizes { _ = append(&sizes, json.String(size)) or_return }
-					content_put(&icon_object, "sizes", sizes) or_return
+					field_put(&icon_object, "sizes", sizes) or_return
 				}
 				_ = append(&icons, icon_object) or_return
 			}
-			content_put(&object, "icons", icons) or_return
+			field_put(&object, "icons", icons) or_return
 		}
 	case Content_Resource:
-		content_put(&object, "type", CONTENT_RESOURCE) or_return
+		field_put(&object, "type", CONTENT_RESOURCE) or_return
 		contents := make(json.Object, 4, allocator) or_return
-		if kind.resource.meta != nil { content_put(&contents, "_meta", kind.resource.meta) or_return }
-		content_put(&contents, "uri", kind.resource.uri) or_return
-		content_put_text(&contents, "mimeType", kind.resource.mime_type) or_return
+		if kind.resource.meta != nil { field_put(&contents, "_meta", kind.resource.meta) or_return }
+		field_put(&contents, "uri", kind.resource.uri) or_return
+		field_put_text(&contents, "mimeType", kind.resource.mime_type) or_return
 		switch resource in kind.resource.variant {
 		case Resource_Text:
-			content_put(&contents, "text", resource.text) or_return
+			field_put(&contents, "text", resource.text) or_return
 		case Resource_Blob:
-			content_put(&contents, "blob", resource.blob) or_return
+			field_put(&contents, "blob", resource.blob) or_return
 		}
-		content_put(&object, "resource", contents) or_return
+		field_put(&object, "resource", contents) or_return
 	case Content_Other:
 	}
 	return object, nil
 }
 
 @(private)
-content_put :: proc(object: ^json.Object, key: string, value: json.Value) -> mem.Allocator_Error {
+field_put :: proc(object: ^json.Object, key: string, value: json.Value) -> mem.Allocator_Error {
 	if map_insert(object, key, value) == nil { return .Out_Of_Memory }
 	return nil
 }
 
 @(private)
-content_put_text :: proc(object: ^json.Object, key: string, text: string) -> mem.Allocator_Error {
+field_put_text :: proc(object: ^json.Object, key: string, text: string) -> mem.Allocator_Error {
 	if text == "" { return nil }
-	return content_put(object, key, json.String(text))
+	return field_put(object, key, json.String(text))
 }
 
 // session_prompt_request builds the wire form of params for the client role, since json.marshal
@@ -693,37 +693,293 @@ V1_Initialize_Result :: struct {
 
 Session_New_Result :: struct {
 	session_id:     string `json:"sessionId"`,
-	config_options: []V1_Config_Option `json:"configOptions,omitempty"`,
+	config_options: []json.Value `json:"configOptions,omitempty"`,
 }
 
-// Config_Value is one choice of a model selector. v1 and v2 options share it; only
-// the option wrapper differs between the two wire shapes.
+CONFIG_TYPE_SELECT :: "select"
+CONFIG_TYPE_BOOLEAN :: "boolean"
+
+// Config_Option is one session configuration option. The kinds share the fields here and
+// variant holds the rest. id is `id` on the v1 wire and `configId` on the v2 wire; an empty
+// category or description is absent.
+Config_Option :: struct {
+	meta:        json.Value,
+	id:          string,
+	name:        string,
+	category:    string,
+	description: string,
+	variant:     union {
+		Config_Select,
+		Config_Boolean,
+		Config_Other,
+	},
+}
+
+Config_Select :: struct {
+	current_value: string,
+	options:       Config_Select_Options,
+}
+
+// Config_Select_Options is a flat list of choices or the same choices under group headers.
+Config_Select_Options :: union {
+	[]Config_Value,
+	[]Config_Group,
+}
+
+Config_Boolean :: struct {
+	current_value: bool,
+}
+
+// Config_Other is a kind this package does not know. raw is the whole option, so encoding it
+// writes the payload back unchanged; its shared fields are only in raw.
+Config_Other :: struct {
+	type: string,
+	raw:  json.Value,
+}
+
+// Config_Value is one choice of a select option.
 Config_Value :: struct {
-	value: string `json:"value"`,
-	name:  string `json:"name"`,
+	meta:        json.Value,
+	value:       string,
+	name:        string,
+	description: string,
 }
 
-V1_Config_Option :: struct {
-	id:            string `json:"id"`,
-	name:          string `json:"name"`,
-	category:      string `json:"category"`,
-	type:          string `json:"type"`,
-	current_value: string `json:"currentValue"`,
-	options:       []Config_Value `json:"options"`,
+// Config_Group is a titled set of choices. id is `group` on the v1 wire and `groupId` on v2.
+Config_Group :: struct {
+	meta:    json.Value,
+	id:      string,
+	name:    string,
+	options: []Config_Value,
 }
 
-V2_Config_Option :: struct {
-	config_id:     string `json:"configId"`,
-	name:          string `json:"name"`,
-	category:      string `json:"category"`,
-	type:          string `json:"type"`,
-	current_value: string `json:"currentValue"`,
-	options:       []Config_Value `json:"options"`,
+// config_option_decode reads one option from its JSON value. Its strings, meta and raw payload
+// borrow from value; only a select's choice slices are allocated with allocator, and
+// config_option_destroy releases them. Either spelling of the id and group id is accepted. It
+// returns Invalid for a mismatched shape and Allocation when a slice cannot be allocated. An unknown
+// `type` is not an error: it becomes Config_Other.
+@(require_results)
+config_option_decode :: proc(value: json.Value, allocator := context.allocator) -> (option: Config_Option, err: Params_Error) {
+	object, is_object := value.(json.Object)
+	if !is_object { return {}, .Invalid }
+	ok := true
+	kind := field_string(object, "type", true, &ok)
+	if !ok { return {}, .Invalid }
+	if kind != CONFIG_TYPE_SELECT && kind != CONFIG_TYPE_BOOLEAN {
+		return Config_Option{variant = Config_Other{type = kind, raw = value}}, .None
+	}
+	option.meta = field_value(object, "_meta")
+	option.id = field_string(object, "id", false, &ok)
+	if option.id == "" { option.id = field_string(object, "configId", false, &ok) }
+	option.name = field_string(object, "name", false, &ok)
+	option.category = field_string(object, "category", false, &ok)
+	option.description = field_string(object, "description", false, &ok)
+	if !ok || option.id == "" { return {}, .Invalid }
+	switch kind {
+	case CONFIG_TYPE_SELECT:
+		select := Config_Select {
+			current_value = field_string(object, "currentValue", true, &ok),
+		}
+		if !ok { return {}, .Invalid }
+		select.options = config_select_options_decode(object["options"], allocator) or_return
+		option.variant = select
+	case CONFIG_TYPE_BOOLEAN:
+		current, is_boolean := object["currentValue"].(json.Boolean)
+		if !is_boolean { return {}, .Invalid }
+		option.variant = Config_Boolean {
+			current_value = bool(current),
+		}
+	}
+	return option, .None
+}
+
+// config_option_destroy releases what config_option_decode allocated with allocator.
+config_option_destroy :: proc(option: Config_Option, allocator := context.allocator) {
+	select, is_select := option.variant.(Config_Select)
+	if !is_select { return }
+	switch options in select.options {
+	case []Config_Value:
+		delete(options, allocator)
+	case []Config_Group:
+		for group in options { delete(group.options, allocator) }
+		delete(options, allocator)
+	case nil:
+	}
+}
+
+// config_options_decode reads a list of options; a missing or null list is empty. Release the
+// result with config_options_destroy.
+@(require_results)
+config_options_decode :: proc(value: json.Value, allocator := context.allocator) -> (options: []Config_Option, err: Params_Error) {
+	if _, is_null := value.(json.Null); is_null || value == nil { return nil, .None }
+	items, is_array := value.(json.Array)
+	if !is_array { return nil, .Invalid }
+	made, make_error := make([]Config_Option, len(items), allocator)
+	if make_error != nil { return nil, .Allocation }
+	for item, index in items {
+		made[index], err = config_option_decode(item, allocator)
+		if err != .None {
+			for option in made[:index] { config_option_destroy(option, allocator) }
+			delete(made, allocator)
+			return nil, err
+		}
+	}
+	return made, .None
+}
+
+config_options_destroy :: proc(options: []Config_Option, allocator := context.allocator) {
+	for option in options { config_option_destroy(option, allocator) }
+	delete(options, allocator)
+}
+
+@(private)
+config_select_options_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (options: Config_Select_Options, err: Params_Error) {
+	items, is_array := value.(json.Array)
+	if !is_array { return nil, .Invalid }
+	grouped := false
+	if len(items) > 0 {
+		first, is_object := items[0].(json.Object)
+		if !is_object { return nil, .Invalid }
+		_, grouped = first["options"]
+	}
+	if !grouped {
+		values, make_error := make([]Config_Value, len(items), allocator)
+		if make_error != nil { return nil, .Allocation }
+		for item, index in items {
+			values[index], err = config_value_decode(item)
+			if err != .None {
+				delete(values, allocator)
+				return nil, err
+			}
+		}
+		return values, .None
+	}
+	groups, make_error := make([]Config_Group, len(items), allocator)
+	if make_error != nil { return nil, .Allocation }
+	for item, index in items {
+		groups[index], err = config_group_decode(item, allocator)
+		if err != .None {
+			for group in groups[:index] { delete(group.options, allocator) }
+			delete(groups, allocator)
+			return nil, err
+		}
+	}
+	return groups, .None
+}
+
+@(private)
+config_value_decode :: proc(value: json.Value) -> (choice: Config_Value, err: Params_Error) {
+	object, is_object := value.(json.Object)
+	if !is_object { return {}, .Invalid }
+	ok := true
+	choice = Config_Value {
+		meta        = field_value(object, "_meta"),
+		value       = field_string(object, "value", true, &ok),
+		name        = field_string(object, "name", false, &ok),
+		description = field_string(object, "description", false, &ok),
+	}
+	if !ok { return {}, .Invalid }
+	return choice, .None
+}
+
+@(private)
+config_group_decode :: proc(value: json.Value, allocator: mem.Allocator) -> (group: Config_Group, err: Params_Error) {
+	object, is_object := value.(json.Object)
+	if !is_object { return {}, .Invalid }
+	ok := true
+	group = Config_Group {
+		meta = field_value(object, "_meta"),
+		id   = field_string(object, "groupId", false, &ok),
+		name = field_string(object, "name", false, &ok),
+	}
+	if group.id == "" { group.id = field_string(object, "group", false, &ok) }
+	items, is_array := object["options"].(json.Array)
+	if !ok || !is_array { return {}, .Invalid }
+	choices, make_error := make([]Config_Value, len(items), allocator)
+	if make_error != nil { return {}, .Allocation }
+	for item, index in items {
+		choices[index], err = config_value_decode(item)
+		if err != .None {
+			delete(choices, allocator)
+			return {}, err
+		}
+	}
+	group.options = choices
+	return group, .None
+}
+
+// config_option_encode builds the wire object of an option for protocol version 1 or 2, which
+// differ in the spelling of the ids. The result borrows every string, meta and raw payload from
+// option and owns only its objects and arrays, which it allocates with allocator; as with
+// content_block_encode, pass context.temp_allocator or an arena. An option with no variant encodes
+// as null. It returns the allocator's error when an object cannot be allocated.
+@(require_results)
+config_option_encode :: proc(option: Config_Option, version: int, allocator := context.allocator) -> (value: json.Value, err: mem.Allocator_Error) {
+	if other, is_other := option.variant.(Config_Other); is_other { return other.raw, nil }
+	if option.variant == nil { return json.Null{}, nil }
+	object := make(json.Object, 8, allocator) or_return
+	if option.meta != nil { field_put(&object, "_meta", option.meta) or_return }
+	field_put(&object, "id" if version < PROTOCOL_VERSION_V2 else "configId", option.id) or_return
+	field_put(&object, "name", option.name) or_return
+	field_put_text(&object, "category", option.category) or_return
+	field_put_text(&object, "description", option.description) or_return
+	switch kind in option.variant {
+	case Config_Select:
+		field_put(&object, "type", CONFIG_TYPE_SELECT) or_return
+		field_put(&object, "currentValue", kind.current_value) or_return
+		choices: json.Array
+		switch options in kind.options {
+		case []Config_Value:
+			choices = config_values_encode(options, allocator) or_return
+		case []Config_Group:
+			choices = make(json.Array, 0, len(options), allocator) or_return
+			for group in options {
+				group_object := make(json.Object, 4, allocator) or_return
+				if group.meta != nil { field_put(&group_object, "_meta", group.meta) or_return }
+				field_put(&group_object, "group" if version < PROTOCOL_VERSION_V2 else "groupId", group.id) or_return
+				field_put(&group_object, "name", group.name) or_return
+				field_put(&group_object, "options", config_values_encode(group.options, allocator) or_return) or_return
+				_ = append(&choices, group_object) or_return
+			}
+		case nil:
+			choices = make(json.Array, 0, 0, allocator) or_return
+		}
+		field_put(&object, "options", choices) or_return
+	case Config_Boolean:
+		field_put(&object, "type", CONFIG_TYPE_BOOLEAN) or_return
+		field_put(&object, "currentValue", json.Boolean(kind.current_value)) or_return
+	case Config_Other:
+	}
+	return object, nil
+}
+
+// config_options_encode builds the wire list of options; see config_option_encode for ownership.
+@(require_results)
+config_options_encode :: proc(options: []Config_Option, version: int, allocator := context.allocator) -> (values: []json.Value, err: mem.Allocator_Error) {
+	values = make([]json.Value, len(options), allocator) or_return
+	for option, index in options {
+		values[index] = config_option_encode(option, version, allocator) or_return
+	}
+	return values, nil
+}
+
+@(private)
+config_values_encode :: proc(values: []Config_Value, allocator: mem.Allocator) -> (choices: json.Array, err: mem.Allocator_Error) {
+	choices = make(json.Array, 0, len(values), allocator) or_return
+	for choice in values {
+		object := make(json.Object, 4, allocator) or_return
+		if choice.meta != nil { field_put(&object, "_meta", choice.meta) or_return }
+		field_put(&object, "value", choice.value) or_return
+		field_put(&object, "name", choice.name) or_return
+		field_put_text(&object, "description", choice.description) or_return
+		_ = append(&choices, object) or_return
+	}
+	return choices, nil
 }
 
 V2_Session_New_Result :: struct {
 	session_id:         string `json:"sessionId"`,
-	config_options:     []V2_Config_Option `json:"configOptions"`,
+	config_options:     []json.Value `json:"configOptions"`,
 	available_commands: []Available_Command `json:"availableCommands,omitempty"`,
 }
 
@@ -734,23 +990,115 @@ Prompt_Result :: struct {
 	stop_reason: string `json:"stopReason"`,
 }
 
+// Session_Set_Config_Option_Params is a request to change one option. The value kinds share
+// the session and option ids.
 Session_Set_Config_Option_Params :: struct {
+	meta:       json.Value,
+	session_id: string,
+	config_id:  string,
+	variant:    union {
+		Config_Set_Id,
+		Config_Set_Boolean,
+		Config_Set_Other,
+	},
+}
+
+Config_Set_Id :: struct {
+	value: string,
+}
+
+Config_Set_Boolean :: struct {
+	value: bool,
+}
+
+// Config_Set_Other is a value kind this package does not know; value is borrowed from the
+// decoded document.
+Config_Set_Other :: struct {
+	type:  string,
+	value: json.Value,
+}
+
+// Session_Set_Config_Option_Request is Session_Set_Config_Option_Params in wire form, built by
+// session_set_config_option_request.
+Session_Set_Config_Option_Request :: struct {
+	meta:       json.Value `json:"_meta,omitempty"`,
 	session_id: string `json:"sessionId"`,
 	config_id:  string `json:"configId"`,
 	type:       string `json:"type,omitempty"`,
-	value:      string `json:"value"`,
+	value:      json.Value `json:"value"`,
 }
 
-V1_Session_Set_Config_Option_Result :: struct {
-	config_options: []V1_Config_Option `json:"configOptions"`,
+// session_set_config_option_request builds the wire form of params for protocol version 1 or 2.
+// Version 2 requires the type of an id value, which version 1 leaves out. Its strings borrow from
+// params and nothing is allocated.
+session_set_config_option_request :: proc(params: Session_Set_Config_Option_Params, version: int) -> Session_Set_Config_Option_Request {
+	request := Session_Set_Config_Option_Request {
+		meta       = params.meta,
+		session_id = params.session_id,
+		config_id  = params.config_id,
+	}
+	switch kind in params.variant {
+	case Config_Set_Id:
+		request.value = json.String(kind.value)
+		if version >= PROTOCOL_VERSION_V2 { request.type = "id" }
+	case Config_Set_Boolean:
+		request.type = CONFIG_TYPE_BOOLEAN
+		request.value = json.Boolean(kind.value)
+	case Config_Set_Other:
+		request.type = kind.type
+		request.value = kind.value
+	case nil:
+	}
+	return request
 }
 
-V2_Session_Set_Config_Option_Result :: struct {
-	config_options: []V2_Config_Option `json:"configOptions"`,
+// session_set_config_option_params_decode reads a set_config_option request of protocol version 1
+// or 2. A missing type or `id` is a string id and `boolean` a bool. Any other type is a string id
+// in version 1, where the specification reads an unknown type with a string payload that way, and
+// Config_Set_Other in version 2. Its strings borrow from value, and nothing is allocated. It
+// returns Invalid for a mismatched shape.
+@(require_results)
+session_set_config_option_params_decode :: proc(value: json.Value, version: int, target: ^Session_Set_Config_Option_Params) -> Params_Error {
+	object, is_object := value.(json.Object)
+	if !is_object { return .Invalid }
+	ok := true
+	params := Session_Set_Config_Option_Params {
+		meta       = field_value(object, "_meta"),
+		session_id = field_string(object, "sessionId", true, &ok),
+		config_id  = field_string(object, "configId", true, &ok),
+	}
+	kind := field_string(object, "type", false, &ok)
+	payload := object["value"]
+	if !ok || payload == nil { return .Invalid }
+	text, is_text := payload.(json.String)
+	switch {
+	case kind == CONFIG_TYPE_BOOLEAN:
+		flag, is_flag := payload.(json.Boolean)
+		if !is_flag { return .Invalid }
+		params.variant = Config_Set_Boolean {
+			value = bool(flag),
+		}
+	case kind == "" || kind == "id" || (is_text && version < PROTOCOL_VERSION_V2):
+		if !is_text { return .Invalid }
+		params.variant = Config_Set_Id {
+			value = string(text),
+		}
+	case:
+		params.variant = Config_Set_Other {
+			type  = kind,
+			value = payload,
+		}
+	}
+	target^ = params
+	return .None
+}
+
+Session_Set_Config_Option_Result :: struct {
+	config_options: []json.Value `json:"configOptions"`,
 }
 
 Session_Resume_Result :: struct {
-	config_options:     []V2_Config_Option `json:"configOptions,omitempty"`,
+	config_options:     []json.Value `json:"configOptions,omitempty"`,
 	available_commands: []Available_Command `json:"availableCommands,omitempty"`,
 }
 

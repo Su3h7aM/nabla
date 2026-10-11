@@ -163,3 +163,114 @@ test_initialize_params_decode_and_encode_per_version :: proc(t: ^testing.T) {
 	bad: V1_Initialize_Params
 	testing.expect_value(t, params_decode(bad_value, &bad, context.temp_allocator), Params_Error.Invalid)
 }
+
+// Every option kind must survive decode and encode, in the spelling of the version it is encoded for.
+@(test)
+test_config_options_round_trip_every_kind_in_both_versions :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	// The v1 spelling of the ids, then the v2 spelling, of the same four options.
+	documents := [?]string {
+		`[{"_meta":{"a":1},"id":"model","name":"Model","category":"model","description":"d","type":"select","currentValue":"a","options":[{"value":"a","name":"A","description":"first"},{"_meta":{},"value":"b","name":"B"}]},{"id":"grouped","name":"G","type":"select","currentValue":"x","options":[{"group":"g1","name":"One","options":[{"value":"x","name":"X"}]}]},{"id":"mute","name":"Mute","type":"boolean","currentValue":true},{"id":"mine","type":"_future","payload":[1]}]`,
+		`[{"_meta":{"a":1},"configId":"model","name":"Model","category":"model","description":"d","type":"select","currentValue":"a","options":[{"value":"a","name":"A","description":"first"},{"_meta":{},"value":"b","name":"B"}]},{"configId":"grouped","name":"G","type":"select","currentValue":"x","options":[{"groupId":"g1","name":"One","options":[{"value":"x","name":"X"}]}]},{"configId":"mute","name":"Mute","type":"boolean","currentValue":true},{"configId":"mine","type":"_future","payload":[1]}]`,
+	}
+	for document, index in documents {
+		version := index + 1
+		value, parse_error := json.parse_string(document, .JSON, true, context.allocator)
+		if !testing.expect_value(t, parse_error, nil) { continue }
+		defer json.destroy_value(value, context.allocator)
+		options, decode_error := config_options_decode(value, context.allocator)
+		if !testing.expect_value(t, decode_error, Params_Error.None) { continue }
+		defer config_options_destroy(options, context.allocator)
+		if !testing.expect_value(t, len(options), 4) { continue }
+
+		select, is_select := options[0].variant.(Config_Select)
+		testing.expect(t, is_select)
+		testing.expect_value(t, options[0].id, "model")
+		testing.expect_value(t, select.current_value, "a")
+		choices, is_flat := select.options.([]Config_Value)
+		testing.expect(t, is_flat)
+		testing.expect_value(t, len(choices), 2)
+		grouped, is_grouped := options[1].variant.(Config_Select)
+		testing.expect(t, is_grouped)
+		groups, has_groups := grouped.options.([]Config_Group)
+		testing.expect(t, has_groups)
+		testing.expect_value(t, groups[0].id, "g1")
+		boolean, is_boolean := options[2].variant.(Config_Boolean)
+		testing.expect(t, is_boolean)
+		testing.expect(t, boolean.current_value)
+		other, is_other := options[3].variant.(Config_Other)
+		testing.expect(t, is_other)
+		testing.expect_value(t, other.type, "_future")
+
+		encoded, encode_error := config_options_encode(options, version, context.temp_allocator)
+		testing.expect_value(t, encode_error, nil)
+		sorted := json.Marshal_Options {
+			sort_maps_by_key = true,
+		}
+		want, want_error := json.marshal(value, sorted, context.temp_allocator)
+		got, got_error := json.marshal(encoded, sorted, context.temp_allocator)
+		testing.expect_value(t, want_error, nil)
+		testing.expect_value(t, got_error, nil)
+		testing.expect_value(t, string(got), string(want))
+	}
+}
+
+@(test)
+test_config_option_decode_refuses_mismatched_shapes :: proc(t: ^testing.T) {
+	documents := [?]string {
+		`"select"`,
+		`{"id":"a"}`,
+		`{"type":"select","currentValue":"a","options":[]}`,
+		`{"id":"a","type":"select","options":[]}`,
+		`{"id":"a","type":"select","currentValue":"a"}`,
+		`{"id":"a","type":"select","currentValue":"a","options":[{"name":"no value"}]}`,
+		`{"id":"a","type":"select","currentValue":"a","options":[{"value":"a"},{"group":"g","options":[]}]}`,
+		`{"id":"a","type":"boolean","currentValue":"yes"}`,
+	}
+	for document in documents {
+		value, parse_error := json.parse_string(document, .JSON, true, context.allocator)
+		if !testing.expect_value(t, parse_error, nil) { continue }
+		defer json.destroy_value(value, context.allocator)
+		option, decode_error := config_option_decode(value, context.allocator)
+		testing.expectf(t, decode_error == .Invalid, "%s was accepted", document)
+		config_option_destroy(option, context.allocator)
+	}
+}
+
+// A set_config_option value is an id, a bool, or a kind this package does not know; version 1 reads an unknown kind with a
+// string payload as an id, and each version writes its own request.
+@(test)
+test_set_config_option_params_decode_and_encode_per_version :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	Case :: struct {
+		document: string,
+		version:  int,
+		want:     string,
+	}
+	cases := [?]Case {
+		{`{"sessionId":"s","configId":"c","value":"a"}`, 1, `{"sessionId":"s","configId":"c","value":"a"}`},
+		{`{"sessionId":"s","configId":"c","type":"id","value":"a"}`, 2, `{"sessionId":"s","configId":"c","type":"id","value":"a"}`},
+		{`{"sessionId":"s","configId":"c","type":"boolean","value":true}`, 2, `{"sessionId":"s","configId":"c","type":"boolean","value":true}`},
+		{`{"sessionId":"s","configId":"c","type":"_x","value":{"k":1}}`, 2, `{"sessionId":"s","configId":"c","type":"_x","value":{"k":1}}`},
+		{`{"sessionId":"s","configId":"c","type":"_x","value":"a"}`, 1, `{"sessionId":"s","configId":"c","value":"a"}`},
+		{`{"sessionId":"s","configId":"c","type":"_x","value":"a"}`, 2, `{"sessionId":"s","configId":"c","type":"_x","value":"a"}`},
+	}
+	for entry in cases {
+		value, parse_error := json.parse_string(entry.document, .JSON, true, context.allocator)
+		if !testing.expect_value(t, parse_error, nil) { continue }
+		defer json.destroy_value(value, context.allocator)
+		params: Session_Set_Config_Option_Params
+		testing.expect_value(t, session_set_config_option_params_decode(value, entry.version, &params), Params_Error.None)
+		request := session_set_config_option_request(params, entry.version)
+		wire, marshal_error := json.marshal(request, {sort_maps_by_key = true}, context.temp_allocator)
+		testing.expect_value(t, marshal_error, nil)
+		testing.expect_value(t, string(wire), entry.want)
+	}
+	for document in ([?]string{`{"sessionId":"s","configId":"c"}`, `{"sessionId":"s","configId":"c","value":1}`, `{"sessionId":"s","configId":"c","type":"boolean","value":"x"}`, `{"configId":"c","value":"a"}`}) {
+		value, parse_error := json.parse_string(document, .JSON, true, context.allocator)
+		if !testing.expect_value(t, parse_error, nil) { continue }
+		defer json.destroy_value(value, context.allocator)
+		params: Session_Set_Config_Option_Params
+		testing.expectf(t, session_set_config_option_params_decode(value, 2, &params) == .Invalid, "%s was accepted", document)
+	}
+}
