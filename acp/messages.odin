@@ -190,8 +190,8 @@ Client_Capabilities :: struct {
 
 Initialize_Params :: struct {
 	protocol_version:    int `json:"protocolVersion"`,
-	client_capabilities: Client_Capabilities `json:"clientCapabilities"`,
-	client_info:         Implementation `json:"clientInfo"`,
+	client_capabilities: Maybe(Client_Capabilities) `json:"clientCapabilities,omitempty"`,
+	client_info:         Maybe(Implementation) `json:"clientInfo,omitempty"`,
 	capabilities:        V2_Client_Capabilities `json:"capabilities"`,
 	info:                Implementation `json:"info"`,
 }
@@ -199,7 +199,7 @@ Initialize_Params :: struct {
 // V2_Client_Capabilities is deliberately limited to the v2 fields Nabla needs to
 // recognize. Unknown client capabilities remain forward-compatible and are ignored.
 V2_Client_Capabilities :: struct {
-	auth: V2_Client_Auth_Capabilities `json:"auth"`,
+	auth: Maybe(V2_Client_Auth_Capabilities) `json:"auth,omitempty"`,
 }
 
 V2_Client_Auth_Capabilities :: struct {
@@ -260,18 +260,18 @@ Session_Meta :: struct {
 
 Session_New_Params :: struct {
 	cwd:                    string `json:"cwd"`,
-	additional_directories: []string `json:"additionalDirectories"`,
+	additional_directories: []string `json:"additionalDirectories,omitempty"`,
 	mcp_servers:            []MCP_Server `json:"mcpServers"`,
-	system_prompt:          string `json:"systemPrompt"`,
-	meta:                   Session_Meta `json:"_meta"`,
+	system_prompt:          string `json:"systemPrompt,omitempty"`,
+	meta:                   Maybe(Session_Meta) `json:"_meta,omitempty"`,
 }
 
 Session_Load_Params :: struct {
 	session_id:    string `json:"sessionId"`,
 	cwd:           string `json:"cwd"`,
 	mcp_servers:   []MCP_Server `json:"mcpServers"`,
-	system_prompt: string `json:"systemPrompt"`,
-	meta:          Session_Meta `json:"_meta"`,
+	system_prompt: string `json:"systemPrompt,omitempty"`,
+	meta:          Maybe(Session_Meta) `json:"_meta,omitempty"`,
 }
 
 Replay_From :: struct {
@@ -282,10 +282,10 @@ Session_Resume_Params :: struct {
 	session_id:             string `json:"sessionId"`,
 	cwd:                    string `json:"cwd"`,
 	mcp_servers:            []MCP_Server `json:"mcpServers"`,
-	additional_directories: []string `json:"additionalDirectories"`,
-	system_prompt:          string `json:"systemPrompt"`,
-	meta:                   Session_Meta `json:"_meta"`,
-	replay_from:            Maybe(Replay_From) `json:"replayFrom"`,
+	additional_directories: []string `json:"additionalDirectories,omitempty"`,
+	system_prompt:          string `json:"systemPrompt,omitempty"`,
+	meta:                   Maybe(Session_Meta) `json:"_meta,omitempty"`,
+	replay_from:            Maybe(Replay_From) `json:"replayFrom,omitempty"`,
 }
 
 Session_List_Params :: struct {
@@ -315,10 +315,10 @@ Embedded_Resource :: struct {
 Content_Block :: struct {
 	type:      string `json:"type"`,
 	text:      string `json:"text"`,
-	uri:       string `json:"uri"`,
+	uri:       string `json:"uri,omitempty"`,
 	data:      string `json:"data,omitempty"`,
 	mime_type: string `json:"mimeType,omitempty"`,
-	resource:  Embedded_Resource `json:"resource"`,
+	resource:  Maybe(Embedded_Resource) `json:"resource,omitempty"`,
 }
 
 Session_Prompt_Params :: struct {
@@ -379,19 +379,20 @@ session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_
 		if resource_value, present := block_object["resource"]; present {
 			resource_object, resource_is_object := resource_value.(json.Object)
 			if !resource_is_object { return .Invalid }
+			resource: Embedded_Resource
 			if uri_value, has_uri := resource_object["uri"]; has_uri {
 				uri, uri_is_string := uri_value.(json.String)
 				if !uri_is_string { return .Invalid }
-				block.resource.uri = string(uri)
+				resource.uri = string(uri)
 			}
 			if text_value, has_text := resource_object["text"]; has_text {
 				text, text_is_string := text_value.(json.String)
 				if !text_is_string { return .Invalid }
-				block.resource.text = string(text)
+				resource.text = string(text)
 			}
 			if mime_value, has_mime := resource_object["mimeType"]; has_mime {
 				if mime, is_mime_string := mime_value.(json.String); is_mime_string {
-					block.resource.mime_type = string(mime)
+					resource.mime_type = string(mime)
 				} else if _, is_null := mime_value.(json.Null); !is_null {
 					return .Invalid
 				}
@@ -399,9 +400,10 @@ session_prompt_params_decode :: proc(value: json.Value, target: ^Session_Prompt_
 			if blob_value, has_blob := resource_object["blob"]; has_blob {
 				blob, is_blob_string := blob_value.(json.String)
 				if !is_blob_string { return .Invalid }
-				block.resource.blob = string(blob)
-				block.resource.blob_present = true
+				resource.blob = string(blob)
+				resource.blob_present = true
 			}
+			block.resource = resource
 		}
 		blocks[index] = block
 	}
@@ -512,7 +514,7 @@ Session_Set_Model_Result :: struct {
 Session_Set_Config_Option_Params :: struct {
 	session_id: string `json:"sessionId"`,
 	config_id:  string `json:"configId"`,
-	type:       string `json:"type"`,
+	type:       string `json:"type,omitempty"`,
 	value:      string `json:"value"`,
 }
 

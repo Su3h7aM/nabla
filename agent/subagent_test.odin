@@ -781,25 +781,23 @@ test_acp_next_reports_a_malformed_json_rpc_frame :: proc(test: ^testing.T) {
 	member := Subagent {
 		allocator = context.allocator,
 	}
-	frames, frames_error := make([dynamic]string, context.allocator)
-	if frames_error != nil { testing.fail_now(test, "could not create the ACP frame") }
+	readers := ACP_Readers {
+		allocator = context.allocator,
+	}
+	readers.frames.allocator = context.allocator
 	frame, frame_error := strings.clone("{}", context.allocator)
-	if frame_error != nil {
-		delete(frames)
-		testing.fail_now(test, "could not create the ACP frame")
-	}
-	if _, append_error := append(&frames, frame); append_error != nil {
+	if frame_error != nil { testing.fail_now(test, "could not create the ACP frame") }
+	if _, append_error := append(&readers.frames, frame); append_error != nil {
 		delete(frame, context.allocator)
-		delete(frames)
 		testing.fail_now(test, "could not create the ACP frame")
-	}
-	connection := ACP_Connection {
-		member = &member,
-		frames = frames,
 	}
 	defer {
-		for queued in connection.frames { delete(queued, context.allocator) }
-		delete(connection.frames)
+		for queued in readers.frames { delete(queued, context.allocator) }
+		delete(readers.frames)
+	}
+	connection := ACP_Connection {
+		member  = &member,
+		readers = &readers,
 	}
 
 	_, problem := acp_next(&connection)
@@ -1469,7 +1467,6 @@ test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
 	connection := ACP_Connection {
 		member = member,
 	}
-	connection.frames.allocator = member.allocator
 	connection.answer.allocator = member.allocator
 	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
 	if problem = acp_connection_open(&connection); !testing.expect_value(test, problem, "") { return }

@@ -348,14 +348,15 @@ acp_request_session_new :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the working directory does not exist: %s", params.cwd))
 		return
 	}
+	meta := params.meta.? or_else acp.Session_Meta{}
 	acp_enqueue_open_session(
 		server,
 		envelope,
 		false,
 		params.cwd,
 		"",
-		acp_session_prompt_text(params.system_prompt, &params.meta),
-		params.meta.session_title,
+		acp_session_prompt_text(params.system_prompt, &meta),
+		meta.session_title,
 		params.mcp_servers,
 		false,
 	)
@@ -385,14 +386,15 @@ acp_request_session_load :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "the load working directory does not match the session")
 		return
 	}
+	meta := params.meta.? or_else acp.Session_Meta{}
 	acp_enqueue_open_session(
 		server,
 		envelope,
 		true,
 		"",
 		params.session_id,
-		acp_session_prompt_text(params.system_prompt, &params.meta),
-		params.meta.session_title,
+		acp_session_prompt_text(params.system_prompt, &meta),
+		meta.session_title,
 		params.mcp_servers,
 		true,
 	)
@@ -434,14 +436,15 @@ acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope)
 		}
 		replay = true
 	}
+	meta := params.meta.? or_else acp.Session_Meta{}
 	acp_enqueue_open_session(
 		server,
 		envelope,
 		true,
 		"",
 		params.session_id,
-		acp_session_prompt_text(params.system_prompt, &params.meta),
-		params.meta.session_title,
+		acp_session_prompt_text(params.system_prompt, &meta),
+		meta.session_title,
 		params.mcp_servers,
 		replay,
 	)
@@ -1119,16 +1122,17 @@ acp_prompt_text :: proc(
 				return "", nil, "the resource path could not be allocated", false
 			}
 		case acp.CONTENT_RESOURCE:
-			if block.resource.text != "" {
-				if !acp_prompt_append(&builder, block.resource.text) {
+			resource := block.resource.? or_else acp.Embedded_Resource{}
+			if resource.text != "" {
+				if !acp_prompt_append(&builder, resource.text) {
 					return "", nil, "the prompt could not be allocated", false
 				}
 			}
-			if block.resource.blob_present {
-				switch acp_prompt_attach(&collected, block.resource.blob, block.resource.uri, allocator) {
+			if resource.blob_present {
+				switch acp_prompt_attach(&collected, resource.blob, resource.uri, allocator) {
 				case .Attached:
 				case .Unrecognized:
-					if !acp_prompt_append_binary_resource(&builder, block.resource) {
+					if !acp_prompt_append_binary_resource(&builder, resource) {
 						return "", nil, "the prompt could not be allocated", false
 					}
 				case .Invalid_Base64:
@@ -1136,8 +1140,8 @@ acp_prompt_text :: proc(
 				case .Allocation:
 					return "", nil, "the prompt could not be allocated", false
 				}
-			} else if block.resource.text == "" && block.resource.uri != "" {
-				path, path_ok := acp_resource_path(block.resource.uri, context.temp_allocator)
+			} else if resource.text == "" && resource.uri != "" {
+				path, path_ok := acp_resource_path(resource.uri, context.temp_allocator)
 				defer delete(path, context.temp_allocator)
 				if !path_ok || !acp_prompt_append(&builder, path) {
 					return "", nil, "the resource path could not be allocated", false

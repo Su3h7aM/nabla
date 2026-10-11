@@ -354,56 +354,6 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 	return "", false
 }
 
-// ACP_Input is the agent's stdin. Its descriptor pair comes from acp_input_open.
-@(private)
-ACP_Input :: struct {
-	ours:   ^os.File,
-	theirs: ^os.File, // for the child's stdin; closed once the child has it
-}
-
-@(private)
-acp_input_writer :: proc(input: ^ACP_Input) -> io.Writer {
-	return io.Stream{procedure = acp_input_stream, data = input}
-}
-
-@(private = "file", require_results)
-acp_input_stream :: proc(stream_data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-	input := cast(^ACP_Input)stream_data
-	#partial switch mode {
-	case .Write:
-		sent, ok := acp_input_send(input, p)
-		if !ok { return i64(sent), .Unexpected_EOF }
-		return i64(sent), nil
-	case .Query:
-		return io.query_utility({.Write, .Query})
-	}
-	return 0, .Unsupported
-}
-
-@(private, require_results)
-acp_input_open :: proc() -> (input: ACP_Input, ok: bool) {
-	read, write, err := os.pipe()
-	if err != nil { return {}, false }
-	return {ours = write, theirs = read}, true
-}
-
-@(private)
-acp_input_close :: proc(input: ^ACP_Input) {
-	if input.theirs != nil { _ = os.close(input.theirs) }
-	if input.ours != nil { _ = os.close(input.ours) }
-	input^ = {}
-}
-
-@(private, require_results)
-acp_input_send :: proc(input: ^ACP_Input, data: []u8) -> (sent: int, ok: bool) {
-	for sent < len(data) {
-		taken, err := os.write(input.ours, data[sent:])
-		if err != nil || taken == 0 { return sent, false }
-		sent += taken
-	}
-	return sent, true
-}
-
 @(private, require_results)
 subagent_executable :: proc(path: string) -> bool {
 	return os.exists(path) && !os.is_dir(path)
@@ -526,11 +476,9 @@ ACP_Connection :: struct {
 	member:         ^Subagent,
 	child:          os.Process,
 	started:        bool,
-	input:          ^ACP_Input,
+	input:          ^os.File, // the agent's stdin; ours to write, closed once the writer has retired
 	readers:        ^ACP_Readers,
 	writer:         acp.Writer,
-	frames:         [dynamic]string,
-	next_frame:     int,
 	next_id:        i64,
 	version:        int, // the ACP version the agent agreed to
 	session_id:     string,
@@ -554,14 +502,12 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		member = member,
 	}
 	defer acp_connection_close(&connection, TOOL_JOBS_STOP_PATIENCE)
-	frames, frames_error := make([dynamic]string, allocator)
 	answer_buffer, answer_error := make([dynamic]u8, allocator)
-	if frames_error != nil || answer_error != nil {
+	if answer_error != nil {
 		subagent_fail(member, .Failed, "the agent's connection could not be held")
 		return
 	}
 	connection.pending.allocator = allocator
-	connection.frames = frames
 	connection.answer = answer_buffer
 	defer if member.status != .Completed && len(connection.answer) > 0 {
 		delete(member.answer, allocator)
@@ -780,13 +726,7 @@ acp_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, method: string, 
 
 @(private, require_results)
 acp_option_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, option: ACP_Config_Option, value: string) -> string {
-	Option :: struct {
-		session_id: string `json:"sessionId"`,
-		config_id:  string `json:"configId"`,
-		type:       string `json:"type,omitempty"`,
-		value:      string `json:"value"`,
-	}
-	request := Option {
+	request := acp.Session_Set_Config_Option_Params {
 		session_id = connection.session_id,
 		config_id  = option.config_id if option.config_id != "" else option.id,
 		type       = "id" if connection.version == 2 else "",
@@ -842,10 +782,7 @@ acp_receive :: proc(connection: ^ACP_Connection) -> string {
 		return acp_configure_refusal(connection, failed.message)
 	}
 	if _, is_prompt := request.variant.(ACP_Prompt_Reply); is_prompt {
-		Accepted :: struct {
-			stop_reason: string `json:"stopReason"`,
-		}
-		accepted: Accepted
+		accepted: acp.Prompt_Result
 		if acp.params_decode(envelope.result, &accepted, context.temp_allocator) != .None { return "the agent's prompt answer is not what ACP defines" }
 		connection.idle = accepted.stop_reason != ""
 		if accepted.stop_reason != "" &&
@@ -959,19 +896,11 @@ acp_options_replace :: proc(connection: ^ACP_Connection, options: []ACP_Config_O
 // acp_prompt_send acknowledges additional version 2 input without waiting for idle.
 @(private, require_results)
 acp_prompt_send :: proc(connection: ^ACP_Connection, text: string) -> string {
-	Text :: struct {
-		type: string `json:"type"`,
-		text: string `json:"text"`,
-	}
-	Prompt :: struct {
-		session_id: string `json:"sessionId"`,
-		prompt:     []Text `json:"prompt"`,
-	}
 	return acp_send(
 		connection,
 		ACP_Prompt_Reply{},
 		acp.METHOD_SESSION_PROMPT,
-		Prompt{session_id = connection.session_id, prompt = {{type = acp.CONTENT_TEXT, text = text}}},
+		acp.Session_Prompt_Params{session_id = connection.session_id, prompt = {{type = acp.CONTENT_TEXT, text = text}}},
 	)
 }
 
@@ -1035,15 +964,10 @@ acp_prompt :: proc(connection: ^ACP_Connection, text: string, after := journal.J
 @(private, require_results)
 acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
-	opened_input, input_ok := acp_input_open()
-	if !input_ok { return "the agent's input could not be created; nothing ran" }
-	input, input_error := new(ACP_Input, member.allocator)
-	if input_error != nil {
-		acp_input_close(&opened_input)
-		return "the agent's input could not be held; nothing ran"
-	}
-	input^ = opened_input
-	connection.input = input
+	input_read, input_write, input_error := os.pipe()
+	if input_error != nil { return "the agent's input could not be created; nothing ran" }
+	defer _ = os.close(input_read)
+	connection.input = input_write
 	readers, readers_error := new(ACP_Readers, member.allocator)
 	if readers_error != nil { return "the agent's readers could not be held; nothing ran" }
 	connection.readers = readers
@@ -1063,16 +987,12 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	if argv_error != nil { return "the agent's arguments could not be held; nothing ran" }
 	argv[0] = member.program.command
 	copy(argv[1:], member.program.arguments)
-	child, spawn_error := os.process_start(
-		{command = argv, working_dir = member.workspace, stdin = input.theirs, stdout = output_write, stderr = errors_write},
-	)
+	child, spawn_error := os.process_start({command = argv, working_dir = member.workspace, stdin = input_read, stdout = output_write, stderr = errors_write})
 	if spawn_error != nil { return fmt.tprintf("%s could not be started: %v; nothing ran", member.program.command, spawn_error) }
 	connection.child = child
 	connection.started = true
 	readers.process = child
-	_ = os.close(input.theirs)
-	input.theirs = nil
-	writer, writer_error := acp.writer_init(acp_input_writer(input), member.allocator)
+	writer, writer_error := acp.writer_init(os.to_writer(input_write), member.allocator)
 	connection.writer = writer
 	decoder, decoder_error := acp.frame_decoder_init(allocator = member.allocator)
 	readers.decoder = decoder
@@ -1128,9 +1048,9 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 		if !process_finished { _ = os.process_kill(connection.child) }
 		writer_retired = acp.writer_destroy(&connection.writer, SUBAGENT_ACP_CLOSE_GRACE)
 	}
-	if writer_retired && connection.input != nil && connection.input.ours != nil {
-		_ = os.close(connection.input.ours)
-		connection.input.ours = nil
+	if writer_retired && connection.input != nil {
+		_ = os.close(connection.input)
+		connection.input = nil
 	}
 	if connection.started {
 		if readers.threads[.Process] == nil {
@@ -1145,10 +1065,7 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 			_ = acp_readers_wait(readers, true, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
 		}
 	}
-	if writer_retired && connection.input != nil {
-		acp_input_close(connection.input)
-		free(connection.input, connection.member.allocator)
-	} else if !writer_retired {
+	if !writer_retired {
 		subagent_fail(connection.member, .Failed, "the agent's writer did not retire; its outcome is unknown and its resources were retained")
 	}
 	if readers != nil {
@@ -1172,8 +1089,6 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 			subagent_fail(connection.member, .Failed, "the agent's transport worker did not retire; its outcome is unknown and its resources were retained")
 		}
 	}
-	for frame in connection.frames { delete(frame, connection.member.allocator) }
-	delete(connection.frames)
 	delete(connection.session_id, connection.member.allocator)
 	delete(connection.message_id, connection.member.allocator)
 	delete(connection.stop_reason, connection.member.allocator)
@@ -1194,11 +1109,6 @@ acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") ->
 	member := connection.member
 	// Version 2 names the client in info; a version 1 agent answers with its own version and
 	// reads the missing clientCapabilities as no file system and no terminal.
-	Initialize :: struct {
-		protocol_version: int `json:"protocolVersion"`,
-		capabilities:     struct{} `json:"capabilities"`,
-		info:             acp.Implementation `json:"info"`,
-	}
 	Initialized :: struct {
 		protocol_version:   int `json:"protocolVersion"`,
 		info:               acp.Implementation `json:"info"`,
@@ -1210,7 +1120,7 @@ acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") ->
 		} `json:"agentCapabilities"`,
 	}
 	initialized: Initialized
-	request := Initialize {
+	request := acp.Initialize_Params {
 		protocol_version = acp.PROTOCOL_VERSION_V2,
 		info = {name = "nabla", version = "0"},
 	}
@@ -1223,13 +1133,9 @@ acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") ->
 	// version 2 requires; they speak version 1.
 	if initialized.info.name == "" { connection.version = acp.PROTOCOL_VERSION }
 
-	New_Session :: struct {
-		cwd:         string `json:"cwd"`,
-		mcp_servers: []acp.MCP_Server `json:"mcpServers"`,
-	}
 	opened: ACP_Session_Opened
 	if session_id == "" {
-		if problem = acp_call(connection, acp.METHOD_SESSION_NEW, New_Session{cwd = member.workspace}, &opened); problem != "" { return }
+		if problem = acp_call(connection, acp.METHOD_SESSION_NEW, acp.Session_New_Params{cwd = member.workspace}, &opened); problem != "" { return }
 		if opened.session_id == "" { return "the agent opened a session without an id" }
 		session_id = opened.session_id
 	} else {
@@ -1239,13 +1145,12 @@ acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") ->
 			if !initialized.agent_capabilities.load_session { return "the ACP agent advertises neither sessionCapabilities.resume nor loadSession; its session cannot be resumed" }
 			method = acp.METHOD_SESSION_LOAD
 		}
-		Resume :: struct {
-			session_id:  string `json:"sessionId"`,
-			cwd:         string `json:"cwd"`,
-			mcp_servers: []acp.MCP_Server `json:"mcpServers"`,
-		}
 		connection.replaying = true
-		problem = acp_call(connection, method, Resume{session_id = session_id, cwd = member.workspace}, &opened)
+		if method == acp.METHOD_SESSION_LOAD {
+			problem = acp_call(connection, method, acp.Session_Load_Params{session_id = session_id, cwd = member.workspace}, &opened)
+		} else {
+			problem = acp_call(connection, method, acp.Session_Resume_Params{session_id = session_id, cwd = member.workspace}, &opened)
+		}
 		connection.replaying = false
 		if problem != "" { return }
 	}
@@ -1274,14 +1179,14 @@ acp_session_configure :: proc(
 				if problem = acp_set_option(connection, option, value); problem != "" { return }
 			}
 		} else if acp_model_offered(opened.models, model) {
-			Set_Model :: struct {
-				session_id: string `json:"sessionId"`,
-				model_id:   string `json:"modelId"`,
-			}
 			set: acp.Session_Set_Model_Result
 			if model != opened.models.current_model_id {
-				if problem = acp_call(connection, acp.METHOD_SESSION_SET_MODEL, Set_Model{session_id = connection.session_id, model_id = model}, &set);
-				   problem != "" { return }
+				if problem = acp_call(
+					connection,
+					acp.METHOD_SESSION_SET_MODEL,
+					acp.Session_Set_Model_Params{session_id = connection.session_id, model_id = model},
+					&set,
+				); problem != "" { return }
 			}
 		} else {
 			return fmt.tprintf("the agent offers no model %q; it offers: %s", model, acp_models_text(opened))
@@ -1322,15 +1227,11 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> string {
 				if problem := acp_option_send(connection, ACP_Model_Reply{model = value, effort = configuration.effort}, option, value);
 				   problem != "" { return problem }
 			} else if acp_model_offered(connection.opened.models, configuration.model) {
-				Set_Model :: struct {
-					session_id: string `json:"sessionId"`,
-					model_id:   string `json:"modelId"`,
-				}
 				if problem := acp_send(
 					connection,
 					ACP_Model_Reply{model = configuration.model, effort = configuration.effort},
 					acp.METHOD_SESSION_SET_MODEL,
-					Set_Model{session_id = connection.session_id, model_id = configuration.model},
+					acp.Session_Set_Model_Params{session_id = connection.session_id, model_id = configuration.model},
 				); problem != "" { return problem }
 			} else {
 				return acp_configure_refusal(
@@ -1367,13 +1268,7 @@ ACP_Session_Opened :: struct {
 @(private, require_results)
 acp_set_option :: proc(connection: ^ACP_Connection, option: ACP_Config_Option, value: string) -> (problem: string) {
 	// Version 2 requires the value's type; version 1 reads a missing type as an id.
-	Set_Option :: struct {
-		session_id: string `json:"sessionId"`,
-		config_id:  string `json:"configId"`,
-		type:       string `json:"type,omitempty"`,
-		value:      string `json:"value"`,
-	}
-	request := Set_Option {
+	request := acp.Session_Set_Config_Option_Params {
 		session_id = connection.session_id,
 		config_id  = option.config_id if option.config_id != "" else option.id,
 		type       = "id" if connection.version == 2 else "",
@@ -1532,12 +1427,7 @@ acp_notification :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) ->
 			if _, append_error := append(&connection.answer, block.text); append_error != nil { return false }
 		}
 	case acp.UPDATE_STATE:
-		State :: struct {
-			state:       string `json:"state"`,
-			stop_reason: string `json:"stopReason"`,
-			error:       Maybe(acp.RPC_Error) `json:"error"`,
-		}
-		state: acp.Session_Notification(State)
+		state: acp.Session_Notification(acp.State_Update)
 		switch acp.params_decode(envelope.params, &state, context.temp_allocator) {
 		case .None:
 		case .Invalid:
@@ -1642,23 +1532,31 @@ acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> (prob
 // for its answer; problem says the agent ended, went silent past that, or could not be read.
 @(private, require_results)
 acp_next :: proc(connection: ^ACP_Connection) -> (envelope: acp.Envelope, problem: string) {
+	allocator := connection.member.allocator
 	for {
-
-		for connection.next_frame < len(connection.frames) {
-			frame := connection.frames[connection.next_frame]
-			connection.next_frame += 1
-			parsed, parse_error := acp.parse_envelope(frame, connection.member.allocator)
+		if frame, taken := acp_frame_take(connection.readers); taken {
+			defer delete(frame, allocator)
+			parsed, parse_error := acp.parse_envelope(frame, allocator)
 			if parse_error == .None { return parsed, "" }
 			return {}, fmt.tprintf("the agent sent a message that could not be parsed as JSON-RPC: %s", acp.envelope_error_text(parse_error))
 		}
-		for frame in connection.frames { delete(frame, connection.member.allocator) }
-		clear(&connection.frames)
-		connection.next_frame = 0
 		if wait_problem := acp_wait(connection); wait_problem != "" { return {}, wait_problem }
 	}
 }
 
-// acp_wait blocks until the agent wrote something or a stop arrived, and reads what came.
+// acp_frame_take removes the oldest frame the reader thread decoded, which the caller then
+// owns. The lock is held only for the removal, so decoding and handling happen outside it.
+@(private, require_results)
+acp_frame_take :: proc(readers: ^ACP_Readers) -> (frame: string, taken: bool) {
+	sync.mutex_guard(&readers.mutex)
+	if len(readers.frames) == 0 { return "", false }
+	frame = readers.frames[0]
+	ordered_remove(&readers.frames, 0)
+	return frame, true
+}
+
+// acp_wait blocks until the agent wrote something or a stop arrived. It returns "" once a
+// frame is waiting for acp_frame_take.
 @(private, require_results)
 acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
@@ -1678,10 +1576,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 		what := "exited"
 		{
 			sync.mutex_guard(&readers.mutex)
-			if len(readers.frames) > 0 {
-				connection.frames, readers.frames = readers.frames, connection.frames
-				return ""
-			}
+			if len(readers.frames) > 0 { return "" }
 			if readers.frame_error != .None {
 				return fmt.tprintf("the agent sent a message that could not be read: %s", acp.frame_error_text(readers.frame_error))
 			}
@@ -1693,10 +1588,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 			_ = acp_readers_wait(readers, false, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
 			{
 				sync.mutex_guard(&readers.mutex)
-				if len(readers.frames) > 0 {
-					connection.frames, readers.frames = readers.frames, connection.frames
-					return ""
-				}
+				if len(readers.frames) > 0 { return "" }
 			}
 			return acp_ended(connection, what)
 		}

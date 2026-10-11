@@ -368,8 +368,52 @@ test_writer_frames_a_request :: proc(t: ^testing.T) {
 	testing.expect(t, write_request(&writer, i64(7), METHOD_SESSION_PROMPT, params) == .None)
 	test_writer_finish(t, &writer)
 
+	want := `{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hi"}]}}` + "\n"
+	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
+}
+
+@(test)
+test_writer_frames_client_requests_without_agent_only_fields :: proc(t: ^testing.T) {
+	buffer: bytes.Buffer
+	bytes.buffer_init_allocator(&buffer, 0, 0, context.allocator)
+	defer bytes.buffer_destroy(&buffer)
+	writer, writer_err := writer_init(test_writer_stream(&buffer))
+	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
+	defer test_writer_cleanup(&writer)
+
+	initialize := Initialize_Params {
+		protocol_version = PROTOCOL_VERSION_V2,
+		info = {name = "nabla", version = "0"},
+	}
+	testing.expect(t, write_request(&writer, i64(1), METHOD_INITIALIZE, initialize) == .None)
+	testing.expect(t, write_request(&writer, i64(2), METHOD_SESSION_NEW, Session_New_Params{cwd = "/w"}) == .None)
+	testing.expect(t, write_request(&writer, i64(3), METHOD_SESSION_RESUME, Session_Resume_Params{session_id = "s", cwd = "/w"}) == .None)
+	testing.expect(t, write_request(&writer, i64(4), METHOD_SESSION_LOAD, Session_Load_Params{session_id = "s", cwd = "/w"}) == .None)
+	option := Session_Set_Config_Option_Params {
+		session_id = "s",
+		config_id  = "model",
+		value      = "m",
+	}
+	testing.expect(t, write_request(&writer, i64(5), METHOD_SESSION_SET_CONFIG_OPTION, option) == .None)
+	prompt := Session_Prompt_Params {
+		session_id = "s",
+		prompt     = {{type = CONTENT_TEXT, text = "hi"}},
+	}
+	testing.expect(t, write_request(&writer, i64(6), METHOD_SESSION_PROMPT, prompt) == .None)
+	test_writer_finish(t, &writer)
+
 	want :=
-		`{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hi","uri":"","resource":{"uri":"","text":""}}]}}` +
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"nabla","version":"0"}}}` +
+		"\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w","mcpServers":[]}}` +
+		"\n" +
+		`{"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":"s","cwd":"/w","mcpServers":[]}}` +
+		"\n" +
+		`{"jsonrpc":"2.0","id":4,"method":"session/load","params":{"sessionId":"s","cwd":"/w","mcpServers":[]}}` +
+		"\n" +
+		`{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"s","configId":"model","value":"m"}}` +
+		"\n" +
+		`{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"text","text":"hi"}]}}` +
 		"\n"
 	testing.expect_value(t, bytes.buffer_to_string(&buffer), want)
 }
@@ -415,7 +459,6 @@ test_v2_resume_params_read_replay_cursor :: proc(t: ^testing.T) {
 		delete(params.mcp_servers)
 		delete(params.additional_directories)
 		delete(params.system_prompt)
-		delete(params.meta.session_title)
 	}
 	cursor, present := params.replay_from.?
 	testing.expect(t, present)
