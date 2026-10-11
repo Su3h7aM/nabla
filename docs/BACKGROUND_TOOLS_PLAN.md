@@ -63,7 +63,7 @@ The heading is `finished`, `failed`, `stopped`, or `lost` (outcome `Unknown`), f
 One owner-placed tool, `jobs`, with two actions:
 
 - `list`: each background job of the session with its id, tool, status, age, and stream files.
-- `stop`: requests the job's stop. The call answers `stopping`; the job's completion still arrives, with outcome `Cancelled` and its partial output.
+- `stop`: requests the job's stop. The call answers `stopping`; the job's completion still arrives and reports what was observed: `Cancelled` when the stop is confirmed, `Unknown` when it cannot be, or the tool's own result if it finished first.
 
 There is no `wait` action. Waiting is ending the response: the turn finishes, and the completion starts the next one. A call that must have its result before continuing is made with `wait: true` in the first place. This matches OpenCode and needs no new blocking state.
 

@@ -22,6 +22,7 @@ Tool_Kind :: enum {
 	MCP,
 	Agent,
 	Agents,
+	Jobs,
 }
 
 // Tool_Args is one call's arguments, typed by the tool that will run it. Strings borrow
@@ -39,6 +40,7 @@ Tool_Args :: union {
 	Agent_Message_Args,
 	Agent_Stop_Args,
 	Agents_Args,
+	Jobs_Args,
 }
 
 Read_Args :: struct {
@@ -107,6 +109,8 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return tool_agent_args(ctx, object)
 	case .Agents:
 		return tool_agents_args(ctx, object)
+	case .Jobs:
+		return tool_jobs_args(ctx, object)
 	case .Custom, .MCP:
 		// The tool validates its own arguments, so none are handed over and the document
 		// travels as admitted, with only its integer fields repaired from the schema.

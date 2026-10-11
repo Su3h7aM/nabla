@@ -191,6 +191,74 @@ tool_loop_background_shell :: proc(test: ^testing.T, cancel: bool, recovery := f
 	testing.expect(test, !chat_background_wait(chat, nil), "the completion is delivered only once")
 }
 
+@(test)
+test_jobs_tool_lists_and_stops_a_background_shell :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	starter: Agent_Provider
+	if !agent_provider_start(
+		test,
+		&starter,
+		{agent_provider_call(TOOL_SHELL_NAME, `{"command":"sleep 30","wait":false}`), agent_provider_reply("waiting")},
+	) { return }
+	defer agent_provider_stop(&starter)
+	starter_endpoint := agent_provider_endpoint(&starter)
+	defer delete(starter_endpoint)
+	_test_accept(test, chat, "start a long command in the background")
+	testing.expect(test, chat_turn_drive(chat, {API = .OpenAI_Chat_Completions, Endpoint = starter_endpoint}, test_retry_policy(), {}, nil, nil))
+	if !testing.expect_value(test, len(chat.background.jobs), 1) { return }
+	name := background_job_name(chat.background.jobs[0].exec.call, context.temp_allocator)
+
+	manager: Agent_Provider
+	if !agent_provider_start(
+		test,
+		&manager,
+		{
+			agent_provider_call(TOOL_JOBS_NAME, `{"action":"list"}`),
+			agent_provider_call(TOOL_JOBS_NAME, fmt.tprintf(`{{"action":"stop","job":%q}}`, name)),
+			agent_provider_reply("stop requested"),
+			agent_provider_reply("received"),
+		},
+	) { return }
+	defer agent_provider_stop(&manager)
+	manager_endpoint := agent_provider_endpoint(&manager)
+	defer delete(manager_endpoint)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = manager_endpoint,
+	}
+	_test_accept(test, chat, "list the jobs, then stop the command")
+	testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil))
+	listing := agent_provider_request(&manager, 1)
+	testing.expect(test, strings.contains(listing, name) && strings.contains(listing, "status: running"), listing)
+	testing.expect(test, strings.contains(listing, "stdout_file:"), listing)
+	testing.expect(test, strings.contains(agent_provider_request(&manager, 2), "stopping"))
+
+	for background_running(chat) { _ = chat_background_wait(chat, nil) }
+	finished := _test_records(test, chat, {.Background_Completed})
+	if !testing.expect_value(test, len(finished), 1) { return }
+	payload: journal.Background_Completed
+	if !testing.expect_value(test, journal.payload_decode(finished[0].data, &payload, context.temp_allocator), nil) { return }
+	testing.expect_value(test, payload.outcome, journal.TOOL_OUTCOME_NAMES[.Cancelled])
+	if accepted, had_message := chat_session_accept_agent_message(chat, {}); accepted == .Accepted && had_message {
+		testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil))
+	}
+	ancestry, read_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
+	if !testing.expect_value(test, read_error, nil) { return }
+	reports := 0
+	for node in ancestry {
+		if node.kind != .User { continue }
+		user: journal.User
+		if !testing.expect_value(test, journal.payload_decode(node.data, &user, context.temp_allocator), nil) { return }
+		if user.origin == journal.USER_ORIGIN_NAMES[.Job] && strings.contains(string(node.body), name) { reports += 1 }
+	}
+	testing.expect_value(test, reports, 1)
+}
+
 // item_object and item_string read the encoded request body the way a provider
 // would: by item type, role, and field. They exist so a test can assert wire
 // order and absence of duplicates instead of asserting a struct it built itself.

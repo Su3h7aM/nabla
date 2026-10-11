@@ -107,6 +107,7 @@ background_detach :: proc(chat: ^Chat_Session, jobs: ^Tool_Jobs, job: ^Tool_Job,
 		return
 	}
 	job.phase = .Running
+	job.dispatched = time.tick_now()
 	// Capacity was reserved before dispatch, so this ownership handoff cannot allocate.
 	_, append_error := append(&chat.background.jobs, job)
 	ensure(append_error == nil, "the reserved background table could not accept its job")
@@ -147,6 +148,13 @@ background_record :: proc(chat: ^Chat_Session, job: ^Tool_Job, result: ^Tool_Res
 	_ = chat_commit(chat, "a background job's outcome could not be recorded")
 }
 
+// background_stop_job asks a detached job to stop and starts its stop patience. Owner only.
+@(private)
+background_stop_job :: proc(job: ^Tool_Job) {
+	tool_job_request_stop(job)
+	job_note_stop(&job.worker, true, time.tick_now())
+}
+
 // background_reap commits published background results and releases their jobs. A worker
 // that ignores its session stop is answered Unknown and abandoned. Owner only.
 background_reap :: proc(chat: ^Chat_Session) {
@@ -161,10 +169,7 @@ background_reap :: proc(chat: ^Chat_Session) {
 			tool_job_release(job)
 			continue
 		}
-		if tool_control_cancelled(job.exec.control) && job.worker.stop_at == nil {
-			tool_job_request_stop(job)
-			job_note_stop(&job.worker, true, now)
-		}
+		if tool_control_cancelled(job.exec.control) && job.worker.stop_at == nil { background_stop_job(job) }
 		if job_overdue(&job.worker, now) {
 			// The worker still owns its result slot, so uncertainty is recorded without one.
 			background_record(chat, job, nil, "error unknown: the operation may still be running; it did not confirm its stop")
@@ -210,11 +215,7 @@ chat_background_deadline :: proc(chat: ^Chat_Session, deadline: Maybe(time.Tick)
 // background_destroy stops all detached jobs, retires published workers without committing,
 // and abandons the rest after the stop patience. Recovery settles the open completions.
 background_destroy :: proc(chat: ^Chat_Session) {
-	now := time.tick_now()
-	for job in chat.background.jobs {
-		tool_job_request_stop(job)
-		job_note_stop(&job.worker, true, now)
-	}
+	for job in chat.background.jobs { background_stop_job(job) }
 	for job in chat.background.jobs {
 		if job_wait_published(&job.worker, job_stop_deadline(&job.worker)) {
 			job_retire(&job.worker)

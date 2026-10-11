@@ -26,6 +26,7 @@ Tool_Output :: union {
 	MCP_Output,
 	Agent_Output,
 	Agents_Output,
+	Jobs_Output,
 	Argument_Failure,
 }
 
@@ -104,6 +105,12 @@ Compact_Output :: struct {
 }
 
 Agents_Output :: struct {
+	content: string,
+}
+
+// Jobs_Output is the list of background jobs: count, and their rendered entries or a note that there are none.
+Jobs_Output :: struct {
+	count:   int,
 	content: string,
 }
 
@@ -248,6 +255,9 @@ tool_result_render :: proc(
 	case Compact_Output:
 		render_field(&head, "state", value.state) or_return
 	case Agents_Output:
+		render_text(&body, value.content) or_return
+	case Jobs_Output:
+		render_field(&head, "jobs", value.count) or_return
 		render_text(&body, value.content) or_return
 	case Agent_Output:
 		render_field(&head, "agent", value.agent) or_return
@@ -553,6 +563,12 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		}
 		value.content = strings.clone(borrowed.content, allocator) or_return
 		owned = value
+	case Jobs_Output:
+		value := Jobs_Output {
+			count = borrowed.count,
+		}
+		value.content = strings.clone(borrowed.content, allocator) or_return
+		owned = value
 	case Agent_Output:
 		value: Agent_Output
 		defer if allocation_error != nil {
@@ -654,6 +670,8 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 	case Compact_Output:
 		delete(value.state, allocator)
 	case Agents_Output:
+		delete(value.content, allocator)
+	case Jobs_Output:
 		delete(value.content, allocator)
 	case Agent_Output:
 		delete(value.agent, allocator)

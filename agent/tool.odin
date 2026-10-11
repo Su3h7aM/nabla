@@ -95,6 +95,8 @@ Tool_Context :: struct {
 	// record, set only for the agent tools; the other is nil. Both outlive the call.
 	agents:           ^Agent_Team,
 	member:           ^Subagent,
+	// background is the calling session's detached jobs, set only for the jobs tool.
+	background:       ^Background_Jobs,
 	// subagent is the delegation an agent tool call acts on, named by the child session.
 	// The owner records it at dispatch except for agent message/configure to a live child, where it
 	// is the delegation the message was queued on; the worker sets subagent_started
@@ -549,6 +551,7 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_CODEMODE_DEFINITION,
 	TOOL_AGENT_DEFINITION,
 	TOOL_AGENTS_DEFINITION,
+	TOOL_JOBS_DEFINITION,
 }
 
 // TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,

@@ -155,6 +155,7 @@ Tool_Job :: struct {
 	result:         Maybe(Tool_Result),
 	committed:      bool,
 	background:     bool,
+	dispatched:     time.Tick, // when a background job was detached; its age is measured from here
 }
 
 // Tool_Jobs is one batch's table. Only the owner reads and writes it.
@@ -422,6 +423,8 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 			job.exec.status_store = chat.store
 			job.exec.status_session = chat.session
 		}
+	case .Jobs:
+		job.exec.background = &chat.background
 	case .Custom, .Read, .Write, .Edit, .Shell, .Skills, .Skill, .Compact, .Codemode, .MCP:
 	}
 
@@ -964,7 +967,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		opened = delegation.subagent != {}
 	case Agent_Message_Args:
 		opened = args.resume.name != ""
-	case Read_Args, Write_Args, Edit_Args, Shell_Args, Skills_Args, Skill_Args, Codemode_Args, Agent_Stop_Args, Agents_Args:
+	case Read_Args, Write_Args, Edit_Args, Shell_Args, Skills_Args, Skill_Args, Codemode_Args, Agent_Stop_Args, Agents_Args, Jobs_Args:
 	case nil:
 	}
 	if opened && !job.exec.subagent_started {
