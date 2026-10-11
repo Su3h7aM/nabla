@@ -254,7 +254,11 @@ Chat_Session :: struct {
 	team:                         ^Agent_Team,
 	background:                   Background_Jobs,
 	background_stop:              ai.Interrupt,
-	member:                       ^Subagent,
+	parent_session:               journal.Session_Id,
+	parent_session_hex:           [journal.SESSION_ID_HEX_LENGTH]u8,
+	subagent_name:                string,
+	nabla_executable:             string,
+	nabla_config:                 string,
 	workers_retained:             bool,
 	// acp_agents are the ACP agent programs subagents may run, borrowed from the loaded config.
 	acp_agents:                   []ACP_Agent_Config,
@@ -400,13 +404,7 @@ chat_session_tool_jobs_abandoned :: proc(chat: ^Chat_Session) -> bool {
 // that owns the journal may call it.
 chat_session_workers_outstanding :: proc(chat: ^Chat_Session) -> bool {
 	job_reclaim(chat)
-	return(
-		chat.workers_retained ||
-		len(chat.abandoned) > 0 ||
-		background_running(chat) ||
-		agent_team_running(chat.team) ||
-		(chat.team != nil && sync.atomic_load(&chat.team.workers_retained)) \
-	)
+	return chat.workers_retained || len(chat.abandoned) > 0 || background_running(chat) || agent_team_running(chat.team)
 }
 
 // Tool_Registry_Replace_Error names why a registry replacement was refused.
@@ -450,6 +448,17 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 // chat_session_apply_harness applies the launch's harness options to a session.
 // The options must outlive the session.
 chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) {
+	delete(chat.nabla_executable, chat.allocator)
+	delete(chat.nabla_config, chat.allocator)
+	executable, executable_error := strings.clone(options.nabla_executable, chat.allocator)
+	config, config_error := strings.clone(options.nabla_config, chat.allocator)
+	if executable_error != nil || config_error != nil {
+		delete(executable, chat.allocator)
+		delete(config, chat.allocator)
+		executable, config = "", ""
+		chat_runtime_message(chat, .Error, "native subagents are unavailable because their launch paths could not be copied")
+	}
+	chat.nabla_executable, chat.nabla_config = executable, config
 	chat.disable_project_instructions = options.disable_project_instructions
 	chat.subagents_max_running = options.subagents_max_running
 	chat.compact_on_switch = options.compact_on_switch
@@ -457,6 +466,11 @@ chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
+	delete(chat.subagent_name, chat.allocator)
+	chat.subagent_name = ""
+	delete(chat.nabla_executable, chat.allocator)
+	delete(chat.nabla_config, chat.allocator)
+	chat.nabla_executable, chat.nabla_config = "", ""
 	if chat.tool_jobs_active {
 		tool_jobs_destroy(&chat.tool_jobs)
 		chat.tool_jobs_active = false

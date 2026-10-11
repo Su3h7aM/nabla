@@ -71,7 +71,7 @@ Agent_Message_Args :: struct {
 	// control is set by the owner, with the message, when the call changes a running child: the
 	// switch already resolved and the compaction asked for. The job owns it until the executor
 	// hands it to the child; a dispatch that cannot commit releases it.
-	control:  Subagent_Control,
+	control:  ACP_Configure,
 }
 
 Agent_Stop_Args :: struct {
@@ -130,7 +130,7 @@ tool_agents_args :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (args: A
 
 @(require_results)
 tool_agents_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
-	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
+	if ctx.subagent_role { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
 	args := arguments.(Agents_Args)
 	if args.action == .Models {
 		if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
@@ -150,7 +150,7 @@ tool_agent_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	case Agent_Start_Args:
 		return tool_agent_start_execute(ctx, args)
 	case Agent_Message_Args:
-		if ctx.member != nil && args.action != .Message { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
+		if ctx.subagent_role && args.action != .Message { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
 		return tool_agent_message_execute(ctx, args)
 	case Agent_Stop_Args:
 		return tool_agent_stop_execute(ctx, args)
@@ -307,7 +307,7 @@ tool_agent_started_output :: proc(member: ^Subagent, requested_effort: string) -
 	output := Agent_Output {
 		agent   = member.name,
 		status  = subagent_status_names[.Running],
-		model   = member.selection.model_id,
+		model   = member.program.model,
 		effort  = member.effort if member.effort != "" else "default",
 		session = journal.session_id_to_hex(member.session, session_hex),
 	}
@@ -365,7 +365,7 @@ tool_agent_launch :: proc(ctx: ^Tool_Context, member: ^Subagent, output: Agent_O
 @(require_results)
 tool_agent_start_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Start_Args)
-	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
+	if ctx.subagent_role { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
 	if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
 	member, problem := subagent_start(ctx.agents, args, ctx.call, ctx.subagent, ctx.allocator)
 	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not started") }
@@ -380,7 +380,7 @@ tool_agent_start_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		sync.mutex_guard(&member.team.mutex)
 		member.stop.parent = ctx.control.interrupt
 	}
-	subagent_run(member)
+	subagent_acp_run(member)
 	output.status = subagent_status_names[member.status]
 	output.acp_session = member.acp_session
 	output.answer = member.answer
@@ -404,10 +404,11 @@ tool_agent_start_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 // delivers it.
 @(private, require_results)
 tool_agent_resume :: proc(ctx: ^Tool_Context, args: Agent_Message_Args) -> Tool_Result {
+	args := args
 	start := Agent_Start_Args {
 		instruction = args.resume.instruction,
 		acp_agent   = args.resume.program,
-		prompt      = args.message, // empty only for a compaction that continues with no message
+		prompt      = args.message, // empty for configuration or compaction without another task
 		model       = args.model,
 		provider    = args.provider,
 		effort      = args.effort,
@@ -416,9 +417,39 @@ tool_agent_resume :: proc(ctx: ^Tool_Context, args: Agent_Message_Args) -> Tool_
 		if start.model == "" { start.model = args.resume.model_id }
 		if start.effort == "" { start.effort = args.resume.effort }
 	}
+	configuration_only := args.message == "" && !args.compact
+	start.wait = configuration_only
+	if configuration_only {
+		start.model, start.provider, start.effort = "", "", ""
+		if start.acp_agent != "" { start.model, start.effort = args.resume.model_id, args.resume.effort }
+	}
 	member, problem := subagent_start(ctx.agents, start, ctx.call, ctx.subagent, ctx.allocator, args.resume)
 	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not resumed") }
 	ctx.subagent_started = true
+	if configuration_only {
+		_, _, problem = acp_configure_plan(ctx.agents, &args)
+		if problem != "" {
+			subagent_fail(member, .Failed, problem)
+			subagent_finish(member)
+			return tool_result_failure(ctx, .Tool_Failed, problem, "not configured")
+		}
+		acp_configure_queue(ctx.agents, member.name, &args.control)
+		subagent_take_slot(member)
+		{
+			sync.mutex_guard(&member.team.mutex)
+			member.stop.parent = ctx.control.interrupt
+		}
+		subagent_acp_run(member)
+		output := tool_agent_started_output(member, args.effort)
+		output.status = subagent_status_names[member.status]
+		result := tool_result_success(ctx, output, fmt.tprintf("%s configured", member.name))
+		if member.status != .Completed {
+			tool_result_destroy(&result)
+			result = tool_result_of(ctx, .Cancelled if member.status == .Stopped else .Tool_Failed, member.cause, output, "not configured")
+		}
+		subagent_finish(member)
+		return result
+	}
 	return tool_agent_launch(ctx, member, tool_agent_started_output(member, args.effort), "resumed")
 }
 
@@ -429,19 +460,15 @@ tool_agent_queued_notice :: proc(args: Agent_Message_Args) -> string {
 	queued := make([dynamic]string, context.temp_allocator)
 	if args.message != "" { append(&queued, "the message") }
 	if args.control.switching {
-		selection := args.control.selection
+		selection := args.control
 		effort := args.control.effort if args.control.effort != "" else "default"
-		if selection.model_id == "" {
+		if selection.model == "" {
 			append(
 				&queued,
-				fmt.tprintf(
-					"an ACP model/effort switch to %s at effort %s",
-					args.control.acp_model if args.control.acp_model != "" else "the current model",
-					effort,
-				),
+				fmt.tprintf("an ACP model/effort switch to %s at effort %s", args.control.model if args.control.model != "" else "the current model", effort),
 			)
 		} else {
-			append(&queued, fmt.tprintf("a switch to %s/%s at effort %s", selection.provider_id, selection.model_id, effort))
+			append(&queued, fmt.tprintf("a switch to %s at effort %s", selection.model, effort))
 		}
 	}
 	if args.control.compact { append(&queued, "a compaction") }
@@ -452,7 +479,7 @@ tool_agent_queued_notice :: proc(args: Agent_Message_Args) -> string {
 @(require_results)
 tool_agent_message_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Message_Args)
-	if member := ctx.member; member != nil {
+	if ctx.subagent_role {
 		if args.agent != "" && args.agent != "orchestrator" {
 			refused := tool_argument_error(.Invalid_Value, "agent", "nothing: a subagent can message only its orchestrator", ctx.allocator)
 			return tool_result_refused(ctx, &refused)
@@ -474,17 +501,15 @@ tool_agent_message_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> 
 		agent  = args.agent,
 		status = "queued",
 	}
-	if args.control.switching || args.control.compact {
-		output.notice = tool_agent_queued_notice(args)
-		subagent_control_apply(ctx.agents, args.agent, &args.control)
-	}
+	if args.control.switching || args.control.compact { output.notice = tool_agent_queued_notice(args) }
+	acp_configure_queue(ctx.agents, args.agent, &args.control)
 	return tool_result_success(ctx, output, "queued")
 }
 
 @(require_results)
 tool_agent_stop_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Result {
 	args := arguments.(Agent_Stop_Args)
-	if ctx.member != nil { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
+	if ctx.subagent_role { return tool_result_failure(ctx, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable") }
 	if ctx.agents == nil { return tool_result_failure(ctx, .Unavailable, "subagents are not available in this session", "unavailable") }
 	if problem := subagent_stop(ctx.agents, args.agent); problem != "" {
 		return tool_result_failure(ctx, .Tool_Failed, problem, "not stopped")

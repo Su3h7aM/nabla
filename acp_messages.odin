@@ -1329,6 +1329,7 @@ acp_main :: proc(args: []string) -> int {
 		acp_usage()
 		return 2
 	}
+	explicit_config := config_path
 	if config_path == "" {
 		directory, directory_err := agent.xdg_directory(.Config, context.temp_allocator)
 		if directory_err != .None {
@@ -1352,6 +1353,11 @@ acp_main :: proc(args: []string) -> int {
 	defer if !retained {
 		agent.catalog_sources_destroy(&sources)
 		agent.mcp_servers_destroy(&mcp_servers)
+	}
+	if !subagent_launch_options(&harness_options, explicit_config) { return 1 }
+	defer {
+		delete(harness_options.nabla_executable)
+		delete(harness_options.nabla_config)
 	}
 
 	// Signals end the run the way a client closing the stream does, so a killed editor

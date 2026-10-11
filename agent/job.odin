@@ -174,9 +174,7 @@ job_abandon :: proc(chat: ^Chat_Session, job: ^Job) {
 // table still holds it, because the table reads the job until it is destroyed, and a provider
 // attempt while the chain that abandoned it still holds it, because the chain's release is
 // what moves the scratch arena into it. A subagent waits until its team no longer holds it;
-// a member whose own workers remain outstanding is retired but kept allocated. Owner only:
-// it records each release in the session's
-// journal.
+// Owner only; it records each release in the session's journal.
 job_reclaim :: proc(chat: ^Chat_Session) {
 	jobs := &chat.abandoned
 	for index := len(jobs) - 1; index >= 0; index -= 1 {
@@ -197,7 +195,7 @@ job_reclaim :: proc(chat: ^Chat_Session) {
 			chat_request_worker_reclaim(container_of(job, Chat_Request_Worker, "worker"))
 		case .Subagent:
 			member := container_of(job, Subagent, "worker")
-			if !member.abandoned { subagent_destroy(member) }
+			subagent_destroy(member)
 		}
 		unordered_remove(jobs, index)
 	}

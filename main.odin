@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:io"
 import "core:os"
+import "core:path/filepath"
 import "core:strings"
 
 import "nabla:agent"
@@ -354,8 +355,47 @@ config_error_display_text :: proc(path: string, err: agent.Config_Error, detail:
 	return text
 }
 
-// chat_main runs one invocation and returns its exit code, so main has a single
-// exit and the deferred cleanup still runs.
+// subagent_launch_options fills the paths inherited by native ACP children.
+// config is only the explicitly supplied path. The caller frees both results with context.allocator.
+subagent_launch_options :: proc(options: ^agent.Harness_Options, config: string) -> bool {
+	executable, executable_error := os.get_executable_path(context.allocator)
+	if executable_error != nil {
+		fmt.eprintf("nabla: cannot locate the executable: %v\n", executable_error)
+		return false
+	}
+	options.nabla_executable = executable
+	complete := false
+	defer if !complete {
+		delete(options.nabla_executable)
+		options.nabla_executable = ""
+	}
+	if config != "" {
+		if os.is_absolute_path(config) {
+			absolute, path_error := strings.clone(config, context.allocator)
+			if path_error != nil {
+				fmt.eprintf("nabla: cannot copy the explicit configuration path: %v\n", path_error)
+				return false
+			}
+			options.nabla_config = absolute
+		} else {
+			directory, directory_error := os.get_working_directory(context.temp_allocator)
+			if directory_error != nil {
+				fmt.eprintf("nabla: cannot resolve the explicit configuration directory: %v\n", directory_error)
+				return false
+			}
+			absolute, path_error := filepath.join({directory, config}, context.allocator)
+			if path_error != nil {
+				fmt.eprintf("nabla: cannot resolve the explicit configuration path: %v\n", path_error)
+				return false
+			}
+			options.nabla_config = absolute
+		}
+	}
+	complete = true
+	return true
+}
+
+// chat_main returns the invocation exit code after deferred cleanup.
 chat_main :: proc() -> int {
 	args := os.args[1:]
 	// The ACP agent is a front-end of its own: it takes over the process's standard
@@ -380,6 +420,7 @@ chat_main :: proc() -> int {
 		chat_cli_usage()
 		return 0
 	}
+	explicit_config := options.config_path
 	if options.config_path == "" {
 		directory, directory_err := agent.xdg_directory(.Config, context.temp_allocator)
 		if directory_err != .None {
@@ -402,6 +443,8 @@ chat_main :: proc() -> int {
 		fmt.eprintln(config_error_display_text(options.config_path, config_err, config_detail))
 		return 1
 	}
+	if !subagent_launch_options(&harness_options, explicit_config) { return 1 }
+	defer { delete(harness_options.nabla_executable); delete(harness_options.nabla_config) }
 	defer agent.catalog_sources_destroy(&sources)
 	defer agent.mcp_servers_destroy(&mcp_servers)
 

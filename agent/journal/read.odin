@@ -123,9 +123,8 @@ read_records :: proc(
 // first. Only committed records are visible, so a line whose commit was busy is delivered
 // after it lands, never twice. They are the user.input records of session, the subagent.completed records of
 // its background tool completions, its background children (a blocking child's answer is already its call's result, and a
-// call that reported no child started has nothing to report), the subagent.message
-// records its children sent it, and the subagent.message records its parent sent it when
-// it is a child. Whatever process committed them, the seq is the order, so a session
+// call that reported no child started has nothing to report), and the subagent.message
+// records its children sent it. Whatever process committed them, the seq is the order, so a session
 // delivers them once by remembering the highest seq it delivered
 // (last_delivered_message). The result is owned by allocator; release it with
 // records_destroy.
@@ -618,7 +617,6 @@ INBOX_QUERY ::
 			AND json_extract(result.data, '$.outcome') NOT IN ('success', 'unknown')))
 	OR (inbound.kind = 'subagent.message' AND inbound.session = inbound.subagent AND inbound.session <> ?1
 		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started' AND started.subagent = inbound.session))
-	OR (inbound.kind = 'subagent.message' AND inbound.subagent = ?1 AND inbound.session <> ?1)
 ) ORDER BY inbound.seq ASC`
 
 // A count the provider did not report is JSON null, which SUM and the paired

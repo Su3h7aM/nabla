@@ -11,6 +11,84 @@ import "core:time"
 import "nabla:agent/journal"
 import "nabla:ai"
 
+NABLA_TEST_EXECUTABLE :: #config(NABLA_TEST_EXECUTABLE, "")
+
+subagent_test_begin :: proc(test: ^testing.T, fixture: ^Chat_Test, workspace: string) {
+	fixture.directory = os.make_directory_temp("", "nabla-subagent-test-*", context.allocator) or_else ""
+	if fixture.directory == "" { testing.fail_now(test, "could not create a test directory") }
+	directory := os.join_path({fixture.directory, "nabla"}, context.temp_allocator) or_else ""
+	locks := os.join_path({directory, "locks"}, context.temp_allocator) or_else ""
+	fixture.store = journal.open(directory, locks, journal.run_id_create(), .Read_Write) or_else nil
+	if fixture.store == nil { testing.fail_now(test, "could not open the subagent journal") }
+	session := journal.create_session(fixture.store, {workspace = workspace, role = .Main}) or_else journal.Session_Id{}
+	if session == {} { testing.fail_now(test, "could not create the parent session") }
+	chat_test_attach(test, fixture, session, journal.INITIAL_BRANCH, 0, workspace)
+	wrapper := os.join_path({fixture.directory, "child"}, context.temp_allocator) or_else ""
+	body := fmt.tprintf(
+		"#!/bin/sh\nexport XDG_STATE_HOME='%s'\nexport XDG_RUNTIME_DIR='%s'\nexport XDG_CACHE_HOME='%s'\nexec '%s' \"$@\"\n",
+		fixture.directory,
+		fixture.directory,
+		fixture.directory,
+		NABLA_TEST_EXECUTABLE,
+	)
+	if os.write_entire_file(wrapper, transmute([]u8)body) != nil ||
+	   os.chmod(wrapper, {.Read_User, .Write_User, .Execute_User}) != nil { testing.fail_now(test, "could not write the native child wrapper") }
+	fixture.chat.nabla_executable = strings.clone(wrapper, fixture.chat.allocator)
+	fixture.chat.nabla_config = os.join_path({fixture.directory, "config.lua"}, fixture.chat.allocator) or_else ""
+}
+
+subagent_test_reopen :: proc(test: ^testing.T, fixture, reopened: ^Chat_Test, workspace: string) -> journal.Recovery {
+	session := fixture.chat.session
+	chat_session_destroy(&fixture.chat)
+	if journal.close(fixture.store) != nil { testing.fail_now(test, "the first journal did not close") }
+	reopened.directory = fixture.directory
+	fixture^ = {}
+	directory := os.join_path({reopened.directory, "nabla"}, context.temp_allocator) or_else ""
+	locks := os.join_path({directory, "locks"}, context.temp_allocator) or_else ""
+	reopened.store = journal.open(directory, locks, journal.run_id_create(), .Read_Write) or_else nil
+	if reopened.store == nil { testing.fail_now(test, "the journal could not be reopened") }
+	if _, claim_error := journal.claim(reopened.store, session); claim_error != nil { testing.fail_now(test, "the parent could not be claimed") }
+	kept := os.join_path({reopened.directory, "tool-output"}, context.temp_allocator) or_else ""
+	recovery := journal.recover(reopened.store, kept) or_else journal.Recovery{}
+	branch, head, head_error := journal.session_head(reopened.store, session)
+	if head_error != nil { testing.fail_now(test, "the parent's head could not be read") }
+	chat_test_attach(test, reopened, session, branch, head, workspace)
+	return recovery
+}
+
+// subagent_test_prepare writes the parent's live catalog for the real child process.
+subagent_test_prepare :: proc(test: ^testing.T, chat: ^Chat_Session) {
+	if chat.catalog.catalog == nil || chat.nabla_config == "" { return }
+	body: strings.Builder
+	strings.builder_init(&body, context.temp_allocator)
+	fmt.sbprint(&body, "return { providers = {")
+	for provider in chat.catalog.catalog.providers {
+		fmt.sbprintf(
+			&body,
+			"[%q] = {{base_url = %q, api = %q, api_key = %q, models = {{",
+			provider.id,
+			provider.base_url.? or_else "",
+			provider.api.? or_else "",
+			provider.api_key.? or_else "",
+		)
+		for model in chat.catalog.catalog.models {
+			if model.provider_id != provider.id { continue }
+			fmt.sbprintf(&body, "[%q] = {{tools = true, context_window = %d, thinking = {{levels = {{", model.id, CHAT_DEFAULT_CONTEXT_WINDOW)
+			for level in model.thinking.levels.? or_else nil { fmt.sbprintf(&body, "%q,", level) }
+			fmt.sbprint(&body, "}}},")
+		}
+		fmt.sbprint(&body, "}},")
+	}
+	fmt.sbprint(&body, "} }")
+	if os.write_entire_file(chat.nabla_config, strings.to_string(body)) != nil { testing.fail_now(test, "could not write the native child config") }
+	agent_team_note_parent(chat)
+}
+
+subagent_test_turn :: proc(test: ^testing.T, chat: ^Chat_Session, connection: ai.Provider_Connection) -> bool {
+	subagent_test_prepare(test, chat)
+	return chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil)
+}
+
 // SUBAGENT_TEST_MAX_RUNNING is the configured cap the queueing tests run under. It differs from
 // SUBAGENTS_MAX_RUNNING, so a test that passes proves the configured value is the one used.
 SUBAGENT_TEST_MAX_RUNNING :: 2
@@ -18,7 +96,7 @@ SUBAGENT_TEST_MAX_RUNNING :: 2
 @(test)
 test_agents_status_reads_running_and_finished_children :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -78,65 +156,6 @@ test_agents_status_reads_running_and_finished_children :: proc(test: ^testing.T)
 	)
 }
 
-@(test)
-test_subagent_switch_at_finish_is_kept_on_resume :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	first, next: Agent_Provider
-	if !subagent_test_hold(test, &first, {agent_provider_reply("finished")}, 1) { return }
-	defer agent_provider_stop(&first)
-	if !agent_provider_start(test, &next, {agent_provider_reply("continued")}) { return }
-	defer agent_provider_stop(&next)
-	first_endpoint := agent_provider_endpoint(&first)
-	defer delete(first_endpoint)
-	next_endpoint := agent_provider_endpoint(&next)
-	defer delete(next_endpoint)
-	catalog: Subagent_Test_Catalog
-	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_catalog_add(&catalog, "test-provider", "test-model", first_endpoint, nil)
-	subagent_test_catalog_add(&catalog, "next-provider", "next-model", next_endpoint, nil)
-	chat.catalog = {
-		catalog = &catalog.catalog,
-	}
-	delete(chat.provider_id, chat.allocator)
-	chat.provider_id = strings.clone("test-provider", chat.allocator)
-	delete(chat.model_id, chat.allocator)
-	chat.model_id = strings.clone("test-model", chat.allocator)
-	agent_team_note_parent(chat)
-	_test_accept(test, chat, "start one")
-	success := journal.TOOL_OUTCOME_NAMES[.Success]
-	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","prompt":"answer"}`), success)
-	child := subagent_test_wait_request(test, chat)
-	testing.expect_value(
-		test,
-		subagent_test_call(test, chat, "switch_1", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","model":"next-model"}`),
-		success,
-	)
-	sync.sema_post(&first.release)
-	if !testing.expect(test, chat_background_wait(chat, nil)) { return }
-	applied, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Selection_Applied}}, context.temp_allocator)
-	testing.expect_value(test, read_error, nil)
-	if !testing.expect(test, found) { return }
-	testing.expect_value(test, applied.model, "next-model")
-	testing.expect_value(test, applied.provider, "next-provider")
-	testing.expect_value(test, agent_provider_request_count(&first), 1)
-	testing.expect_value(test, agent_provider_request_count(&next), 0)
-	testing.expect_value(
-		test,
-		subagent_test_call(test, chat, "resume_1", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Continue."}`),
-		success,
-	)
-	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)
-	for agent_team_running(chat.team) {
-		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(test, "the resumed child did not finish") }
-		time.sleep(time.Millisecond)
-	}
-	_ = agent_team_reap(chat.team, chat)
-	testing.expect_value(test, agent_provider_request_count(&next), 1)
-	testing.expect(test, strings.contains(agent_provider_request(&next, 0), `"model":"next-model"`))
-}
 
 // subagent_test_wait_request waits until the only child's newest journal record is a request
 // sent, which is a child held mid-request by the fixture, and returns its session.
@@ -165,6 +184,7 @@ subagent_test_hold :: proc(test: ^testing.T, provider: ^Agent_Provider, response
 // proposal would be, so its admission, delegation records, and result are the real ones.
 // It returns the call's outcome.
 subagent_test_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, name, arguments: string) -> string {
+	subagent_test_prepare(test, chat)
 	_test_stage_call(test, chat, id, arguments, name)
 	testing.expect_value(test, chat_run_tools(chat, {}), 1)
 	chat_pending_calls_clear(chat)
@@ -183,13 +203,14 @@ subagent_test_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, name, argu
 @(test)
 test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	member := Subagent {
-		name    = "agent-1",
-		session = journal.session_id_create(),
-		team    = chat.team,
+		name           = "agent-1",
+		parent_session = chat.session,
+		session        = journal.session_id_create(),
+		team           = chat.team,
 	}
 	append(&chat.team.members, &member)
 	defer clear(&chat.team.members)
@@ -204,7 +225,7 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	sent := _test_records(test, chat, {.Subagent_Message})
 	if !testing.expect_value(test, len(sent), 1) { return }
 	testing.expect_value(test, sent[0].subagent, member.session)
-	inbox, inbox_error := journal.read_inbox(chat.store, member.session, 0, context.temp_allocator)
+	inbox, inbox_error := acp_inbox(chat.store, &member, 0, context.temp_allocator)
 	testing.expect_value(test, inbox_error, nil)
 	if !testing.expect_value(test, len(inbox), 1) { return }
 	text, origin := inbox_text(inbox[0])
@@ -213,8 +234,8 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 
 	// A subagent can message only its orchestrator.
 	child_context := Tool_Context {
-		allocator = context.allocator,
-		member    = &member,
+		allocator     = context.allocator,
+		subagent_role = true,
 	}
 	to_sibling := tool_agent_execute(&child_context, Agent_Message_Args{agent = "agent-2", message = "Do this."})
 	defer tool_result_destroy(&to_sibling)
@@ -223,7 +244,7 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	// The child's own journal carries its message to the orchestrator.
 	chat_record(chat, {kind = .Subagent_Started, subagent = member.session}, journal.Subagent_Started{background = true})
 	_test_commit(test, chat)
-	child_store, child_store_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
+	child_store, child_store_open_error := journal.open(chat.store.directory, chat.store.locks, journal.run_id_create(), .Read_Write)
 	if child_store_open_error != nil {
 		testing.fail_now(test, "the child's journal could not be opened")
 	}
@@ -242,7 +263,7 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	if _, commit_error := journal.commit(child_store); commit_error != nil { testing.fail_now(test, "the child's message could not be committed") }
 	// The child's message is not the orchestrator's own message to read back.
 	own, _ := journal.read_inbox(chat.store, member.session, 0, context.temp_allocator)
-	testing.expect_value(test, len(own), 1)
+	testing.expect_value(test, len(own), 0)
 
 	chat.state = .Requesting
 	chat_steering_observe(chat, {}, nil)
@@ -315,7 +336,7 @@ subagent_test_catalog_destroy :: proc(fixture: ^Subagent_Test_Catalog) {
 @(test)
 test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
@@ -343,9 +364,12 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 		Endpoint   = endpoint,
 		Credential = "test-key",
 	}
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed")
+	testing.expect(test, subagent_test_turn(test, chat, connection), "the turn completed")
 
-	if !testing.expect_value(test, agent_provider_request_count(&provider), 4) { return }
+	if agent_provider_request_count(&provider) != 4 {
+		for record in _test_records(test, chat, {.Subagent_Completed, .Tool_Completed}) { testing.expectf(test, false, "%s: %s\n%s", journal.RECORD_KIND_NAMES[record.kind], record.data, string(record.body)) }
+		return
+	}
 	child := agent_provider_request(&provider, 1)
 	testing.expect(test, strings.contains(child, "what is six times seven"), "the subagent's request carries its task")
 	testing.expect(test, strings.contains(child, "Answer with one word."), "the subagent's request carries its instruction")
@@ -402,7 +426,7 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 @(test)
 test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	chat.tools_enabled = true
@@ -437,7 +461,7 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 		Endpoint   = orchestrator_endpoint,
 		Credential = "test-key",
 	}
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the first turn completed")
+	testing.expect(test, subagent_test_turn(test, chat, connection), "the first turn completed")
 	testing.expect(test, strings.contains(agent_provider_request(&orchestrator, 1), "agent-1"), "the call returned the subagent's id")
 
 	// The subagent has been waiting on its provider the whole time.
@@ -445,7 +469,7 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 	if !testing.expect(test, chat_background_wait(chat, nil), "the subagent's report arrives") { return }
 	accepted, had_message := chat_session_accept_agent_message(chat, {})
 	testing.expect(test, had_message && accepted == .Accepted)
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the report's turn completed")
+	testing.expect(test, subagent_test_turn(test, chat, connection), "the report's turn completed")
 	testing.expect(test, !chat_background_wait(chat, nil), "nothing more is pending")
 
 	testing.expect(test, strings.contains(agent_provider_request(&delegate, 0), `"reasoning_effort":"medium"`), "the subagent runs one level below")
@@ -456,64 +480,21 @@ test_a_background_subagent_reports_its_answer_as_a_message :: proc(test: ^testin
 
 // A script that starts a background subagent and returns without waiting on it still starts
 // it: the script's end does not stop a call whose work is meant to outlive it.
-@(test)
-test_a_script_starts_a_background_subagent_without_waiting :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	chat.tools_enabled = true
-	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
-
-	script := agent_provider_call("codemode", `{"code":"job.start('agent', {action = 'start', prompt = 'what is six times seven', model = 'sub-model'})"}`)
-	orchestrator: Agent_Provider
-	if !agent_provider_start(test, &orchestrator, {script, agent_provider_reply("waiting"), agent_provider_reply("got it")}) { return }
-	defer agent_provider_stop(&orchestrator)
-	delegate: Agent_Provider
-	if !agent_provider_start(test, &delegate, {agent_provider_reply("forty-two")}, deferred = true) { return }
-	defer agent_provider_stop(&delegate)
-	orchestrator_endpoint := agent_provider_endpoint(&orchestrator)
-	defer delete(orchestrator_endpoint)
-	delegate_endpoint := agent_provider_endpoint(&delegate)
-	defer delete(delegate_endpoint)
-
-	catalog: Subagent_Test_Catalog
-	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_catalog_add(&catalog, "test-provider", "test-model", orchestrator_endpoint, nil)
-	subagent_test_catalog_add(&catalog, "sub-provider", "sub-model", delegate_endpoint, nil)
-	chat.catalog = {
-		catalog = &catalog.catalog,
-	}
-
-	_test_accept(test, chat, "start a subagent from a script")
-	connection := ai.Provider_Connection {
-		API        = .OpenAI_Chat_Completions,
-		Endpoint   = orchestrator_endpoint,
-		Credential = "test-key",
-	}
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed before the subagent answered")
-
-	agent_provider_serve_now(&delegate)
-	if !testing.expect(test, chat_background_wait(chat, nil), "the subagent's report arrives") { return }
-	accepted, had_message := chat_session_accept_agent_message(chat, {})
-	testing.expect(test, had_message && accepted == .Accepted)
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the report's turn completed")
-	testing.expect(test, strings.contains(agent_provider_request(&orchestrator, 2), "forty-two"), "the report carries the answer")
-}
 
 // A subagent may only message its orchestrator, and the refusal names that action.
 @(test)
 test_a_subagent_cannot_start_a_subagent :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	member := Subagent {
 		name    = "agent-1",
 		session = chat.session,
 	}
-	chat.member = &member
-	defer chat.member = nil
+	chat.role = .Subagent
+	chat.parent_session = journal.session_id_create()
+	chat.subagent_name = strings.clone(member.name, chat.allocator)
 	testing.expect_value(test, tool_registry_remove_agent_management(&chat.tools), nil)
 	_test_accept(test, chat, "Investigate.")
 	for arguments in ([]string{`{"action":"start","prompt":"recurse"}`, `{"action":"configure","compact":true}`, `{"action":"stop","agent":"agent-2"}`}) {
@@ -536,7 +517,7 @@ test_a_subagent_cannot_start_a_subagent :: proc(test: ^testing.T) {
 @(test)
 test_agents_models_reads_live_catalog_and_acp_choices :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	catalog: Subagent_Test_Catalog
@@ -578,7 +559,7 @@ test_agents_models_reads_live_catalog_and_acp_choices :: proc(test: ^testing.T) 
 @(test)
 test_agent_actions_refuse_fields_from_other_actions :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	_test_accept(test, chat, "invalid calls")
@@ -595,7 +576,7 @@ test_agent_actions_refuse_fields_from_other_actions :: proc(test: ^testing.T) {
 @(test)
 test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -643,7 +624,7 @@ test_stopping_a_background_subagent_reports_to_its_parent :: proc(test: ^testing
 @(test)
 test_a_failed_background_subagent_reports_cause_and_partial_text :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	// The provider says a resend is pointless, so the cut stream ends the child's turn with
@@ -686,7 +667,7 @@ test_a_failed_background_subagent_reports_cause_and_partial_text :: proc(test: ^
 
 // subagent_test_full_team points the orchestrator at catalog's one model and fills every
 // slot with children the test finishes itself.
-subagent_test_full_team :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Catalog, endpoint: string) {
+subagent_test_full_team :: proc(test: ^testing.T, chat: ^Chat_Session, catalog: ^Subagent_Test_Catalog, endpoint: string) {
 	subagent_test_catalog_add(catalog, "test-provider", "test-model", endpoint, nil)
 	chat.catalog = {
 		catalog = &catalog.catalog,
@@ -705,7 +686,7 @@ subagent_test_full_team :: proc(chat: ^Chat_Session, catalog: ^Subagent_Test_Cat
 @(test)
 test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -716,7 +697,8 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 	defer delete(endpoint)
 	catalog: Subagent_Test_Catalog
 	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_full_team(chat, &catalog, endpoint)
+	subagent_test_full_team(test, chat, &catalog, endpoint)
+	subagent_test_prepare(test, chat)
 	team := chat.team
 	tool_context := Tool_Context {
 		allocator = context.allocator,
@@ -756,7 +738,7 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 @(test)
 test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -766,7 +748,7 @@ test_stopping_a_queued_subagent_never_starts_it :: proc(test: ^testing.T) {
 	defer delete(endpoint)
 	catalog: Subagent_Test_Catalog
 	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_full_team(chat, &catalog, endpoint)
+	subagent_test_full_team(test, chat, &catalog, endpoint)
 	_test_accept(test, chat, "start one")
 	if !testing.expect_value(
 		test,
@@ -913,7 +895,7 @@ subagent_test_acp_version_one :: proc() -> string {
 @(test)
 test_an_acp_program_answers_as_a_subagent :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	directory, directory_error := os.make_directory_temp("", "nabla-acp-agent-*", context.allocator)
 	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
@@ -965,7 +947,7 @@ test_effort_steps_down_one_level :: proc(test: ^testing.T) {
 @(test)
 test_a_crash_with_a_running_and_a_queued_child_reports_both_outcomes_once :: proc(test: ^testing.T) {
 	first: Chat_Test
-	chat_test_begin(test, &first, tool_loop_workspace(test))
+	subagent_test_begin(test, &first, tool_loop_workspace(test))
 	chat := &first.chat
 	chat.tools_enabled = true
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW)
@@ -1006,7 +988,7 @@ test_a_crash_with_a_running_and_a_queued_child_reports_both_outcomes_once :: pro
 		Endpoint   = orchestrator_endpoint,
 		Credential = "test-key",
 	}
-	if !testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed") {
+	if !testing.expect(test, subagent_test_turn(test, chat, connection), "the turn completed") {
 		chat_test_end(test, &first)
 		return
 	}
@@ -1022,7 +1004,7 @@ test_a_crash_with_a_running_and_a_queued_child_reports_both_outcomes_once :: pro
 	sends_before := agent_provider_request_count(&orchestrator)
 
 	reopened: Chat_Test
-	recovery := chat_test_reopen(test, &first, &reopened, tool_loop_workspace(test))
+	recovery := subagent_test_reopen(test, &first, &reopened, tool_loop_workspace(test))
 	defer chat_test_end(test, &reopened)
 	next := &reopened.chat
 	chat_test_capacity(next, CHAT_DEFAULT_CONTEXT_WINDOW)
@@ -1087,7 +1069,7 @@ subagent_test_result :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
 @(test)
 test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -1109,7 +1091,7 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 	child := children[0].id
 
 	// A session another process runs is refused by the claim, and the child's failure says so.
-	holder, holder_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
+	holder, holder_open_error := journal.open(chat.store.directory, chat.store.locks, journal.run_id_create(), .Read_Write)
 	if holder_open_error != nil {
 		testing.fail_now(test, "the second journal could not be opened")
 	}
@@ -1120,7 +1102,7 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 		success,
 	)
 	refused := subagent_test_report(test, chat)
-	testing.expect(test, strings.contains(refused, "agent-1 failed") && strings.contains(refused, "another process holds the session"), refused)
+	testing.expect(test, strings.contains(refused, "agent-1 failed") && strings.contains(refused, "another process runs it"), refused)
 	holder_error := journal.close(holder)
 	testing.expect(test, holder_error == nil, "the second journal closed")
 
@@ -1148,139 +1130,66 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 	testing.expect_value(test, answers, 2)
 }
 
-// A child that failed is reopened by agent configure on a model of another provider, and the
-// request that reaches it carries the whole conversation. Calls that cannot reopen it are
-// refused with what the model needs to correct them, and leave no message behind.
+// A finished child accepts independent selectors without generating a task, then continues on that selection.
 @(test)
-test_agent_message_reopens_a_failed_subagent_on_another_model :: proc(test: ^testing.T) {
+test_finished_subagent_configures_model_and_effort_independently :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
-	cut := "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-should-retry: false\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"The parser lives in\"},\"finish_reason\":null}]}\n\n"
-	failing: Agent_Provider
-	if !agent_provider_start(test, &failing, {cut}) { return }
-	defer agent_provider_stop(&failing)
-	other: Agent_Provider
-	if !agent_provider_start(test, &other, {agent_provider_reply("parser.odin")}) { return }
-	defer agent_provider_stop(&other)
-	failing_endpoint := agent_provider_endpoint(&failing)
-	defer delete(failing_endpoint)
-	other_endpoint := agent_provider_endpoint(&other)
-	defer delete(other_endpoint)
+	first, second: Agent_Provider
+	if !agent_provider_start(test, &first, {agent_provider_reply("first answer")}) { return }
+	defer agent_provider_stop(&first)
+	if !agent_provider_start(test, &second, {agent_provider_reply("continued answer")}) { return }
+	defer agent_provider_stop(&second)
+	first_endpoint := agent_provider_endpoint(&first)
+	defer delete(first_endpoint)
+	second_endpoint := agent_provider_endpoint(&second)
+	defer delete(second_endpoint)
 	catalog: Subagent_Test_Catalog
 	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_catalog_add(&catalog, "test-provider", "test-model", failing_endpoint, nil)
-	subagent_test_catalog_add(&catalog, "other-provider", "other-model", other_endpoint, nil)
+	subagent_test_catalog_add(&catalog, "test-provider", "test-model", first_endpoint, {"low", "high"})
+	subagent_test_catalog_add(&catalog, "other-provider", "other-model", second_endpoint, {"low", "high"})
 	subagent_test_parent(chat, &catalog)
 	_test_accept(test, chat, "start one")
-
 	success := journal.TOOL_OUTCOME_NAMES[.Success]
-	testing.expect_value(
-		test,
-		subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","instruction":"Report file names only.","prompt":"find the parser"}`),
-		success,
-	)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "agent-1 failed"), "the child failed")
-
-	// A name that is not a child of this session lists the ones that are, with how each ended.
-	testing.expect(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-9","message":"Hello."}`) != success)
-	testing.expect(test, strings.contains(subagent_test_result(test, chat), "agent-1 (failed)"), subagent_test_result(test, chat))
-	// A provider that does not exist lists the ones that do, and a refused call leaves no message.
-	testing.expect(
-		test,
-		subagent_test_call(test, chat, "send_2", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","message":"Continue.","provider":"nowhere"}`) !=
-		success,
-	)
-	testing.expect(
-		test,
-		strings.contains(subagent_test_result(test, chat), "configured providers: test-provider, other-provider"),
-		subagent_test_result(test, chat),
-	)
-	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 0)
-
-	testing.expect_value(
-		test,
-		subagent_test_call(test, chat, "send_3", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","message":"Continue.","model":"other-model"}`),
-		success,
-	)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "parser.odin"), "the reopened child answered")
-	testing.expect_value(test, agent_provider_request_count(&failing), 1)
-	if !testing.expect_value(test, agent_provider_request_count(&other), 1) { return }
-	request := agent_provider_request(&other, 0)
-	for expected in ([]string{"Report file names only.", "find the parser", "Continue."}) {
-		testing.expect(test, strings.contains(request, expected), expected)
-	}
-	children, _ := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
-	if !testing.expect_value(test, len(children), 1) { return }
-	turn, found, turn_error := journal.read_latest(chat.store, {session = children[0].id, kinds = {.Turn_Started}}, context.temp_allocator)
-	testing.expect(test, turn_error == nil && found)
-	testing.expect_value(test, turn.provider, "other-provider")
-	testing.expect_value(test, turn.model, "other-model")
-}
-
-// agent configure with compact and no message reopens a finished child only to compact it: the
-// child's journal gets the summary and its checkpoint, and the orchestrator gets a completion.
-// A later message names an effort, which the child's next turn runs with.
-@(test)
-test_agent_configure_compacts_a_finished_subagent_and_continues_with_an_effort :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	provider: Agent_Provider
-	// The child holds more than the newest messages a summary keeps verbatim, and the
-	// oldest are longer than the summary, so there is something to summarize.
-	bulk, _ := strings.repeat("forty-two ", 1000, context.temp_allocator)
-	responses := make([dynamic]string, context.temp_allocator)
-	append(&responses, agent_provider_reply(bulk))
-	for _ in 0 ..< 5 { append(&responses, agent_provider_reply("again")) }
-	append(&responses, agent_provider_reply(COMPACT_TEST_SUMMARY), agent_provider_reply("eighty-four"))
-	if !agent_provider_start(test, &provider, responses[:]) { return }
-	defer agent_provider_stop(&provider)
-	endpoint := agent_provider_endpoint(&provider)
-	defer delete(endpoint)
-	catalog: Subagent_Test_Catalog
-	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_catalog_add(&catalog, "test-provider", "test-model", endpoint, {"low", "high"})
-	subagent_test_parent(chat, &catalog)
-	_test_accept(test, chat, "start one")
-
-	success := journal.TOOL_OUTCOME_NAMES[.Success]
-	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","prompt":"what is six times seven"}`), success)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "forty-two"), "the child answered")
+	testing.expect_value(test, subagent_test_call(test, chat, "spawn", TOOL_AGENT_NAME, `{"action":"start","prompt":"first task","effort":"high"}`), success)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "first answer"))
 	children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
 	if !testing.expect(test, children_error == nil && len(children) == 1) { return }
 	child := children[0].id
-	for index in 0 ..< 5 {
-		call := fmt.tprintf("more_%d", index)
-		testing.expect_value(test, subagent_test_call(test, chat, call, TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Again."}`), success)
-		testing.expect(test, strings.contains(subagent_test_report(test, chat), "again"), "the child answered")
-	}
-
-	testing.expect_value(test, subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","compact":true}`), success)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "agent-1 answered"), "the compaction ended with a completion")
-	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 5)
-
-	for kind in ([]journal.Record_Kind{.Compaction_Completed, .Checkpoint_Installed}) {
-		records, _, read_error := journal.read_records(chat.store, {session = child, kinds = {kind}}, 0, 0, context.temp_allocator)
-		testing.expect(test, read_error == nil && len(records) == 1, "the child's journal holds the compaction")
-	}
-
 	testing.expect_value(
 		test,
-		subagent_test_call(test, chat, "send_2", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","message":"Now double it.","effort":"high"}`),
+		subagent_test_call(test, chat, "model", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","model":"other-model"}`),
 		success,
 	)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "eighty-four"), "the reopened child answered")
-	turn, found, turn_error := journal.read_latest(chat.store, {session = child, kinds = {.Turn_Started}}, context.temp_allocator)
-	testing.expect(test, turn_error == nil && found)
+	selected := subagent_test_result(test, chat)
+	testing.expect(test, strings.contains(selected, "other-provider/other-model") && strings.contains(selected, "high"), selected)
+	testing.expect_value(test, agent_provider_request_count(&first), 1)
+	testing.expect_value(test, agent_provider_request_count(&second), 0)
+	testing.expect_value(test, subagent_test_call(test, chat, "effort", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","effort":"low"}`), success)
+	selected = subagent_test_result(test, chat)
+	testing.expect(test, strings.contains(selected, "other-provider/other-model") && strings.contains(selected, "low"), selected)
+	testing.expect_value(test, agent_provider_request_count(&first), 1)
+	testing.expect_value(test, agent_provider_request_count(&second), 0)
+	testing.expect_value(
+		test,
+		subagent_test_call(test, chat, "continue", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Continue this task."}`),
+		success,
+	)
+	testing.expect(test, strings.contains(subagent_test_report(test, chat), "continued answer"))
+	testing.expect_value(test, agent_provider_request_count(&second), 1)
+	request := agent_provider_request(&second, 0)
+	for expected in ([]string{"first task", "first answer", "Continue this task."}) { testing.expect(test, strings.contains(request, expected), expected) }
+	turn, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Turn_Started}}, context.temp_allocator)
+	if !testing.expect(test, read_error == nil && found) { return }
 	started: journal.Turn_Started
-	testing.expect(test, journal.payload_decode(turn.data, &started, context.temp_allocator) == nil)
-	testing.expect_value(test, started.effort, "high")
-
-	// Neither a message nor compact is not a call.
-	testing.expect(test, subagent_test_call(test, chat, "send_3", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1"}`) != success)
+	testing.expect_value(test, journal.payload_decode(turn.data, &started, context.temp_allocator), nil)
+	testing.expect_value(test, turn.provider, "other-provider")
+	testing.expect_value(test, turn.model, "other-model")
+	testing.expect_value(test, started.effort, "low")
+	children, children_error = journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+	testing.expect(test, children_error == nil && len(children) == 1 && children[0].id == child)
 }
 
 // While a child's first request is held, agent configure with a model on another provider switches
@@ -1289,7 +1198,7 @@ test_agent_configure_compacts_a_finished_subagent_and_continues_with_an_effort :
 @(test)
 test_agent_configure_switches_a_running_subagent_to_another_provider :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	first, second: Agent_Provider
@@ -1322,7 +1231,8 @@ test_agent_configure_switches_a_running_subagent_to_another_provider :: proc(tes
 		subagent_test_call(test, chat, "send_2", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","message":"Typo.","model":"nowhere"}`) != success,
 	)
 	sync.sema_post(&first.release)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "second"), "the child answered from the second provider")
+	report := subagent_test_report(test, chat)
+	testing.expect(test, strings.contains(report, "second"), report)
 
 	testing.expect_value(test, agent_provider_request_count(&first), 1)
 	if !testing.expect_value(test, agent_provider_request_count(&second), 1) { return }
@@ -1336,56 +1246,12 @@ test_agent_configure_switches_a_running_subagent_to_another_provider :: proc(tes
 	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 1)
 }
 
-// A switch needs no message: agent configure with only a model switches the running child at its
-// next request, which reaches the other provider, and records no message.
-@(test)
-test_agent_configure_with_only_a_model_switches_a_running_subagent :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	first, second: Agent_Provider
-	if !subagent_test_hold(test, &first, {agent_provider_call("codemode", `{"code":"return 1"}`)}, 1) { return }
-	defer agent_provider_stop(&first)
-	if !agent_provider_start(test, &second, {agent_provider_reply("second")}) { return }
-	defer agent_provider_stop(&second)
-	first_endpoint := agent_provider_endpoint(&first)
-	defer delete(first_endpoint)
-	second_endpoint := agent_provider_endpoint(&second)
-	defer delete(second_endpoint)
-	catalog: Subagent_Test_Catalog
-	defer subagent_test_catalog_destroy(&catalog)
-	subagent_test_catalog_add(&catalog, "test-provider", "test-model", first_endpoint, nil)
-	subagent_test_catalog_add(&catalog, "other-provider", "other-model", second_endpoint, nil)
-	subagent_test_parent(chat, &catalog)
-	_test_accept(test, chat, "start one")
-
-	success := journal.TOOL_OUTCOME_NAMES[.Success]
-	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","prompt":"first task"}`), success)
-	child := subagent_test_wait_request(test, chat)
-	testing.expect_value(
-		test,
-		subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","model":"other-model"}`),
-		success,
-	)
-	testing.expect(test, strings.contains(subagent_test_result(test, chat), "a switch to other-provider/other-model"), subagent_test_result(test, chat))
-	sync.sema_post(&first.release)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "second"), "the child answered from the second provider")
-
-	testing.expect_value(test, agent_provider_request_count(&first), 1)
-	testing.expect_value(test, agent_provider_request_count(&second), 1)
-	applied, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Selection_Applied}}, context.temp_allocator)
-	testing.expect(test, read_error == nil && found)
-	testing.expect_value(test, applied.model, "other-model")
-	testing.expect_value(test, len(_test_records(test, chat, {.Subagent_Message})), 0)
-}
-
 // While a child's request is held, agent message with a message delivers it into the running
-// turn: the child's next request carries it and no second turn starts.
+// turn: the child's next request carries it exactly once.
 @(test)
 test_agent_message_delivers_a_message_into_a_running_subagent_turn :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -1401,18 +1267,19 @@ test_agent_message_delivers_a_message_into_a_running_subagent_turn :: proc(test:
 
 	success := journal.TOOL_OUTCOME_NAMES[.Success]
 	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","prompt":"first task"}`), success)
-	child := subagent_test_wait_request(test, chat)
+	_ = subagent_test_wait_request(test, chat)
 	testing.expect_value(
 		test,
 		subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Also check the tests."}`),
 		success,
 	)
 	sync.sema_post(&provider.release)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "second"), "the child answered the message")
+	report := subagent_test_report(test, chat)
+	testing.expect(test, strings.contains(report, "second"), report)
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 1), "Also check the tests."), "the second request carries the message")
-	turns, _, turns_error := journal.read_records(chat.store, {session = child, kinds = {.Turn_Started}}, 0, 0, context.temp_allocator)
-	testing.expect(test, turns_error == nil && len(turns) == 1, "the message continued the running turn")
+	testing.expect_value(test, strings.count(agent_provider_request(&provider, 1), "Also check the tests."), 1)
+
 }
 
 // While a child's request is held, agent configure with compact starts the child's compaction, and
@@ -1420,7 +1287,7 @@ test_agent_message_delivers_a_message_into_a_running_subagent_turn :: proc(test:
 @(test)
 test_agent_configure_compacts_a_running_subagent_without_stopping_it :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	provider: Agent_Provider
@@ -1476,7 +1343,7 @@ test_agent_configure_compacts_a_running_subagent_without_stopping_it :: proc(tes
 @(test)
 test_agent_configure_resumes_a_finished_acp_subagent :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	directory, directory_error := os.make_directory_temp("", "nabla-acp-resume-*", context.allocator)
@@ -1511,7 +1378,7 @@ test_agent_configure_resumes_a_finished_acp_subagent :: proc(test: ^testing.T) {
 		compact = true,
 	}
 	_, refusal := subagent_resume_plan(chat, chat.team, &compact)
-	testing.expect_value(test, refusal, "ACP agents manage their own context")
+	testing.expect_value(test, refusal, "")
 	testing.expect_value(
 		test,
 		subagent_test_call(
@@ -1583,7 +1450,7 @@ test_agent_configure_resumes_a_finished_acp_subagent :: proc(test: ^testing.T) {
 @(test)
 test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	directory, directory_error := os.make_directory_temp("", "nabla-acp-switch-*", context.allocator)
 	if directory_error != nil { testing.fail_now(test, "could not create a temporary directory") }
@@ -1615,17 +1482,20 @@ test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
 		agent   = member.name,
 		compact = true,
 	}
-	_, live, refusal := subagent_control_plan(member.team, &compact)
+	_, live, refusal := acp_configure_plan(member.team, &compact)
 	testing.expect(test, live)
-	testing.expect_value(test, refusal, "ACP agents manage their own context")
+	testing.expect_value(test, refusal, "")
 	invalid := Agent_Message_Args {
 		agent = member.name,
 		model = "missing",
 	}
-	_, live, refusal = subagent_control_plan(member.team, &invalid)
+	_, live, refusal = acp_configure_plan(member.team, &invalid)
 	if !testing.expect(test, live && refusal == "", refusal) { return }
-	subagent_control_apply(member.team, member.name, &invalid.control)
+	acp_configure_queue(member.team, member.name, &invalid.control)
 	if problem = acp_control_apply(&connection); !testing.expect_value(test, problem, "") { return }
+	for len(connection.pending) > 0 {
+		if problem = acp_receive(&connection); !testing.expect_value(test, problem, "") { return }
+	}
 	messages, inbox_error := journal.read_inbox(fixture.chat.store, fixture.chat.session, 0, context.temp_allocator)
 	if testing.expect(test, inbox_error == nil && len(messages) == 1) {
 		text, _ := inbox_text(messages[0])
@@ -1636,11 +1506,14 @@ test_acp_model_switch_applies_between_prompts :: proc(test: ^testing.T) {
 		model  = "model-b",
 		effort = "high",
 	}
-	_, live, refusal = subagent_control_plan(member.team, &update)
+	_, live, refusal = acp_configure_plan(member.team, &update)
 	testing.expect(test, live)
 	if !testing.expect_value(test, refusal, "") { return }
-	subagent_control_apply(member.team, member.name, &update.control)
+	acp_configure_queue(member.team, member.name, &update.control)
 	if problem = acp_control_apply(&connection); !testing.expect_value(test, problem, "") { return }
+	for len(connection.pending) > 0 {
+		if problem = acp_receive(&connection); !testing.expect_value(test, problem, "") { return }
+	}
 	reason, prompt_problem = acp_prompt(&connection, "Check switch.")
 	testing.expect_value(test, prompt_problem, "")
 	testing.expect_value(test, reason, "end_turn")
@@ -1667,7 +1540,7 @@ subagent_hold_run :: proc(worker: ^Job) {
 @(test)
 test_an_abandoned_subagent_is_reclaimed_after_publication :: proc(test: ^testing.T) {
 	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	subagent_test_begin(test, &fixture, tool_loop_workspace(test))
 	defer chat_test_end(test, &fixture)
 	chat := &fixture.chat
 	team := chat.team

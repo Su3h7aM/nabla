@@ -442,7 +442,7 @@ Subagent_Completed :: struct {
 
 // Subagent_Message carries one message of a delegation in the body. The record's
 // session is the sender's and its subagent column the child's session, so each
-// side finds the other's messages with read_inbox. name is the id the parent's model
+// parent's inbox reads replies while its ACP client sends parent messages as prompts. name is the id the parent's model
 // knows the child by.
 Subagent_Message :: struct {
 	version: int,

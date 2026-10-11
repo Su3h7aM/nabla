@@ -403,6 +403,14 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		name := completed.name if completed.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
 		switch completed.outcome {
 		case journal.TOOL_OUTCOME_NAMES[.Success]:
+			if body == "" {
+				selection := ""
+				if completed.acp_model != "" { selection = fmt.tprintf("model: %s", completed.acp_model) }
+				if completed.acp_effort != "" {
+					selection = fmt.tprintf("%s%seffort: %s", selection, "\n" if selection != "" else "", completed.acp_effort)
+				}
+				return inbox_report(fmt.tprintf("%s finished", name), selection), .Agent
+			}
 			return inbox_report(fmt.tprintf("%s answered", name), body), .Agent
 		case journal.TOOL_OUTCOME_NAMES[.Cancelled]:
 			return inbox_report(fmt.tprintf("%s stopped", name), inbox_last_text(body)), .Agent

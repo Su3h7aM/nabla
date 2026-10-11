@@ -48,6 +48,10 @@ collection="-collection:nabla=$NABLA_ROOT"
 out_directory="$(mktemp -d "${TMPDIR:-/tmp}/nabla-test.XXXXXX")"
 trap 'rm -rf "$out_directory"' EXIT
 
+# Native subagent tests launch the same executable users run.
+nabla_step "build native ACP test executable"
+"$NABLA_ODIN" build . "$collection" "${NABLA_DEFINES[@]}" "-out:$out_directory/nabla"
+
 # Both configurations run: -debug carries extra contract asserts (notably in
 # layout and tui) that release compiles out, while release tests the exact
 # codegen that ships. One mode cannot stand in for the other.
@@ -63,6 +67,7 @@ for config in "${configs[@]}"; do
 		[[ -n "$target" && "$target" != "$pkg" ]] && continue
 		extra=(
 			-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+			"-define:NABLA_TEST_EXECUTABLE=$out_directory/nabla"
 			"-out:$out_directory/${pkg//\//_}-$config.bin"
 			"${NABLA_DEFINES[@]}"
 		)

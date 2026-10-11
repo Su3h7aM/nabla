@@ -25,6 +25,9 @@ Config_Error :: enum {
 }
 
 Harness_Options :: struct {
+	// Launch paths are borrowed runtime inputs, not configuration values.
+	nabla_executable:             string,
+	nabla_config:                 string,
 	disable_project_instructions: bool,
 	compact_on_switch:            bool,
 	// subagents_max_running is the configured subagent concurrency; zero means unset, which

@@ -94,7 +94,7 @@ Tool_Context :: struct {
 	// agents is the calling orchestrator's team and member the calling subagent's own
 	// record, set only for the agent tools; the other is nil. Both outlive the call.
 	agents:           ^Agent_Team,
-	member:           ^Subagent,
+	subagent_role:    bool,
 	// background is the calling session's detached jobs, set only for the jobs tool.
 	background:       ^Background_Jobs,
 	// subagent is the delegation an agent tool call acts on, named by the child session.

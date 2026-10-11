@@ -418,8 +418,8 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	if definition.placement == .Owner { job.exec.compact = &chat.compact }
 	switch definition.kind {
 	case .Agent, .Agents:
-		job.exec.agents = chat.team if chat.member == nil else nil
-		job.exec.member = chat.member
+		job.exec.agents = chat.team
+		job.exec.subagent_role = chat.role == .Subagent
 		if definition.kind == .Agents {
 			job.exec.status_store = chat.store
 			job.exec.status_session = chat.session
@@ -449,7 +449,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		return
 	}
 	object := job.admitted.value.(json.Object)
-	if definition.kind == .Agent && job.exec.member != nil {
+	if definition.kind == .Agent && job.exec.subagent_role {
 		if action, is_string := object["action"].(json.String); is_string && action != "message" {
 			job.result = tool_result_failure(&job.exec, .Unavailable, TOOL_AGENT_ORCHESTRATOR_ONLY, "unavailable")
 			job.phase = .Result_Ready
@@ -468,6 +468,12 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	#partial switch decoded in args {
 	case Shell_Args:
 		job.background = !decoded.wait
+	case Agent_Message_Args:
+		if decoded.action == .Configure && decoded.message == "" && !decoded.compact {
+			job.placement = .Worker
+			job.lane = job
+			job.exec.compact = nil
+		}
 	case Agent_Start_Args:
 		job.background = !decoded.wait
 		if decoded.wait {
@@ -718,7 +724,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat
 		repair_names[repair_count] = TOOL_REPAIR_NAMES[repair]
 		repair_count += 1
 	}
-	if _, is_update := job.arguments.(Agent_Message_Args); is_update && job.exec.agents != nil && job.exec.member == nil {
+	if _, is_update := job.arguments.(Agent_Message_Args); is_update && job.exec.agents != nil && !job.exec.subagent_role {
 		// A child that has finished is continued from its journal records, so its outcome is
 		// committed before the message that continues it.
 		_ = agent_team_reap(job.exec.agents, chat)
@@ -734,7 +740,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat
 		journal.Tool_Admitted{tool = job.name, repairs = repair_names[:repair_count]},
 		transmute([]u8)job.admitted.effective,
 	)
-	if start, is_start := job.arguments.(Agent_Start_Args); is_start && job.exec.agents != nil && job.exec.member == nil {
+	if start, is_start := job.arguments.(Agent_Start_Args); is_start && job.exec.agents != nil && !job.exec.subagent_role {
 		// The delegation is named before its child exists, so the child's session is
 		// traceable to this call whatever happens next.
 		job.exec.subagent = journal.session_id_create()
@@ -762,7 +768,7 @@ tool_jobs_dispatch :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat
 	if updates && committed && job.exec.subagent != {} { owner_wake_signal() }
 	if !committed {
 		// The call never runs, so the switch resolved for the child is not handed over.
-		if update, is_update := &job.arguments.(Agent_Message_Args); is_update { subagent_control_destroy(&update.control) }
+		if update, is_update := &job.arguments.(Agent_Message_Args); is_update { acp_configure_destroy(&update.control) }
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}
@@ -815,17 +821,18 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, update: ^Age
 		call        = job.call.call,
 		parent_call = parent_call,
 	}
-	if member := job.exec.member; member != nil {
+	if chat.role == .Subagent {
 		// A subagent can message only its orchestrator; the executor refuses the rest.
 		if (update.agent != "" && update.agent != "orchestrator") || update.action != .Message { return }
-		header.subagent = member.session
-		job.exec.subagent = member.session
-		chat_record(chat, header, journal.Subagent_Message{name = member.name}, transmute([]u8)update.message)
+		header.subagent = chat.session
+		job.exec.subagent = chat.session
+		chat_record(chat, header, journal.Subagent_Message{name = chat.subagent_name}, transmute([]u8)update.message)
 		return
 	}
 	if job.exec.agents == nil || update.agent == "" { return }
-	session, live, problem := subagent_control_plan(job.exec.agents, update)
+	session, live, problem := acp_configure_plan(job.exec.agents, update)
 	if live {
+		update.control.call = job.call.call
 		if problem != "" {
 			update.refusal = problem
 			return
@@ -846,7 +853,7 @@ tool_job_stage_message :: proc(chat: ^Chat_Session, job: ^Tool_Job, update: ^Age
 			provider   = update.provider,
 			model      = update.model,
 			effort     = update.effort,
-			background = true,
+			background = update.message != "" || update.compact,
 		}
 		chat_record(chat, start, started, transmute([]u8)update.resume.instruction)
 	}
