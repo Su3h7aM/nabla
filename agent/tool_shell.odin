@@ -43,6 +43,246 @@ TOOL_SHELL_FIELDS :: []string{"command", "working_directory", "timeout_ms", "wai
 TOOL_SHELL_DEFAULT_TIMEOUT :: 120 * time.Second
 
 TOOL_SHELL_BACKGROUND_NOTICE :: "background processes left in the command's process group were terminated; start a long-running process with setsid to keep it"
+// TOOL_SHELL_SEARCH_HINT_FORMAT is the note a shell result carries after its stdout and
+// stderr sections when its command ran a file-search CLI. It states what ran and softly
+// prefers the native tools for file search; the model decides what to call.
+TOOL_SHELL_SEARCH_HINT_FORMAT :: "\nhint: this command ran %s; prefer the native find and grep tools for file search (paged results with cursors).\n"
+
+// TOOL_SHELL_SEPARATORS end a command in a command list or a pipeline.
+@(private)
+TOOL_SHELL_SEPARATORS :: ";&|\n"
+
+// TOOL_SHELL_BLANKS end a word of a command.
+@(private)
+TOOL_SHELL_BLANKS :: " \t\r"
+
+// tool_shell_search_command names the file-search CLI command runs, so its result can say
+// so. It splits command into command lists at `;`, `&&`, `||`, `&`, and newline outside
+// quotes, and checks the first command of each pipeline: a grep that filters another
+// command's output is no file search. It reports false when no checked command is a
+// file-search CLI. It reads only the command text: it never runs, blocks, or fails,
+// whatever the command holds.
+@(require_results)
+tool_shell_search_command :: proc(command: string) -> (name: string, found: bool) {
+	position := 0
+	pipeline_start := true
+	for position < len(command) {
+		end := tool_shell_scan(command, position, TOOL_SHELL_SEPARATORS)
+		if pipeline_start {
+			name, found = tool_shell_search_cli(command[position:end])
+			if found { return }
+		}
+		if end == len(command) { break }
+		rest := command[end:]
+		width := 1
+		switch {
+		case strings.has_prefix(rest, "||"):
+			width = 2
+			pipeline_start = true
+		case strings.has_prefix(rest, "|&"):
+			width = 2
+			pipeline_start = false
+		case rest[0] == '|':
+			pipeline_start = false
+		case:
+			pipeline_start = true
+		}
+		position = end + width
+	}
+	return "", false
+}
+
+// tool_shell_search_cli names the file-search CLI that simple_command runs. It skips
+// leading assignments, `(`, `{`, `!`, redirections, and wrapper words with their options,
+// then reads the basename of the next word, and git's subcommand after its flags. A wrapper
+// option that takes a value is skipped with it for sudo only.
+@(private, require_results)
+tool_shell_search_cli :: proc(simple_command: string) -> (name: string, found: bool) {
+	position := 0
+	wrapper := ""
+	skip_word := false
+	for {
+		word, next, ok := tool_shell_next_word(simple_command, position)
+		if !ok { return "", false }
+		position = next
+		word = strings.trim_left(word, "(")
+		base := tool_shell_word_base(word)
+		redirection := strings.trim_left(word, "0123456789")
+		switch {
+		case skip_word:
+			skip_word = false
+		case word == "" || word == "{" || word == "!":
+		case strings.contains_rune(word, '='):
+		// An assignment before the command, as in `FOO=1 rg ...`.
+		case redirection != "" && (redirection[0] == '<' || redirection[0] == '>'):
+			// `> file` keeps its target in the next word; `>file` holds it.
+			skip_word = strings.trim_left(redirection, "<>") == ""
+		case wrapper == "command" && word[0] == '-' && strings.contains_any(word, "vV"):
+			// `command -v rg` describes rg and runs nothing.
+			return "", false
+		case wrapper != "" && word[0] == '-':
+			skip_word = wrapper == "sudo" && tool_shell_sudo_flag_takes_value(word)
+		case tool_shell_is_wrapper(base):
+			wrapper = base
+		case base == "git":
+			return tool_shell_git_subcommand(simple_command, position)
+		case:
+			if tool_shell_is_search_cli(base) { return base, true }
+			return "", false
+		}
+	}
+}
+
+// tool_shell_git_subcommand reports "git grep" when the subcommand in command, read from
+// position after git's flags and their values, is grep.
+@(private, require_results)
+tool_shell_git_subcommand :: proc(command: string, position: int) -> (name: string, found: bool) {
+	index := position
+	skip_word := false
+	for {
+		word, next, ok := tool_shell_next_word(command, index)
+		if !ok { return "", false }
+		index = next
+		switch {
+		case skip_word:
+			skip_word = false
+		case strings.contains_rune(word, '='):
+		case word[0] == '-':
+			skip_word = tool_shell_git_flag_takes_value(word)
+		case:
+			if word == "grep" { return "git grep", true }
+			return "", false
+		}
+	}
+}
+
+@(private, require_results)
+tool_shell_is_search_cli :: proc(name: string) -> bool {
+	switch name {
+	case "grep", "egrep", "fgrep", "rg", "ag", "ack", "fd", "fdfind", "find", "locate":
+		return true
+	}
+	return false
+}
+
+@(private, require_results)
+tool_shell_is_wrapper :: proc(name: string) -> bool {
+	switch name {
+	case "sudo", "env", "command", "time", "nice", "nohup", "exec":
+		return true
+	}
+	return false
+}
+
+// tool_shell_sudo_flag_takes_value reports whether the sudo flag takes the next word as its
+// value. A `--flag=value` word never reaches here: its assignment is skipped whole.
+@(private, require_results)
+tool_shell_sudo_flag_takes_value :: proc(flag: string) -> bool {
+	switch flag {
+	case "-C",
+	     "--close-from",
+	     "-D",
+	     "--chdir",
+	     "-g",
+	     "--group",
+	     "-h",
+	     "--host",
+	     "-p",
+	     "--prompt",
+	     "-r",
+	     "--role",
+	     "-t",
+	     "--type",
+	     "-U",
+	     "--other-user",
+	     "-u",
+	     "--user":
+		return true
+	}
+	return false
+}
+
+// tool_shell_git_flag_takes_value reports whether the git flag takes the next word as its
+// value.
+@(private, require_results)
+tool_shell_git_flag_takes_value :: proc(flag: string) -> bool {
+	switch flag {
+	case "-C", "-c", "--config-env", "--git-dir", "--namespace", "--super-prefix", "--work-tree":
+		return true
+	}
+	return false
+}
+
+// tool_shell_word_base strips one layer of surrounding quotes from a shell word and then
+// its directory, so `"rg"`, `'rg'`, and `/usr/bin/rg` all read as `rg`. Interior quotes
+// stay, so a word that only quotes part of its text names nothing known.
+@(private, require_results)
+tool_shell_word_base :: proc(word: string) -> string {
+	name := word
+	if len(name) >= 2 {
+		first, last := name[0], name[len(name) - 1]
+		if first == last && (first == '\'' || first == '"') { name = name[1:len(name) - 1] }
+	}
+	if slash := strings.last_index_byte(name, '/'); slash >= 0 { name = name[slash + 1:] }
+	return name
+}
+
+// tool_shell_next_word reads the word of text that starts at or after position, skipping
+// blanks first. The word borrows text. ok is false when no word follows.
+@(private, require_results)
+tool_shell_next_word :: proc(text: string, position: int) -> (word: string, next: int, ok: bool) {
+	start := len(text) - len(strings.trim_left(text[position:], TOOL_SHELL_BLANKS))
+	if start == len(text) { return "", start, false }
+	end := tool_shell_scan(text, start, TOOL_SHELL_BLANKS)
+	return text[start:end], end, true
+}
+
+// tool_shell_scan returns the index of the first byte of text at or after start that is in
+// stops and outside quotes, backslash escapes, and comments, or len(text) when there is none.
+// Single quotes hold every byte literally; elsewhere a backslash escapes the next byte. A `#`
+// that starts a word begins a comment.
+@(private, require_results)
+tool_shell_scan :: proc(text: string, start: int, stops: string) -> int {
+	quote := byte(0)
+	index := start
+	for index < len(text) {
+		c := text[index]
+		switch {
+		case quote == '\'':
+			if c == '\'' { quote = 0 }
+		case c == '\\':
+			index += 1
+		case quote == '"':
+			if c == '"' { quote = 0 }
+		case c == '\'' || c == '"':
+			quote = c
+		case c == '#' && (index == 0 || strings.index_byte(" \t\r;&|\n(", text[index - 1]) >= 0):
+			// A comment runs to the end of the line; the newline itself is still scanned.
+			for index + 1 < len(text) && text[index + 1] != '\n' { index += 1 }
+		case strings.index_byte(stops, c) >= 0:
+			return index
+		}
+		index += 1
+	}
+	return len(text)
+}
+
+// tool_shell_search_hint appends the file-search hint for command to result's content,
+// after the stdout and stderr sections. The command's own output bytes are untouched, and a
+// command that runs no file-search CLI, or a hint that cannot be appended, leaves the
+// result as it was: the hint never blocks, fails, or rewrites an execution.
+@(require_results)
+tool_shell_search_hint :: proc(ctx: ^Tool_Context, result: Tool_Result, command: string) -> Tool_Result {
+	name, found := tool_shell_search_command(command)
+	if !found { return result }
+	result := result
+	hint := fmt.tprintf(TOOL_SHELL_SEARCH_HINT_FORMAT, name)
+	joined, join_error := strings.concatenate({result.content, hint}, result.allocator)
+	if join_error != nil { return result }
+	delete(result.content, result.allocator)
+	result.content = joined
+	return result
+}
 
 // tool_shell_description describes the shell tool for shell, which decides the syntax the
 // model has to write. The caller owns the text, allocated with allocator.
@@ -169,14 +409,29 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	if spawn != .Started { return tool_shell_not_started(ctx, spawn_error, data) }
 	defer subprocess.child_close(&child)
 
+	// Only a command that started ran, so only its result can name a file-search CLI.
+	result := tool_shell_finish(ctx, &child, stdout_read, stderr_read, args, &data)
+	return tool_shell_search_hint(ctx, result, args.command)
+}
+
+// tool_shell_finish drains the output of a started command, waits for it, and reports how
+// it ended.
+@(require_results)
+tool_shell_finish :: proc(
+	ctx: ^Tool_Context,
+	child: ^subprocess.Child,
+	stdout_read, stderr_read: ^os.File,
+	args: Shell_Args,
+	data: ^Shell_Output,
+) -> Tool_Result {
 	stop, wait_error, background_terminated := tool_drain_pipes(
-		&child,
+		child,
 		stdout_read,
 		stderr_read,
 		time.tick_now(),
 		args.timeout,
 		ctx.control,
-		&data,
+		data,
 		ctx.output_base,
 		ctx.stream,
 		ctx.allocator,
@@ -184,34 +439,34 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	switch stop {
 	case .Wait_Failed:
 		message := fmt.tprintf("the harness could not wait for the command, so it was stopped: %s", os.error_string(wait_error))
-		return tool_result_of(ctx, .Tool_Failed, message, data, "wait failed")
+		return tool_result_of(ctx, .Tool_Failed, message, data^, "wait failed")
 	case .Cancelled:
-		return tool_result_of(ctx, .Cancelled, "the command was cancelled", data, "cancelled")
+		return tool_result_of(ctx, .Cancelled, "the command was cancelled", data^, "cancelled")
 	case .Timed_Out:
-		return tool_result_of(ctx, .Timed_Out, "the command exceeded its timeout", data, "timed out")
+		return tool_result_of(ctx, .Timed_Out, "the command exceeded its timeout", data^, "timed out")
 	case .None:
 	}
 
-	exited, exit_code, waited := subprocess.child_reap(&child)
+	exited, exit_code, waited := subprocess.child_reap(child)
 	if !waited {
 		message := "the command ran, but its exit status could not be read"
 		message = tool_shell_background_message(message, background_terminated)
-		return tool_result_of(ctx, .Unknown, message, data, "exit unknown")
+		return tool_result_of(ctx, .Unknown, message, data^, "exit unknown")
 	}
 	if !exited {
 		message := "the command was ended by a signal"
 		message = tool_shell_background_message(message, background_terminated)
-		return tool_result_of(ctx, .Tool_Failed, message, data, "signalled")
+		return tool_result_of(ctx, .Tool_Failed, message, data^, "signalled")
 	}
 	data.exit_code = exit_code
 	if exit_code != 0 {
 		message := fmt.tprintf("the command exited with status %d", exit_code)
 		message = tool_shell_background_message(message, background_terminated)
-		return tool_result_of(ctx, .Tool_Failed, message, data, fmt.tprintf("exited %d", exit_code))
+		return tool_result_of(ctx, .Tool_Failed, message, data^, fmt.tprintf("exited %d", exit_code))
 	}
 	message := ""
 	if background_terminated { message = TOOL_SHELL_BACKGROUND_NOTICE }
-	return tool_result_of(ctx, .Success, message, data, "exited 0")
+	return tool_result_of(ctx, .Success, message, data^, "exited 0")
 }
 
 // tool_shell_not_started reports a command that did not start, naming the
