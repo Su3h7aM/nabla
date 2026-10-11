@@ -1,6 +1,7 @@
 #+test
 package agent
 
+import "core:container/queue"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -784,16 +785,20 @@ test_acp_next_reports_a_malformed_json_rpc_frame :: proc(test: ^testing.T) {
 	readers := ACP_Readers {
 		allocator = context.allocator,
 	}
-	readers.frames.allocator = context.allocator
+	if queue.init(&readers.frames, allocator = context.allocator) != nil { testing.fail_now(test, "could not create the ACP frame queue") }
 	frame, frame_error := strings.clone("{}", context.allocator)
 	if frame_error != nil { testing.fail_now(test, "could not create the ACP frame") }
-	if _, append_error := append(&readers.frames, frame); append_error != nil {
+	if _, push_error := queue.push_back(&readers.frames, frame); push_error != nil {
 		delete(frame, context.allocator)
 		testing.fail_now(test, "could not create the ACP frame")
 	}
 	defer {
-		for queued in readers.frames { delete(queued, context.allocator) }
-		delete(readers.frames)
+		for {
+			queued, ok := queue.pop_front_safe(&readers.frames)
+			if !ok { break }
+			delete(queued, context.allocator)
+		}
+		queue.destroy(&readers.frames)
 	}
 	connection := ACP_Connection {
 		member  = &member,

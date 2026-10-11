@@ -1,6 +1,7 @@
 package agent
 
 import "base:runtime"
+import "core:container/queue"
 import "core:encoding/json"
 import "core:fmt"
 import "core:io"
@@ -380,7 +381,7 @@ ACP_Readers :: struct {
 	threads:     [ACP_Worker]^thread.Thread,
 	done:        [ACP_Worker]bool,
 	decoder:     acp.Frame_Decoder,
-	frames:      [dynamic]string,
+	frames:      queue.Queue(string),
 	frame_error: acp.Frame_Error,
 	read_error:  os.Error,
 	wait_error:  os.Error,
@@ -419,7 +420,7 @@ acp_output_read :: proc(worker: ^thread.Thread) {
 		frame_error := acp.frame_decoder_feed(&readers.decoder, buffer[:taken], &frames)
 		{
 			sync.mutex_guard(&readers.mutex)
-			if _, append_error := append(&readers.frames, ..frames[:]); append_error != nil {
+			if _, push_error := queue.push_back_elems(&readers.frames, ..frames[:]); push_error != nil {
 				for frame in frames { delete(frame, readers.allocator) }
 				frame_error = .Allocation
 			}
@@ -660,8 +661,6 @@ subagent_acp_run :: proc(member: ^Subagent) {
 
 // ACP_Outstanding owns the identity and values needed when its response arrives.
 @(private)
-ACP_Prompt_Reply :: struct {}
-@(private)
 ACP_Model_Reply :: struct {
 	model, effort: string,
 }
@@ -669,9 +668,10 @@ ACP_Model_Reply :: struct {
 ACP_Effort_Reply :: struct {
 	effort: string,
 }
+// ACP_Reply is what installing an answer needs beyond the answer. A prompt's answer carries
+// only its stop reason, so a prompt is the nil reply.
 @(private)
 ACP_Reply :: union {
-	ACP_Prompt_Reply,
 	ACP_Model_Reply,
 	ACP_Effort_Reply,
 }
@@ -684,7 +684,7 @@ ACP_Outstanding :: struct {
 @(private)
 acp_request_destroy :: proc(request: ^ACP_Outstanding, allocator: mem.Allocator) {
 	switch reply in request.variant {
-	case ACP_Prompt_Reply:
+	case nil:
 	case ACP_Model_Reply:
 		delete(reply.model, allocator); delete(reply.effort, allocator)
 	case ACP_Effort_Reply:
@@ -701,21 +701,22 @@ acp_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, method: string, 
 	}
 	failed := true
 	defer if failed { acp_request_destroy(&request, allocator) }
+	// A failed clone leaves its string empty, so the deferred destroy releases the other.
 	switch value in reply {
-	case ACP_Prompt_Reply:
-		request.variant = value
+	case nil:
 	case ACP_Model_Reply:
-		owned := ACP_Model_Reply{}
-		owned.model = strings.clone(value.model, allocator) or_else ""
-		owned.effort = strings.clone(value.effort, allocator) or_else ""
+		owned: ACP_Model_Reply
+		model_error, effort_error: mem.Allocator_Error
+		owned.model, model_error = strings.clone(value.model, allocator)
+		owned.effort, effort_error = strings.clone(value.effort, allocator)
 		request.variant = owned
-		if (value.model != "" && owned.model == "") || (value.effort != "" && owned.effort == "") { return "the pending ACP request could not be held" }
+		if model_error != nil || effort_error != nil { return "the pending ACP request could not be held" }
 	case ACP_Effort_Reply:
-		owned := ACP_Effort_Reply {
-			effort = strings.clone(value.effort, allocator) or_else "",
-		}
+		owned: ACP_Effort_Reply
+		effort_error: mem.Allocator_Error
+		owned.effort, effort_error = strings.clone(value.effort, allocator)
 		request.variant = owned
-		if value.effort != "" && owned.effort == "" { return "the pending ACP request could not be held" }
+		if effort_error != nil { return "the pending ACP request could not be held" }
 	}
 	if _, append_error := append(&connection.pending, request); append_error != nil { return "the pending ACP request could not be held" }
 	connection.next_id += 1
@@ -726,13 +727,33 @@ acp_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, method: string, 
 
 @(private, require_results)
 acp_option_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, option: ACP_Config_Option, value: string) -> string {
-	request := acp.Session_Set_Config_Option_Params {
+	return acp_send(connection, reply, acp.METHOD_SESSION_SET_CONFIG_OPTION, acp_option_request(connection, option, value))
+}
+
+// acp_option_request is the session/set_config_option that sets option to value. Version 2
+// requires the value's type; version 1 reads a missing type as an id. The strings borrow
+// connection and option.
+@(private)
+acp_option_request :: proc(connection: ^ACP_Connection, option: ACP_Config_Option, value: string) -> acp.Session_Set_Config_Option_Params {
+	return {
 		session_id = connection.session_id,
-		config_id  = option.config_id if option.config_id != "" else option.id,
-		type       = "id" if connection.version == 2 else "",
-		value      = value,
+		config_id = option.config_id if option.config_id != "" else option.id,
+		type = "id" if connection.version == 2 else "",
+		value = value,
 	}
-	return acp_send(connection, reply, acp.METHOD_SESSION_SET_CONFIG_OPTION, request)
+}
+
+// acp_option_install records the agent's answer to a set_config_option for the option of
+// category: the options it sent back replace ours, or when it sent none the value just set
+// becomes the option's current value. problem is static text, "" when the answer is held.
+@(private, require_results)
+acp_option_install :: proc(connection: ^ACP_Connection, answered: []ACP_Config_Option, category, value: string) -> (problem: string) {
+	if len(answered) > 0 {
+		if !acp_options_replace(connection, answered) { return "the agent's config options could not be held" }
+	} else if !acp_option_current(connection, category, value) {
+		return "the selected option could not be held"
+	}
+	return ""
 }
 
 @(private, require_results)
@@ -778,10 +799,10 @@ acp_receive :: proc(connection: ^ACP_Connection) -> string {
 	ordered_remove(&connection.pending, index)
 	defer acp_request_destroy(&request, connection.member.allocator)
 	if failed, has_error := envelope.rpc_error.?; has_error {
-		if _, is_prompt := request.variant.(ACP_Prompt_Reply); is_prompt { return fmt.tprintf("the agent refused session/prompt: %s", failed.message) }
+		if request.variant == nil { return fmt.tprintf("the agent refused session/prompt: %s", failed.message) }
 		return acp_configure_refusal(connection, failed.message)
 	}
-	if _, is_prompt := request.variant.(ACP_Prompt_Reply); is_prompt {
+	if request.variant == nil {
 		accepted: acp.Prompt_Result
 		if acp.params_decode(envelope.result, &accepted, context.temp_allocator) != .None { return "the agent's prompt answer is not what ACP defines" }
 		connection.idle = accepted.stop_reason != ""
@@ -791,21 +812,19 @@ acp_receive :: proc(connection: ^ACP_Connection) -> string {
 	}
 	configured: ACP_Session_Opened
 	if acp.params_decode(envelope.result, &configured, context.temp_allocator) != .None { return "the agent's configuration answer is not what ACP defines" }
-	if len(configured.config_options) > 0 {
-		if !acp_options_replace(connection, configured.config_options) { return "the agent's config options could not be held" }
-	} else {
-		switch reply in request.variant {
-		case ACP_Model_Reply:
-			if !acp_option_current(connection, ACP_OPTION_CATEGORY_MODEL, reply.model) { return "the selected model could not be held" }
-		case ACP_Effort_Reply:
-			if !acp_option_current(connection, ACP_OPTION_CATEGORY_EFFORT, reply.effort) { return "the selected effort could not be held" }
-		case ACP_Prompt_Reply:
-		}
+	category, value := ACP_OPTION_CATEGORY_EFFORT, ""
+	switch reply in request.variant {
+	case ACP_Model_Reply:
+		category, value = ACP_OPTION_CATEGORY_MODEL, reply.model
+	case ACP_Effort_Reply:
+		value = reply.effort
+	case nil:
 	}
+	if install_problem := acp_option_install(connection, configured.config_options, category, value); install_problem != "" { return install_problem }
 	member := connection.member
 	if !acp_selection_apply(connection) { return "the agent's selected options could not be held" }
 	switch &reply in request.variant {
-	case ACP_Prompt_Reply:
+	case nil:
 	case ACP_Model_Reply:
 		if _, reported := acp_option(configured.config_options, ACP_OPTION_CATEGORY_MODEL); !reported {
 			sync.mutex_guard(&member.team.mutex)
@@ -898,7 +917,7 @@ acp_options_replace :: proc(connection: ^ACP_Connection, options: []ACP_Config_O
 acp_prompt_send :: proc(connection: ^ACP_Connection, text: string) -> string {
 	return acp_send(
 		connection,
-		ACP_Prompt_Reply{},
+		nil,
 		acp.METHOD_SESSION_PROMPT,
 		acp.Session_Prompt_Params{session_id = connection.session_id, prompt = {{type = acp.CONTENT_TEXT, text = text}}},
 	)
@@ -973,7 +992,7 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	connection.readers = readers
 	readers.allocator = member.allocator
 	readers.wake = &member.wake
-	readers.frames.allocator = member.allocator
+	if queue.init(&readers.frames, allocator = member.allocator) != nil { return "the agent's frame queue could not be held; nothing ran" }
 	readers.stderr_tail.allocator = member.allocator
 	output_read, output_write, output_error := os.pipe()
 	if output_error != nil { return "the agent's output pipe could not be created; nothing ran" }
@@ -1080,8 +1099,12 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 			}
 			if readers.threads[.Output] == nil && readers.output != nil { _ = os.close(readers.output) }
 			if readers.threads[.Errors] == nil && readers.errors != nil { _ = os.close(readers.errors) }
-			for frame in readers.frames { delete(frame, readers.allocator) }
-			delete(readers.frames)
+			for {
+				frame, queued := queue.pop_front_safe(&readers.frames)
+				if !queued { break }
+				delete(frame, readers.allocator)
+			}
+			queue.destroy(&readers.frames)
 			delete(readers.stderr_tail)
 			acp.frame_decoder_destroy(&readers.decoder)
 			free(readers, connection.member.allocator)
@@ -1173,12 +1196,13 @@ acp_session_configure :: proc(
 	member := connection.member
 
 	if model != "" {
-		if option, found := acp_option(opened.config_options, ACP_OPTION_CATEGORY_MODEL); found && acp_option_value(option, model) != "" {
-			value := acp_option_value(option, model)
+		option, value, listed := acp_model_find(opened.config_options, opened.models, model)
+		switch {
+		case value != "":
 			if value != option.current_value {
 				if problem = acp_set_option(connection, option, value); problem != "" { return }
 			}
-		} else if acp_model_offered(opened.models, model) {
+		case listed:
 			set: acp.Session_Set_Model_Result
 			if model != opened.models.current_model_id {
 				if problem = acp_call(
@@ -1188,8 +1212,8 @@ acp_session_configure :: proc(
 					&set,
 				); problem != "" { return }
 			}
-		} else {
-			return fmt.tprintf("the agent offers no model %q; it offers: %s", model, acp_models_text(opened))
+		case:
+			return acp_model_unavailable(opened, model)
 		}
 	}
 	// An effort the agent does not offer is treated as one left out, as for a native subagent.
@@ -1221,23 +1245,20 @@ acp_control_apply :: proc(connection: ^ACP_Connection) -> string {
 	defer acp_configure_destroy(&configuration)
 	if configuration.switching {
 		if configuration.model != "" {
-			option, found := acp_option(connection.config_options, ACP_OPTION_CATEGORY_MODEL)
-			value := acp_option_value(option, configuration.model)
-			if found && value != "" {
+			option, value, listed := acp_model_find(connection.config_options, connection.opened.models, configuration.model)
+			switch {
+			case value != "":
 				if problem := acp_option_send(connection, ACP_Model_Reply{model = value, effort = configuration.effort}, option, value);
 				   problem != "" { return problem }
-			} else if acp_model_offered(connection.opened.models, configuration.model) {
+			case listed:
 				if problem := acp_send(
 					connection,
 					ACP_Model_Reply{model = configuration.model, effort = configuration.effort},
 					acp.METHOD_SESSION_SET_MODEL,
 					acp.Session_Set_Model_Params{session_id = connection.session_id, model_id = configuration.model},
 				); problem != "" { return problem }
-			} else {
-				return acp_configure_refusal(
-					connection,
-					fmt.tprintf("the agent offers no model %q; it offers: %s", configuration.model, acp_models_text(connection.opened)),
-				)
+			case:
+				return acp_configure_refusal(connection, acp_model_unavailable(connection.opened, configuration.model))
 			}
 		} else if problem := acp_effort_send(connection, configuration.effort); problem != "" { return problem }
 	}
@@ -1267,19 +1288,10 @@ ACP_Session_Opened :: struct {
 
 @(private, require_results)
 acp_set_option :: proc(connection: ^ACP_Connection, option: ACP_Config_Option, value: string) -> (problem: string) {
-	// Version 2 requires the value's type; version 1 reads a missing type as an id.
-	request := acp.Session_Set_Config_Option_Params {
-		session_id = connection.session_id,
-		config_id  = option.config_id if option.config_id != "" else option.id,
-		type       = "id" if connection.version == 2 else "",
-		value      = value,
-	}
 	set: ACP_Session_Opened
-	if problem = acp_call(connection, acp.METHOD_SESSION_SET_CONFIG_OPTION, request, &set); problem != "" { return problem }
-	if len(set.config_options) > 0 {
-		if !acp_options_replace(connection, set.config_options) { return "the agent's config options could not be held" }
-	} else if !acp_option_current(connection, option.category, value) { return "the selected option could not be held" }
-	return ""
+	if problem = acp_call(connection, acp.METHOD_SESSION_SET_CONFIG_OPTION, acp_option_request(connection, option, value), &set);
+	   problem != "" { return problem }
+	return acp_option_install(connection, set.config_options, option.category, value)
 }
 
 @(private, require_results)
@@ -1306,6 +1318,25 @@ acp_model_offered :: proc(models: acp.Models_State, model: string) -> bool {
 		if offered.model_id == model { return true }
 	}
 	return false
+}
+
+// acp_model_find looks model up among what an agent offers: a config option that names it, or
+// else the pre-standard model list. value is the option's own spelling of model, and is empty
+// when no option offers it; listed says the model list offers it. A model neither offers is
+// unavailable. options and models must outlive the results.
+@(private)
+acp_model_find :: proc(options: []ACP_Config_Option, models: acp.Models_State, model: string) -> (option: ACP_Config_Option, value: string, listed: bool) {
+	if found, is_found := acp_option(options, ACP_OPTION_CATEGORY_MODEL); is_found {
+		if value = acp_option_value(found, model); value != "" { return found, value, false }
+	}
+	return {}, "", acp_model_offered(models, model)
+}
+
+// acp_model_unavailable says that opened offers no model, with what it does offer. The
+// text is temp-allocated.
+@(private)
+acp_model_unavailable :: proc(opened: ACP_Session_Opened, model: string) -> string {
+	return fmt.tprintf("the agent offers no model %q; it offers: %s", model, acp_models_text(opened))
 }
 
 // acp_models_text lists the models a session offers, temp-allocated. A list that cannot be
@@ -1549,10 +1580,7 @@ acp_next :: proc(connection: ^ACP_Connection) -> (envelope: acp.Envelope, proble
 @(private, require_results)
 acp_frame_take :: proc(readers: ^ACP_Readers) -> (frame: string, taken: bool) {
 	sync.mutex_guard(&readers.mutex)
-	if len(readers.frames) == 0 { return "", false }
-	frame = readers.frames[0]
-	ordered_remove(&readers.frames, 0)
-	return frame, true
+	return queue.pop_front_safe(&readers.frames)
 }
 
 // acp_wait blocks until the agent wrote something or a stop arrived. It returns "" once a
@@ -1576,7 +1604,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 		what := "exited"
 		{
 			sync.mutex_guard(&readers.mutex)
-			if len(readers.frames) > 0 { return "" }
+			if queue.len(readers.frames) > 0 { return "" }
 			if readers.frame_error != .None {
 				return fmt.tprintf("the agent sent a message that could not be read: %s", acp.frame_error_text(readers.frame_error))
 			}
@@ -1588,7 +1616,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 			_ = acp_readers_wait(readers, false, time.tick_add(time.tick_now(), SUBAGENT_ACP_CLOSE_GRACE))
 			{
 				sync.mutex_guard(&readers.mutex)
-				if len(readers.frames) > 0 { return "" }
+				if queue.len(readers.frames) > 0 { return "" }
 			}
 			return acp_ended(connection, what)
 		}
