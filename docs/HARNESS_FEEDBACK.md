@@ -37,3 +37,7 @@ Status should distinguish a queued follow-up, an active request, and a completed
 - Attempt: call `agent` start with `model="opencode-go/muse-spark-1.3-contributor"`, the form the `agents` models listing prints, with and without `provider="opencode-go"`.
 - Gap: without a provider the call failed with "no configured provider serves model". With the provider it failed with "model not found for provider". The start description says to pass "exact catalog model id with its vendor prefix", and the models listing prints the provider prefix in front of each id, so both suggest the prefixed form.
 - Workaround: pass `model="muse-spark-1.3-contributor"` with `provider="opencode-go"`. The listing should print the id exactly as `start` accepts it, or `start` should accept the printed form.
+
+## 2026-10-11 Subagent idle after compaction
+
+agent-45 finished a turn, its context was compacted, and `agents status` then showed it as running with `last record: compaction.completed` for more than 18 minutes while two follow-up messages stayed unread. No request record appeared. I stopped it and started a new child with the same task. This matches the 2026-10-09 report: a follow-up accepted after a finished turn and a compaction is not delivered, and status cannot tell a waiting message from an active request.
