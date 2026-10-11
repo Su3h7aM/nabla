@@ -26,12 +26,15 @@ background_detach :: proc(chat: ^Chat_Session, jobs: ^Tool_Jobs, job: ^Tool_Job,
 		return
 	}
 	receipt^ = {
-		id        = job.id,
-		turn_id   = job.turn_id,
-		ordinal   = job.ordinal,
-		call      = job.call,
-		allocator = job.allocator,
-		phase     = .Retiring,
+		id         = job.id,
+		turn_id    = job.turn_id,
+		ordinal    = job.ordinal,
+		call       = job.call,
+		parent     = job.parent,
+		nested     = job.nested,
+		background = job.background,
+		allocator  = job.allocator,
+		phase      = .Retiring,
 	}
 	transferred := false
 	defer if !transferred { tool_job_release(receipt) }
@@ -80,6 +83,11 @@ background_detach :: proc(chat: ^Chat_Session, jobs: ^Tool_Jobs, job: ^Tool_Job,
 		tool_jobs_latch_stop(jobs, chat)
 		return
 	}
+	if job.nested {
+		receipt.nested_call = job.nested_call
+		receipt.call = &receipt.nested_call
+		job.nested_call = {}
+	}
 	receipt.committed = true
 	receipt.tabled = true
 	for &entry in jobs.jobs {
@@ -87,9 +95,17 @@ background_detach :: proc(chat: ^Chat_Session, jobs: ^Tool_Jobs, job: ^Tool_Job,
 	}
 	transferred = true
 	jobs.committed += 1
-	jobs.committed_roots += 1
-	_observer_tool_result(observer, job.exec.call, parent_call, job.name, job.call.arguments, &result)
+	if !job.nested { jobs.committed_roots += 1 }
+	if parent := receipt.parent; parent != nil {
+		for &entry in parent.lua_children {
+			if entry.job == job { entry.job = receipt; break }
+		}
+		codemode_job_child_committed(jobs, receipt, &result)
+	}
+	_observer_tool_result(observer, job.exec.call, parent_call, job.name, receipt.call.arguments, &result)
 	job.call = nil
+	job.parent = nil
+	job.tabled = false
 	job.interrupt.parent = &chat.background_stop
 	// The observer belongs to the turn; progress is available in the kept stream files.
 	job.exec.stream = {}

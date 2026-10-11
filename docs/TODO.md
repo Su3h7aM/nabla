@@ -17,3 +17,7 @@ A subagent is a session like any other: the orchestrator can bring it back, insp
 ## Ownership
 
 - `session_install` (`app_session.odin`) destroys `setup.session` and then initializes a new session in the same `Chat_Session` memory, even when `chat_session_workers_outstanding` says an abandoned worker may still read that session's stop tokens or catalog. Hold the session by pointer in `Run_Setup`, so a switch leaves a retained session allocated and installs a new one, as `subagent_run` already does for a child.
+
+## MCP background calls
+
+- MCP defines background tool calls as Tasks, in two incompatible shapes: an experimental core feature in 2025-11-25 (a `task` field on `tools/call`, per-tool `execution.taskSupport`, `tasks/get`, a blocking `tasks/result`, `tasks/cancel`) and the `io.modelcontextprotocol/tasks` extension in 2026-07-28 (the server decides per request, `tasks/get` polling with `pollIntervalMs`, `tasks/update` for input, no `tasks/result`). The `mcp` package is stdio only with one request in flight per client, declares no task capability, and would reject a task result. Supporting Tasks needs a client that can hold a task while other calls run, both shapes or a decision to support only the current one, and a ruling on whether waiting out a server's poll interval counts as a deadline rather than a polling timer. Few servers support Tasks yet; revisit when they do.

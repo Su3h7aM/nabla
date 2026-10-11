@@ -154,6 +154,7 @@ Tool_Job :: struct {
 	// outcome
 	result:         Maybe(Tool_Result),
 	committed:      bool,
+	// background means this call's work outlives the call: a detached worker or a background agent start.
 	background:     bool,
 	dispatched:     time.Tick, // when a background job was detached; its age is measured from here
 }
@@ -466,14 +467,9 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 	}
 	#partial switch decoded in args {
 	case Shell_Args:
-		if !decoded.wait && job.nested {
-			field_error := tool_argument_error(.Invalid_Value, "wait", "true; background calls are not available inside codemode yet", job.allocator)
-			job.result = tool_result_refused(&job.exec, &field_error)
-			job.phase = .Result_Ready
-			return
-		}
 		job.background = !decoded.wait
 	case Agent_Start_Args:
+		job.background = !decoded.wait
 		if decoded.wait {
 			// A blocking start holds its own worker and lane for the child's whole run.
 			job.placement = .Worker

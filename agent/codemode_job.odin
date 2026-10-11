@@ -260,14 +260,13 @@ codemode_job_child_committed :: proc(jobs: ^Tool_Jobs, child: ^Tool_Job, result:
 
 // codemode_job_stop_children stops every child that has not committed: a queued one never
 // runs, and a running one is asked to stop. Each still commits, so the record stays whole.
-// A background agent start is left to run: the subagent it starts is meant to outlive the
-// script, and the call itself returns at once. A cancelled turn still drops it before it runs.
+// A background child's work outlives its call and the script, so it is left to run.
+// A cancelled turn still drops a queued call before it runs.
 @(private)
 codemode_job_stop_children :: proc(job: ^Tool_Job) {
 	for entry in job.lua_children {
-		if entry.committed { continue }
+		if entry.committed || entry.job.background { continue }
 		child := entry.job
-		if start, is_start := child.arguments.(Agent_Start_Args); is_start && !start.wait { continue }
 		#partial switch child.phase {
 		case .Queued:
 			child.result = tool_result_failure(&child.exec, .Not_Executed, "the script ended before this call ran", "not executed")

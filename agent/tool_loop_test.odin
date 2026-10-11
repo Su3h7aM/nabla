@@ -14,6 +14,97 @@ import "nabla:ai"
 import "nabla:db"
 
 @(test)
+test_codemode_background_child_returns_a_receipt_and_delivers_its_completion :: proc(test: ^testing.T) {
+	if !test_isolate_process(test, #procedure) { return }
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+	chat.tools_enabled = true
+	gate := fmt.tprintf("%s/release", fixture.directory)
+	command := fmt.tprintf("/bin/sh -c 'while [ ! -f \"$1\" ]; do sleep 0.01; done; printf lua-background-ok' sh %q", gate)
+	code :=
+		strings.concatenate(
+			{
+				"local handle = job.start('shell', {command = ",
+				fmt.tprintf("%q", command),
+				", wait = false})\n",
+				"local receipt = job.wait(handle)\n",
+				"assert(receipt.outcome == 'success')\n",
+				"assert(receipt.output.status == 'running')\n",
+				"assert(string.match(receipt.output.job, '^job%-'))\n",
+				"return receipt.output",
+			},
+			context.temp_allocator,
+		) or_else ""
+	if !testing.expect(test, code != "") { return }
+	arguments, encode_error := json.marshal(struct {
+			code: string,
+		}{code}, allocator = context.temp_allocator)
+	if !testing.expect_value(test, encode_error, nil) { return }
+	provider: Agent_Provider
+	if !agent_provider_start(
+		test,
+		&provider,
+		{agent_provider_call(TOOL_CODEMODE_NAME, string(arguments)), agent_provider_reply("waiting"), agent_provider_reply("received")},
+	) { return }
+	defer agent_provider_stop(&provider)
+	endpoint := agent_provider_endpoint(&provider)
+	defer delete(endpoint)
+	connection := ai.Provider_Connection {
+		API      = .OpenAI_Chat_Completions,
+		Endpoint = endpoint,
+	}
+	_test_accept(test, chat, "start a shell child in the background")
+	if !testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil)) { return }
+	if !testing.expect_value(test, len(chat.background.jobs), 1) { return }
+	admissions := _test_records(test, chat, {.Tool_Admitted})
+	if !testing.expect_value(test, len(admissions), 2) { return }
+	parent := admissions[0].call
+	child := admissions[1].call
+	testing.expect_value(test, admissions[1].parent_call, parent)
+	testing.expect_value(test, admissions[1].node, 0)
+	admitted: journal.Tool_Admitted
+	if !testing.expect_value(test, journal.payload_decode(admissions[1].data, &admitted, context.temp_allocator), nil) { return }
+	testing.expect(test, admitted.background)
+	results := _test_records(test, chat, {.Tool_Completed})
+	if !testing.expect_value(test, len(results), 2) { return }
+	testing.expect_value(test, results[0].call, child)
+	testing.expect_value(test, results[0].parent_call, parent)
+	testing.expect_value(test, results[0].node, 0)
+	testing.expect_value(test, results[1].call, parent)
+	name := background_job_name(child, context.temp_allocator)
+	testing.expect(test, strings.contains(string(results[0].body), fmt.tprintf("job: %s", name)), "the child commits its receipt")
+	completed: journal.Tool_Completed
+	if !testing.expect_value(test, journal.payload_decode(results[1].data, &completed, context.temp_allocator), nil) { return }
+	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
+	testing.expect(test, strings.contains(string(results[1].body), name), "Lua returns the typed receipt after job.wait")
+	testing.expect(
+		test,
+		strings.contains(agent_provider_request(&provider, 1), name),
+		"the script ends and the model sees its receipt before the shell completes",
+	)
+	if !testing.expect_value(test, os.write_entire_file(gate, nil), nil) { return }
+	if !testing.expect(test, chat_background_wait(chat, nil)) { return }
+	finished := _test_records(test, chat, {.Background_Completed})
+	if !testing.expect_value(test, len(finished), 1) { return }
+	testing.expect_value(test, finished[0].call, child)
+	completion: journal.Background_Completed
+	if !testing.expect_value(test, journal.payload_decode(finished[0].data, &completion, context.temp_allocator), nil) { return }
+	testing.expect_value(test, completion.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
+	testing.expect(test, strings.contains(string(finished[0].body), "lua-background-ok"), "the detached shell survived the script and turn ending")
+	accepted, had_message := chat_session_accept_agent_message(chat, {})
+	if !testing.expect(test, accepted == .Accepted && had_message) { return }
+	if !testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil)) { return }
+	report := agent_provider_request(&provider, 2)
+	testing.expect(
+		test,
+		strings.contains(report, name) && strings.contains(report, "lua-background-ok"),
+		"the model receives the completion in the inbox report turn",
+	)
+}
+
+@(test)
 test_background_shell_delivers_its_result_after_the_turn :: proc(test: ^testing.T) {
 	if !test_isolate_process(test, #procedure) { return }
 	tool_loop_background_shell(test, false)
