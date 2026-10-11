@@ -472,6 +472,96 @@ acp_work_id :: proc(id: acp.JSONRPC_Id, allocator: mem.Allocator) -> (acp.JSONRP
 	return id, true
 }
 
+// acp_steer_submit transfers work only when a turn is running. The ACP lock precedes
+// the queue lock so admission cannot race the owner's final queue check.
+@(require_results)
+acp_steer_submit :: proc(session: ^ACP_Session, work: ACP_Work) -> (steered, kept: bool) {
+	if sync.mutex_guard(&session.steer_mu) {
+		if !session.turn_running { return false, false }
+		steered = true
+		prompt := work.variant.(ACP_Work_Prompt)
+		if reserve(&session.steer_requests, len(session.steer_requests) + 1) == nil && agent.steer_push(&session.steer, prompt.text) {
+			// The reserve covers this append.
+			_, _ = append(&session.steer_requests, work)
+			kept = true
+		}
+	}
+	if !kept {
+		owned := work
+		acp_work_destroy(&owned, session.conn.alloc)
+	}
+	acp_session_touch(session)
+	return
+}
+
+// acp_steer_accept_committed answers in FIFO order from insertion facts, including
+// input committed but not yet delivered. The owner alone advances the watermark.
+@(require_results)
+acp_steer_accept_committed :: proc(session: ^ACP_Session) -> bool {
+	chat := &session.app.setup.session
+	if chat.store == nil || chat.turn == 0 { return true }
+	pending := false
+	if sync.mutex_guard(&session.steer_mu) { pending = len(session.steer_requests) > 0 }
+	if !pending { return true }
+	records, after, read_error := journal.read_records(
+		chat.store,
+		{session = chat.session, turn = chat.turn, kinds = {.User_Input}},
+		session.steer_after,
+		0,
+		context.temp_allocator,
+	)
+	if read_error != nil { return false }
+	defer journal.records_destroy(records, context.temp_allocator)
+	for record in records {
+		if record.run != chat.store.run || agent.user_input_origin(record) != .Steering { continue }
+		work: ACP_Work
+		if sync.mutex_guard(&session.steer_mu) {
+			if len(session.steer_requests) == 0 { break }
+			work = session.steer_requests[0]
+			ordered_remove(&session.steer_requests, 0)
+		}
+		session.user_occurrences += 1
+		message_id := fmt.tprintf("msg-user-%d-%d", i64(chat.turn), session.user_occurrences)
+		acp_sent(session, acp_send_user_message(session, message_id, string(record.body)))
+		acp_sent(session, acp.writer_write_response(&session.conn.writer, work.id, acp.Prompt_Accepted_Result{message_id = message_id}))
+		acp_work_destroy(&work, session.conn.alloc)
+	}
+	session.steer_after = after
+	return true
+}
+
+acp_steer_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Observer) {
+	session := cast(^ACP_Session)steer.apply_data
+	if !acp_steer_accept_committed(session) {
+		acp_steer_cancel(session, "the steering insertion could not be read from the journal")
+		agent.turn_control_stop(&session.app.run.control)
+	} else if agent.turn_control_stop_requested(&session.app.run.control) || !acp_session_live(session) {
+		acp_steer_cancel(session, "the turn ended before the request could run")
+	}
+}
+
+// acp_steer_cancel refuses only requests with no committed insertion. Callers settle
+// committed requests first, except shutdown, which runs after the worker retired.
+acp_steer_cancel :: proc(session: ^ACP_Session, message: string) {
+	requests: [dynamic]ACP_Work
+	if sync.mutex_guard(&session.steer_mu) {
+		session.turn_running = false
+		requests = session.steer_requests
+		session.steer_requests = {}
+		session.steer_requests.allocator = session.conn.alloc
+	}
+	defer delete(requests)
+	for {
+		line, queued := agent.steer_pop(&session.steer)
+		if !queued { break }
+		agent.steer_line_free(&session.steer, line)
+	}
+	for &work in requests {
+		acp_sent(session, acp.writer_write_error(&session.conn.writer, work.id, acp.ERROR_INVALID_REQUEST, message))
+		acp_work_destroy(&work, session.conn.alloc)
+	}
+}
+
 // --- the worker --------------------------------------------------------------
 
 // acp_owner_service_pending reports whether the session has a model request, a model
@@ -981,26 +1071,35 @@ acp_work_close_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: 
 	acp_sent(session, acp.writer_write_response(&session.conn.writer, id, acp.Empty_Result{}))
 }
 
-acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Work_Prompt) {
+@(require_results)
+acp_accept_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Work_Prompt) -> bool {
 	chat := &session.app.setup.session
 	accepted := agent.chat_session_accept_user(chat, work.text, acp_observer(session), work.attachments)
 	switch accepted {
 	case .Accepted:
 	case .Storage_Failed:
 		acp_sent(session, acp.writer_write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, agent.chat_session_last_error(chat)))
-		return
+		return false
 	case .Busy:
 		acp_sent(session, acp.writer_write_error(&session.conn.writer, id, acp.ERROR_INVALID_REQUEST, "the session is already running a turn"))
-		return
+		return false
 	}
 	if acp_is_v2(session.conn) {
 		acp_clear_active_message_id(session)
+		session.user_occurrences = 1
+		if sync.mutex_guard(&session.steer_mu) { session.turn_running = true }
 		message_id := acp_user_message_id(session)
 		acp_sent(session, acp_send_user_message(session, message_id, work.text))
 		acp_sent(session, acp.writer_write_response(&session.conn.writer, id, acp.Prompt_Accepted_Result{message_id = message_id}))
 		acp_sent(session, acp_send_state(session, "running", ""))
 	}
 
+	return true
+}
+
+acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Work_Prompt) {
+	if !acp_accept_prompt(session, id, work) { return }
+	chat := &session.app.setup.session
 	// The completion flag is read because the terminal status alone cannot report a
 	// turn the store could not record: the status still names what the model reached,
 	// so an unrecorded completion is corrected to a failure below.
@@ -1049,19 +1148,62 @@ acp_v2_turn_end :: proc(session: ^ACP_Session, turn_completed: bool) {
 	}
 }
 
-// acp_report_turn runs a turn for the oldest message a background subagent sent while no
-// request ran, and reports whether it ran one. The turn counts as work, so a cancel or a
-// shutdown stops it the way it stops a prompt's turn.
+// acp_run_steered_turn keeps late input on the owner. A line admitted after the final
+// collection starts the next turn, and the remaining lines steer that turn.
 acp_run_steered_turn :: proc(session: ^ACP_Session, chat: ^agent.Chat_Session) -> bool {
 	chat.catalog = app_catalog_ref(&session.app)
 	observer := acp_observer(session)
 	steer := agent.Steer_Context {
+		queue      = &session.steer,
+		observe    = acp_steer_observe,
 		apply      = acp_model_selection_steer,
 		apply_data = session,
 	}
-	return agent.chat_run_turn_steered(chat, session.app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &session.app.run.control)
+	if sync.mutex_guard(&session.steer_mu) { session.turn_running = true }
+	for {
+		session.steer_after = 0
+		completed := agent.chat_run_turn_steered(
+			chat,
+			session.app.run.connection,
+			agent.chat_retry_policy_default(),
+			observer,
+			&steer,
+			&session.app.run.control,
+		)
+		settled := acp_steer_accept_committed(session)
+		if !settled ||
+		   !completed ||
+		   chat.terminal_status != .Completed ||
+		   !acp_session_live(session) ||
+		   agent.turn_control_stop_requested(&session.app.run.control) {
+			acp_steer_cancel(session, "the turn ended before the request could run")
+			return completed
+		}
+		work: ACP_Work
+		has_prompt := false
+		if sync.mutex_guard(&session.steer_mu) {
+			line, queued := agent.steer_pop(&session.steer)
+			if queued {
+				agent.steer_line_free(&session.steer, line)
+				work = session.steer_requests[0]
+				ordered_remove(&session.steer_requests, 0)
+				has_prompt = true
+			} else {
+				session.turn_running = false
+			}
+		}
+		if !has_prompt { return completed }
+		prompt := work.variant.(ACP_Work_Prompt)
+		accepted := acp_accept_prompt(session, work.id, prompt)
+		acp_work_destroy(&work, session.conn.alloc)
+		if !accepted {
+			acp_steer_cancel(session, "the turn ended before the request could run")
+			return false
+		}
+	}
 }
 
+// acp_report_turn runs a turn for the oldest background subagent message while idle.
 @(private = "file", require_results)
 acp_report_turn :: proc(session: ^ACP_Session) -> bool {
 	chat := &session.app.setup.session
@@ -1076,6 +1218,8 @@ acp_report_turn :: proc(session: ^ACP_Session) -> bool {
 	defer acp_queue_remove(session)
 	defer agent.turn_control_clear(&session.app.run.control)
 	acp_clear_active_message_id(session)
+	session.user_occurrences = 1
+	if sync.mutex_guard(&session.steer_mu) { session.turn_running = true }
 	acp_sent(session, acp_send_state(session, "running", ""))
 	turn_completed := acp_run_steered_turn(session, chat)
 	acp_v2_turn_end(session, turn_completed)
@@ -1442,6 +1586,7 @@ acp_current_message_id :: proc(session: ^ACP_Session) -> string {
 acp_observer :: proc(session: ^ACP_Session) -> agent.Chat_Observer {
 	return {
 		user_data = session,
+		user_text = acp_obs_user_text,
 		assistant_begin = acp_obs_assistant_begin,
 		assistant_text = acp_obs_assistant_text,
 		tool_call = acp_obs_tool_call,
@@ -1449,6 +1594,16 @@ acp_observer :: proc(session: ^ACP_Session) -> agent.Chat_Observer {
 		message = acp_obs_message,
 		request_finished = acp_obs_request_finished,
 		retry_scheduled = acp_obs_retry_scheduled,
+	}
+}
+
+acp_obs_user_text :: proc(user_data: rawptr, text: string, origin: journal.User_Origin) {
+	session := cast(^ACP_Session)user_data
+	if origin == .Steering {
+		if !acp_steer_accept_committed(session) {
+			acp_steer_cancel(session, "the steering insertion could not be read from the journal")
+			agent.turn_control_stop(&session.app.run.control)
+		}
 	}
 }
 

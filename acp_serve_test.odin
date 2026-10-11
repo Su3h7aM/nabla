@@ -133,13 +133,15 @@ acp_test_stream_reply :: proc(body: string, allocator := context.allocator) -> s
 // in for a provider endpoint, so a turn runs for real: the harness sends requests, reads
 // streams, and records results exactly as it would against a server.
 ACP_Test_Provider :: struct {
-	listener: net.TCP_Socket,
-	port:     int,
-	replies:  []string,
-	served:   int,
-	lock:     sync.Mutex,
-	failed:   bool,
-	thread:   ^thread.Thread,
+	listener:         net.TCP_Socket,
+	port:             int,
+	replies:          []string,
+	served:           int,
+	lock:             sync.Mutex,
+	failed:           bool,
+	thread:           ^thread.Thread,
+	first_reply_gate: ^sync.One_Shot_Event,
+	request_ready:    sync.Cond,
 }
 
 acp_test_provider_start :: proc(t: ^testing.T, provider: ^ACP_Test_Provider, replies: []string) -> bool {
@@ -219,7 +221,10 @@ acp_test_provider_answer :: proc(provider: ^ACP_Test_Provider, client: net.TCP_S
 
 	sync.mutex_lock(&provider.lock)
 	provider.served += 1
+	first := provider.served == 1
+	sync.cond_broadcast(&provider.request_ready)
 	sync.mutex_unlock(&provider.lock)
+	if first && provider.first_reply_gate != nil { sync.one_shot_event_wait(provider.first_reply_gate) }
 	_, _ = net.send_tcp(client, transmute([]u8)reply)
 }
 
@@ -1769,4 +1774,180 @@ test_acp_idle_v2_store_session_stays_evictable_after_an_owner_wake :: proc(t: ^t
 	testing.expect(t, acp_session_find(&server, "session-0") == nil, "the least recently used session was not evicted")
 	testing.expect(t, acp_session_find(&server, "session-1") != nil, "a newer session was evicted instead")
 	testing.expect(t, acp_session_find(&server, "session-ninth") != nil, "the new session was not published")
+}
+
+@(test)
+test_acp_v2_running_prompt_is_inserted_as_steering :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-prompt-workspace-*", context.allocator)
+	if workspace_err != nil {
+		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
+		return
+	}
+	defer {
+		_ = os.remove_all(workspace)
+		delete(workspace, context.allocator)
+	}
+	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
+	if state_err != nil {
+		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
+		return
+	}
+	defer {
+		_ = os.remove_all(state)
+		delete(state, context.allocator)
+	}
+	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
+	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
+	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
+	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
+	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
+	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+
+	replies := []string {
+		acp_test_stream_reply(
+			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
+		),
+		acp_test_stream_reply(
+			acp_test_sse_body(
+				{`{"choices":[{"delta":{"content":"steered answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+			),
+		),
+	}
+	defer for reply in replies { delete(reply, context.allocator) }
+	release_first: sync.One_Shot_Event
+	provider := ACP_Test_Provider {
+		first_reply_gate = &release_first,
+	}
+	if !acp_test_provider_start(t, &provider, replies) { return }
+	defer acp_test_provider_stop(t, &provider)
+
+	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
+	defer delete(sources, context.allocator)
+	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
+	defer delete(models, context.allocator)
+	models[0] = {
+		id                = "v2model",
+		context_window    = 100000,
+		max_output_tokens = 4096,
+		tools             = true,
+	}
+	sources[0] = {
+		id       = "v2provider",
+		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
+		api      = "openai_chat_completions",
+		api_key  = "test-key",
+		models   = models,
+	}
+	defer delete(sources[0].base_url.?, context.allocator)
+
+	client: ACP_Test_Client
+	defer acp_test_client_destroy(&client)
+	run := ACP_Test_Run {
+		client  = &client,
+		sources = sources,
+	}
+	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-prompt-run")
+	if run_thread == nil {
+		testing.expect(t, false, "the run thread could not be started")
+		return
+	}
+	run_thread.data = &run
+	thread.start(run_thread)
+	defer {
+		sync.one_shot_event_signal(&release_first)
+		acp_test_client_hang_up(&client)
+		thread.join(run_thread)
+		testing.expect(t, run.served, "the run did not end cleanly")
+		thread.destroy(run_thread)
+		free_all(context.temp_allocator)
+	}
+
+	handshake := strings.builder_make(context.temp_allocator)
+	fmt.sbprint(
+		&handshake,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
+	)
+	strings.write_byte(&handshake, '\n')
+	acp_test_client_send(&client, strings.to_string(handshake))
+	v2_hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
+	if v2_hello == "" { return }
+	testing.expectf(t, strings.contains(v2_hello, `"image":{}`), "v2 initialize did not announce image prompts: %s", v2_hello)
+
+	opening := strings.builder_make(context.temp_allocator)
+	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
+	strings.write_string(&opening, workspace)
+	strings.write_string(&opening, `","mcpServers":[]}}`)
+	strings.write_byte(&opening, '\n')
+	acp_test_client_send(&client, strings.to_string(opening))
+	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
+	if opening_frame == "" { return }
+	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2model"`) {
+		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
+		return
+	}
+	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
+	if session_id == "" { return }
+	defer delete(session_id, context.allocator)
+	prompting := strings.builder_make(context.temp_allocator)
+	acp_test_prompt_message(&prompting, 3, session_id, "say hello")
+	acp_test_client_send(&client, strings.to_string(prompting))
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the first prompt was not reported") == "" { return }
+	if acp_test_client_expect(t, &client, `"result":{"messageId":"msg-user-1-1"}`, "the first prompt was not inserted") == "" { return }
+	if acp_test_client_expect(t, &client, `"state":"running"`, "the turn did not start") == "" { return }
+
+	if sync.mutex_guard(&provider.lock) {
+		for provider.served == 0 {
+			if !testing.expect(
+				t,
+				sync.cond_wait_with_timeout(&provider.request_ready, &provider.lock, ACP_TEST_BOUND),
+				"the first request did not reach the provider",
+			) { return }
+		}
+	}
+
+	steering := strings.builder_make(context.temp_allocator)
+	acp_test_prompt_message(&steering, 4, session_id, "use the other file")
+	// The reader answers this only after it has handled the preceding prompt.
+	strings.write_string(&steering, `{"jsonrpc":"2.0","id":5,"method":"session/list","params":{}}`)
+	acp_test_end(&steering)
+	acp_test_client_send(&client, strings.to_string(steering))
+	barrier := acp_test_client_receive(&client)
+	if !testing.expectf(t, strings.contains(barrier, `"id":5,"result"`), "steering was answered before insertion: %s", barrier) { return }
+	sync.one_shot_event_signal(&release_first)
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "the first answer did not stream") == "" { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the first request did not report usage") == "" { return }
+	inserted := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the steering message was not reported")
+	if !testing.expect(t, strings.contains(inserted, "use the other file")) { return }
+	accepted := acp_test_client_expect(t, &client, `"id":4,"result"`, "the steering prompt was not accepted")
+	if !testing.expect(t, strings.contains(accepted, `"messageId":"msg-user-1-2"`)) { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "the steering answer did not stream") == "" { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the steering request did not report usage") == "" { return }
+	if acp_test_client_expect(t, &client, `"state":"idle","stopReason":"end_turn"`, "the steered turn did not finish") == "" { return }
+
+	directory, directory_error := agent.xdg_directory(.State, context.allocator)
+	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
+	defer delete(directory, context.allocator)
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
+	defer delete(locks, context.allocator)
+	reader, open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
+	if !testing.expect_value(t, open_error, nil) { return }
+	defer _ = journal.close(reader)
+	session, session_ok := journal.session_id_parse(session_id)
+	if !testing.expect(t, session_ok) { return }
+	records, _, read_error := journal.read_records(reader, {session = session, kinds = {.User_Input, .Turn_Started}}, 0, 0, context.temp_allocator)
+	if !testing.expect_value(t, read_error, nil) { return }
+	defer journal.records_destroy(records, context.temp_allocator)
+	turns, steering_count := 0, 0
+	for record in records {
+		if record.kind == .Turn_Started { turns += 1 }
+		if record.kind == .User_Input && string(record.body) == "use the other file" {
+			steering_count += 1
+			testing.expect_value(t, agent.user_input_origin(record), journal.User_Origin.Steering)
+			testing.expect_value(t, i64(record.turn), i64(1))
+		}
+	}
+	testing.expect_value(t, steering_count, 1)
+	testing.expect_value(t, turns, 1)
 }

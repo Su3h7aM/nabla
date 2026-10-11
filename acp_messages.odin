@@ -961,6 +961,13 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		variant = ACP_Work_Prompt{text = text, attachments = attachments},
 	}
 	queued = true
+	if acp_is_v2(server) && len(attachments) == 0 {
+		steered, kept := acp_steer_submit(session, work)
+		if steered {
+			if !kept { acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the steering request could not be queued") }
+			return
+		}
+	}
 	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}

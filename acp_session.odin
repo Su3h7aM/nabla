@@ -15,8 +15,8 @@ import "nabla:agent/journal"
 
 // The ACP connection holds what every session of it shares, and a table of the sessions
 // themselves. Each ACP_Session has exactly one owner, its worker thread: the worker holds
-// the session's journal, chat, queue, Turn_Control and MCP runtime, and nothing else touches
-// them while it runs. The reader thread alone creates, finds, and frees sessions, so a
+// the session's journal, chat, Turn_Control and MCP runtime. The reader submits work and
+// steering through guarded queues. The reader thread alone creates, finds, and frees sessions, so a
 // session it found stays valid for the request it is handling.
 
 // ACP_MAX_SESSIONS is how many sessions one connection runs at once. Opening one more
@@ -62,6 +62,13 @@ ACP_Session :: struct {
 	// queue_mu guards pending_work.
 	queue_mu:          sync.Mutex,
 	pending_work:      int,
+	// steer_mu guards turn_running and steering RPCs. It precedes the queue lock.
+	steer_mu:          sync.Mutex,
+	steer:             agent.Steer_Queue,
+	turn_running:      bool,
+	steer_requests:    [dynamic]ACP_Work,
+	steer_after:       journal.Journal_Seq, // owner only
+	user_occurrences:  int, // owner only; stable live/replay user message ids
 	// model_mu guards only the single pending reader-to-owner handoff.
 	model_mu:          sync.Mutex,
 	model_request:     ACP_Model_Request,
@@ -257,6 +264,8 @@ acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP
 	made.conn = conn
 	made.id = id
 	made.work = channel
+	made.steer = agent.steer_queue_init(conn.alloc)
+	made.steer_requests.allocator = conn.alloc
 	shared := &conn.app.setup
 	setup := &made.app.setup
 	setup.harness_options = shared.harness_options
@@ -280,6 +289,8 @@ acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP
 acp_session_free :: proc(session: ^ACP_Session) {
 	alloc := session.conn.alloc
 	if session.work != {} { chan.destroy(&session.work) }
+	agent.steer_queue_destroy(&session.steer)
+	delete(session.steer_requests)
 	delete(session.id, alloc)
 	delete(session.title, alloc)
 	delete(session.workspace, alloc)
@@ -433,6 +444,7 @@ acp_session_shutdown :: proc(session: ^ACP_Session) {
 		_ = acp.writer_write_error(&session.conn.writer, queued.id, acp.ERROR_INVALID_REQUEST, "the session closed before the request could run")
 		acp_work_destroy(&queued, alloc)
 	}
+	acp_steer_cancel(session, "the session closed before the request could run")
 	request := acp_model_request_take(session)
 	if request.active {
 		_ = acp.writer_write_error(
