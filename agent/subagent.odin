@@ -1026,7 +1026,7 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 			sync.mutex_guard(&team.mutex)
 			if member := subagent_find(team, child.name); member != nil {
 				child.after = member.acp_after
-				if member.program.name != "" {
+				if !subagent_native(member) {
 					cloned, clone_error := strings.clone(member.acp_session, context.temp_allocator)
 					if clone_error != nil { return "", "the ACP agent's session id could not be held" }
 					child.acp_session = cloned

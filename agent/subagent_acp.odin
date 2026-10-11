@@ -66,6 +66,17 @@ acp_configure_destroy :: proc(configuration: ^ACP_Configure) {
 	configuration^ = {}
 }
 
+// acp_model_named reports whether name is "provider_id/id", without building it.
+@(private, require_results)
+acp_model_named :: proc(provider_id, id, name: string) -> bool {
+	return(
+		len(name) == len(provider_id) + 1 + len(id) &&
+		strings.has_prefix(name, provider_id) &&
+		name[len(provider_id)] == '/' &&
+		strings.has_suffix(name, id) \
+	)
+}
+
 // acp_native_model resolves catalog identity and effort, not a provider connection.
 // The returned strings are temporary-allocated.
 @(private, require_results)
@@ -91,7 +102,7 @@ acp_native_model :: proc(
 	if current_value != "" {
 		found := false
 		for candidate in catalog.models {
-			if fmt.tprintf("%s/%s", candidate.provider_id, candidate.id) != current_value { continue }
+			if !acp_model_named(candidate.provider_id, candidate.id, current_value) { continue }
 			default_provider, default_model = candidate.provider_id, candidate.id
 			found = true
 			break
@@ -100,7 +111,7 @@ acp_native_model :: proc(
 	}
 	if provider == "" && model != "" {
 		for candidate in catalog.models {
-			if fmt.tprintf("%s/%s", candidate.provider_id, candidate.id) == model {
+			if acp_model_named(candidate.provider_id, candidate.id, model) {
 				provider, model = candidate.provider_id, candidate.id
 				break
 			}
@@ -184,6 +195,22 @@ acp_inbox :: proc(
 	return
 }
 
+// acp_inbox_text joins the parent's messages to this child after the last one it consumed into
+// one prompt. after is the sequence of the latest message, and 0 with text "" when there is
+// none. text belongs to allocator.
+@(private, require_results)
+acp_inbox_text :: proc(store: ^journal.Journal, member: ^Subagent, allocator: mem.Allocator) -> (text: string, after: journal.Journal_Seq, problem: string) {
+	records, read_error := acp_inbox(store, member, member.acp_after, context.temp_allocator)
+	if read_error != nil { return "", 0, "the subagent's inbox could not be read" }
+	if len(records) == 0 { return "", 0, "" }
+	lines, lines_error := make([]string, len(records), context.temp_allocator)
+	if lines_error != nil { return "", 0, "the orchestrator's message could not be held" }
+	for record, index in records { lines[index], _ = inbox_text(record) }
+	joined, join_error := strings.join(lines, "\n\n", allocator)
+	if join_error != nil { return "", 0, "the orchestrator's message could not be held" }
+	return joined, records[len(records) - 1].seq, ""
+}
+
 @(private)
 acp_inbox_consumed :: proc(member: ^Subagent, after: journal.Journal_Seq) {
 	sync.mutex_guard(&member.team.mutex)
@@ -202,16 +229,19 @@ acp_configure_plan :: proc(team: ^Agent_Team, update: ^Agent_Message_Args) -> (s
 		if member == nil { return {}, false, "" }
 		session, live = member.session, true
 		member_allocator = member.allocator
-		native = member.program.name == ""
+		native = subagent_native(member)
 		copy_error: mem.Allocator_Error
 		parent, copy_error = agent_parent_temp_copy(team.parent, context.temp_allocator)
 		if copy_error != nil { return session, true, "the orchestrator's selection could not be copied" }
-		current_model = strings.clone(member.program.model, context.temp_allocator) or_else ""
-		current_effort = strings.clone(member.effort, context.temp_allocator) or_else ""
+		model, effort := member.program.model, member.effort
 		if member.configuration.switching {
-			if member.configuration.model != "" { current_model = strings.clone(member.configuration.model, context.temp_allocator) or_else "" }
-			if member.configuration.effort != "" { current_effort = strings.clone(member.configuration.effort, context.temp_allocator) or_else "" }
+			if member.configuration.model != "" { model = member.configuration.model }
+			if member.configuration.effort != "" { effort = member.configuration.effort }
 		}
+		current_model, copy_error = strings.clone(model, context.temp_allocator)
+		if copy_error != nil { return session, true, "the orchestrator's selection could not be copied" }
+		current_effort, copy_error = strings.clone(effort, context.temp_allocator)
+		if copy_error != nil { return session, true, "the orchestrator's selection could not be copied" }
 	}
 	if update.model == "" && update.provider == "" && update.effort == "" && !update.compact { return session, true, "" }
 	configuration := ACP_Configure {
@@ -494,6 +524,12 @@ ACP_Connection :: struct {
 	stop_deadline:  time.Tick,
 }
 
+// subagent_native reports whether the member is a Nabla child rather than a configured ACP agent.
+@(private, require_results)
+subagent_native :: proc(member: ^Subagent) -> bool {
+	return member.program.name == ""
+}
+
 // subagent_acp_run runs the member's ACP agent until it answers the task and every message the
 // orchestrator sent after that, and records the outcome in member.
 @(private)
@@ -514,140 +550,8 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		delete(member.answer, allocator)
 		member.answer = strings.clone(string(connection.answer[:]), allocator) or_else ""
 	}
-	previous_session := member.acp_session
-	if member.program.name == "" {
-		if !member.resumed {
-			store, open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Write, allocator)
-			if open_error != nil { subagent_fail(member, .Failed, "the native child session could not be created"); return }
-			_, create_error := journal.create_session(
-				store,
-				{
-					id = member.session,
-					workspace = member.workspace,
-					role = .Subagent,
-					parent_session = member.parent_session,
-					parent_call = member.parent_call,
-				},
-			)
-			if create_error == nil { _, create_error = journal.commit(store) }
-			close_error := journal.close(store)
-			if create_error != nil || close_error != nil { subagent_fail(member, .Failed, "the native child session could not be committed"); return }
-		}
-		hex: [journal.SESSION_ID_HEX_LENGTH]u8
-		previous_session = journal.session_id_to_hex(member.session, hex[:])
-	}
-	if problem := acp_connection_open(&connection); problem != "" {
-		subagent_fail(member, .Failed, problem)
-		return
-	}
-	if problem := acp_session_open(&connection, previous_session); problem != "" {
-		subagent_fail(member, acp_stopped(&connection) ? .Stopped : .Failed, problem)
-		return
-	}
-	session_text, session_error := strings.clone(connection.session_id, allocator)
-	if session_error != nil {
-		subagent_fail(member, .Failed, "the agent's session id could not be held")
-		return
-	}
-
-	{
-		sync.mutex_guard(&member.team.mutex)
-		delete(member.acp_session, allocator)
-		member.acp_session = session_text
-	}
-
-	if problem := acp_control_apply(&connection); problem != "" { subagent_fail(member, .Failed, problem); return }
-	for len(connection.pending) > 0 || !connection.idle {
-		if problem := acp_receive(&connection); problem != "" { subagent_fail(member, .Failed, problem); return }
-	}
-
-	// Parent messages are read through a separate journal connection; the client never owns the child's claim.
-	store, store_open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Only, allocator)
-	if store_open_error != nil {
-		subagent_fail(
-			member,
-			.Failed,
-			fmt.tprintf("the subagent's inbox could not be opened: %s", journal.error_text(store_open_error, context.temp_allocator)),
-		)
-		return
-	}
-	// This is the client's read-only view of the parent's records: a close that fails cannot
-	// change what the child did, so the outcome stays as the run left it.
-	defer _ = journal.close(store)
-	connection.inbox = store
-
-	text := member.prompt
-	if member.program.name != "" &&
-	   !member.resumed &&
-	   member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
-	// text is a copy this loop releases once its prompt is answered, after the first.
-	owned := false
-	after := member.acp_after
-	if member.resumed {
-		records, read_error := acp_inbox(store, member, member.acp_after, context.temp_allocator)
-		if read_error != nil { subagent_fail(member, .Failed, "the subagent's inbox could not be read"); return }
-		if len(records) > 0 {
-			after = records[len(records) - 1].seq
-			lines, lines_error := make([]string, len(records), context.temp_allocator)
-			if lines_error != nil { subagent_fail(member, .Failed, "the orchestrator's message could not be held"); return }
-			for record, index in records { lines[index], _ = inbox_text(record) }
-			joined, join_error := strings.join(lines, "\n\n", allocator)
-			if join_error != nil { subagent_fail(member, .Failed, "the orchestrator's message could not be held"); return }
-			text, owned = joined, true
-		}
-	}
-	loop: for {
-		// Each prompt releases the temp memory its answers were decoded into.
-		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		if member.compact {
-			member.compact = false
-			if problem := acp_prompt_send(&connection, "/compact"); problem != "" { subagent_fail(member, .Failed, problem); return }
-		}
-		stop_reason, problem := acp_prompt(&connection, text, after)
-		if owned { delete(text, allocator) }
-		text = ""
-		owned = false
-		switch {
-		case problem != "":
-			subagent_fail(member, acp_stopped(&connection) ? .Stopped : .Failed, problem)
-			return
-		case stop_reason == "cancelled" || acp_stopped(&connection):
-			subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
-			return
-		case stop_reason == "error":
-			subagent_fail(
-				member,
-				.Failed,
-				connection.turn_error if connection.turn_error != "" else "the agent reported that its turn failed without an error message",
-			)
-			return
-		case stop_reason != "end_turn":
-			reason := fmt.tprintf("the agent ended its turn with %q; what it answered:\n\n%s", stop_reason, string(connection.answer[:]))
-			subagent_fail(member, .Failed, reason)
-			return
-		}
-		records, read_error := acp_inbox(store, member, member.acp_after, context.temp_allocator)
-		if read_error != nil {
-			subagent_fail(member, .Failed, "the subagent's inbox could not be read")
-			return
-		}
-		if len(records) == 0 {
-			sync.mutex_guard(&member.team.mutex)
-			if member.configuration.switching || member.configuration.compact { continue loop }
-			member.status = .Completed
-			break loop
-		}
-		after = records[len(records) - 1].seq
-		lines, lines_error := make([]string, len(records), context.temp_allocator)
-		if lines_error != nil { subagent_fail(member, .Failed, "the orchestrator's message could not be held"); return }
-		for record, index in records { lines[index], _ = inbox_text(record) }
-		joined, join_error := strings.join(lines, "\n\n", allocator)
-		if join_error != nil {
-			subagent_fail(member, .Failed, "the orchestrator's message could not be held")
-			return
-		}
-		text, owned = joined, true
-	}
+	if !acp_run_start(&connection) { return }
+	if !acp_run_prompts(&connection) { return }
 	// An answer that cannot be held is not the answer the orchestrator asked for, so the
 	// outcome says the delegation failed rather than reporting none as a completion.
 	answer_text, clone_error := strings.clone(string(connection.answer[:]), allocator)
@@ -657,6 +561,164 @@ subagent_acp_run :: proc(member: ^Subagent) {
 	}
 	delete(member.answer, allocator)
 	member.answer = answer_text
+}
+
+// acp_run_start creates a native child's session, starts the agent, opens or resumes its
+// session, and applies the configuration chosen before it started. It records the failure in
+// the member and returns false when the run cannot go on.
+@(private, require_results)
+acp_run_start :: proc(connection: ^ACP_Connection) -> (started: bool) {
+	member := connection.member
+	allocator := member.allocator
+	previous_session := member.acp_session
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	if subagent_native(member) {
+		if !member.resumed {
+			if problem := acp_native_session_create(member); problem != "" {
+				subagent_fail(member, .Failed, problem)
+				return false
+			}
+		}
+		previous_session = journal.session_id_to_hex(member.session, hex[:])
+	}
+	if problem := acp_connection_open(connection); problem != "" {
+		subagent_fail(member, .Failed, problem)
+		return false
+	}
+	if problem := acp_session_open(connection, previous_session); problem != "" {
+		subagent_fail(member, acp_stopped(connection) ? .Stopped : .Failed, problem)
+		return false
+	}
+	session_text, session_error := strings.clone(connection.session_id, allocator)
+	if session_error != nil {
+		subagent_fail(member, .Failed, "the agent's session id could not be held")
+		return false
+	}
+
+	{
+		sync.mutex_guard(&member.team.mutex)
+		delete(member.acp_session, allocator)
+		member.acp_session = session_text
+	}
+
+	if problem := acp_control_apply(connection); problem != "" {
+		subagent_fail(member, .Failed, problem)
+		return false
+	}
+	for len(connection.pending) > 0 || !connection.idle {
+		if problem := acp_receive(connection); problem != "" {
+			subagent_fail(member, .Failed, problem)
+			return false
+		}
+	}
+	return true
+}
+
+// acp_native_session_create commits the journal session a new native child works in.
+@(private, require_results)
+acp_native_session_create :: proc(member: ^Subagent) -> (problem: string) {
+	store, open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Write, member.allocator)
+	if open_error != nil { return "the native child session could not be created" }
+	_, create_error := journal.create_session(
+		store,
+		{id = member.session, workspace = member.workspace, role = .Subagent, parent_session = member.parent_session, parent_call = member.parent_call},
+	)
+	if create_error == nil { _, create_error = journal.commit(store) }
+	close_error := journal.close(store)
+	if create_error != nil || close_error != nil { return "the native child session could not be committed" }
+	return ""
+}
+
+// acp_run_prompts sends the task, then every message the orchestrator sends and every pending
+// compaction, until a turn ends with nothing left to answer. It marks the member completed and
+// returns true then; otherwise it records the failure and returns false.
+@(private, require_results)
+acp_run_prompts :: proc(connection: ^ACP_Connection) -> (completed: bool) {
+	member := connection.member
+	allocator := member.allocator
+	// Parent messages are read through a separate journal connection; the client never owns the child's claim.
+	store, store_open_error := journal.open(member.store_directory, member.lock_directory, member.run, .Read_Only, allocator)
+	if store_open_error != nil {
+		subagent_fail(
+			member,
+			.Failed,
+			fmt.tprintf("the subagent's inbox could not be opened: %s", journal.error_text(store_open_error, context.temp_allocator)),
+		)
+		return false
+	}
+	// This is the client's read-only view of the parent's records: a close that fails cannot
+	// change what the child did, so the outcome stays as the run left it.
+	defer _ = journal.close(store)
+	connection.inbox = store
+	defer connection.inbox = nil
+
+	text := member.prompt
+	if !subagent_native(member) &&
+	   !member.resumed &&
+	   member.instruction != "" { text = strings.concatenate({member.instruction, "\n\n", member.prompt}, context.temp_allocator) }
+	// text is a copy this loop releases once its prompt is answered, after the first.
+	owned := false
+	after: journal.Journal_Seq
+	if member.resumed {
+		inbox, inbox_after, problem := acp_inbox_text(store, member, allocator)
+		if problem != "" {
+			subagent_fail(member, .Failed, problem)
+			return false
+		}
+		if inbox_after != 0 { text, after, owned = inbox, inbox_after, true }
+	}
+	for {
+		// Each prompt releases the temp memory its answers were decoded into.
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+		if member.compact {
+			member.compact = false
+			if problem := acp_prompt_send(connection, "/compact"); problem != "" {
+				subagent_fail(member, .Failed, problem)
+				return false
+			}
+		}
+		stop_reason, problem := acp_prompt(connection, text, after)
+		if owned { delete(text, allocator) }
+		text, after, owned = "", 0, false
+		if !acp_turn_succeeded(connection, stop_reason, problem) { return false }
+		inbox, inbox_after, inbox_problem := acp_inbox_text(store, member, allocator)
+		if inbox_problem != "" {
+			subagent_fail(member, .Failed, inbox_problem)
+			return false
+		}
+		if inbox_after == 0 {
+			sync.mutex_guard(&member.team.mutex)
+			if member.configuration.switching || member.configuration.compact { continue }
+			member.status = .Completed
+			return true
+		}
+		text, after, owned = inbox, inbox_after, true
+	}
+}
+
+// acp_turn_succeeded reports whether a prompt ended with the agent's answer. Otherwise it
+// records why the member stopped or failed.
+@(private, require_results)
+acp_turn_succeeded :: proc(connection: ^ACP_Connection, stop_reason, problem: string) -> bool {
+	member := connection.member
+	switch {
+	case problem != "":
+		subagent_fail(member, acp_stopped(connection) ? .Stopped : .Failed, problem)
+	case stop_reason == "cancelled" || acp_stopped(connection):
+		subagent_fail(member, .Stopped, "the subagent was stopped before it finished")
+	case stop_reason == "error":
+		subagent_fail(
+			member,
+			.Failed,
+			connection.turn_error if connection.turn_error != "" else "the agent reported that its turn failed without an error message",
+		)
+	case stop_reason != "end_turn":
+		reason := fmt.tprintf("the agent ended its turn with %q; what it answered:\n\n%s", stop_reason, string(connection.answer[:]))
+		subagent_fail(member, .Failed, reason)
+	case:
+		return true
+	}
+	return false
 }
 
 // ACP_Outstanding owns the identity and values needed when its response arrives.
@@ -928,17 +990,22 @@ acp_service :: proc(connection: ^ACP_Connection) -> string {
 	if problem := acp_control_apply(connection); problem != "" { return problem }
 	if connection.inbox == nil { return "" }
 	member := connection.member
-	records, read_error := acp_inbox(connection.inbox, member, member.acp_after, context.temp_allocator)
-	if read_error != nil { return "the subagent's inbox could not be read" }
-	if len(records) == 0 { return "" }
-	defer journal.records_destroy(records, context.temp_allocator)
-	lines := make([]string, len(records), context.temp_allocator) or_else nil
-	if lines == nil { return "the orchestrator's message could not be held" }
-	for record, index in records { lines[index], _ = inbox_text(record) }
-	text, join_error := strings.join(lines, "\n\n", context.temp_allocator)
-	if join_error != nil { return "the orchestrator's message could not be held" }
-	if problem := acp_prompt_send(connection, text); problem != "" { return problem }
-	acp_inbox_consumed(member, records[len(records) - 1].seq)
+	text, after, problem := acp_inbox_text(connection.inbox, member, context.temp_allocator)
+	if problem != "" { return problem }
+	if after == 0 { return "" }
+	if problem = acp_prompt_send(connection, text); problem != "" { return problem }
+	acp_inbox_consumed(member, after)
+	return ""
+}
+
+// acp_serve_live applies what the parent changed while a prompt is live. Version 2 takes the
+// configuration and forwards new messages as prompts at once; version 1 reconfigures only once
+// its turn is over. A stopped connection takes nothing new.
+@(private, require_results)
+acp_serve_live :: proc(connection: ^ACP_Connection) -> string {
+	if !connection.live_prompt || acp_stopped(connection) { return "" }
+	if connection.version == 2 { return acp_service(connection) }
+	if connection.idle && len(connection.pending) == 0 { return acp_control_apply(connection) }
 	return ""
 }
 
@@ -959,13 +1026,7 @@ acp_prompt :: proc(connection: ^ACP_Connection, text: string, after := journal.J
 	connection.live_prompt = true
 	defer connection.live_prompt = false
 	for {
-		if !acp_stopped(connection) {
-			if connection.version == 2 {
-				if problem = acp_service(connection); problem != "" { return }
-			} else if connection.idle && len(connection.pending) == 0 {
-				if problem = acp_control_apply(connection); problem != "" { return }
-			}
-		}
+		if problem = acp_serve_live(connection); problem != "" { return }
 		if connection.idle && len(connection.pending) == 0 { break }
 		if problem = acp_receive(connection); problem != "" { return }
 	}
@@ -1590,9 +1651,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
 	readers := connection.readers
 	for {
-		if connection.live_prompt && connection.version == 2 && !acp_stopped(connection) {
-			if service_problem := acp_service(connection); service_problem != "" { return service_problem }
-		}
+		if service_problem := acp_serve_live(connection); service_problem != "" { return service_problem }
 
 		if ai.interrupt_requested(&member.stop) && !connection.cancel_sent {
 			connection.cancel_sent = true

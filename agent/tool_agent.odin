@@ -311,7 +311,7 @@ tool_agent_started_output :: proc(member: ^Subagent, requested_effort: string) -
 		effort  = member.effort if member.effort != "" else "default",
 		session = journal.session_id_to_hex(member.session, session_hex),
 	}
-	if member.program.name != "" {
+	if !subagent_native(member) {
 		output.model = member.program.model if member.program.model != "" else "the agent's default"
 		output.effort = member.effort if member.effort != "" else "one level below yours, if the agent offers levels"
 		output.acp_session = member.acp_session
