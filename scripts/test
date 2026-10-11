@@ -48,9 +48,12 @@ collection="-collection:nabla=$NABLA_ROOT"
 out_directory="$(mktemp -d "${TMPDIR:-/tmp}/nabla-test.XXXXXX")"
 trap 'rm -rf "$out_directory"' EXIT
 
-# Native subagent tests launch the same executable users run.
-nabla_step "build native ACP test executable"
-"$NABLA_ODIN" build . "$collection" "${NABLA_DEFINES[@]}" "-out:$out_directory/nabla"
+# Native subagent tests launch the same executable users run. Only the agent package reads it
+# (NABLA_TEST_EXECUTABLE), so only a run that includes that package builds it and passes the define.
+if [[ -z "$target" || "$target" == agent ]]; then
+	nabla_step "build native ACP test executable"
+	"$NABLA_ODIN" build . "$collection" "${NABLA_DEFINES[@]}" "-out:$out_directory/nabla"
+fi
 
 # Both configurations run: -debug carries extra contract asserts (notably in
 # layout and tui) that release compiles out, while release tests the exact
@@ -67,7 +70,6 @@ for config in "${configs[@]}"; do
 		[[ -n "$target" && "$target" != "$pkg" ]] && continue
 		extra=(
 			-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
-			"-define:NABLA_TEST_EXECUTABLE=$out_directory/nabla"
 			"-out:$out_directory/${pkg//\//_}-$config.bin"
 			"${NABLA_DEFINES[@]}"
 		)
@@ -78,6 +80,7 @@ for config in "${configs[@]}"; do
 		# The PTY lifecycle test needs the term fault-injection hooks; without
 		# the define its file contributes no tests.
 		[[ "$pkg" == term ]] && extra+=(-define:NABLA_TERM_TEST_HOOKS=true)
+		[[ "$pkg" == agent ]] && extra+=("-define:NABLA_TEST_EXECUTABLE=$out_directory/nabla")
 		nabla_step "test $pkg ($config)"
 		status=0
 		nabla_contained timeout "$timeout_secs" "$NABLA_ODIN" test "$pkg" "$collection" "${extra[@]}" || status=$?
