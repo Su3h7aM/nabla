@@ -624,7 +624,8 @@ subagent_acp_run :: proc(member: ^Subagent) {
 		)
 		return
 	}
-	// Nothing is written through it, so a close that fails changes nothing.
+	// This is the client's read-only view of the parent's records: a close that fails cannot
+	// change what the child did, so the outcome stays as the run left it.
 	defer _ = journal.close(store)
 	connection.inbox = store
 
@@ -826,8 +827,7 @@ acp_receive :: proc(connection: ^ACP_Connection) -> string {
 	if problem != "" { return problem }
 	defer acp.destroy_envelope(&envelope, connection.member.allocator)
 	if envelope.kind != .Response {
-		if !acp_handle(connection, envelope) { return "the agent's message could not be held" }
-		return ""
+		return acp_handle(connection, envelope)
 	}
 	id, is_number := envelope.id.(i64)
 	if !is_number { return "" }
@@ -1001,9 +1001,10 @@ acp_service :: proc(connection: ^ACP_Connection) -> string {
 acp_prompt :: proc(connection: ^ACP_Connection, text: string, after := journal.Journal_Seq(0)) -> (stop_reason: string, problem: string) {
 	if text != "" {
 		clear(&connection.answer)
-		_ = acp_replace(&connection.message_id, "", connection.member.allocator)
-		_ = acp_replace(&connection.stop_reason, "", connection.member.allocator)
-		_ = acp_replace(&connection.turn_error, "", connection.member.allocator)
+		for owned in ([]^string{&connection.message_id, &connection.stop_reason, &connection.turn_error}) {
+			delete(owned^, connection.member.allocator)
+			owned^ = ""
+		}
 		if problem = acp_prompt_send(connection, text); problem != "" { return }
 		if after != 0 { acp_inbox_consumed(connection.member, after) }
 	}
@@ -1028,6 +1029,9 @@ acp_prompt :: proc(connection: ^ACP_Connection, text: string, after := journal.J
 }
 
 // acp_connection_open starts the agent program with its three standard streams piped here.
+// Everything it made before a failure is already recorded in connection, in the order it
+// was made, so the caller's acp_connection_close releases it and retires the reader threads
+// that were started; open itself releases nothing beyond the child's ends of the pipes.
 @(private, require_results)
 acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	member := connection.member
@@ -1437,7 +1441,7 @@ acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result
 		if next_problem != "" { return next_problem }
 		defer acp.destroy_envelope(&envelope, connection.member.allocator)
 		if envelope.kind != .Response {
-			if !acp_handle(connection, envelope) { return "the agent's message could not be held" }
+			if handle_problem := acp_handle(connection, envelope); handle_problem != "" { return handle_problem }
 			continue
 		}
 		answered, is_number := envelope.id.(i64)
@@ -1455,20 +1459,26 @@ acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result
 	}
 }
 
-// acp_handle acts on a message that answers nothing this client asked. It reports false when
-// what the message carries could not be held, which ends the connection rather than letting
-// the answer or the stop reason go missing.
+// ACP_MESSAGE_NOT_HELD and ACP_PERMISSION_REPLY_NOT_SENT are the static texts of the two
+// ways handling an agent's message fails.
+ACP_MESSAGE_NOT_HELD :: "the agent's message could not be held"
+ACP_PERMISSION_REPLY_NOT_SENT :: "the reply to the agent's permission request was not sent"
+
+// acp_handle acts on a message that answers nothing this client asked. problem is static
+// text, "" when the message was handled: it says that what the message carries could not be
+// held, or that a reply to the agent was not sent. Either ends the connection rather than
+// letting the answer, the stop reason, or an unanswered request go missing.
 @(private, require_results)
-acp_handle :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
+acp_handle :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> (problem: string) {
 	// What a message is decoded into is released with it, so a long turn holds no scratch.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	#partial switch envelope.kind {
 	case .Notification:
-		return acp_notification(connection, envelope)
+		if !acp_notification(connection, envelope) { return ACP_MESSAGE_NOT_HELD }
 	case .Request:
 		return acp_answer(connection, envelope)
 	}
-	return true
+	return ""
 }
 
 // acp_notification follows the agent's latest message and, in version 2, the end of its turn.
@@ -1580,29 +1590,36 @@ acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) -> 
 }
 
 // acp_answer answers a request the agent sent. A permission request is granted once, as a
-// native subagent's tools run without asking; nothing else is offered.
+// native subagent's tools run without asking; nothing else is offered. problem is static
+// text, "" when the agent was answered. A reply the writer did not queue leaves the agent
+// waiting for it, so it ends the exchange.
 @(private, require_results)
-acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
-	// A write to the agent that fails ends the exchange: the next read reports it.
+acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> (problem: string) {
 	if envelope.method != acp.METHOD_SESSION_REQUEST_PERMISSION {
-		_ = acp.write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method")
-		return true
+		if acp.write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method") != .None {
+			return "the refusal of the agent's unsupported request was not sent"
+		}
+		return ""
 	}
 	request: acp.Request_Permission_Params
 	switch acp.params_decode(envelope.params, &request, context.temp_allocator) {
 	case .None:
 	case .Invalid:
-		_ = acp.write_error(&connection.writer, envelope.id, acp.ERROR_INVALID_PARAMS, "the permission request is not what ACP defines")
-		return true
+		if acp.write_error(&connection.writer, envelope.id, acp.ERROR_INVALID_PARAMS, "the permission request is not what ACP defines") != .None {
+			return "the refusal of the agent's malformed permission request was not sent"
+		}
+		return ""
 	case .Allocation:
-		return false
+		return ACP_MESSAGE_NOT_HELD
 	}
 	outcome := acp.Permission_Outcome {
 		outcome = "cancelled",
 	}
 	if acp_stopped(connection) {
-		_ = acp.write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
-		return true
+		if acp.write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome}) != .None {
+			return ACP_PERMISSION_REPLY_NOT_SENT
+		}
+		return ""
 	}
 	for kind in ([]string{"allow_once", "allow_always"}) {
 		for option in request.options {
@@ -1614,8 +1631,10 @@ acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool 
 			}
 		}
 	}
-	_ = acp.write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
-	return true
+	if acp.write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome}) != .None {
+		return ACP_PERMISSION_REPLY_NOT_SENT
+	}
+	return ""
 }
 
 // acp_next returns the next message the agent sent, owned by the member's allocator, reading

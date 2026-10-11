@@ -371,8 +371,7 @@ tool_agent_start_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 	if member == nil { return tool_result_failure(ctx, .Invalid_Arguments, problem, "not started") }
 	ctx.subagent_started = true
 
-	output := tool_agent_started_output(member, args.effort)
-	if !args.wait { return tool_agent_launch(ctx, member, output, "started") }
+	if !args.wait { return tool_agent_launch(ctx, member, tool_agent_started_output(member, args.effort), "started") }
 
 	// A blocking subagent stops with this call.
 	subagent_take_slot(member)
@@ -381,6 +380,9 @@ tool_agent_start_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> To
 		member.stop.parent = ctx.control.interrupt
 	}
 	subagent_acp_run(member)
+	// The run replaces the model and effort strings the output borrows, so the output
+	// describes the member only once the run is over.
+	output := tool_agent_started_output(member, args.effort)
 	output.status = subagent_status_names[member.status]
 	output.acp_session = member.acp_session
 	output.answer = member.answer
