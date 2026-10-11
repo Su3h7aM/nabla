@@ -51,18 +51,11 @@ OPOST :: 0o1
 VTIME :: 5
 VMIN :: 6
 
-// MAX_ERRNO bounds the negated errnos ioctl returns at the top of the address
-// space, as in the kernel's IS_ERR_VALUE.
-MAX_ERRNO :: 4095
-
-// _ioctl returns the errno decoded from linux.ioctl's raw result.
+// _ioctl runs request against fd and returns its errno.
 @(require_results)
 _ioctl :: proc "contextless" (fd: linux.Fd, request: u32, arg: rawptr) -> linux.Errno {
-	result := linux.ioctl(fd, request, uintptr(arg))
-	if result > ~uintptr(0) - MAX_ERRNO {
-		return linux.Errno(-int(result))
-	}
-	return .NONE
+	_, err := linux.ioctl(fd, request, uintptr(arg))
+	return err
 }
 
 @(require_results)

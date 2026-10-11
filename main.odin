@@ -369,7 +369,7 @@ subagent_launch_options :: proc(options: ^agent.Harness_Options, config: string)
 		options.nabla_executable = ""
 	}
 	if config != "" {
-		absolute, path_error := os.get_absolute_path_lexical(config, context.allocator)
+		absolute, path_error := os.get_absolute_path(config, context.allocator)
 		if path_error != nil {
 			fmt.eprintf("nabla: cannot resolve the explicit configuration path: %v\n", path_error)
 			return false
@@ -457,12 +457,6 @@ chat_main :: proc() -> int {
 }
 
 main :: proc() {
-	// An unsupported platform has no SIGPIPE to catch, which is the old
-	// signal_catch_pipe no-op; only a real failure stops the launch.
-	if err := os.pipe_errors_on_broken(); err != nil && err != .Unsupported {
-		fmt.eprintf("nabla: SIGPIPE could not be caught: %s\n", os.error_string(err))
-		os.exit(1)
-	}
 	os.exit(chat_main())
 }
 
