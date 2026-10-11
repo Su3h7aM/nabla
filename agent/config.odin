@@ -32,6 +32,9 @@ Harness_Options :: struct {
 	subagents_max_running:        int,
 	// acp_agents is owned by the loaded configuration for the process lifetime.
 	acp_agents:                   []ACP_Agent_Config,
+	// web_search is the loaded search configuration, nil only when disabled. It is owned by
+	// the loaded configuration for the process lifetime.
+	web_search:                   ^Web_Search_Config,
 }
 
 config_error_text :: proc(err: Config_Error) -> string {
@@ -571,11 +574,11 @@ load_lua_config :: proc(
 	Config_Error,
 	string,
 ) {
-	if path == "" { return {}, {}, {}, .None, "" }
+	if path == "" { return load_lua_config_default(allocator, .None) }
 	// A missing file is a valid setup: no providers, default options. Only a
 	// file that exists but cannot be read is an error.
 	if info, stat_err := os.stat(path, context.temp_allocator); stat_err != nil {
-		if stat_err == os.General_Error.Not_Exist { return {}, {}, {}, .Missing, "" }
+		if stat_err == os.General_Error.Not_Exist { return load_lua_config_default(allocator, .Missing) }
 		return {}, {}, {}, .Read, ""
 	} else if info.type != .Regular {
 		return {}, {}, {}, .Read, ""
@@ -658,7 +661,34 @@ load_lua_config :: proc(
 		return {}, {}, {}, acp_agents_err, agents_detail
 	}
 	options.acp_agents = acp_agents[:]
+	lua.settop(state, base)
+	web_search, web_search_err, web_search_detail := load_web_search(state, -1, allocator)
+	if web_search_err != .None {
+		catalog_sources_destroy(&result, allocator)
+		mcp_servers_destroy(&servers, allocator)
+		ACP_Agent_Configs_Destroy(acp_agents[:], allocator)
+		return {}, {}, {}, web_search_err, web_search_detail
+	}
+	options.web_search = web_search
 	return result, options, servers, .None, ""
+}
+
+// load_lua_config_default is the no-file configuration: search endpoints detected from
+// the environment, with the other harness options at their defaults.
+@(private, require_results)
+load_lua_config_default :: proc(
+	allocator: mem.Allocator,
+	status: Config_Error,
+) -> (
+	[dynamic]Catalog_Provider_Source,
+	Harness_Options,
+	[dynamic]MCP_Server_Config,
+	Config_Error,
+	string,
+) {
+	config, err := web_search_config_from_environment(allocator)
+	if err != nil { return {}, {}, {}, .Allocation, "" }
+	return {}, Harness_Options{web_search = config}, {}, status, ""
 }
 
 // load_mcp_servers_from reads the `mcp` table, which holds the `servers` table. The

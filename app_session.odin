@@ -588,7 +588,15 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 // here is the agent its orchestrator ran.
 @(require_results)
 session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem: string) {
-	new_session, tool_error := agent.chat_session_init(opened.store, opened.id, opened.branch, opened.head, opened.workspace, setup.alloc)
+	new_session, tool_error := agent.chat_session_init(
+		opened.store,
+		opened.id,
+		opened.branch,
+		opened.head,
+		opened.workspace,
+		setup.alloc,
+		setup.harness_options.web_search,
+	)
 	if tool_error.kind != .None {
 		if opened.store == setup.store { opened.store = nil }
 		opened_session_destroy(opened, setup.alloc)

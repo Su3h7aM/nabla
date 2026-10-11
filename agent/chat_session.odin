@@ -293,6 +293,7 @@ chat_session_init :: proc(
 	head: journal.Node_Id,
 	workspace: string,
 	allocator := context.allocator,
+	web_search: ^Web_Search_Config = nil,
 ) -> (
 	Chat_Session,
 	Tool_Registry_Error,
@@ -300,7 +301,7 @@ chat_session_init :: proc(
 	// The native definitions are compile-time constants, so a build failure
 	// here is a programming error; the registry tests hold them to validity.
 	// A partial registry is never installed: make destroys it before returning.
-	tools, tool_error := tool_registry_make(allocator)
+	tools, tool_error := tool_registry_make(allocator, web_search)
 	if tool_error.kind != .None { return {}, tool_error }
 	owned_workspace, clone_error := strings.clone(workspace, allocator)
 	if clone_error != nil {

@@ -426,7 +426,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		}
 	case .Jobs:
 		job.exec.background = &chat.background
-	case .Custom, .Read, .Write, .Edit, .Shell, .Skills, .Skill, .Compact, .Codemode, .MCP:
+	case .Custom, .Read, .Write, .Edit, .Shell, .Skills, .Skill, .Compact, .Codemode, .MCP, .Web_Search:
 	}
 
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
@@ -963,7 +963,7 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 		opened = delegation.subagent != {}
 	case Agent_Message_Args:
 		opened = args.resume.name != ""
-	case Read_Args, Write_Args, Edit_Args, Shell_Args, Skills_Args, Skill_Args, Codemode_Args, Agent_Stop_Args, Agents_Args, Jobs_Args:
+	case Read_Args, Write_Args, Edit_Args, Shell_Args, Skills_Args, Skill_Args, Codemode_Args, Agent_Stop_Args, Agents_Args, Jobs_Args, Web_Search_Args:
 	case nil:
 	}
 	if opened && !job.exec.subagent_started {

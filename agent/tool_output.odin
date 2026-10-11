@@ -6,6 +6,7 @@ import "core:strings"
 import "core:unicode/utf8"
 
 import "nabla:agent/journal"
+import "nabla:web"
 
 // Tool_Output is what one call produced, typed by the tool that produced it. A result
 // with nothing of its own to report, such as a refusal or a timeout, carries nil.
@@ -27,6 +28,7 @@ Tool_Output :: union {
 	Agent_Output,
 	Agents_Output,
 	Jobs_Output,
+	Web_Search_Output,
 	Argument_Failure,
 }
 
@@ -126,6 +128,14 @@ Agent_Output :: struct {
 	acp_session: string,
 	notice:      string, // a repair of the call, such as an effort the model does not state
 	answer:      string,
+}
+
+// Web_Search_Output is the search's results and an optional synthesized answer. notice
+// reports a repair of the request, such as a count lowered to the service's maximum.
+Web_Search_Output :: struct {
+	notice:  string,
+	answer:  string,
+	results: []web.Result,
 }
 
 // Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
@@ -268,6 +278,27 @@ tool_result_render :: proc(
 		if value.acp_session != "" { render_field(&head, "acp_session", value.acp_session) or_return }
 		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
 		render_text(&body, value.answer) or_return
+	case Web_Search_Output:
+		render_field(&head, "results", len(value.results)) or_return
+		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
+		render_section(&body, "answer", value.answer) or_return
+		if len(value.results) == 0 {
+			render_text(&body, "No results. Try a broader query, fewer domain filters, or different words.") or_return
+		}
+		for result, index in value.results {
+			if index > 0 || value.answer != "" { render_byte(&body, '\n') or_return }
+			render_integer(&body, i64(index + 1)) or_return
+			render_text(&body, ". ") or_return
+			render_value(&body, result.title) or_return
+			render_byte(&body, '\n') or_return
+			render_value(&body, result.url) or_return
+			render_byte(&body, '\n') or_return
+			if result.published != "" { render_field(&body, "published", result.published) or_return }
+			if result.snippet != "" {
+				render_text(&body, result.snippet) or_return
+				if !strings.has_suffix(result.snippet, "\n") { render_byte(&body, '\n') or_return }
+			}
+		}
 	case Codemode_Output:
 		if value.failure != "" {
 			render_field(&head, "failure", value.failure) or_return
@@ -584,6 +615,22 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.notice = strings.clone(borrowed.notice, allocator) or_return
 		value.answer = strings.clone(borrowed.answer, allocator) or_return
 		owned = value
+	case Web_Search_Output:
+		value: Web_Search_Output
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
+		value.notice = strings.clone(borrowed.notice, allocator) or_return
+		value.answer = strings.clone(borrowed.answer, allocator) or_return
+		value.results = make([]web.Result, len(borrowed.results), allocator) or_return
+		for item, index in borrowed.results {
+			value.results[index].title = strings.clone(item.title, allocator) or_return
+			value.results[index].url = strings.clone(item.url, allocator) or_return
+			value.results[index].snippet = strings.clone(item.snippet, allocator) or_return
+			value.results[index].published = strings.clone(item.published, allocator) or_return
+		}
+		owned = value
 	case Codemode_Output:
 		value := Codemode_Output {
 			calls_total = borrowed.calls_total,
@@ -682,6 +729,16 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.acp_session, allocator)
 		delete(value.notice, allocator)
 		delete(value.answer, allocator)
+	case Web_Search_Output:
+		delete(value.notice, allocator)
+		delete(value.answer, allocator)
+		for item in value.results {
+			delete(item.title, allocator)
+			delete(item.url, allocator)
+			delete(item.snippet, allocator)
+			delete(item.published, allocator)
+		}
+		delete(value.results, allocator)
 	case Codemode_Output:
 		delete(value.failure, allocator)
 		delete(value.value, allocator)

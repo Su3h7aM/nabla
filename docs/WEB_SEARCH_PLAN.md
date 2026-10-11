@@ -1,200 +1,76 @@
-# Native web search: implementation plan
+# Native web search
 
-This plan replaces the Python-based `web-search` skill with a native `web_search` tool. It consolidates a study of eight reference projects (OpenCode `v2`, pi-web-access, ferris-search, mcp-web-search, agent-asearch, search-cli, websearch-mcpserver, ddgs) and fits the result to Nabla's architecture.
+The native `web_search` tool is implemented. This document records the finished design; `web_fetch` remains separate work.
 
-## 1. What the references agree on
+## Packages
 
-Every reference, whatever its language or size, has the same core:
+- `html/` is a standalone, non-allocating HTML tokenizer. Tokens and attributes borrow the input. It recognizes tags, text, comments, doctypes, and raw-text elements, but builds no tree, applies no implied end tags, and does not decode character references. It deliberately implements only part of HTML tokenization, not a browser parser.
+- `web/` is a standalone client for web search services. It builds requests, decodes JSON or HTML at the boundary, and returns native `Result` values with `title`, `url`, `snippet`, and optional `published` text. `Response` also carries an optional synthesized answer and a count-clamping notice value. It has no tool, session, or harness configuration concept.
+- `agent/tool_web_search.odin` owns the tool definition, arguments, execution, and human-facing reason. `agent/tool_output.odin` renders its typed output. `agent/config_web_search.odin` loads the provider configuration.
 
-- One normalized result of three fields, `title`, `url`, `snippet`, sometimes with a published date. Every provider maps into it, and nothing downstream knows which provider answered.
-- One small piece of code per provider: build the request, decode the response into the normalized result. No class hierarchy; a router switches on the provider name.
-- A tool whose only required argument is `query`. Most add a result count; the richer ones add a recency filter and include/exclude domain lists. OpenCode `v2` has only `query`.
-- A plain-text rendering for the model: one block per result with title, URL, optional date, and snippet. Zero results is a success with a short note, not an error.
-- The same five providers recur: DuckDuckGo's HTML endpoint (no key), Brave, Tavily, Exa, and SearXNG (self-hosted, no key). Jina, Firecrawl, Serper, and Perplexity appear in some.
+`web.search` calls one endpoint with caller-owned cancellation and deadline control through `http/client.Options`. Responses and error details belong to the caller's allocator and have matching destroy procedures. Error details contain static text plus numbers the package owns, never provider-supplied text or API keys.
 
-Where they differ, the difference is mostly over-engineering we should not copy: pi chains 37 providers with three overlapping selection mechanisms; search-cli fuses 13 providers with reciprocal-rank fusion and a disk cache; websearch-mcpserver has SQLite caching, rerankers, and key pools; OpenCode `v2` runs a consent form inside the tool and parses Exa results out of MCP text with regular expressions. Key pools, rate-limit coordinators, caches, rerankers, and fan-out to several providers per call all solve problems Nabla does not have.
+`web.search_first` tries endpoints in order and returns the first success, including an empty result list. Its optional `first` argument moves that service's endpoints ahead of the others without changing their relative order. `web.engine` treats Exa REST and MCP as one service. Failures are recorded in order; `Cancelled` and `Timed_Out` stop fallback because the same caller control applies to every attempt.
 
-Ideas worth keeping:
+## Provider requests
 
-- OpenCode `v2`: the minimal model interface, the one result type, the rendering (`## [title](url)`, `Published:`, content), and treating 429 as the signal to move to another provider.
-- pi-web-access: the full `SearchOptions` shape (`numResults`, `recencyFilter` day/week/month/year, `domainFilter`), folding domain filters into the query as `site:` and `-site:` for providers without native filters, and the split between bounded model text and full structured data for programmatic callers (our Lua `Tool_Output`).
-- search-cli: failure categories with a `retryable` flag decided from the HTTP status, and keeping a provider's synthesized answer out of the result list.
-- mcp-web-search and ddgs: DuckDuckGo `POST https://html.duckduckgo.com/html/` parsed by element class, with the real URL taken from the `uddg` query parameter and ad results skipped.
+`base_url` replaces the default endpoint URL, except for SearXNG, where it names the required instance root and the client appends `/search`.
 
-## 2. Design
+| Provider | Request and authentication | Count | Freshness | Domains | Results from |
+| --- | --- | --- | --- | --- | --- |
+| Brave | `GET https://api.search.brave.com/res/v1/web/search`, `q`, `count`, `freshness`; `X-Subscription-Token` | maximum 20 | `pd/pw/pm/py` | `site:` / `-site:` in `q` | `web.results[].title, url, description, age` |
+| Tavily | `POST https://api.tavily.com/search`, bearer key; JSON `query`, `max_results`, `search_depth:"basic"`, `include_answer:"basic"`, `include_published_date:true`, `time_range`, `include_domains`, `exclude_domains` | maximum 20 | `day/week/month/year` | native | `results[].title, url, content, published_date`, plus `answer` |
+| Exa REST | `POST https://api.exa.ai/search`, `x-api-key`; JSON `query`, `numResults`, `type:"auto"`, `contents:{highlights:true}`, `startPublishedDate`, `includeDomains`, `excludeDomains` | maximum 100 | RFC 3339 start date, now minus 1, 7, 30, or 365 days | native | `results[].title, url, publishedDate`, joined `highlights` or fallback `text` |
+| Exa MCP | `POST https://mcp.exa.ai/mcp?tools=web_search_advanced_exa`, no key; JSON-RPC `tools/call` of `web_search_advanced_exa`, with `query`, `numResults`, `type:"auto"`, `enableHighlights:true`, `startPublishedDate`, `includeDomains`, `excludeDomains`; accepts JSON and event streams | maximum 100 | same as Exa REST | native | JSON search response in the first nonempty MCP text block, decoded like Exa REST |
+| SearXNG | `GET {base_url}/search`, `q`, `format=json`, `time_range`; no key | instance page, keep at most requested count | `day/month/year`, week maps to month | `site:` / `-site:` in `q` | `results[].title, url, content, publishedDate` |
+| DuckDuckGo HTML | `POST https://html.duckduckgo.com/html/`, form `q`, `df`; no key, browser `User-Agent`, HTML `Accept`, and `Referer` | one page, keep at most requested count | `df=d/w/m/y` | `site:` / `-site:` in `q` | result link and snippet classes, real URL from `uddg`, skipping ads |
 
-### 2.1 Packages
+Counts above a documented API maximum are lowered and reported in the tool's notice. DuckDuckGo bot challenges are `Rate_Limited`, not empty searches. Exa MCP replies may be bare JSON or SSE data messages; decoding matches the request id and reads JSON from the tool's text block, not `Title:` or `URL:` lines.
 
-A new library package `websearch` (library layer), describable without naming Nabla: "a client for web search APIs that returns normalized results". It imports `nabla:http/client`, `core:encoding/json`, `core:encoding/entity` (HTML entity decoding), and `core:net` (percent encoding). It carries no tool, session, or config concept.
+## Configuration
 
-A new library package `html` holding a small HTML tokenizer: start tags with attributes, end tags, text, comments, and raw text inside `script` and `style`. DuckDuckGo parsing needs it now, and a later `web_fetch` tool needs it for HTML to Markdown. A tokenizer is more robust than searching the page for class-name strings, which breaks on attribute order and quoting. It follows the shape of `core:encoding/xml`'s tokenizer.
+At configuration load, an absent `web_search`, `web_search = true`, or a table without `providers` builds the default endpoints with `web.endpoints_from_environment`. `ENVIRONMENT_VARIABLES` defines the detection order: Brave from `BRAVE_API_KEY`, Tavily from `TAVILY_API_KEY`, Exa REST from `EXA_API_KEY`, and SearXNG from `SEARXNG_URL`, each included only when its variable is nonempty. Keyless Exa MCP and DuckDuckGo always follow. `web_search = false` removes the tool.
 
-The harness side lives in `agent`: `agent/tool_web_search.odin` (definition, arguments, execute, rendering) and the config loading in `agent/config.odin`.
-
-### 2.2 Library types
-
-```odin
-package websearch
-
-Provider :: enum {
-	DuckDuckGo, // zero value: needs no key
-	Brave,
-	Tavily,
-	Exa,
-	SearXNG,
-}
-
-Freshness :: enum {
-	Any,
-	Day,
-	Week,
-	Month,
-	Year,
-}
-
-// Query is one search. Strings and slices are borrowed for the call.
-Query :: struct {
-	text:            string,
-	count:           int, // 0 means the provider's default
-	freshness:       Freshness,
-	include_domains: []string,
-	exclude_domains: []string,
-}
-
-// Endpoint is one configured provider. api_key is "" for keyless providers.
-// base_url replaces the provider's documented URL; SearXNG requires it.
-Endpoint :: struct {
-	provider: Provider,
-	api_key:  string,
-	base_url: string,
-}
-
-Result :: struct {
-	title:     string,
-	url:       string,
-	snippet:   string,
-	published: string, // as the provider wrote it; "" when absent
-}
-
-Response :: struct {
-	results: []Result,
-	answer:  string, // a provider's synthesized answer (Tavily), "" when none
-}
-
-Error_Kind :: enum {
-	None,
-	Missing_Credential, // the provider needs api_key or base_url
-	Unauthorized,       // 401, 403
-	Quota,              // 402, provider quota codes
-	Rate_Limited,       // 429; retry_after when the response stated one
-	Rejected,           // other 4xx
-	Server,             // 5xx
-	Transport,          // DNS, TLS, connection, framing
-	Timed_Out,
-	Cancelled,
-	Invalid_Response,   // the body did not decode into results
-}
-
-Error :: struct {
-	kind:        Error_Kind,
-	status:      int,
-	retry_after: time.Duration,
-	detail:      string, // owned by the allocator passed to search
-}
-
-// search sends query to endpoint and returns the normalized results, allocated
-// with allocator. options carries the caller's probe, so cancellation and the
-// deadline belong to the caller.
-search :: proc(endpoint: Endpoint, query: Query, options: client.Options, allocator := context.allocator) -> (response: Response, err: Error)
-
-response_destroy :: proc(response: ^Response, allocator := context.allocator)
-```
-
-`search` switches on `endpoint.provider`; each provider is one file with two procedures, `brave_request(endpoint, query) -> client.Request` and `brave_decode(body) -> (Response, Error)`. JSON providers unmarshal into private wire structs that hold only the fields read (as `acp/protocol.odin` does with `json.unmarshal`), then copy into `Result`. JSON stays inside these files. The status-to-kind mapping is one procedure shared by every provider, and an error `detail` never contains the key.
-
-### 2.3 Provider requests
-
-| Provider | Request | Auth | Count | Freshness | Domains | Results from |
-| --- | --- | --- | --- | --- | --- | --- |
-| DuckDuckGo | `POST https://html.duckduckgo.com/html/`, form `q`, `df` | none; browser `User-Agent` | one page, about 10 | `df=d/w/m/y` | `site:` / `-site:` in `q` | `.result` not `.result--ad`: `a.result__a` text and `href` (real URL in `uddg`), `.result__snippet` text |
-| Brave | `GET https://api.search.brave.com/res/v1/web/search?q&count&freshness` | `X-Subscription-Token` | max 20 | `pd/pw/pm/py` | `site:` / `-site:` in `q` | `web.results[].title, url, description, age` |
-| Tavily | `POST https://api.tavily.com/search`, JSON `query, max_results, search_depth:"basic", time_range, include_domains, exclude_domains` | `Authorization: Bearer` | max 20 | `day/week/month/year` | native | `results[].title, url, content, published_date`; `answer` when asked |
-| Exa | `POST https://api.exa.ai/search`, JSON `query, numResults, type:"auto", contents:{highlights:true}, startPublishedDate, includeDomains, excludeDomains` | `x-api-key` | max 100 | `startPublishedDate` = now minus period | native | `results[].title, url, highlights` (else `text`), `publishedDate` |
-| SearXNG | `GET {base_url}/search?q&format=json&time_range` | none | page of the instance | `day/month/year` (week maps to month) | `site:` / `-site:` in `q` | `results[].title, url, content, publishedDate` |
-
-Each provider's maximum count and freshness support come from its API documentation, so they are external limits (`docs/ARCHITECTURE.md` section 2.1). A requested count above a provider's maximum is sent as the maximum, and the result says so, as a reported repair.
-
-### 2.4 Configuration
-
-Search providers work the way model providers already do: with no configuration at all, every provider whose credential is in the environment is set up and used, and a provider that needs no key is always available.
-
-- Detection: `BRAVE_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`, and `SEARXNG_URL` each enable their provider. Exa through its public MCP endpoint (`https://mcp.exa.ai/mcp`, JSON-RPC `tools/call` of `web_search_exa` over one HTTP POST, which OpenCode uses) and DuckDuckGo need no key and are always present.
-- Default order, keyed providers first: Brave, Tavily, Exa (API), SearXNG, Exa (MCP), DuckDuckGo. A provider that fails for any reason other than `Cancelled` is recorded and the next one is tried; the first success ends the call.
-- Configuration only overrides. A `web_search` Lua table can reorder the list, add a key under another name (`api_key = "${MY_KEY}"`, resolved at use through `config_resolve_credential`), set a `base_url`, or remove a provider; `web_search = false` removes the tool.
+A nonempty `providers` list sets the exact endpoint order and replaces the defaults. Entries accept `provider`, optional `api_key`, and optional `base_url`. `web.PROVIDER_NAMES` and `provider_parse` define the names `brave`, `tavily`, `exa`, `exa_mcp`, `searxng`, and `duckduckgo`; parsing ignores case.
 
 ```lua
 web_search = {
-	providers = {
-		{ provider = "searxng", base_url = "http://localhost:8888" },
-		{ provider = "brave", api_key = "${WORK_BRAVE_KEY}" },
-	},
+    providers = {
+        { provider = "searxng", base_url = "http://localhost:8888" },
+        { provider = "brave", api_key = "${WORK_BRAVE_KEY}" },
+    },
 }
 ```
 
-`Provider` gains `Exa_MCP` beside `Exa`: one decodes the REST response, the other the MCP `tools/call` result, whose text blocks hold `Title:`, `URL:`, `Published:`, and `Text:` lines per result. Tavily's keyless header (`X-Tavily-Access-Mode: keyless`) is undocumented; it is tested against the live API before it is added, and left out if it is not a public mode.
+The loaded `Web_Search_Config` owns the endpoints and the deduplicated services in priority order for the process lifetime; sessions and tool definitions borrow it. Default selection happens at load, not on every search. At use, configured credential text is resolved through `config_resolve_credential`; an empty key or URL takes the provider's environment value. This does not add endpoints to the loaded list.
 
-### 2.5 The tool
+## Tool contract
 
-- Name `web_search`, `Tool_Kind.Web_Search`, `Web_Search_Args` in `agent/tool_args.odin`, `Worker` placement, native lane, default timeout 30 seconds that the model may override.
-- Hints: read-only yes, destructive no, idempotent no, open world yes.
-- Arguments: `query` (required string), `count` (integer, default 8), `freshness` (`any`, `day`, `week`, `month`, `year`), `include_domains` and `exclude_domains` (string arrays), `timeout`.
-- Execute builds a `client.Probe` from `ctx.control.interrupt` and the deadline, as `fetch_control_probe` in `agent/fetch.odin` does, so a stop or the timeout ends the request in any blocking phase.
-- The description states what the tool returns, that it searches the configured providers in order, that the current date is not known to the provider (the model should put a year in the query for recent events), and the shape of the result.
-- `Tool_Output` gets a `Web_Search_Output` variant holding the provider and the results, so a Lua caller reads typed values while the model reads the rendering.
+`web_search` runs as a Worker on the native lane with an external network claim. It is read-only, non-destructive, non-idempotent, and open-world. Its default timeout is 30 seconds, with no harness maximum; `timeout_ms` overrides it. One interrupt and deadline probe covers all fallback attempts.
 
-Rendering, following section 14.3:
+`query` is required and nonempty. Optional arguments are `count`, default 8; `freshness`, one of `any`, `day`, `week`, `month`, or `year`; `include_domains`; `exclude_domains`; `timeout_ms`; and `provider`. The model should put the year in queries about recent events because the search service does not know today's date.
 
-```text
-ok
-provider: brave
-results: 3
-failed: tavily: rate limited (HTTP 429, retry after 30s)
+The description, result text, and Lua output do not name services. The only service-specific model interface is the optional `provider` argument. Its schema enum lists the session's configured services in priority order, deduplicating Exa REST and MCP as `exa`. Selecting a service tries it first and retains the others as fallbacks.
 
-1. Bun v1.2 released
-https://bun.sh/blog/bun-v1.2
-published: 2025-01-22
-Bun 1.2 adds ...
+Successful model text starts with `ok` and `results: <count>`, an optional `notice`, then an optional answer and numbered title, URL, published date, and snippet blocks. Zero results is success with advice to broaden the query. `Web_Search_Output` gives Lua the typed `notice`, `answer`, and `results`, with no provider or failure list.
 
-2. ...
-```
+The answering service, per-endpoint failures, HTTP status, retry delay, and missing-credential hints go only to `Tool_Result.reason`, the human-facing summary. They never enter the model text or Lua output. When every endpoint fails, model feedback is generic: trying again later may help if any failure was temporary, otherwise it is unlikely to help. Cancellation and timeout have their own outcomes and return no partial results.
 
-- Zero results: `ok`, `results: 0`, and one line suggesting a broader query.
-- Every provider failed: `error tool_failed: no provider returned results`, then one `failed:` line per provider with its kind, status, and detail. A missing credential names the config field and the environment variable it should reference.
-- A cancelled or timed-out call is `Cancelled` or `Timed_Out` with no partial results.
+## Left out
 
-### 2.6 What is left out, and why
+- Tavily still requires a key. Its keyless access header works but is undocumented, so the client does not send it.
+- No cache, automatic retries, key pools, rate-limit coordinator, parallel fan-out, result fusion, or reranking. Ordered fallback handles endpoint failures; the model can repeat a search.
+- Search hosted by a model provider is a separate API mechanism. If added, it belongs in `ai` request building rather than this standalone tool.
+- No provider error text in package errors or model diagnostics. The caller gets classified failures without copying remote messages into trusted feedback.
 
-- Hosted search by the model provider (Anthropic `web_search`, OpenAI `web_search`) runs on the provider's side as a different mechanism; it belongs to `ai` request building if we ever want it, not to this tool.
-- No cache, retries, key pools, rate limiters, fan-out, or ranking. The ordered provider list covers failure, and the model can repeat a search.
-- Hosted search by the model provider waits for provider authentication beyond API keys.
+## Completed phases
 
-## 3. Phases
+1. Done: standalone `html` tokenizer and tests.
+2. Done: `web` core, JSON providers, environment discovery, and ordered fallback.
+3. Done: DuckDuckGo HTML provider using `html`.
+4. Done: native tool, configuration, provider preference, typed output, and tool tests.
+5. Done: documentation of the finished design and architecture.
 
-Each phase is one jj change, with `mise run fmt`, `mise run check`, and the tests of the touched packages before it closes.
+## Later: `web_fetch`
 
-1. **`html` tokenizer.** Package `html/`: `doc.odin`, a tokenizer returning tokens that borrow the input, and tests on real pages saved as test data. No tree building.
-2. **`websearch` core and JSON providers.** `websearch/doc.odin`, `websearch.odin` (types, `search`, status mapping), `brave.odin`, `tavily.odin`, `exa.odin`, `searxng.odin`. Tests run `search` against a local HTTP listener through `base_url`, serving recorded responses, and check the normalized results and the error kinds for 401, 429 with `Retry-After`, 500, and a malformed body.
-3. **DuckDuckGo provider.** `websearch/duckduckgo.odin` on the `html` tokenizer, with a recorded results page as test data, including an ad result and a `uddg` redirect.
-4. **Tool and config.** `agent/tool_web_search.odin`, the `Tool_Kind`, `Tool_Args`, and `Tool_Output` additions, the `web_search` config table, the registry entry, and one tool-level test that runs a call against a local listener and checks the rendering and the provider fallback.
-5. **Documentation.** Section 14 of `docs/ARCHITECTURE.md` (tool table and native tool notes), section 4 (package map), and the default timeout in section 27. Then retire the Python `web-search` skill in `~/.agents/skills/web-search`, or reduce it to guidance on writing queries.
-
-Phases 1 and 2 touch disjoint files and can run in parallel. Phase 3 waits for both, and phase 4 waits for phase 2.
-
-## 4. Later: `web_fetch`
-
-A companion `web_fetch(url, timeout)` that returns a page as Markdown, built on the `html` tokenizer with a walker that keeps headings, paragraphs, lists, links, code, and tables and drops `script`, `style`, `nav`, and similar elements. Every reference that has a search tool also has one, and it replaces the `curl | html2text` half of the current skill. It is a separate plan once `web_search` is in.
-
-## 5. Open questions
-
-- The native lane serializes `web_search` with `read`, `shell`, and the other native tools. That matches how every native tool runs today; a lane of its own would let a slow search run beside file work, and would need a new `Tool_Lane` variant.
-- Whether the model should see the list of configured providers in the description. It changes nothing the model can choose, so the plan leaves it out.
+A separate `web_fetch` tool can retrieve a URL and return Markdown using the `html` tokenizer. HTML-to-Markdown conversion, content selection, and fetch-tool policy are not part of this search implementation.

@@ -183,7 +183,7 @@ app_tools_refresh :: proc(app: ^App) -> string {
 	if setup.workers_abandoned || agent.chat_session_workers_outstanding(&setup.session) { return "" }
 
 	installed := false
-	registry, registry_err := agent.tool_registry_make(setup.alloc)
+	registry, registry_err := agent.tool_registry_make(setup.alloc, setup.harness_options.web_search)
 	if registry_err.kind != .None {
 		return "the tool registry could not be built"
 	}

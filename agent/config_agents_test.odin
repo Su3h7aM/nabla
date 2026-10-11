@@ -15,6 +15,7 @@ acp_agents_config_load :: proc(t: ^testing.T, name, body: string, allocator := c
 	write_err := os.write_entire_file(path, body)
 	testing.expect(t, write_err == nil)
 	_, harness_options, _, err, detail := load_lua_config(path, allocator)
+	defer web_search_config_destroy(harness_options.web_search, allocator)
 	if detail != "" { delete(detail, allocator) }
 	return harness_options.acp_agents, err
 }

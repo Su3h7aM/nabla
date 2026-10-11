@@ -3,6 +3,8 @@ package agent
 import "core:encoding/json"
 import "core:time"
 
+import "nabla:web"
+
 // TOOL_PAGE_MAX_VALUE keeps the sum of a page offset and limit representable as int.
 TOOL_PAGE_MAX_VALUE :: max(int) / 2
 
@@ -23,6 +25,7 @@ Tool_Kind :: enum {
 	Agent,
 	Agents,
 	Jobs,
+	Web_Search,
 }
 
 // Tool_Args is one call's arguments, typed by the tool that will run it. Strings borrow
@@ -41,6 +44,7 @@ Tool_Args :: union {
 	Agent_Stop_Args,
 	Agents_Args,
 	Jobs_Args,
+	Web_Search_Args,
 }
 
 Read_Args :: struct {
@@ -83,6 +87,18 @@ Codemode_Args :: struct {
 	timeout: time.Duration,
 }
 
+// Web_Search_Args is one search. query borrows the admitted document; the two domain
+// lists are allocated beside it and released by tool_args_destroy.
+Web_Search_Args :: struct {
+	query:           string,
+	provider:        Maybe(web.Provider),
+	count:           int,
+	freshness:       web.Freshness,
+	include_domains: []string,
+	exclude_domains: []string,
+	timeout:         time.Duration,
+}
+
 // tool_args_decode reads one admitted document as the tool's own arguments. It is the
 // only place a document becomes arguments, so tools, Lua child calls, and repaired
 // calls all read the same way.
@@ -111,6 +127,8 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return tool_agents_args(ctx, object)
 	case .Jobs:
 		return tool_jobs_args(ctx, object)
+	case .Web_Search:
+		return tool_web_search_args(ctx, object, (^Web_Search_Config)(definition.backend))
 	case .Custom, .MCP:
 		// The tool validates its own arguments, so none are handed over and the document
 		// travels as admitted, with only its integer fields repaired from the schema.
@@ -120,9 +138,13 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 	return nil, nil
 }
 
-// tool_args_destroy releases what one typed call owns: the edit arrays, which are the only
-// part of the union that is not borrowed.
+// tool_args_destroy releases what one typed call owns: the edit arrays and the search
+// domain lists, which are the only parts of the union that are not borrowed.
 tool_args_destroy :: proc(args: ^Tool_Args, allocator := context.allocator) {
 	if edit, is_edit := &args.(Edit_Args); is_edit { patch_args_destroy(edit, allocator) }
+	if search, is_search := &args.(Web_Search_Args); is_search {
+		delete(search.include_domains, allocator)
+		delete(search.exclude_domains, allocator)
+	}
 	args^ = nil
 }

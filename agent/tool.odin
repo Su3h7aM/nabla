@@ -78,8 +78,8 @@ Tool_Context :: struct {
 	timeout:          time.Duration,
 	allocator:        mem.Allocator,
 	skills:           ^skills.Catalog,
-	// backend is the borrowed adapter state the definition was registered with, nil
-	// for native tools. Only the paired execute procedure may interpret it, and it
+	// backend is the borrowed binding the definition was registered with, nil for tools
+	// without one. Only the paired decoder and executor may interpret it, and it
 	// must never be freed through this struct.
 	backend:          rawptr,
 	// compact is the borrowed session compaction control for tools that ask for a
@@ -163,9 +163,9 @@ Tool_Definition :: struct {
 	// means none; there is no maximum.
 	timeout:        time.Duration,
 	execute:        Tool_Execute,
-	// backend is borrowed adapter state, nil for native tools. The registry copies the
-	// pointer but never frees it; the registering adapter owns the state. Only the
-	// paired execute procedure may cast it back.
+	// backend is borrowed binding state. The registry copies the pointer but never frees
+	// it; the registering caller owns the state. Only the paired decoder and executor
+	// may cast it back.
 	backend:        rawptr,
 	lane:           Tool_Lane,
 }
@@ -178,11 +178,11 @@ Tool_Registry :: struct {
 }
 
 @(require_results)
-tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
+tool_registry_make :: proc(allocator := context.allocator, web_search: ^Web_Search_Config = nil) -> (registry: Tool_Registry, err: Tool_Registry_Error) {
 	registry = Tool_Registry {
 		allocator = allocator,
 	}
-	definitions, alloc_error := make([dynamic]Tool_Definition, 0, TOOL_NATIVE_COUNT, allocator)
+	definitions, alloc_error := make([dynamic]Tool_Definition, 0, TOOL_NATIVE_COUNT + (1 if web_search != nil else 0), allocator)
 	if alloc_error != nil { return {}, Tool_Registry_Error{kind = .Allocation} }
 	registry.definitions = definitions
 	// The shell tool's description names the shell this process runs, known only here,
@@ -199,6 +199,19 @@ tool_registry_make :: proc(allocator := context.allocator) -> (registry: Tool_Re
 	}
 	for definition in ([?]Tool_Definition{shell, read}) {
 		if add_error := tool_registry_add(&registry, definition); add_error.kind != .None {
+			tool_registry_destroy(&registry)
+			return {}, add_error
+		}
+	}
+	if web_search != nil {
+		search, search_error := tool_web_search_definition(web_search, allocator)
+		if search_error != nil {
+			tool_registry_destroy(&registry)
+			return {}, Tool_Registry_Error{kind = .Allocation, tool = TOOL_WEB_SEARCH_NAME}
+		}
+		defer delete(search.description, allocator)
+		defer delete(search.input_schema, allocator)
+		if add_error := tool_registry_add(&registry, search); add_error.kind != .None {
 			tool_registry_destroy(&registry)
 			return {}, add_error
 		}
@@ -537,8 +550,8 @@ AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session wor
 
 // TOOL_DECLARED is the native tools written as constants, in the order they are
 // registered. tool_registry_sort fixes the advertised order after this list is
-// read. The shell and read tools are not here: tool_registry_make builds their
-// descriptions with the shell and preview size. Only the shell states a timeout
+// read. The shell, read, and web search tools are not here: tool_registry_make builds their
+// descriptions with the shell, the preview size, and the search defaults. Only the shell and web search state a timeout
 // policy; the file and skill tools carry a zero policy, which means no
 // tool-specific bound rather than a forgotten configuration.
 @(private)
@@ -554,7 +567,7 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_JOBS_DEFINITION,
 }
 
-// TOOL_NATIVE_COUNT is how many native tools a registry holds: the declared ones,
-// plus the shell and read tools, whose definitions are built at run time.
+// TOOL_NATIVE_COUNT is how many unconditional native tools a registry holds: the declared
+// ones plus shell and read. A web search configuration adds one more.
 @(private)
 TOOL_NATIVE_COUNT :: len(TOOL_DECLARED) + 2

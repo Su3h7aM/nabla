@@ -15,7 +15,8 @@ mcp_config_load :: proc(t: ^testing.T, name, body: string, allocator := context.
 	defer os.remove(path)
 	write_err := os.write_entire_file(path, body)
 	testing.expect(t, write_err == nil)
-	_, _, servers, err, detail := load_lua_config(path, allocator)
+	_, options, servers, err, detail := load_lua_config(path, allocator)
+	defer web_search_config_destroy(options.web_search, allocator)
 	if detail != "" { delete(detail, allocator) }
 	return servers, err
 }

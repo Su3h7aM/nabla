@@ -823,6 +823,29 @@ tool_field_array :: proc(
 	return array[:], nil
 }
 
+// tool_field_optional_strings reads an optional array of strings; absent and null are
+// empty. The slice is owned by allocator and its strings borrow the document.
+@(require_results)
+tool_field_optional_strings :: proc(object: json.Object, name: string, path := "", allocator := context.allocator) -> ([]string, Tool_Argument_Error) {
+	value, present := object[name]
+	if !present { return nil, nil }
+	if _, is_null := value.(json.Null); is_null { return nil, nil }
+	field := tool_field_path(path, name)
+	array, is_array := value.(json.Array)
+	if !is_array { return nil, tool_argument_error(.Wrong_Type, field, "an array of strings or null", allocator = allocator) }
+	texts, make_error := make([]string, len(array), allocator)
+	if make_error != nil { return nil, Tool_Argument_Defect{kind = .Out_Of_Memory} }
+	for element, index in array {
+		text, is_string := element.(json.String)
+		if !is_string {
+			delete(texts, allocator)
+			return nil, tool_argument_error(.Wrong_Type, fmt.tprintf("%s/%d", field, index), "a string", allocator = allocator)
+		}
+		texts[index] = string(text)
+	}
+	return texts, nil
+}
+
 // tool_field_object reads an object that is already known to be there, naming it
 // by the path the diagnostic should use.
 @(require_results)
