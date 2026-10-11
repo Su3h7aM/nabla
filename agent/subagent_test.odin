@@ -677,6 +677,7 @@ test_a_failed_background_subagent_reports_cause_and_partial_text :: proc(test: ^
 	report, _ := inbox_text(records[0])
 	testing.expect(test, strings.contains(report, "agent-1 failed"), report)
 	testing.expect(test, strings.contains(report, "The parser lives in"), report)
+	testing.expect(test, strings.contains(report, "action configure"), report)
 	completion: journal.Subagent_Completed
 	if journal.payload_decode(records[0].data, &completion, context.temp_allocator) != nil { testing.fail_now(test, "the completion could not be read") }
 	testing.expect_value(test, completion.outcome, journal.TOOL_OUTCOME_NAMES[.Tool_Failed])

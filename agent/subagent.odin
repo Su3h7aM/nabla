@@ -811,13 +811,18 @@ subagent_conclude :: proc(member: ^Subagent) {
 	owner_wake_signal()
 }
 
+// SUBAGENT_NO_CAUSE is what the orchestrator reads when a child failed and its session kept
+// no account of why.
+SUBAGENT_NO_CAUSE :: "the subagent ended without recording why"
+
 // subagent_fail records why a subagent ended. The status is the outcome either way; a reason
-// that cannot be kept leaves the status as the whole outcome.
+// that cannot be kept leaves the status as the whole outcome. An empty reason becomes
+// SUBAGENT_NO_CAUSE, so a failure always reaches the orchestrator with a cause.
 @(private)
 subagent_fail :: proc(member: ^Subagent, status: Subagent_Status, reason: string) {
 	member.status = status
 	delete(member.cause, member.allocator)
-	member.cause = strings.clone(reason, member.allocator) or_else ""
+	member.cause = strings.clone(reason if reason != "" else SUBAGENT_NO_CAUSE, member.allocator) or_else ""
 }
 
 // subagent_keep_answer sets member.answer to the text of the last Assistant node the
