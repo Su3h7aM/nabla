@@ -3,8 +3,10 @@
 # Deliberately at .mise/config.toml rather than a root mise.toml: it keeps the
 # repository root clean and is higher precedence than .config/mise/config.toml.
 
-[tools]
-odin = "latest"
+# Nabla builds against the maintainer's Odin fork, not an installed release. An
+# installed odin tool would export its own ODIN_ROOT and override this one.
+[env]
+ODIN_ROOT = "{{env.HOME}}/Projects/Odin"
 
 [task_config]
 # Replaces mise's default task directories (mise-tasks/, .mise/tasks/, ...) so
