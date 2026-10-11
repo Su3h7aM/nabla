@@ -77,7 +77,10 @@ connect_request :: proc(
 	if framing_err == .None && framing == .Exact {
 		summary.declared_body_bytes = u64(length)
 	}
-	if framing_err != .None { return nil, failure }
+	if framing_err != .None {
+		failure.cause = framing_err
+		return nil, failure
+	}
 	if body_err := stream_body(&exchange.reader, framing, length, state, callback); body_err != .None {
 		failure.cause = body_err
 		return nil, failure

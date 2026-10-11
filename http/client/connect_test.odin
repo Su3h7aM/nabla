@@ -144,23 +144,34 @@ test_connect_hands_off_coalesced_tunnel_bytes_and_destroy_closes_it :: proc(t: ^
 }
 
 @(test)
-test_connect_streams_a_non_success_response_body :: proc(t: ^testing.T) {
-	server := Connect_Test_Server {
-		response = "HTTP/1.1 407 Proxy Authentication Required\r\ncontent-length: 6\r\n\r\ndenied",
+test_connect_preserves_refusal_body_and_framing_error :: proc(t: ^testing.T) {
+	cases := []struct {
+		response, body: string,
+		cause:          Error,
+	} {
+		{"HTTP/1.1 407 Proxy Authentication Required\r\ncontent-length: 6\r\n\r\ndenied", "denied", .None},
+		{"HTTP/1.1 407 Proxy Authentication Required\r\ncontent-length: invalid\r\n\r\n", "", .Bad_Response},
 	}
-	listener, worker, url := connect_test_start(t, &server)
-	defer {
-		connect_test_stop(listener, worker)
-		delete(url, context.allocator)
-	}
-	if worker == nil { return }
+	for entry in cases {
+		server := Connect_Test_Server {
+			response = entry.response,
+		}
+		listener, worker, url := connect_test_start(t, &server)
+		defer {
+			connect_test_stop(listener, worker)
+			delete(url, context.allocator)
+		}
+		if worker == nil { return }
 
-	body: Connect_Test_Body
-	response, failure := connect_request("destination.example:443", url, nil, {}, &body, connect_test_collect)
-	defer if response != nil { upgraded_destroy(response) }
-	defer failure_destroy(&failure, context.allocator)
-	testing.expect_value(t, failure.kind, Failure_Kind.HTTP_Status)
-	testing.expect_value(t, failure.status, 407)
-	testing.expect_value(t, string(body.bytes[:body.length]), "denied")
-	testing.expect(t, server.request_matches, "the server received an unexpected CONNECT request")
+		body: Connect_Test_Body
+		response, failure := connect_request("destination.example:443", url, nil, {}, &body, connect_test_collect)
+		defer if response != nil { upgraded_destroy(response) }
+		defer failure_destroy(&failure, context.allocator)
+		testing.expect_value(t, failure.kind, Failure_Kind.HTTP_Status)
+		testing.expect_value(t, failure.status, 407)
+		testing.expect_value(t, failure.cause, entry.cause)
+		testing.expect_value(t, string(body.bytes[:body.length]), entry.body)
+		thread.join(worker)
+		testing.expect(t, server.request_matches, "the server received an unexpected CONNECT request")
+	}
 }

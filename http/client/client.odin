@@ -148,7 +148,10 @@ stream_request :: proc(request: Request, options: Options, state: $T, callback: 
 	if framing_err != .None {
 		// The head's framing is unusable, so there is no body this client can frame
 		// or hand over. A refusal is still reported as the refusal it is.
-		if refusal.kind != .None { return refusal }
+		if refusal.kind != .None {
+			refusal.cause = framing_err
+			return refusal
+		}
 		return failure_from_error(framing_err, request.allocator)
 	}
 	if body_err := stream_body(&exchange.reader, framing, length, state, callback); body_err != .None {
