@@ -30,10 +30,3 @@ Each report has a dated heading with a short name, then four parts:
 I asked agent-9 to review the completed navigation change. The message tool accepted the follow-ups, but status continued to show running, a last record of turn.completed older than 40 minutes, and two unread messages. No new request record appeared during the checks. I stopped the child and reviewed the final diff directly instead of waiting longer.
 
 Status should distinguish a queued follow-up, an active request, and a completed turn, and say why accepted messages are waiting. This would make it possible to decide whether to wait or replace the work without relying on an old assistant answer.
-
-## 2026-10-11 Model ids listed by agents models
-
-- Goal: start subagents on a model shown by `agents{action: "models"}`.
-- Attempt: `agent` start with `model` set to the id as listed, such as `cliproxyapi/openai/gpt-6.1-sol` with `provider = "cliproxyapi"`, and `opencode-go/muse-spark-1.3-contributor` with `provider = "opencode-go"`.
-- Gap: the listing prefixes each model id with its provider id, while `start` wants the bare model id. Because model ids may themselves contain slashes (`openai/gpt-6.1-sol`), the reader cannot tell which part is the provider. Each call failed once with "no configured provider serves model" or "model not found for provider".
-- Workaround: strip the provider prefix by hand (`openai/gpt-6.1-sol`, `muse-spark-1.3-contributor`) and pass `provider` separately. The listing should print the bare model id under its provider heading, or `start` should accept the listed form.

@@ -10,7 +10,7 @@ import "nabla:agent/journal"
 
 TOOL_AGENT_NAME :: "agent"
 TOOL_AGENT_DESCRIPTION :: "Manage subagents with start, message, configure, or stop. Only the orchestrator manages children; a subagent can only message its orchestrator. Call agents with action models to see live native model/provider choices and configured ACP programs. Normally start with only instruction and prompt; override model/provider/effort only when the user or your instructions name them.\n\nStart gives a separate session one narrow task. It sees none of your conversation, so supply all facts, paths, decisions, scope and exactly what to return. Delegate focused research or disjoint edits instead of broad goals. You receive its answer, not its working context; it usually runs cheaper. Do not do delegated work yourself while it runs. Everyone shares one workspace: assign disjoint files, tell each child who else is working and which files it owns, and do not edit its files. Children cannot talk to each other; relay relevant findings yourself.\n\nA background start returns an id at once, or queued when no slot is free. Keep working on independent work; answers arrive as messages. If nothing else can proceed, end your turn and the answer starts a new one. wait true blocks and returns the answer. Message a running or queued child to steer it, change its task, answer questions or pass on findings; delivery is between requests and the call returns at once.\n\nMessage to a finished child reopens the same id and session, including its task, history and last answer, whether it completed, failed, stopped or crashed. Use it for follow-ups and retries instead of repeating the task in a new child. It runs in the background and keeps its last model/effort. Configure with a message to reopen on another selection. A session another process is running cannot be reopened; unknown ids list this session's children and outcomes.\n\nConfigure names only what changes; it needs model, provider, effort or compact true, and may also send a message. A running child switches at its next request; the newest pending switch replaces the previous one. A switch that does not fit compacts first when configuration allows, otherwise the child reports refusal. Compaction installs at a request boundary. A finished child with compact true works while the summary runs if given a message, or ends once the summary installs without one; completion reaches you. ACP children reopen only with session/resume or session/load support. ACP model/effort switches apply between prompts; provider and compact are refused because ACP manages them.\n\nStop returns stopping at once. Work ends at the next step and a notice arrives as a message; a queued child never starts. Existing file changes remain. A finished child cannot be stopped.\n\nA subagent uses message with agent omitted to ask about missing facts, report a wrong premise or share an early finding. The orchestrator's reply arrives as a message."
-TOOL_AGENT_SCHEMA :: `{"additionalProperties":false,"properties":{"acp_agent":{"description":"start: configured ACP program name, listed by agents action models. Default: native child. Model and effort are chosen among the program's offerings.","type":["string","null"]},"action":{"description":"start creates a child; message only sends text or reopens a child; configure changes model/provider/effort or compacts; stop cancels.","enum":["start","message","configure","stop"],"type":"string"},"agent":{"description":"message/configure/stop: child id returned by start. Required for the orchestrator. A subagent omits it to message the orchestrator.","type":["string","null"]},"compact":{"description":"configure: true requests compaction at a running child's request boundary, or on reopening a finished native child. Refused for ACP.","type":"boolean"},"effort":{"description":"start/configure: a stated reasoning effort level. start defaults to one level below yours; configure keeps the last effort or the nearest level the model states.","type":["string","null"]},"instruction":{"description":"start: system prompt, how to work and what to return.","type":["string","null"]},"message":{"description":"message: required, non-empty text. configure: optional text; required to reopen a finished child unless compact is true.","type":["string","null"]},"model":{"description":"start/configure: exact catalog model id with its vendor prefix; no aliases. See agents action models. start defaults to your model; configure keeps the child's last model.","type":["string","null"]},"prompt":{"description":"start: one narrow task with all needed facts, paths, scope and return requirements.","type":"string"},"provider":{"description":"start/configure: configured provider id, not a vendor name; needed when several providers serve model. start prefers your provider if it serves model, otherwise the only one that does; configure keeps the last provider.","type":["string","null"]},"wait":{"description":"start: default false, run in the background and deliver the answer later. true blocks and returns the answer; use only when nothing else can proceed before it.","type":["boolean","null"]}},"required":["action"],"type":"object"}`
+TOOL_AGENT_SCHEMA :: `{"additionalProperties":false,"properties":{"acp_agent":{"description":"start: configured ACP program name, listed by agents action models. Default: native child. Model and effort are chosen among the program's offerings.","type":["string","null"]},"action":{"description":"start creates a child; message only sends text or reopens a child; configure changes model/provider/effort or compacts; stop cancels.","enum":["start","message","configure","stop"],"type":"string"},"agent":{"description":"message/configure/stop: child id returned by start. Required for the orchestrator. A subagent omits it to message the orchestrator.","type":["string","null"]},"compact":{"description":"configure: true requests compaction at a running child's request boundary, or on reopening a finished native child. Refused for ACP.","type":"boolean"},"effort":{"description":"start/configure: a stated reasoning effort level. start defaults to one level below yours; configure keeps the last effort or the nearest level the model states.","type":["string","null"]},"instruction":{"description":"start: system prompt, how to work and what to return.","type":["string","null"]},"message":{"description":"message: required, non-empty text. configure: optional text; required to reopen a finished child unless compact is true.","type":["string","null"]},"model":{"description":"start/configure: exact catalog model id with its vendor prefix; no aliases. See agents action models. start defaults to your model; configure keeps the child's last model.","type":["string","null"]},"prompt":{"description":"start: one narrow task with all needed facts, paths, scope and return requirements.","type":"string"},"provider":{"description":"start/configure: configured provider id, not a vendor name; needed only when several providers serve the same model id. start prefers your provider if it serves model, otherwise the only one that does; configure keeps the last provider.","type":["string","null"]},"wait":{"description":"start: default false, run in the background and deliver the answer later. true blocks and returns the answer; use only when nothing else can proceed before it.","type":["boolean","null"]}},"required":["action"],"type":"object"}`
 TOOL_AGENT_MESSAGE_SCHEMA :: `{"additionalProperties":false,"properties":{"action":{"enum":["message"],"type":"string"},"agent":{"description":"Omit to message your orchestrator; no sibling messages.","type":["string","null"]},"message":{"description":"A non-empty message to your orchestrator.","type":"string"}},"required":["action","message"],"type":"object"}`
 TOOL_AGENT_START_FIELDS :: []string{"action", "instruction", "prompt", "model", "provider", "effort", "wait", "acp_agent"}
 TOOL_AGENT_MESSAGE_FIELDS :: []string{"action", "agent", "message"}
@@ -30,7 +30,7 @@ TOOL_AGENT_DEFINITION :: Tool_Definition {
 TOOL_AGENTS_NAME :: "agents"
 TOOL_AGENTS_DEFINITION :: Tool_Definition {
 	name = TOOL_AGENTS_NAME,
-	description = "Observe without changing a child or sending messages. list shows every child's name, status and session. status reads one child's journal: last selection, newest record and age, last failure, last Assistant text marked partial when applicable, unread messages and a resume call. models lists live configured providers and their model ids, known context/effort/cost facts, ACP programs and your current model/effort. Unknown ids list known children. Orchestrator only.",
+	description = "Observe without changing a child or sending messages. list shows every child's name, status and session. status reads one child's journal: last selection, newest record and age, last failure, last Assistant text marked partial when applicable, unread messages and a resume call. models lists the live model ids by provider with their effort levels and prices, the ACP programs and your current model/effort. Unknown ids list known children. Orchestrator only.",
 	input_schema = `{"additionalProperties":false,"properties":{"action":{"description":"Default list. status inspects one child; models lists live provider/model and ACP choices.","enum":["list","status","models"],"type":"string"},"agent":{"description":"status only: required child id returned by agent action start.","type":"string"}},"type":"object"}`,
 	hints = {read_only = .Yes, destructive = .No, idempotent = .Yes, open_world = .No},
 	placement = .Owner,
@@ -257,7 +257,7 @@ tool_agents_models :: proc(team: ^Agent_Team) -> (text: string, err: mem.Allocat
 		catalog = parent.catalog
 		append(
 			&parts,
-			fmt.tprintf("current: %s/%s, effort %s\n", parent.provider_id, parent.model_id, parent.effort if parent.effort != "" else "default"),
+			fmt.tprintf("current: %s (%s), effort %s\n", parent.model_id, parent.provider_id, parent.effort if parent.effort != "" else "default"),
 		) or_return
 		append(&parts, "ACP agents:\n") or_return
 		if len(parent.acp_agents) == 0 { append(&parts, "  none configured\n") or_return }
@@ -265,7 +265,7 @@ tool_agents_models :: proc(team: ^Agent_Team) -> (text: string, err: mem.Allocat
 			append(&parts, fmt.tprintf("  %s: %s\n", program.name, program.description)) or_return
 		}
 	}
-	append(&parts, "Native providers and models (pass model id and provider id separately):\n") or_return
+	append(&parts, "Native models by provider. Pass the model id as listed; add provider only when several providers serve one id:\n") or_return
 	if catalog.catalog == nil {
 		append(&parts, "  no catalog available\n") or_return
 		return strings.concatenate(parts[:], context.temp_allocator)
@@ -277,23 +277,17 @@ tool_agents_models :: proc(team: ^Agent_Team) -> (text: string, err: mem.Allocat
 		append(&parts, fmt.tprintf("provider: %s\n", provider.id)) or_return
 		for model in catalog.catalog.models {
 			if model.provider_id != provider.id { continue }
-			append(&parts, "  ", provider.id, "/", model.id) or_return
-			if window, known := model.context_window.?; known { append(&parts, fmt.tprintf("; context %d tokens", window)) or_return }
-			if output, known := model.max_output_tokens.?; known { append(&parts, fmt.tprintf("; max output %d tokens", output)) or_return }
+			append(&parts, "  ", model.id) or_return
 			levels := model.thinking.levels.? or_else nil
 			if len(levels) > 0 {
-				append(&parts, "; effort ") or_return
-				for level, index in levels {
-					if index > 0 { append(&parts, ", ") or_return }
-					append(&parts, level) or_return
-				}
+				joined := strings.join(levels, ", ", context.temp_allocator) or_return
+				append(&parts, "; effort ", joined) or_return
 			} else {
-				append(&parts, "; no stated effort levels") or_return
+				append(&parts, "; no effort levels") or_return
 			}
-			if price, known := model.cost.input.?; known { append(&parts, fmt.tprintf("; input $%g/M tokens", price)) or_return }
-			if price, known := model.cost.output.?; known { append(&parts, fmt.tprintf("; output $%g/M tokens", price)) or_return }
-			if price, known := model.cost.cache_read.?; known { append(&parts, fmt.tprintf("; cache read $%g/M tokens", price)) or_return }
-			if price, known := model.cost.cache_write.?; known { append(&parts, fmt.tprintf("; cache write $%g/M tokens", price)) or_return }
+			input, input_known := model.cost.input.?
+			output, output_known := model.cost.output.?
+			if input_known && output_known { append(&parts, fmt.tprintf("; $%g in, $%g out per M tokens", input, output)) or_return }
 			append(&parts, "\n") or_return
 		}
 	}
@@ -313,7 +307,7 @@ tool_agent_started_output :: proc(member: ^Subagent, requested_effort: string) -
 	output := Agent_Output {
 		agent   = member.name,
 		status  = subagent_status_names[.Running],
-		model   = fmt.tprintf("%s/%s", member.selection.provider_id, member.selection.model_id),
+		model   = member.selection.model_id,
 		effort  = member.effort if member.effort != "" else "default",
 		session = journal.session_id_to_hex(member.session, session_hex),
 	}

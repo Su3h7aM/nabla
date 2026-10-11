@@ -564,15 +564,15 @@ test_agents_models_reads_live_catalog_and_acp_choices :: proc(test: ^testing.T) 
 	testing.expect_value(test, subagent_test_call(test, chat, "models_1", TOOL_AGENTS_NAME, `{"action":"models"}`), journal.TOOL_OUTCOME_NAMES[.Success])
 	results := _test_records(test, chat, {.Tool_Completed})
 	text := string(results[len(results) - 1].body)
-	for fact in ([]string{"current: test-provider/vendor/test-model, effort high", "provider: test-provider", "test-provider/vendor/test-model", "context 200000 tokens", "max output 8000 tokens", "effort low, high", "input $2.5/M tokens", "output $10/M tokens", "reviewer: Reviews code"}) {
+	for fact in ([]string{"current: vendor/test-model (test-provider), effort high", "provider: test-provider", "  vendor/test-model; effort low, high; $2.5 in, $10 out per M tokens", "reviewer: Reviews code"}) {
 		testing.expect(test, strings.contains(text, fact), text)
 	}
-	for secret in ([]string{"test-key", "private-endpoint", "private-command"}) { testing.expect(test, !strings.contains(text, secret), text) }
+	for secret in ([]string{"test-key", "private-endpoint", "private-command", "context", "max output"}) { testing.expect(test, !strings.contains(text, secret), text) }
 	subagent_test_catalog_add(&catalog, "new-provider", "vendor/new-model", "http://localhost/unused", nil)
 	testing.expect_value(test, subagent_test_call(test, chat, "models_2", TOOL_AGENTS_NAME, `{"action":"models"}`), journal.TOOL_OUTCOME_NAMES[.Success])
 	results = _test_records(test, chat, {.Tool_Completed})
 	text = string(results[len(results) - 1].body)
-	testing.expect(test, strings.contains(text, "new-provider/vendor/new-model; context 131072 tokens; no stated effort levels"), text)
+	testing.expect(test, strings.contains(text, "  vendor/new-model; no effort levels"), text)
 }
 
 @(test)
