@@ -110,7 +110,6 @@ Stdio :: struct {
 	// wakes it from its poll for good.
 	drain_stop_read:  ^os.File,
 	drain_stop_write: ^os.File,
-	sigpipe_owned:    bool,
 	allocator:        mem.Allocator,
 }
 
@@ -125,15 +124,8 @@ stdio_start :: proc(stdio: ^Stdio, config: Stdio_Config, allocator := context.al
 	defer stdio_vectors_destroy(argv, environment, allocator)
 	if !vectors_ok { return error_make(.Out_Of_Memory, allocator = allocator) }
 
-	// A dead peer must be an error, not a signal that kills the harness.
-	if sigpipe_error := stdio_sigpipe_acquire(); sigpipe_error != nil {
-		return stdio_spawn_error("the SIGPIPE disposition could not be saved", sigpipe_error, allocator)
-	}
-	stdio.sigpipe_owned = true
 	pipes, child, spawn_error := stdio_spawn(argv, environment, config.working_directory)
 	if spawn_error != nil {
-		stdio_sigpipe_release()
-		stdio.sigpipe_owned = false
 		return stdio_spawn_error("the server process could not be started", spawn_error, allocator)
 	}
 
@@ -229,10 +221,6 @@ stdio_stop :: proc(stdio: ^Stdio) {
 	delete(stdio.line)
 	delete(stdio.out)
 	delete(stdio.stderr_tail)
-	if stdio.sigpipe_owned {
-		stdio_sigpipe_release()
-		stdio.sigpipe_owned = false
-	}
 	stdio^ = {}
 }
 

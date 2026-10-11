@@ -429,6 +429,10 @@ chat_main :: proc() -> int {
 }
 
 main :: proc() {
+	if err := signal_catch_pipe(); err != nil {
+		fmt.eprintf("nabla: SIGPIPE could not be caught: %s\n", os.error_string(err))
+		os.exit(1)
+	}
 	os.exit(chat_main())
 }
 

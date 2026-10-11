@@ -3,7 +3,6 @@ package mcp
 import "core:mem"
 import "core:os"
 import "core:strings"
-import "core:sync"
 import "nabla:subprocess"
 
 // Stdio_Pipes is the parent's end of a spawned server's three streams. Each end
@@ -68,43 +67,6 @@ stdio_await_readable :: proc(file: ^os.File, stop: ^os.File) -> (stopped: bool, 
 	entries := [2]subprocess.Poll{{fd = subprocess.fd(file)}, {fd = subprocess.fd(stop)}}
 	subprocess.poll(entries[:], {}, false) or_return
 	return entries[1].ready, nil
-}
-
-// SIGPIPE is process-wide, but the stdio transport is not. These fields hold the
-// saved disposition while at least one stdio server is running. The lock makes
-// concurrent starts and stops agree on which one owns the restore.
-@(private)
-stdio_sigpipe_mutex: sync.Mutex
-@(private)
-stdio_sigpipe_users: int
-@(private)
-stdio_sigpipe_previous: Stdio_Signal_State
-@(private)
-stdio_sigpipe_saved: bool
-
-// stdio_sigpipe_acquire makes a pipe write report EPIPE instead of terminating the
-// process, and saves the disposition that was in force before the first stdio server.
-@(require_results)
-stdio_sigpipe_acquire :: proc() -> os.Error {
-	sync.mutex_guard(&stdio_sigpipe_mutex)
-	if stdio_sigpipe_users == 0 {
-		stdio_sigpipe_ignore(&stdio_sigpipe_previous) or_return
-		stdio_sigpipe_saved = true
-	}
-	stdio_sigpipe_users += 1
-	return nil
-}
-
-// stdio_sigpipe_release restores the process disposition when the last stdio server
-// stops. A failed restore is left to the process owner; the transport must not keep
-// a stale reference count and prevent a later owner from trying again.
-stdio_sigpipe_release :: proc() {
-	sync.mutex_guard(&stdio_sigpipe_mutex)
-	if stdio_sigpipe_users == 0 { return }
-	stdio_sigpipe_users -= 1
-	if stdio_sigpipe_users != 0 || !stdio_sigpipe_saved { return }
-	stdio_sigpipe_restore(&stdio_sigpipe_previous)
-	stdio_sigpipe_saved = false
 }
 
 // Stdio_Wait is what ended a wait on a pipe end.

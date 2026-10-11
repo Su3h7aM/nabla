@@ -20,4 +20,5 @@
 // Message shapes are decoded into concrete types rather than into a generic RPC
 // value. Only the operations the harness needs are implemented, and one that is
 // not implemented is refused with a diagnostic instead of being half-handled.
+// On POSIX, the program must not let SIGPIPE terminate it, for example by catching it, because a write to a server that exited raises it.
 package mcp
