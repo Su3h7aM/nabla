@@ -12,14 +12,17 @@
 // is a request, a notification, or a response, and leaves params and result as JSON
 // because their shape belongs to the method. parse_batch splits a JSON-RPC batch into
 // one frame per member, so every member is held to the same per-message rules. A
-// Frame_Decoder turns a byte stream into frames and imposes no size limit, since the
-// protocol has none: its buffer grows to hold whatever the peer sends. A frame
-// refused as empty or non-UTF-8 is dropped whole and the decoder keeps reading, so
-// one bad frame does not hide the frames behind it.
+// stream is read as frames with a bufio.Scanner that frame_scanner_init prepares: it
+// splits at newlines with frame_split, so bytes after the last newline are a message
+// the peer never finished, and it imposes no size limit, since the protocol has none:
+// its buffer grows to hold whatever the peer sends. A token borrows the scanner's
+// buffer until the next scan. frame_check refuses a frame as empty or non-UTF-8; the
+// caller drops it whole and scans on, so one bad frame does not hide the frames behind it.
 //
 // What the decoding side allocates, it owns, with the allocator it was given:
-// destroy_envelope releases an Envelope, frame_strings_destroy releases the frames
-// frame_decoder_feed cloned, and frame_decoder_destroy releases the decoder.
+// destroy_envelope releases an Envelope, frame_strings_destroy releases a list of
+// frames such as parse_batch returns, and the caller's bufio.scanner_destroy releases
+// the scanner's buffer.
 //
 // A Writer encodes each complete frame before transferring its owned bytes to an
 // unbounded FIFO. One writer thread owns the stream, so senders never wait for I/O

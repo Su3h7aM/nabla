@@ -1,6 +1,7 @@
 package agent
 
 import "base:runtime"
+import "core:bufio"
 import "core:container/queue"
 import "core:encoding/json"
 import "core:fmt"
@@ -410,7 +411,6 @@ ACP_Readers :: struct {
 	process:     os.Process,
 	threads:     [ACP_Worker]^thread.Thread,
 	done:        [ACP_Worker]bool,
-	decoder:     acp.Frame_Decoder,
 	frames:      queue.Queue(string),
 	frame_error: acp.Frame_Error,
 	read_error:  os.Error,
@@ -437,28 +437,41 @@ acp_output_read :: proc(worker: ^thread.Thread) {
 		readers.done[.Output] = true
 		acp_readers_signal(readers)
 	}
-	buffer: [SUBAGENT_ACP_READ_BYTES]u8
-	for {
-		taken, err := os.read(readers.output, buffer[:])
-		if err != nil || taken == 0 {
-			sync.mutex_guard(&readers.mutex)
-			if err != io.Error.EOF { readers.read_error = err }
-			return
-		}
-		frames: [dynamic]string
-		frames.allocator = readers.allocator
-		frame_error := acp.frame_decoder_feed(&readers.decoder, buffer[:taken], &frames)
+	scanner: bufio.Scanner
+	acp.frame_scanner_init(&scanner, os.to_reader(readers.output), readers.allocator)
+	defer bufio.scanner_destroy(&scanner)
+	for bufio.scan(&scanner) {
+		text := bufio.scanner_text(&scanner)
+		frame_error := acp.frame_check(text)
+		if frame_error == .Empty_Frame { continue }
+		// The frame leaves the scanner's buffer here: the next scan reuses it, and the
+		// consumer reads this one on another thread.
+		frame, clone_error := strings.clone(text, readers.allocator)
+		if frame_error == .None && clone_error != nil { frame_error = .Allocation }
 		{
 			sync.mutex_guard(&readers.mutex)
-			if _, push_error := queue.push_back_elems(&readers.frames, ..frames[:]); push_error != nil {
-				for frame in frames { delete(frame, readers.allocator) }
-				frame_error = .Allocation
+			if frame_error == .None {
+				if _, push_error := queue.push_back(&readers.frames, frame); push_error != nil {
+					delete(frame, readers.allocator)
+					frame_error = .Allocation
+				}
+			} else {
+				delete(frame, readers.allocator)
 			}
-			if frame_error != .None && frame_error != .Empty_Frame { readers.frame_error = frame_error }
+			if frame_error != .None { readers.frame_error = frame_error }
 			acp_readers_signal(readers)
 		}
-		delete(frames)
-		if frame_error != .None && frame_error != .Empty_Frame { return }
+		if frame_error != .None { return }
+	}
+	scan_error := bufio.scanner_error(&scanner)
+	if scan_error != nil {
+		sync.mutex_guard(&readers.mutex)
+		#partial switch error in scan_error {
+		case io.Error:
+			readers.read_error = error
+		case:
+			readers.read_error = io.Error.Unknown
+		}
 	}
 }
 
@@ -1074,9 +1087,7 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	readers.process = child
 	writer, writer_error := acp.writer_init(os.to_writer(input_write), member.allocator)
 	connection.writer = writer
-	decoder, decoder_error := acp.frame_decoder_init(allocator = member.allocator)
-	readers.decoder = decoder
-	if writer_error != nil || decoder_error != nil { return "the agent's connection could not be allocated" }
+	if writer_error != nil { return "the agent's connection could not be allocated" }
 	procedures := [ACP_Worker]thread.Thread_Proc {
 		.Output  = acp_output_read,
 		.Errors  = acp_errors_read,
@@ -1167,7 +1178,6 @@ acp_connection_close :: proc(connection: ^ACP_Connection, patience: time.Duratio
 			}
 			queue.destroy(&readers.frames)
 			delete(readers.stderr_tail)
-			acp.frame_decoder_destroy(&readers.decoder)
 			free(readers, connection.member.allocator)
 		} else {
 			subagent_fail(connection.member, .Failed, "the agent's transport worker did not retire; its outcome is unknown and its resources were retained")

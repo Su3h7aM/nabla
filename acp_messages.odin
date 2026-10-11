@@ -3,6 +3,7 @@ package main
 
 import "base:runtime"
 
+import "core:bufio"
 import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
@@ -31,51 +32,31 @@ NABLA_ACP_VERSION :: "0.1.0"
 // client simply closed it, which is how a client says it is done.
 @(require_results)
 acp_serve :: proc(server: ^ACP_Server, input: io.Reader) -> bool {
-	decoder, decoder_error := acp.frame_decoder_init(server.alloc)
-	if decoder_error != nil {
-		// A write error latches the writer, which acp_serve reports as the run's
-		// failure, so a reply's own result is not acted on here or below.
-		_ = acp.write_error(&server.writer, nil, acp.ERROR_INTERNAL, "the ACP frame buffer could not be allocated")
-		return false
+	scanner: bufio.Scanner
+	acp.frame_scanner_init(&scanner, input, server.alloc)
+	defer bufio.scanner_destroy(&scanner)
+	for !acp.writer_failed(&server.writer) && bufio.scan(&scanner) {
+		// The frame borrows the scanner's buffer, which the next scan reuses, so nothing may
+		// keep it past this iteration.
+		frame := bufio.scanner_text(&scanner)
+		if frame_err := acp.frame_check(frame); frame_err != .None {
+			// The message is dropped rather than half-read; the client is told what was
+			// wrong with it, and the conversation continues. A write error latches the
+			// writer, which acp_serve reports as the run's failure, so a reply's own result
+			// is not acted on here or below.
+			_ = acp.write_error(&server.writer, nil, acp.ERROR_PARSE, acp.frame_error_text(frame_err))
+			continue
+		}
+		// A session whose worker retired gives its slot back before the next request.
+		acp_sessions_reap(server)
+		acp_handle_frame(server, frame)
+		// Temp scratch belongs to one message: a request is decoded into it and
+		// whatever outlives the message is cloned.
+		free_all(context.temp_allocator)
 	}
-	defer acp.frame_decoder_destroy(&decoder)
-	frames: [dynamic]string
-	frames.allocator = server.alloc
-	defer acp.frame_strings_destroy(&frames, server.alloc)
-
-	buffer: [ACP_READ_BYTES]u8
-	read_failed := false
-	for !acp.writer_failed(&server.writer) {
-		count, read_err := io.read(input, buffer[:])
-		if count == 0 && read_err == nil {
-			// A blocking stream that reports nothing read and no error has nothing more to
-			// give. Waiting on it again would spin the reader.
-			read_err = .EOF
-		}
-		if count > 0 {
-			if frame_err := acp.frame_decoder_feed(&decoder, buffer[:count], &frames); frame_err != .None {
-				// The message is dropped rather than half-read; the client is told what was
-				// wrong with it, and the conversation continues.
-				_ = acp.write_error(&server.writer, nil, acp.ERROR_PARSE, acp.frame_error_text(frame_err))
-			}
-			for frame in frames {
-				// A session whose worker retired gives its slot back before the next request.
-				acp_sessions_reap(server)
-				acp_handle_frame(server, frame)
-				delete(frame, server.alloc)
-				// Temp scratch belongs to one message: a request is decoded into it and
-				// whatever outlives the message is cloned.
-				free_all(context.temp_allocator)
-			}
-			clear(&frames)
-		}
-		if read_err != nil {
-			// End of input is how a client closes the conversation; any other error means
-			// the stream is gone either way.
-			read_failed = read_err != .EOF
-			break
-		}
-	}
+	// End of input is how a client closes the conversation; any other error means the
+	// stream is gone either way.
+	read_failed := bufio.scanner_error(&scanner) != nil
 	// A turn still running is stopped before the workers are joined: it settles as
 	// cancelled, so the record says the session was interrupted rather than guessing.
 	for session in server.sessions {
