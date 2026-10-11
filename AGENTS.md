@@ -72,7 +72,9 @@ Tests live in the package they validate: `<source>_test.odin` beside the source,
 
 Use **mise** for everything: it installs Odin and runs the tasks `build`, `check`, `fmt`, and `test` (`mise run <task>`). Each task is a standalone Bash script under `scripts/` that also runs directly; read it before changing it.
 
-The tasks run the `odin` on `PATH`, which is the version mise installs. With `ODIN_ROOT` set they run `$ODIN_ROOT/odin` and that tree's `core`, `base`, and `vendor` instead, for example `ODIN_ROOT=/home/su3h7am/Projects/Odin mise run check` for the maintainer's fork. The mise version and the fork differ in places, and code must compile with both. The fork has compiler checks the mise version lacks, so run `check` and `test` with it before committing a change that touches ownership or pointers.
+Nabla is built against the maintainer's Odin fork at `/home/su3h7am/Projects/Odin`, which has library features and compiler checks the official release lacks. Run every task with it: `ODIN_ROOT=/home/su3h7am/Projects/Odin mise run <task>`. With `ODIN_ROOT` set, the tasks run `$ODIN_ROOT/odin` and that tree's `core`, `base`, and `vendor`; without it they run the official `odin` mise installs on `PATH`, which is not the target. Read the standard library from the fork too.
+
+When Nabla needs something Odin does not provide, such as a system call, a constant, or a feature that only libc offers, add it to `/tmp/odin-missing-features.md` with the file and line that works around it, so it can be added to the fork.
 
 Before committing a code change, run `mise run fmt`, `mise run check`, and the tests covering what you touched. `mise run test` is the full gate. Documentation-only changes need no run.
 
