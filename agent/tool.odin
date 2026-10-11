@@ -551,7 +551,7 @@ AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session wor
 // TOOL_DECLARED is the native tools written as constants, in the order they are
 // registered. tool_registry_sort fixes the advertised order after this list is
 // read. The shell, read, and web search tools are not here: tool_registry_make builds their
-// descriptions with the shell, the preview size, and the search defaults. Only the shell and web search state a timeout
+// descriptions with the shell, the preview size, and the search defaults. The shell, web search, and web fetch state a timeout
 // policy; the file and skill tools carry a zero policy, which means no
 // tool-specific bound rather than a forgotten configuration.
 @(private)
@@ -565,6 +565,7 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_AGENT_DEFINITION,
 	TOOL_AGENTS_DEFINITION,
 	TOOL_JOBS_DEFINITION,
+	TOOL_WEB_FETCH_DEFINITION,
 }
 
 // TOOL_NATIVE_COUNT is how many unconditional native tools a registry holds: the declared

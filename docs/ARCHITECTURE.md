@@ -172,7 +172,7 @@ harness      agent  agent/journal  agent/material  root package (nabla executabl
 | foundation | text, Markdown parsing, input, terminal, layout, immediate-mode UI | anything about models, sessions, HTTP |
 | `dns` `tls` `http` `http/client` `sse` `websocket` | protocols, transfer phases, byte and delivery facts | retries of model work, provider knowledge, harness logging policy |
 | `html` | non-allocating HTML tokenization with borrowed tokens and attributes; no tree building | browser parsing, page extraction policy |
-| `web` | search service requests, normalized results, classified errors, environment endpoints, ordered fallback | tool policy, sessions, harness configuration |
+| `web` | page fetching and HTML conversion, search service requests, normalized results, classified errors, environment endpoints, ordered fallback | tool policy, sessions, harness configuration |
 | `subprocess` | starting a child in its own process group, exit watching, group termination (SIGTERM, grace, SIGKILL), readiness polling | what the child is for, pipes policy, output capture |
 | `ai` | provider API families, encoding with caller-owned encode cache, stream decoding, failure classification, delivery evidence, one-send operations, Responses WebSocket connection | turn control, retry authorization, catalog policy, storage |
 | `mcp` | MCP client protocol over stdio, delivery state | tool policy, naming policy |
@@ -771,6 +771,7 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 | `skills` | Session | Worker |
 | `skill` | Read(skill file) | Worker |
 | `web_search` | External(network) | Worker |
+| `web_fetch` | External(network) | Worker |
 | `agent` action `start` (main sessions only) | Read(all) or Process, by scope | Worker |
 | `agent` actions `message`, `configure`, `stop` | Session | Owner |
 | `agents` (main sessions only, read-only) | Session | Owner |
@@ -814,7 +815,8 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 - Write: validate, temp file in the same directory, write, fsync, rename; refuse symlinks and non-regular targets; keep the mode.
 - Shell: `$SHELL -c` (fallback `/bin/sh` only when exec failed), fresh process group, stdin closed, inherited environment, async-signal-safe child path, one `poll` over both pipes, the child's exit handle, and the job's stop wake with the deadline as its timeout, TERM to the group then KILL after `SHELL_KILL_GRACE`, reap, exec failure distinct from exit 127, UTF-8-sanitized output retained whole: each stream is written as it arrives to `<call>.stdout.txt` or `<call>.stderr.txt` beside the other kept outputs, and held in memory up to `TOOL_STREAM_MEMORY_BYTES`. A stream that stayed within memory is whole in the result and its file is removed when the call ends; a larger stream keeps its file, named in the result, with only its beginning in the result. A call whose process ends mid-run therefore leaves the output it produced so far in those files, which recovery names (section 9). A file that cannot be created leaves its stream in memory. The timeout is the model's value when given, else the default; there is no maximum.
 - MCP: one shared executor; one request at a time per client lane. Delivery state maps to `Transport_Failed` (not delivered) or `Unknown` (delivered, no reply). Non-text blocks are described, not dumped.
-- Web search: `web.search_first` over configured endpoints with one probe from the job's interrupt and deadline; cancellation and timeout stop fallback and return no partial results. `query` is required; `count` defaults to 8, with optional freshness, domain filters, and `timeout_ms` overriding the 30-second default without a maximum. The description, result text, and Lua output are service-neutral. Only the optional `provider` schema enum names the session's services in priority order; selecting one tries it first and keeps the others as fallbacks. Exa REST and MCP are one service. Results include an optional notice when an API maximum lowered the count and an optional answer; zero results succeeds with query advice. Service outcomes and credential hints go only to the human-facing `Tool_Result.reason`. All-failed model feedback is generic, with retry advice when any failure was temporary. Configuration belongs to section 13.1.
+- Web search: `web.search_first` over configured endpoints with one probe from the job's interrupt and deadline; cancellation and timeout stop fallback and return no partial results. `query` is required; `count` defaults to 8, with optional freshness, domain filters, and `timeout_ms` overriding the 30-second default without a maximum. The description, result text, and Lua output are service-neutral. Only the optional `provider` schema enum names the session's services in priority order; selecting one tries it first and keeps the others as fallbacks. Exa REST and MCP are one service. Results include an optional notice when an API maximum lowered the count and an optional answer; zero results succeeds with query advice. Service outcomes and credential hints go only to the human-facing `Tool_Result.reason`. All-failed model feedback names the cause and advice of the last service tried (the shared per-kind text of `tool_web.odin`, also used by web fetch) and never an endpoint. Configuration belongs to section 13.1.
+- Web fetch: always registered; `web.fetch` retrieves one URL with the same interrupt and deadline probe as web search. The URL is repaired when it has surrounding whitespace (`Text_Trimmed`) or no scheme (`Url_Scheme_Added`, https); a non-HTTP scheme, empty host, userinfo, control byte, or inner space is refused. It returns the final URL after redirects, title, Content-Type when known, and full content as Markdown, text, or HTML. Text and JSON pass through; unsupported media and charsets are actionable failures. Large content uses the existing result spill, never truncation.
 
 ### 14.5 Attachments
 
@@ -843,6 +845,8 @@ Tool_Repair :: enum {
 	Integer_From_String,
 	Integer_From_Float,
 	Trailing_Comma,
+	Url_Scheme_Added,
+	Text_Trimmed,
 }
 Tool_Repairs :: bit_set[Tool_Repair]
 ```
@@ -1154,6 +1158,7 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `TOOL_KILL_GRACE` | 500 ms | TERM to KILL |
 | `TOOL_SHELL_DEFAULT_TIMEOUT` | 120 s | default when the model gives none; no maximum |
 | `TOOL_WEB_SEARCH_DEFAULT_TIMEOUT` | 30 s | default when the model gives none; no maximum |
+| `TOOL_WEB_FETCH_DEFAULT_TIMEOUT` | 30 s | default when the model gives none; no maximum |
 | `TOOL_READ_DEFAULT_LINES` | 2000 lines | default when the model gives none; no maximum |
 | `TOOL_RESULT_PREVIEW_BYTES` | 32 KiB | what one result shows the model; the rest is kept in a file |
 | `TOOL_RESULT_NOTICE_TOKENS` | 128 | context reserved per later result in a batch |

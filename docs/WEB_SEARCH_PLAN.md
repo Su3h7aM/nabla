@@ -1,6 +1,6 @@
 # Native web search
 
-The native `web_search` tool is implemented. This document records the finished design; `web_fetch` remains separate work.
+The native `web_search` tool is implemented. This document records the finished design; `web_fetch` is documented in `ARCHITECTURE.md`.
 
 ## Packages
 
@@ -71,6 +71,3 @@ The answering service, per-endpoint failures, HTTP status, retry delay, and miss
 4. Done: native tool, configuration, provider preference, typed output, and tool tests.
 5. Done: documentation of the finished design and architecture.
 
-## Later: `web_fetch`
-
-A separate `web_fetch` tool can retrieve a URL and return Markdown using the `html` tokenizer. HTML-to-Markdown conversion, content selection, and fetch-tool policy are not part of this search implementation.

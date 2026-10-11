@@ -4,21 +4,20 @@ import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:time"
 
-import "nabla:ai"
-import "nabla:http/client"
 import "nabla:web"
 
 TOOL_WEB_SEARCH_NAME :: "web_search"
 
 // TOOL_WEB_SEARCH_DESCRIPTION is a format: the default count, then the default timeout in seconds.
-TOOL_WEB_SEARCH_DESCRIPTION :: `Search the web and return titles, URLs, and snippets. The search service does not know today's date: put the year in the query when you look for recent events.
+TOOL_WEB_SEARCH_DESCRIPTION :: `Search the web for sources and return titles, URLs, and snippets. Use it to discover pages; use web_fetch to read a URL you already have. Put the year in the query when you look for recent events.
 
-query is required. count is the number of results wanted (default %d); the search service's maximum applies, and the result says when the count was lowered. freshness limits results to the last day, week, month, or year (default any). include_domains and exclude_domains restrict or remove sites. The timeout is %d seconds unless you set timeout_ms, and there is no maximum.
+count is the number of results wanted (default %d); a service maximum lowers it and the result says so. freshness limits results to the last day, week, month, or year. include_domains and exclude_domains restrict or remove sites. provider selects the service tried first; the others remain as fallbacks. The timeout defaults to %d seconds; timeout_ms overrides it without a maximum.
 
-The result gives results (their count), an optional notice and answer, and after a blank line the numbered results, each with a title, a URL, published when available, and a snippet. A search with no results succeeds and suggests a broader query.`
+No results is not an error: broaden the query or drop the filters.`
 
 TOOL_WEB_SEARCH_SCHEMA ::
 	`{"type":"object","properties":{` +
@@ -63,10 +62,7 @@ tool_web_search_definition :: proc(config: ^Web_Search_Config, allocator := cont
 	}
 	description := fmt.tprintf(TOOL_WEB_SEARCH_DESCRIPTION, TOOL_WEB_SEARCH_DEFAULT_COUNT, int(TOOL_WEB_SEARCH_DEFAULT_TIMEOUT / time.Second))
 	definition.description = strings.clone(description, allocator) or_return
-	services := config.services
-	names := web.PROVIDER_NAMES
-	choices := make([]string, len(services), context.temp_allocator) or_return
-	for service, index in services { choices[index] = names[service] }
+	choices := tool_web_search_provider_names(config.services) or_return
 	encoded, encode_error := json.marshal(choices, allocator = context.temp_allocator)
 	if encode_error != nil { return definition, .Out_Of_Memory }
 	before, _, after := strings.partition(TOOL_WEB_SEARCH_SCHEMA, "%s")
@@ -75,21 +71,13 @@ tool_web_search_definition :: proc(config: ^Web_Search_Config, allocator := cont
 	return definition, nil
 }
 
-// TOOL_WEB_SEARCH_KIND_TEXT is how a failure kind reads in a failed line.
-@(private)
-TOOL_WEB_SEARCH_KIND_TEXT :: [web.Error_Kind]string {
-	.None               = "",
-	.Missing_Credential = "missing credential",
-	.Unauthorized       = "unauthorized",
-	.Quota              = "quota exhausted",
-	.Rate_Limited       = "rate limited",
-	.Rejected           = "rejected",
-	.Server             = "server error",
-	.Transport          = "transport failed",
-	.Timed_Out          = "timed out",
-	.Cancelled          = "cancelled",
-	.Invalid_Response   = "invalid response",
-	.Out_Of_Memory      = "out of memory",
+// tool_web_search_provider_names returns the names of services in temp memory.
+@(private, require_results)
+tool_web_search_provider_names :: proc(services: []web.Provider) -> (names: []string, err: mem.Allocator_Error) {
+	table := web.PROVIDER_NAMES
+	names = make([]string, len(services), context.temp_allocator) or_return
+	for service, index in services { names[index] = table[service] }
+	return names, nil
 }
 
 // tool_web_search_args reads the search's arguments. A timeout the model gives is honored as
@@ -106,20 +94,14 @@ tool_web_search_args :: proc(ctx: ^Tool_Context, arguments: json.Object, config:
 		if !is_string { return {}, tool_argument_error(.Wrong_Type, "provider", "a string", ctx.allocator) }
 		provider, parsed := web.provider_parse(string(name))
 		service := web.engine(provider)
-		matched := false
-		if config != nil && parsed {
-			for allowed in config.services {
-				if allowed == service { matched = true; break }
+		if config == nil || !parsed || !slice.contains(config.services, service) {
+			allowed: []string
+			if config != nil {
+				names_error: mem.Allocator_Error
+				allowed, names_error = tool_web_search_provider_names(config.services)
+				if names_error != nil { return {}, Tool_Argument_Defect{kind = .Out_Of_Memory} }
 			}
-		}
-		if !matched {
-			allowed: []web.Provider
-			if config != nil { allowed = config.services }
-			choices, make_error := make([]string, len(allowed), context.temp_allocator)
-			if make_error != nil { return {}, tool_argument_error(.Out_Of_Memory) }
-			names := web.PROVIDER_NAMES
-			for allowed_service, index in allowed { choices[index] = names[allowed_service] }
-			return {}, tool_argument_error(.Invalid_Value, "provider", strings.join(choices, ", ", context.temp_allocator), ctx.allocator)
+			return {}, tool_argument_error(.Invalid_Value, "provider", strings.join(allowed, ", ", context.temp_allocator), ctx.allocator)
 		}
 		args.provider = service
 	}
@@ -139,16 +121,7 @@ tool_web_search_args :: proc(ctx: ^Tool_Context, arguments: json.Object, config:
 	case:
 		return {}, tool_argument_error(.Invalid_Value, "freshness", "any, day, week, month, or year", ctx.allocator)
 	}
-	timeout_ms := tool_field_optional_int(
-		arguments,
-		"timeout_ms",
-		int(ctx.timeout / time.Millisecond),
-		1,
-		int(max(time.Duration) / time.Millisecond),
-		&ctx.repairs,
-		allocator = ctx.allocator,
-	) or_return
-	args.timeout = time.Duration(timeout_ms) * time.Millisecond
+	args.timeout = tool_web_timeout(ctx, arguments) or_return
 	args.include_domains = tool_field_optional_strings(arguments, "include_domains", allocator = ctx.allocator) or_return
 	args.exclude_domains, err = tool_field_optional_strings(arguments, "exclude_domains", allocator = ctx.allocator)
 	if err != nil {
@@ -197,7 +170,6 @@ tool_web_search_endpoints :: proc(config: ^Web_Search_Config, allocator: mem.All
 tool_web_search_reason :: proc(found: bool, provider: web.Provider, count: int, failures: []web.Failure) -> (text: string, err: mem.Allocator_Error) {
 	builder := strings.builder_make(context.temp_allocator) or_return
 	names := web.PROVIDER_NAMES
-	kinds := TOOL_WEB_SEARCH_KIND_TEXT
 	if found {
 		render_text(&builder, fmt.tprintf("%d results from %s", count, names[web.engine(provider)])) or_return
 	}
@@ -205,8 +177,7 @@ tool_web_search_reason :: proc(found: bool, provider: web.Provider, count: int, 
 		if found || index > 0 { render_text(&builder, "; ") or_return }
 		render_text(&builder, names[failure.provider]) or_return
 		render_text(&builder, ": ") or_return
-		render_text(&builder, kinds[failure.error.kind]) or_return
-		if failure.error.status > 0 { render_text(&builder, fmt.tprintf(" (HTTP %d)", failure.error.status)) or_return }
+		render_text(&builder, tool_web_failure_cause(failure.error)) or_return
 		if failure.error.retry_after > 0 { render_text(&builder, fmt.tprintf(" (retry after %v)", failure.error.retry_after)) or_return }
 		if failure.error.detail != "" {
 			render_text(&builder, ": ") or_return
@@ -233,13 +204,8 @@ tool_web_search_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	if endpoints_error != nil { return tool_result_failure(ctx, .Tool_Failed, "the web search could not run: out of memory", "out of memory") }
 	defer web.endpoints_destroy(endpoints, ctx.allocator)
 
-	control := ai.HTTP_Control {
-		interrupt = ctx.control.interrupt,
-	}
-	if args.timeout > 0 { control.deadline = ai.deadline_in(args.timeout) }
-	options := client.Options {
-		probe = {check = ai.http_probe, user_data = &control},
-	}
+	control := tool_web_control(ctx.control, args.timeout)
+	options := tool_web_options(&control)
 	query := web.Query {
 		text            = args.query,
 		count           = args.count,
@@ -256,23 +222,9 @@ tool_web_search_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Too
 	if reason_error != nil { return tool_result_failure(ctx, .Tool_Failed, "the web search could not be described: out of memory", "out of memory") }
 
 	if !found {
-		if len(failures) > 0 {
-			#partial switch failures[len(failures) - 1].error.kind {
-			case .Cancelled:
-				return tool_result_failure(ctx, .Cancelled, "the search was cancelled", reason)
-			case .Timed_Out:
-				return tool_result_failure(ctx, .Timed_Out, "the search exceeded its timeout", reason)
-			}
-		}
-		may_retry := false
-		for failure in failures {
-			#partial switch failure.error.kind {
-			case .Rate_Limited, .Quota, .Server, .Transport, .Timed_Out:
-				may_retry = true
-			}
-		}
-		message := "the web search failed; trying again later may help" if may_retry else "the web search failed; trying again later is unlikely to help"
-		return tool_result_failure(ctx, .Tool_Failed, message, reason)
+		if len(failures) == 0 { return tool_result_failure(ctx, .Tool_Failed, "web_search failed: no search service was tried", reason) }
+		// The last service tried decides what the model is told; the others are in the reason.
+		return tool_web_failure_result(ctx, TOOL_WEB_SEARCH_NAME, failures[len(failures) - 1].error, false, reason)
 	}
 
 	output := Web_Search_Output {

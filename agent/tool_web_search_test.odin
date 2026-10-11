@@ -45,7 +45,9 @@ test_web_search_falls_back_to_the_next_provider :: proc(t: ^testing.T) {
 	testing.expect(t, !strings.contains(result.content, "brave") && !strings.contains(result.content, "searxng"), result.content)
 	testing.expect(t, strings.contains(result.reason, "brave: rate limited (HTTP 429)"), result.reason)
 	testing.expect(t, strings.contains(result.content, "1. Bun v1.2\nhttps://bun.sh/blog/bun-v1.2\npublished: 2025-01-22\nBun 1.2 adds SQL\n"), result.content)
-	testing.expect(t, strings.contains(result.content, "2. Second\nhttps://example.com/b\nother\n"), result.content); preferred: Agent_Provider
+	testing.expect(t, strings.contains(result.content, "2. Second\nhttps://example.com/b\nother\n"), result.content)
+
+	preferred: Agent_Provider
 	if !agent_provider_start(t, &preferred, {agent_provider_refusal("200 OK", body)}) { return }
 	defer agent_provider_stop(&preferred)
 	preferred_url := agent_provider_endpoint(&preferred)
@@ -82,7 +84,6 @@ test_web_search_falls_back_to_the_next_provider :: proc(t: ^testing.T) {
 	defer tool_result_destroy(&refused)
 	testing.expect_value(t, refused.outcome, journal.Tool_Outcome.Invalid_Arguments)
 	testing.expect(t, strings.contains(refused.content, "brave, searxng"), refused.content)
-
 }
 
 @(test)
@@ -151,7 +152,7 @@ test_web_search_recommends_retry_after_a_mixed_failure :: proc(t: ^testing.T) {
 	result := tool_test_execute(&ctx, definition, arguments.(json.Object))
 	defer tool_result_destroy(&result)
 	testing.expect_value(t, result.outcome, journal.Tool_Outcome.Tool_Failed)
-	testing.expect(t, strings.contains(result.content, "trying again later may help"), result.content)
+	testing.expect(t, strings.contains(result.content, "web_search failed: server error (HTTP 500); retry later"), result.content)
 	testing.expect(t, !strings.contains(result.content, "brave") && !strings.contains(result.content, "tavily"), result.content)
 }
 

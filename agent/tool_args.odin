@@ -26,6 +26,7 @@ Tool_Kind :: enum {
 	Agents,
 	Jobs,
 	Web_Search,
+	Web_Fetch,
 }
 
 // Tool_Args is one call's arguments, typed by the tool that will run it. Strings borrow
@@ -45,6 +46,7 @@ Tool_Args :: union {
 	Agents_Args,
 	Jobs_Args,
 	Web_Search_Args,
+	Web_Fetch_Args,
 }
 
 Read_Args :: struct {
@@ -99,6 +101,13 @@ Web_Search_Args :: struct {
 	timeout:         time.Duration,
 }
 
+// Web_Fetch_Args borrows url from the admitted document.
+Web_Fetch_Args :: struct {
+	url:     string,
+	format:  web.Format,
+	timeout: time.Duration,
+}
+
 // tool_args_decode reads one admitted document as the tool's own arguments. It is the
 // only place a document becomes arguments, so tools, Lua child calls, and repaired
 // calls all read the same way.
@@ -127,6 +136,8 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return tool_agents_args(ctx, object)
 	case .Jobs:
 		return tool_jobs_args(ctx, object)
+	case .Web_Fetch:
+		return tool_web_fetch_args(ctx, object)
 	case .Web_Search:
 		return tool_web_search_args(ctx, object, (^Web_Search_Config)(definition.backend))
 	case .Custom, .MCP:

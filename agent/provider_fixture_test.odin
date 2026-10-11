@@ -99,6 +99,9 @@ Agent_Provider :: struct {
 	// after its request was read and recorded. Zero holds nothing. agent_provider_stop posts
 	// release, so a test that fails first never leaves the serve thread waiting.
 	hold:       int,
+	// hold_body waits after the response head for the 1-based response index.
+	// stop releases it, so a test can interrupt a read with an observed HTTP status.
+	hold_body:  int,
 	release:    sync.Sema,
 	// lock orders the state the serve thread writes with the test that reads it. The
 	// socket a response crosses does not give that ordering, so the fixture states it.
@@ -242,6 +245,16 @@ agent_provider_serve :: proc(thread: ^thread.Thread) {
 			agent_provider_note_failure(provider)
 			agent_provider_release(provider, socket)
 			return
+		}
+		if provider.hold_body > 0 && provider.hold_body == next {
+			head_end := strings.index(response, "\r\n\r\n") + 4
+			if head_end < 4 || !agent_provider_write(socket, response[:head_end]) {
+				agent_provider_note_failure(provider)
+				agent_provider_release(provider, socket)
+				return
+			}
+			_ = sync.sema_wait_with_timeout(&provider.release, AGENT_PROVIDER_BOUND)
+			response = response[head_end:]
 		}
 		write_ok := agent_provider_write(socket, response)
 		agent_provider_release(provider, socket)

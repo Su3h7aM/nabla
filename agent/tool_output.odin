@@ -29,6 +29,7 @@ Tool_Output :: union {
 	Agents_Output,
 	Jobs_Output,
 	Web_Search_Output,
+	Web_Fetch_Output,
 	Argument_Failure,
 }
 
@@ -136,6 +137,15 @@ Web_Search_Output :: struct {
 	notice:  string,
 	answer:  string,
 	results: []web.Result,
+}
+
+Web_Fetch_Output :: struct {
+	url:          string,
+	redirected:   bool,
+	title:        string,
+	description:  string,
+	content_type: string,
+	content:      string,
 }
 
 // Codemode_Call is one tool call a script made, as its parent reports it. It is a summary,
@@ -278,6 +288,12 @@ tool_result_render :: proc(
 		if value.acp_session != "" { render_field(&head, "acp_session", value.acp_session) or_return }
 		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
 		render_text(&body, value.answer) or_return
+	case Web_Fetch_Output:
+		if value.redirected { render_field(&head, "url", value.url) or_return }
+		if value.title != "" { render_field(&head, "title", value.title) or_return }
+		if value.description != "" { render_field(&head, "description", value.description) or_return }
+		if value.content_type != "" { render_field(&head, "content_type", value.content_type) or_return }
+		render_text(&body, value.content) or_return
 	case Web_Search_Output:
 		render_field(&head, "results", len(value.results)) or_return
 		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
@@ -334,7 +350,7 @@ tool_result_render :: proc(
 		if value.field != "" { render_field(&head, "field", value.field) or_return }
 		if value.expected != "" { render_field(&head, "expected", value.expected) or_return }
 	}
-	if len(body.buf) > 0 {
+	if _, is_fetch := output.(Web_Fetch_Output); len(body.buf) > 0 || is_fetch {
 		render_byte(&head, '\n') or_return
 		render_text(&head, strings.to_string(body)) or_return
 	}
@@ -615,6 +631,20 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.notice = strings.clone(borrowed.notice, allocator) or_return
 		value.answer = strings.clone(borrowed.answer, allocator) or_return
 		owned = value
+	case Web_Fetch_Output:
+		value := Web_Fetch_Output {
+			redirected = borrowed.redirected,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
+		value.url = strings.clone(borrowed.url, allocator) or_return
+		value.title = strings.clone(borrowed.title, allocator) or_return
+		value.description = strings.clone(borrowed.description, allocator) or_return
+		value.content_type = strings.clone(borrowed.content_type, allocator) or_return
+		value.content = strings.clone(borrowed.content, allocator) or_return
+		owned = value
 	case Web_Search_Output:
 		value: Web_Search_Output
 		defer if allocation_error != nil {
@@ -729,6 +759,12 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.acp_session, allocator)
 		delete(value.notice, allocator)
 		delete(value.answer, allocator)
+	case Web_Fetch_Output:
+		delete(value.url, allocator)
+		delete(value.title, allocator)
+		delete(value.description, allocator)
+		delete(value.content_type, allocator)
+		delete(value.content, allocator)
 	case Web_Search_Output:
 		delete(value.notice, allocator)
 		delete(value.answer, allocator)

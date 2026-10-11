@@ -33,6 +33,10 @@ Tool_Repair :: enum {
 	Integer_From_Float,
 	// A comma after the last value of an object or array was dropped.
 	Trailing_Comma,
+	// A URL had a missing scheme, which was read as https://.
+	Url_Scheme_Added,
+	// A text argument had whitespace around it, which was dropped.
+	Text_Trimmed,
 }
 
 Tool_Repairs :: bit_set[Tool_Repair]
@@ -44,6 +48,8 @@ TOOL_REPAIR_NAMES := [Tool_Repair]string {
 	.Integer_From_String        = "integer_from_string",
 	.Integer_From_Float         = "integer_from_float",
 	.Trailing_Comma             = "trailing_comma",
+	.Url_Scheme_Added           = "url_scheme_added",
+	.Text_Trimmed               = "text_trimmed",
 }
 
 Tool_Argument_Error_Kind :: enum {
