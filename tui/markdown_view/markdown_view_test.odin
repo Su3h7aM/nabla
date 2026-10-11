@@ -20,20 +20,21 @@ THEME :: Theme {
 }
 
 Rendered :: struct {
-	frame:  layout.Frame_Result,
-	paints: tui.Paints,
-	links:  [dynamic]string,
-	rows:   [dynamic]string,
+	frame:   layout.Frame_Result,
+	paints:  tui.Paints,
+	links:   [dynamic]string,
+	rows:    [dynamic]string,
+	measure: tui.Measure_Context,
 }
 
 // render declares source into a columns by rows frame and draws it into rows.
 render :: proc(t: ^testing.T, rendered: ^Rendered, context_: ^layout.Context, source: string, columns, rows: int, overflow := false, theme := THEME) {
 	document, parse_error := markdown.parse(source, context.temp_allocator)
 	testing.expect_value(t, parse_error, nil)
-	measure := tui.Measure_Context {
+	rendered.measure = {
 		profile = text.DEFAULT_WIDTH_PROFILE,
 	}
-	layout.set_services(context_, tui.layout_services(&measure))
+	layout.set_services(context_, tui.layout_services(&rendered.measure))
 	rendered.paints = make(tui.Paints, context.temp_allocator)
 	rendered.links = make([dynamic]string, context.temp_allocator)
 	if layout.frame(context_, {layout.Scalar(columns), layout.Scalar(rows)}) {
