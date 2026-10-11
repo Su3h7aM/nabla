@@ -325,7 +325,11 @@ expect_marshaled :: proc(t: ^testing.T, value: $T, want: string, loc := #caller_
 test_protocol_payloads_marshal_to_their_wire_names :: proc(t: ^testing.T) {
 	defer free_all(context.temp_allocator)
 	meta := json.Value(json.Object{})
-	expect_marshaled(t, Current_Mode_Update{session_update = UPDATE_CURRENT_MODE, current_mode_id = "m"}, `{"sessionUpdate":"current_mode_update","currentModeId":"m"}`)
+	expect_marshaled(
+		t,
+		Current_Mode_Update{session_update = UPDATE_CURRENT_MODE, current_mode_id = "m"},
+		`{"sessionUpdate":"current_mode_update","currentModeId":"m"}`,
+	)
 	expect_marshaled(
 		t,
 		Plan{session_update = UPDATE_PLAN, entries = {{content = "c", priority = "high", status = "pending"}}},
