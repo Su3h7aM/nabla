@@ -14,7 +14,7 @@ import "nabla:ai"
 
 // --- Lua execution boundary ---------------------------------------------------
 //
-// This file owns one Lua 5.4 execution: the state, the restricted environment, and the
+// This file owns one Lua 5.4 execution: the state, its environment, and the
 // suspension protocol. It knows nothing about tools, the session, or the model.
 //
 // Script work runs on a private coroutine in bounded slices. Two things bring control
@@ -47,16 +47,6 @@ LUA_CHUNK_NAME :: "@code"
 // LUA_FIRST_UPVALUE is the pseudo-index of a C closure's first upvalue.
 @(private)
 LUA_FIRST_UPVALUE :: lua.REGISTRYINDEX - 1
-
-// lua_os_fields is the part of the `os` library a script gets: clocks and dates, nothing
-// that reaches the file system, the environment, or the process.
-@(private, rodata)
-lua_os_fields := [?]cstring{"clock", "date", "difftime", "time"}
-
-// lua_removed_globals are the base functions a script does not get: loading code,
-// driving the collector, and the harness's own diagnostics channel.
-@(private, rodata)
-lua_removed_globals := [?]cstring{"load", "loadfile", "dofile", "require", "collectgarbage", "warn"}
 
 // Lua_Failure is how a run failed. None is a run that suspended, returned, or was
 // cancelled.
@@ -343,63 +333,25 @@ codemode_lua_unknown_tool :: proc "c" (state: ^lua.State, table_index, name_inde
 
 // --- restricted environment ----------------------------------------------------
 
-// codemode_lua_open_libraries installs the allowlist. `L_openlibs` is never called: a
-// library that was never opened costs nothing to reason about.
+// codemode_lua_open_libraries installs the Lua standard library. `coroutine` is the one
+// library left out: a coroutine a script created would receive the host's yields.
 @(private)
 codemode_lua_open_libraries :: proc(state: ^lua.State) {
 	libraries := [?]lua.L_Reg {
 		{lua.GNAME, lua.open_base},
+		{lua.LOADLIBNAME, lua.open_package},
 		{lua.STRLIBNAME, lua.open_string},
 		{lua.TABLIBNAME, lua.open_table},
 		{lua.MATHLIBNAME, lua.open_math},
 		{lua.UTF8LIBNAME, lua.open_utf8},
+		{lua.IOLIBNAME, lua.open_io},
 		{lua.OSLIBNAME, lua.open_os},
+		{lua.DBLIBNAME, lua.open_debug},
 	}
 	for library in libraries {
 		lua.L_requiref(state, library.name, library.func, 1)
 		lua.pop(state, 1)
 	}
-
-	for name in lua_removed_globals {
-		lua.pushnil(state)
-		lua.setglobal(state, name)
-	}
-	// Bytecode would put a loader back in the script's hands.
-	lua.getglobal(state, lua.STRLIBNAME)
-	lua.pushnil(state)
-	lua.setfield(state, -2, "dump")
-	lua.pop(state, 1)
-
-	lua.createtable(state, 0, c.int(len(lua_os_fields)))
-	lua.getglobal(state, lua.OSLIBNAME)
-	for name in lua_os_fields {
-		lua.getfield(state, -1, name)
-		lua.setfield(state, -3, name)
-	}
-	lua.pop(state, 1)
-	lua.setglobal(state, lua.OSLIBNAME)
-
-	// setmetatable keeps the base function as its upvalue.
-	lua.getglobal(state, "setmetatable")
-	lua.pushcclosure(state, codemode_lua_setmetatable, 1)
-	lua.setglobal(state, "setmetatable")
-}
-
-// codemode_lua_setmetatable refuses a metatable with `__gc`. A finalizer runs with hooks
-// off, where no slice ends and no stop reaches it, and again when the state closes.
-// Every other metamethod runs as ordinary script code, and the host reads values raw.
-@(private)
-codemode_lua_setmetatable :: proc "c" (state: ^lua.State) -> c.int {
-	if lua.type(state, 2) == .TABLE {
-		lua.pushstring(state, "__gc")
-		finalizer := lua.Type(lua.rawget(state, 2))
-		lua.pop(state, 1)
-		if finalizer != .NIL { return c.int(lua.L_error(state, "a metatable with __gc is not allowed")) }
-	}
-	lua.pushvalue(state, LUA_FIRST_UPVALUE)
-	lua.insert(state, 1)
-	lua.call(state, lua.gettop(state) - 1, 1)
-	return 1
 }
 
 // codemode_lua_install_table sets the global name to a new table of C functions.

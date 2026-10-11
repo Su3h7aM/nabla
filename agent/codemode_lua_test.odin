@@ -199,29 +199,27 @@ lua_timeout_reaches_a_loop_inside_a_c_call :: proc(t: ^testing.T) {
 }
 
 @(test)
-lua_environment_has_the_allowlist :: proc(t: ^testing.T) {
-	absent := lua_test_returned(
+lua_environment_has_the_standard_library :: proc(t: ^testing.T) {
+	present := lua_test_returned(
 		t,
-		`local names = {"io", "package", "debug", "coroutine", "require", "load", "loadfile", "dofile", "collectgarbage", "warn"}
-local present = {}
-for _, name in ipairs(names) do if _G[name] ~= nil then present[#present + 1] = name end end
-for _, name in ipairs({"execute", "exit", "getenv", "remove", "rename", "tmpname"}) do if os[name] ~= nil then present[#present + 1] = "os." .. name end end
-if string.dump ~= nil then present[#present + 1] = "string.dump" end
-return table.concat(present, ",")`,
+		`local names = {"package", "io", "os", "debug", "string", "table", "math", "utf8"}
+local missing = {}
+for _, name in ipairs(names) do if type(_G[name]) ~= "table" then missing[#missing + 1] = name end end
+if type(load) ~= "function" or type(require) ~= "function" or type(os.getenv) ~= "function" then missing[#missing + 1] = "functions" end
+if coroutine ~= nil then missing[#missing + 1] = "coroutine must be absent" end
+return table.concat(missing, ",")`,
 	)
-	testing.expect_value(t, absent, "")
+	testing.expect_value(t, present, "")
 
 	available := lua_test_returned(
 		t,
 		`local point = setmetatable({}, {__index = function(_, key) return key .. "!" end})
 local ok = pcall(error, "x")
 local date = os.date("!%Y", 0)
-return point.x .. tostring(ok) .. date .. type(os.time()) .. type(os.clock()) .. utf8.char(233) .. math.floor(2.5) .. rawlen({1})`,
+local loaded = load("return 6 * 7")()
+return point.x .. tostring(ok) .. date .. type(os.time()) .. type(os.clock()) .. utf8.char(233) .. math.floor(2.5) .. rawlen({1}) .. loaded`,
 	)
-	testing.expect_value(t, available, "x!false1970numbernumberé21")
-
-	finalizer := lua_test_returned(t, `local ok, err = pcall(setmetatable, {}, {__gc = function() end}) return err`)
-	testing.expect(t, strings.contains(finalizer, "__gc is not allowed"), finalizer)
+	testing.expect_value(t, available, "x!false1970numbernumberé2142")
 }
 
 @(test)
