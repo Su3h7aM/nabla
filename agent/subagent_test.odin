@@ -523,6 +523,8 @@ test_a_subagent_cannot_start_a_subagent :: proc(test: ^testing.T) {
 	}
 	_, observers := tool_registry_find(&chat.tools, TOOL_AGENTS_NAME)
 	testing.expect(test, !observers)
+	_, has_codemode := tool_registry_find(&chat.tools, TOOL_CODEMODE_NAME)
+	testing.expect(test, has_codemode, "a subagent keeps every tool but the ones that manage subagents")
 	testing.expect_value(
 		test,
 		subagent_test_call(test, chat, "message", TOOL_AGENT_NAME, `{"action":"message","message":"What should I inspect?"}`),

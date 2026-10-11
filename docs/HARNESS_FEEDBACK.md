@@ -18,13 +18,6 @@ Each report has a dated heading with a short name, then four parts:
 - Gap: why it did not work or was not enough.
 - Workaround: how you did it instead, with the command or script shape.
 
-## 2026-10-07 Sub-agents have no Code Mode
-
-- Goal: let a sub-agent repair a file where `edit` applied a repeated identical hunk twice.
-- Attempt: `edit` again, which refuses or mis-applies hunks whose unchanged lines occur several times in the file.
-- Gap: the sub-agent had no Code Mode tool, so it could not replace by counted occurrence in Lua.
-- Workaround: a Python one-liner through the shell. The orchestrator now tells sub-agents to avoid repeated-hunk edits and to ask when a patch cannot be applied.
-
 ## 2026-10-08 Action-specific agent arguments
 
 - Goal: send subagent messages and list configured models through the native tools, without wrapping a single tool call in Code Mode.
