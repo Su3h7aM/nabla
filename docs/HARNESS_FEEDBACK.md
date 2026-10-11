@@ -30,3 +30,10 @@ Each report has a dated heading with a short name, then four parts:
 I asked agent-9 to review the completed navigation change. The message tool accepted the follow-ups, but status continued to show running, a last record of turn.completed older than 40 minutes, and two unread messages. No new request record appeared during the checks. I stopped the child and reviewed the final diff directly instead of waiting longer.
 
 Status should distinguish a queued follow-up, an active request, and a completed turn, and say why accepted messages are waiting. This would make it possible to decide whether to wait or replace the work without relying on an old assistant answer.
+
+## 2026-10-11 Subagent model id format
+
+- Goal: start a subagent on `muse-spark-1.3-contributor` served by provider `opencode-go`.
+- Attempt: call `agent` start with `model="opencode-go/muse-spark-1.3-contributor"`, the form the `agents` models listing prints, with and without `provider="opencode-go"`.
+- Gap: without a provider the call failed with "no configured provider serves model". With the provider it failed with "model not found for provider". The start description says to pass "exact catalog model id with its vendor prefix", and the models listing prints the provider prefix in front of each id, so both suggest the prefixed form.
+- Workaround: pass `model="muse-spark-1.3-contributor"` with `provider="opencode-go"`. The listing should print the id exactly as `start` accepts it, or `start` should accept the printed form.
