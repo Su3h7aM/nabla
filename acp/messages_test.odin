@@ -110,3 +110,56 @@ test_prompt_params_decode_reads_content_blocks_and_tolerates_extra_fields :: pro
 	testing.expect(t, is_link)
 	testing.expect_value(t, link.uri, "file:///a.odin")
 }
+
+// The two versions of initialize name the client differently, so each request document
+// decodes into its own type and encodes back to its own field names.
+@(test)
+test_initialize_params_decode_and_encode_per_version :: proc(t: ^testing.T) {
+	defer free_all(context.temp_allocator)
+	v1_value, v1_error := json.parse_string(
+		`{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":false},"terminal":true},"clientInfo":{"name":"c","version":"1"}}`,
+		.JSON,
+		true,
+		context.allocator,
+	)
+	testing.expect_value(t, v1_error, nil)
+	defer json.destroy_value(v1_value, context.allocator)
+	v1: V1_Initialize_Params
+	testing.expect_value(t, params_decode(v1_value, &v1, context.temp_allocator), Params_Error.None)
+	capabilities, has_capabilities := v1.client_capabilities.?
+	testing.expect(t, has_capabilities)
+	testing.expect(t, capabilities.fs.read_text_file)
+	testing.expect(t, capabilities.terminal)
+	info, has_info := v1.client_info.?
+	testing.expect(t, has_info)
+	testing.expect_value(t, info.name, "c")
+
+	v2_value, v2_error := json.parse_string(
+		`{"protocolVersion":2,"capabilities":{"auth":{"terminal":true}},"info":{"name":"c","version":"2"}}`,
+		.JSON,
+		true,
+		context.allocator,
+	)
+	testing.expect_value(t, v2_error, nil)
+	defer json.destroy_value(v2_value, context.allocator)
+	v2: V2_Initialize_Params
+	testing.expect_value(t, params_decode(v2_value, &v2, context.temp_allocator), Params_Error.None)
+	auth, has_auth := v2.capabilities.auth.?
+	testing.expect(t, has_auth)
+	testing.expect(t, auth.terminal)
+	testing.expect_value(t, v2.info.version, "2")
+
+	v1_wire, v1_marshal_error := json.marshal(v1, allocator = context.temp_allocator)
+	testing.expect_value(t, v1_marshal_error, nil)
+	testing.expect_value(
+		t,
+		string(v1_wire),
+		`{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":false},"terminal":true},"clientInfo":{"name":"c","version":"1"}}`,
+	)
+
+	bad_value, bad_error := json.parse_string(`{"protocolVersion":1,"clientInfo":"c"}`, .JSON, true, context.allocator)
+	testing.expect_value(t, bad_error, nil)
+	defer json.destroy_value(bad_value, context.allocator)
+	bad: V1_Initialize_Params
+	testing.expect_value(t, params_decode(bad_value, &bad, context.temp_allocator), Params_Error.Invalid)
+}

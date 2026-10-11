@@ -1474,7 +1474,7 @@ test_acp_v2_batch_answers_reader_owned_requests_as_one_frame :: proc(t: ^testing
 }
 
 @(test)
-test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
+test_acp_buzz_v2_request_uses_the_v1_wire_profile_and_a_malformed_v1_request_is_refused :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
 	state, state_err := os.make_directory_temp("", "nabla-acp-buzz-state-*", context.allocator)
 	if state_err != nil {
@@ -1511,6 +1511,11 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
 		thread.destroy(run_thread)
 		free_all(context.temp_allocator)
 	}
+
+	// A request that is not v2 is read as v1, so a malformed client description is refused.
+	malformed := `{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":1,"clientInfo":"buzz-acp"}}` + "\n"
+	acp_test_client_send(&client, malformed)
+	if acp_test_client_expect(t, &client, `"code":-32602`, "a malformed clientInfo was not refused as invalid params") == "" { return }
 
 	message :=
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"clientCapabilities":{},"clientInfo":{"name":"buzz-acp","version":"test"}}}` +

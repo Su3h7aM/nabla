@@ -340,7 +340,7 @@ test_writer_frames_client_requests_without_agent_only_fields :: proc(t: ^testing
 	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
 	defer test_writer_cleanup(&writer)
 
-	initialize := Initialize_Params {
+	initialize := V2_Initialize_Params {
 		protocol_version = PROTOCOL_VERSION_V2,
 		info = {name = "nabla", version = "0"},
 	}

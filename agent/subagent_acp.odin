@@ -1215,7 +1215,7 @@ acp_session_open :: proc(connection: ^ACP_Connection, previous_session := "") ->
 		} `json:"agentCapabilities"`,
 	}
 	initialized: Initialized
-	request := acp.Initialize_Params {
+	request := acp.V2_Initialize_Params {
 		protocol_version = acp.PROTOCOL_VERSION_V2,
 		info = {name = "nabla", version = "0"},
 	}

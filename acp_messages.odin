@@ -245,16 +245,22 @@ acp_request_params_error_code :: proc(params_error: acp.Params_Error) -> i64 {
 // --- requests the reader answers alone ---------------------------------------
 
 acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
-	params: acp.Initialize_Params
+	// The version is inside the params, so the request is read as v2 first. A v2 request is
+	// valid only when it carries the v2 info object. Buzz currently asks for version 2
+	// while sending the v1 field names, so it deliberately receives the v1 surface instead
+	// of being forced through a lifecycle it does not implement; that request is then read
+	// as v1.
+	params: acp.V2_Initialize_Params
 	if !acp_request_params_decode(server, envelope, &params, "initialize needs a protocol version") { return }
 	if params.protocol_version < 1 {
 		acp_reply_error(server, envelope, acp.ERROR_INVALID_PARAMS, "initialize needs a positive protocol version")
 		return
 	}
-	// A v2 request is valid only when it carries the v2 info object. Buzz currently
-	// asks for version 2 while sending the v1 field names, so it deliberately receives
-	// the v1 surface instead of being forced through a lifecycle it does not implement.
 	v2_request := params.protocol_version >= acp.PROTOCOL_VERSION_V2 && params.info.name != "" && params.info.version != ""
+	if !v2_request {
+		v1_params: acp.V1_Initialize_Params
+		if !acp_request_params_decode(server, envelope, &v1_params, "initialize has a malformed client description") { return }
+	}
 	negotiated := params.protocol_version
 	if v2_request {
 		negotiated = acp.PROTOCOL_VERSION_V2
@@ -283,7 +289,7 @@ acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		_ = acp.write_response(&server.writer, envelope.id, result)
 		return
 	}
-	result := acp.Initialize_Result {
+	result := acp.V1_Initialize_Result {
 		protocol_version = negotiated,
 		agent_capabilities = {
 			// A session can be reopened by the id it was given, with its conversation

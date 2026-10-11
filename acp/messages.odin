@@ -175,22 +175,26 @@ Implementation :: struct {
 	version: string `json:"version"`,
 }
 
-Fs_Capabilities :: struct {
+V1_Fs_Capabilities :: struct {
 	read_text_file:  bool `json:"readTextFile"`,
 	write_text_file: bool `json:"writeTextFile"`,
 }
 
-Client_Capabilities :: struct {
-	fs:       Fs_Capabilities `json:"fs"`,
+V1_Client_Capabilities :: struct {
+	fs:       V1_Fs_Capabilities `json:"fs"`,
 	terminal: bool `json:"terminal"`,
 }
 
-Initialize_Params :: struct {
+V1_Initialize_Params :: struct {
 	protocol_version:    int `json:"protocolVersion"`,
-	client_capabilities: Maybe(Client_Capabilities) `json:"clientCapabilities,omitempty"`,
+	client_capabilities: Maybe(V1_Client_Capabilities) `json:"clientCapabilities,omitempty"`,
 	client_info:         Maybe(Implementation) `json:"clientInfo,omitempty"`,
-	capabilities:        V2_Client_Capabilities `json:"capabilities"`,
-	info:                Implementation `json:"info"`,
+}
+
+V2_Initialize_Params :: struct {
+	protocol_version: int `json:"protocolVersion"`,
+	capabilities:     V2_Client_Capabilities `json:"capabilities"`,
+	info:             Implementation `json:"info"`,
 }
 
 // V2_Client_Capabilities is deliberately limited to the v2 fields Nabla needs to
@@ -662,27 +666,27 @@ Session_Cancel_Params :: struct {
 
 // --- what an agent answers ---------------------------------------------------
 
-Prompt_Capabilities :: struct {
+V1_Prompt_Capabilities :: struct {
 	image:            bool `json:"image"`,
 	audio:            bool `json:"audio"`,
 	embedded_context: bool `json:"embeddedContext"`,
 }
 
-MCP_Capabilities :: struct {
+V1_MCP_Capabilities :: struct {
 	http: bool `json:"http"`,
 	sse:  bool `json:"sse"`,
 }
 
-Agent_Capabilities :: struct {
+V1_Agent_Capabilities :: struct {
 	load_session:         bool `json:"loadSession"`,
 	session_capabilities: V1_Session_List_Capabilities `json:"sessionCapabilities"`,
-	prompt_capabilities:  Prompt_Capabilities `json:"promptCapabilities"`,
-	mcp_capabilities:     MCP_Capabilities `json:"mcpCapabilities"`,
+	prompt_capabilities:  V1_Prompt_Capabilities `json:"promptCapabilities"`,
+	mcp_capabilities:     V1_MCP_Capabilities `json:"mcpCapabilities"`,
 }
 
-Initialize_Result :: struct {
+V1_Initialize_Result :: struct {
 	protocol_version:   int `json:"protocolVersion"`,
-	agent_capabilities: Agent_Capabilities `json:"agentCapabilities"`,
+	agent_capabilities: V1_Agent_Capabilities `json:"agentCapabilities"`,
 	auth_methods:       []json.Value `json:"authMethods"`,
 	agent_info:         Implementation `json:"agentInfo"`,
 }
