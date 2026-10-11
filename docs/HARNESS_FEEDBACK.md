@@ -18,27 +18,6 @@ Each report has a dated heading with a short name, then four parts:
 - Gap: why it did not work or was not enough.
 - Workaround: how you did it instead, with the command or script shape.
 
-## 2026-10-06 Splitting a change by hunk
-
-- Goal: split one working-copy change into several commits when one file held hunks for two commits.
-- Attempt: `jj split` with paths, which moves whole files only. `jj-hunk-tool` is not installed.
-- Gap: no tool selects hunks non-interactively.
-- Workaround: a Python script wrote an intermediate version of the mixed file (the old text with only some hunks applied, and `jj file show -r @-` for the parent text), then `jj split <paths>`, then the full file was copied back.
-
-## 2026-10-06 Operating-system experiments across processes
-
-- Goal: measure whether an inotify event on a SQLite WAL commit can arrive before a reader sees the commit, and whether a SIGKILLed flock holder raises an inotify close event on its lock file.
-- Attempt: Code Mode, rejected because its Lua calls only the harness tools.
-- Gap: Code Mode has no inotify, SQLite, flock, or process control, and no timing control between two cooperating processes; the shell tool runs one command at a time and returns at exit.
-- Workaround: Python scripts using `sqlite3`, `ctypes` inotify, `fcntl.flock`, and `subprocess` with SIGKILL, run once through the shell (kept in /tmp/walexp).
-
-## 2026-10-07 Overlapping context in grep results
-
-- Goal: see a few lines around close matches with `fff_grep` and `context`.
-- Attempt: `fff_grep` on `catalog_model_provider` and `MAX_MESSAGE_DEPTH` with context lines.
-- Gap: overlapping context blocks were repeated for nearby matches, and leading indentation was lost in `content` output.
-- Workaround: `read` of the line range.
-
 ## 2026-10-07 Sub-agents have no Code Mode
 
 - Goal: let a sub-agent repair a file where `edit` applied a repeated identical hunk twice.
