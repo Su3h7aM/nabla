@@ -6,6 +6,7 @@ import "core:strings"
 import "core:unicode/utf8"
 
 import "nabla:agent/journal"
+import "nabla:search"
 import "nabla:web"
 
 // Tool_Output is what one call produced, typed by the tool that produced it. A result
@@ -22,6 +23,8 @@ Tool_Output :: union {
 	Shell_Output,
 	Skills_Output,
 	Skill_Output,
+	Find_Output,
+	Grep_Output,
 	Compact_Output,
 	Codemode_Output,
 	MCP_Output,
@@ -272,6 +275,105 @@ tool_result_render :: proc(
 		render_field(&head, "directory", value.directory) or_return
 		render_field(&head, "content_digest", value.content_digest) or_return
 		render_text(&body, value.instructions) or_return
+	case Find_Output:
+		render_field(&head, "total_matches", value.total_matches) or_return
+		if value.next_cursor != "" { render_field(&head, "next_cursor", value.next_cursor) or_return }
+		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
+		render_skipped(&head, value.skipped) or_return
+		// The body is what the front-end previews, so it carries the same
+		// facts the head counts: the labeled recovery first, an empty result
+		// as its indexed count, and a page under its best-match header with
+		// its counts and its cursor trailer. A body is never empty, so no
+		// find preview falls back to a bare status word.
+		if value.notice != "" {
+			render_text(&body, value.notice) or_return
+			render_byte(&body, '\n') or_return
+		}
+		if len(value.files) == 0 {
+			// A fallback always carries rows, so an empty page here is a true
+			// non-match restated with its indexed count.
+			if value.notice == "" {
+				render_text(&body, "0 results (") or_return
+				render_integer(&body, i64(value.indexed)) or_return
+				render_text(&body, " indexed)\n") or_return
+			}
+		} else {
+			render_text(&body, "→ Read ") or_return
+			render_text(&body, value.files[0]) or_return
+			if value.exact_match {
+				render_text(&body, " (exact match!)\n") or_return
+			} else {
+				render_text(&body, " (best match)\n") or_return
+			}
+			render_integer(&body, i64(len(value.files))) or_return
+			render_text(&body, " of ") or_return
+			render_integer(&body, i64(value.total_matches)) or_return
+			render_text(&body, " paths\n") or_return
+			for file in value.files {
+				render_text(&body, file) or_return
+				render_byte(&body, '\n') or_return
+			}
+			if value.next_cursor != "" {
+				render_text(&body, "cursor: ") or_return
+				render_text(&body, value.next_cursor) or_return
+				render_byte(&body, '\n') or_return
+			}
+		}
+	case Grep_Output:
+		render_field(&head, "total_matches", value.total_matches) or_return
+		if value.next_cursor != "" { render_field(&head, "next_cursor", value.next_cursor) or_return }
+		if value.notice != "" { render_field(&head, "notice", value.notice) or_return }
+		render_skipped(&head, value.skipped) or_return
+		if value.full_lines_file != "" { render_field(&head, "full_lines_in", value.full_lines_file) or_return }
+		// The body is what the front-end previews: an empty result reads as
+		// its zero count, and a labeled recovery stays up front so the rows
+		// that follow are read as what the notice says they are.
+		if len(value.matches) == 0 && len(value.files) == 0 {
+			if value.notice != "" {
+				render_text(&body, value.notice) or_return
+				render_byte(&body, '\n') or_return
+			} else {
+				render_text(&body, "0 matches\n") or_return
+			}
+		} else {
+			if value.notice != "" {
+				render_text(&body, value.notice) or_return
+				render_byte(&body, '\n') or_return
+			}
+			if len(value.matches) > 0 {
+				render_text(&body, "→ Read ") or_return
+				render_text(&body, value.matches[0].path) or_return
+				render_text(&body, " (best match)\n") or_return
+				current := ""
+				for match, index in value.matches {
+					if match.path != current {
+						if index > 0 { render_text(&body, "--\n") or_return }
+						render_text(&body, match.path) or_return
+						render_byte(&body, '\n') or_return
+						current = match.path
+					}
+					if match.is_context {
+						render_byte(&body, ' ') or_return
+						render_integer(&body, i64(match.line)) or_return
+						render_byte(&body, '-') or_return
+					} else {
+						render_integer(&body, i64(match.line)) or_return
+						render_text(&body, ": ") or_return
+					}
+					render_text(&body, match.text) or_return
+					render_byte(&body, '\n') or_return
+				}
+			}
+			for path in value.files {
+				render_text(&body, path) or_return
+				render_byte(&body, '\n') or_return
+			}
+			if value.next_cursor != "" {
+				render_text(&body, "cursor: ") or_return
+				render_text(&body, value.next_cursor) or_return
+				render_byte(&body, '\n') or_return
+			}
+		}
 	case Compact_Output:
 		render_field(&head, "state", value.state) or_return
 	case Agents_Output:
@@ -476,6 +578,49 @@ render_section :: proc(builder: ^strings.Builder, label, body: string) -> (writt
 	written = len(builder.buf) - start
 	return
 }
+
+// render_skipped writes the `skipped:` line breaking the file count into its
+// named reasons, and the `denylist:` line for pruned directories. A line is
+// written only when it counts something, so a clean search shows neither.
+render_skipped :: proc(builder: ^strings.Builder, skipped: search.Skip_Breakdown) -> (written: int, err: mem.Allocator_Error) #optional_allocator_error {
+	start := len(builder.buf)
+	if total := search.skip_files_total(skipped); total > 0 {
+		render_text(builder, "skipped: ") or_return
+		render_integer(builder, i64(total)) or_return
+		render_text(builder, " (") or_return
+		shown := false
+		if skipped.binary > 0 {
+			render_text(builder, "binary: ") or_return
+			render_integer(builder, i64(skipped.binary)) or_return
+			shown = true
+		}
+		if skipped.oversize > 0 {
+			if shown { render_text(builder, ", ") or_return }
+			render_text(builder, "oversize: ") or_return
+			render_integer(builder, i64(skipped.oversize)) or_return
+			shown = true
+		}
+		if skipped.unreadable > 0 {
+			if shown { render_text(builder, ", ") or_return }
+			render_text(builder, "unreadable: ") or_return
+			render_integer(builder, i64(skipped.unreadable)) or_return
+			shown = true
+		}
+		render_text(builder, ")\n") or_return
+	}
+	if skipped.denylist > 0 {
+		render_text(builder, "denylist: ") or_return
+		render_integer(builder, i64(skipped.denylist)) or_return
+		if skipped.denylist == 1 {
+			render_text(builder, " directory\n") or_return
+		} else {
+			render_text(builder, " directories\n") or_return
+		}
+	}
+	written = len(builder.buf) - start
+	return
+}
+
 // tool_result_body is the raw body of rendered result text, or the outcome line's
 // message when the result has no body. A front-end shows it instead of the whole text.
 tool_result_body :: proc(text: string) -> string {
@@ -593,6 +738,49 @@ tool_output_clone :: proc(output: Tool_Output, allocator: mem.Allocator) -> (own
 		value.directory = strings.clone(borrowed.directory, allocator) or_return
 		value.content_digest = strings.clone(borrowed.content_digest, allocator) or_return
 		value.instructions = strings.clone(borrowed.instructions, allocator) or_return
+		owned = value
+	case Find_Output:
+		value := Find_Output {
+			total_matches = borrowed.total_matches,
+			skipped       = borrowed.skipped,
+			indexed       = borrowed.indexed,
+			exact_match   = borrowed.exact_match,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
+		value.next_cursor = strings.clone(borrowed.next_cursor, allocator) or_return
+		value.notice = strings.clone(borrowed.notice, allocator) or_return
+		value.files = make([]string, len(borrowed.files), allocator) or_return
+		for file, index in borrowed.files {
+			value.files[index] = strings.clone(file, allocator) or_return
+		}
+		owned = value
+	case Grep_Output:
+		value := Grep_Output {
+			total_matches = borrowed.total_matches,
+			skipped       = borrowed.skipped,
+		}
+		defer if allocation_error != nil {
+			partial: Tool_Output = value
+			tool_output_destroy(&partial, allocator)
+		}
+		value.next_cursor = strings.clone(borrowed.next_cursor, allocator) or_return
+		value.notice = strings.clone(borrowed.notice, allocator) or_return
+		value.matches = make([]search.Grep_Match, len(borrowed.matches), allocator) or_return
+		for match, index in borrowed.matches {
+			value.matches[index].line = match.line
+			value.matches[index].col = match.col
+			value.matches[index].is_context = match.is_context
+			value.matches[index].path = strings.clone(match.path, allocator) or_return
+			value.matches[index].text = strings.clone(match.text, allocator) or_return
+		}
+		value.full_lines_file = strings.clone(borrowed.full_lines_file, allocator) or_return
+		value.files = make([]string, len(borrowed.files), allocator) or_return
+		for path, index in borrowed.files {
+			value.files[index] = strings.clone(path, allocator) or_return
+		}
 		owned = value
 	case Compact_Output:
 		value: Compact_Output
@@ -744,6 +932,26 @@ tool_output_destroy :: proc(output: ^Tool_Output, allocator: mem.Allocator) {
 		delete(value.directory, allocator)
 		delete(value.content_digest, allocator)
 		delete(value.instructions, allocator)
+	case Find_Output:
+		delete(value.next_cursor, allocator)
+		delete(value.notice, allocator)
+		for file in value.files {
+			delete(file, allocator)
+		}
+		delete(value.files, allocator)
+	case Grep_Output:
+		delete(value.next_cursor, allocator)
+		delete(value.notice, allocator)
+		for match in value.matches {
+			delete(match.path, allocator)
+			delete(match.text, allocator)
+		}
+		delete(value.matches, allocator)
+		delete(value.full_lines_file, allocator)
+		for path in value.files {
+			delete(path, allocator)
+		}
+		delete(value.files, allocator)
 	case Compact_Output:
 		delete(value.state, allocator)
 	case Agents_Output:

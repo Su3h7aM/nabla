@@ -19,6 +19,8 @@ Tool_Kind :: enum {
 	Shell,
 	Skills,
 	Skill,
+	Find,
+	Grep,
 	Compact,
 	Codemode,
 	MCP,
@@ -39,6 +41,8 @@ Tool_Args :: union {
 	Shell_Args,
 	Skills_Args,
 	Skill_Args,
+	Find_Args,
+	Grep_Args,
 	Codemode_Args,
 	Agent_Start_Args,
 	Agent_Message_Args,
@@ -126,6 +130,10 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 		return tool_skills_args(ctx, object)
 	case .Skill:
 		return tool_skill_args(ctx, object)
+	case .Find:
+		return tool_find_args(ctx, object)
+	case .Grep:
+		return tool_grep_args(ctx, object)
 	case .Compact:
 		return nil, tool_fields_known(object, nil, allocator = ctx.allocator)
 	case .Codemode:
@@ -149,13 +157,16 @@ tool_args_decode :: proc(ctx: ^Tool_Context, definition: Tool_Definition, object
 	return nil, nil
 }
 
-// tool_args_destroy releases what one typed call owns: the edit arrays and the search
-// domain lists, which are the only parts of the union that are not borrowed.
+// tool_args_destroy releases what one typed call owns: the edit arrays, the search
+// domain lists, and the find/grep root keys, which are the only parts of the union
+// that are not borrowed.
 tool_args_destroy :: proc(args: ^Tool_Args, allocator := context.allocator) {
 	if edit, is_edit := &args.(Edit_Args); is_edit { patch_args_destroy(edit, allocator) }
 	if search, is_search := &args.(Web_Search_Args); is_search {
 		delete(search.include_domains, allocator)
 		delete(search.exclude_domains, allocator)
 	}
+	if find, is_find := &args.(Find_Args); is_find { delete(find.root_key, allocator) }
+	if grep, is_grep := &args.(Grep_Args); is_grep { delete(grep.root_key, allocator) }
 	args^ = nil
 }

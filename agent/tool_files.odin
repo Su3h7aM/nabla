@@ -14,7 +14,7 @@ import "nabla:ai"
 
 TOOL_READ_NAME :: "read"
 
-TOOL_READ_DESCRIPTION :: `Read a text file and return a window of its lines. Use it to see a file before editing it and to continue a result that was cut off; to find text across many files, run a search command with shell instead of reading them all. Relative paths start at the session workspace, and absolute paths are used as given. PNG, JPEG, GIF, WebP images and PDF files are attached to the result so you can view them, when the selected model accepts that input; offset and limit do not apply to them. Directories, other binary files, and files that are not valid UTF-8 fail.
+TOOL_READ_DESCRIPTION :: `Read a text file and return a window of its lines. Use it to see a file before editing it and to continue a result that was cut off; to find files by name use find, and to find text across many files use grep. Relative paths start at the session workspace, and absolute paths are used as given. PNG, JPEG, GIF, WebP images and PDF files are attached to the result so you can view them, when the selected model accepts that input; offset and limit do not apply to them. Directories, other binary files, and files that are not valid UTF-8 fail.
 
 offset is the first line, counting from 1 (default 1), and limit is the number of lines (default 2000). The result starts with path, first_line, line_count (lines returned), total_lines, and truncated, which is true when lines remain after the window; the text of the lines follows after a blank line. At most %d KiB of one result is shown to you. When the window is longer, the text is cut at a line break and a notice gives the number of complete lines shown and the offset to continue from; call read again with that offset and a smaller limit. The notice also names a file that holds the whole result.`
 
@@ -88,6 +88,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 
 	if media, is_media := ai.Provider_Media_Detect(data); is_media {
 		transferred = true
+		search_record_access(ctx, path)
 		return tool_read_media(ctx, args.path, path, media, data)
 	}
 	text := string(data)
@@ -111,6 +112,7 @@ tool_read_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 		truncated   = end < len(text),
 	}
 	reason := fmt.tprintf("lines %d-%d of %d", args.offset, args.offset + lines - 1, total_lines) if lines > 0 else "no lines"
+	search_record_access(ctx, path)
 	return tool_result_success(ctx, result, reason)
 }
 
@@ -233,6 +235,7 @@ tool_write_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 	} else if write_error != nil {
 		return tool_result_failure(ctx, .Tool_Failed, fmt.tprintf("could not write %s: %s", args.path, os.error_string(write_error)), "write failed")
 	}
+	search_record_access(ctx, path)
 	return tool_result_success(ctx, Write_Output{path = args.path, bytes = len(args.content)}, fmt.tprintf("wrote %d bytes", len(args.content)))
 }
 

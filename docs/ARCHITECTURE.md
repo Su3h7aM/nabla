@@ -163,7 +163,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 
 ```text
 foundation   text  markdown  input  term  layout  tui  tui/widgets  tui/markdown_view
-libraries    dns  tls  http  http/client  sse  websocket  html  web  subprocess  ai  mcp  acp  db  db/sqlite
+libraries    dns  tls  http  http/client  sse  websocket  html  web  subprocess  fuzzy  search  ai  mcp  acp  db  db/sqlite
 harness      agent  agent/journal  agent/material  root package (nabla executable)
 ```
 
@@ -174,16 +174,18 @@ harness      agent  agent/journal  agent/material  root package (nabla executabl
 | `html` | non-allocating HTML tokenization with borrowed tokens and attributes; no tree building | browser parsing, page extraction policy |
 | `web` | page fetching and HTML conversion, search service requests, normalized results, classified errors, environment endpoints, ordered fallback | tool policy, sessions, harness configuration |
 | `subprocess` | starting a child in its own process group, exit watching, group termination (SIGTERM, grace, SIGKILL), readiness polling | what the child is for, pipes policy, output capture |
+| `fuzzy` | typo-tolerant scoring of one query against candidate strings: tiers, normalized score, bounded top-K retention | I/O, files, threads, paths, ranking by anything but the match |
+| `search` | file discovery and content search over one index per root: scan with ignore rules, find, grep, cursors, frecency scoring and its log, parallel walks; imports `fuzzy` | sessions, tools, models, tool output formats, policy about which roots may be searched |
 | `ai` | provider API families, encoding with caller-owned encode cache, stream decoding, failure classification, delivery evidence, one-send operations, Responses WebSocket connection | turn control, retry authorization, catalog policy, storage |
 | `mcp` | MCP client protocol over stdio, delivery state | tool policy, naming policy |
 | `acp` | ACP framing, JSON-RPC, payload shapes for both agent and client roles, writer | sessions, turns, Nabla concepts |
 | `db` `db/sqlite` | engine-neutral SQL facility and the SQLite binding | harness record semantics |
 | `agent/journal` | journal schema, record and node types, append/commit, claims, recovery queries, bounded reads, migrations | execution types from `agent`, model execution, filesystem discovery |
 | `agent/material` | `.agents/` and user material formats: skills, rules, commands, Task metadata, frontmatter subset, bounded discovery, verified loads | sessions, models, permissions |
-| `agent` | owner loop, state machine, jobs, tools, repair, policy, hooks, Lua runtime, Tasks, subagents, projection, compaction, catalog resolution, config parsing and validation | terminal, rendering, process-global UI state, file watching |
+| `agent` | owner loop, state machine, jobs, tools, repair, policy, hooks, Lua runtime, Tasks, subagents, projection, compaction, catalog resolution, config parsing and validation; the `find` and `grep` tools, the session's workspace search cache, and the wiring of the frecency log (section 14.6) | terminal, rendering, process-global UI state, file watching |
 | root | process lifetime, signals, config discovery and file watching, catalog refresh thread, TUI, headless, ACP server, export command | a second copy of any `agent` policy |
 
-Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` and `markdown` import only `core:`. `agent/material` replaces `agent/skills`. No further packages without a second consumer.
+Rules: dependencies point inward; only root imports both foundation and `agent`; `agent/journal` imports only `db`, `db/sqlite`, and `core:`; `agent/material` and `markdown` import only `core:`; `fuzzy` imports only `core:` and `base:`; `search` imports only `fuzzy`, `core:`, and `base:`. `agent/material` replaces `agent/skills`. No further packages without a second consumer.
 
 ## 5. Identities and vocabulary
 
@@ -772,6 +774,8 @@ The registry is built, validated (names, schemas, collisions), and sorted inside
 | `skill` | Read(skill file) | Worker |
 | `web_search` | External(network) | Worker |
 | `web_fetch` | External(network) | Worker |
+| `find` | Read-only hint | Worker |
+| `grep` | Read-only hint | Worker |
 | `agent` action `start` (main sessions only) | Read(all) or Process, by scope | Worker |
 | `agent` actions `message`, `configure`, `stop` | Session | Owner |
 | `agents` (main sessions only, read-only) | Session | Owner |
@@ -817,6 +821,7 @@ decode (provider JSON or Lua value) -> validate -> [repair -> revalidate] -> hoo
 - MCP: one shared executor; one request at a time per client lane. Delivery state maps to `Transport_Failed` (not delivered) or `Unknown` (delivered, no reply). Non-text blocks are described, not dumped.
 - Web search: `web.search_first` over configured endpoints with one probe from the job's interrupt and deadline; cancellation and timeout stop fallback and return no partial results. `query` is required; `count` defaults to 8, with optional freshness, domain filters, and `timeout_ms` overriding the 30-second default without a maximum. The description, result text, and Lua output are service-neutral. Only the optional `provider` schema enum names the session's services in priority order; selecting one tries it first and keeps the others as fallbacks. Exa REST and MCP are one service. Results include an optional notice when an API maximum lowered the count and an optional answer; zero results succeeds with query advice. Service outcomes and credential hints go only to the human-facing `Tool_Result.reason`. All-failed model feedback names the cause and advice of the last service tried (the shared per-kind text of `tool_web.odin`, also used by web fetch) and never an endpoint. Configuration belongs to section 13.1.
 - Web fetch: always registered; `web.fetch` retrieves one URL with the same interrupt and deadline probe as web search. The URL is repaired when it has surrounding whitespace (`Text_Trimmed`) or no scheme (`Url_Scheme_Added`, https); a non-HTTP scheme, empty host, userinfo, control byte, or inner space is refused. It returns the final URL after redirects, title, Content-Type when known, and full content as Markdown, text, or HTML. Text and JSON pass through; unsupported media and charsets are actionable failures. Large content uses the existing result spill, never truncation.
+- Find and grep: thin adapters over the `search` package (`agent/tool_search.odin`). Admission decodes the arguments and resolves the root to an absolute path without scanning it; every scan runs on the worker. The default timeout is `TOOL_SEARCH_DEFAULT_TIMEOUT` with no maximum. A grep match line longer than 180 bytes is shown cut around the hit, and the full lines are kept in a `<call>.lines.txt` file beside the other kept outputs (section 14.3). Section 14.6 states the search contract.
 
 ### 14.5 Attachments
 
@@ -827,6 +832,51 @@ An attachment is a file a model reads beside the text of a user message or a too
 - Projection: the projection reads the bytes into the chain arena. Request building keeps an attachment only when the selected model's `input_modalities` admits its format; one it leaves out becomes a line in the message text naming the file and the input the model does not list, so the model knows it was not shown. The decision is made per request, so a model switch changes it without rewriting history.
 - Encoding: `ai` writes the bytes as base64 in the API family's own part. Chat Completions takes text only in a tool message, so the files of a run of tool results follow it in one user message that names each call.
 - Estimate: an image counts `CHAT_IMAGE_TOKENS` and a PDF `CHAT_PDF_PAGE_TOKENS` per page; the provider's count calibrates both like any estimate (section 23.1).
+
+### 14.6 File search
+
+The `find` and `grep` tools search the workspace or any directory the call names as `root`. The `search` package owns matching, paging, and recovery. `fuzzy` owns the typo-tolerant scoring. `agent` owns the tool definitions, argument decoding, the session's workspace index, and the frecency wiring.
+
+Matching and recovery:
+
+- A query matches exactly first. Only when it has zero exact hits does one typo-tolerant fuzzy fallback run, and the result carries a `notice` that labels its rows as approximate. A true non-match returns zero rows and no notice.
+- Grep in plain mode first retries a multi-word pattern without its leading word, then falls back to fuzzy. Grep in regex mode never recovers by fuzzy matching. An invalid regular expression is searched as a literal and the notice says so.
+- Exact rows are never capped. Grep's fuzzy fallback keeps at most `APPROX_CAP` rows; find's fallback keeps every match and pages it like exact rows. A `limit` at or below zero returns every row.
+- Find ranks its rows by match score, raised by frecency and file modification time, then by shorter path and path. Grep orders files by frecency and file modification time, else by path, and re-reads only the files of the requested page. Rows inside a file follow line order.
+- Grep skips binary files (a NUL in the first 4 KiB), files over 10 MiB, and unreadable files. A skip never fails the query. Every result reports the skips by cause, and find still lists those files.
+
+Index and scan:
+
+- An index holds one root as exactly two allocations: a paths buffer and the file list whose strings view that buffer. Queries borrow it. One owner mutates it, and an update never runs beside a query.
+- A scan prunes hidden directories, `.git`, and `DENY_DIRS` (`node_modules`, `target`, `__pycache__`). It indexes hidden files and skips symlinks and other non-regular files without following them.
+- Only inside a Git or Jujutsu repository (a `.git` or `.jj` entry in the root, an ancestor, or a directory the scan reaches) does a scan also apply `.gitignore` files per directory, `.git/info/exclude`, and ancestor ignore files, with Git's pattern syntax and precedence. Nested repositories are honored. An ignored directory is never entered. Outside a repository no ignore rule applies.
+- The workspace root has one cached index. A prewarm thread builds it at session start. A query refreshes it only when the root directory's mtime moved, which sees entries created, removed, or renamed directly under the root; an edit to an existing file or a change below the top level is not seen until the mtime moves. The first install of a concurrent build wins, so no generation moves under a live cursor.
+- Every other root, including a subdirectory of the workspace, is one-shot. The call scans it, queries it, and frees the index before it returns, so searching anywhere on the filesystem retains no memory and its cursors never age.
+
+Cursors:
+
+- A cursor is the text `<generation>.<offset>.<16 hex fnv64a of the root>`. Parsing is strict: canonical decimal numbers, lowercase hex, exactly three fields. A malformed cursor or one from another root is `Invalid_Cursor`. One from before a rescan is `Stale_Cursor`. Both come back as feedback that names the cause. An offset past the end returns an empty page.
+
+Frecency:
+
+- Frecency is a decayed weight per absolute path with a 3-day half-life and a 7-day window. The workspace has one, and a call on another root ranks without it.
+- The log is append-only under `$XDG_STATE_HOME/nabla/frecency/<hash>.log`, where the hash is the fnv64a of the absolute workspace path. It is replayed and compacted when the session opens it.
+- The harness records an access when `read`, `write`, or `edit` succeeds on a path inside the workspace. If the log cannot be opened, frecency is memory-only for the session. Ranking is not critical, so no frecency failure reaches the model or the user.
+
+Threading and cancellation:
+
+- `parallel_for` creates worker threads for each walk or grep pass, sized by the core count, and the calling thread is one of the workers. Workers allocate only from their own allocators. The calling thread copies the results into the caller's allocator. No lock spans I/O: the workspace cache takes its guard only to read or install the index pointer, and a scan runs outside it.
+- The library has no interrupt. A stop or timeout is observed when the call returns. A late result reports `Timed_Out` and still shows its rows.
+
+Fuzzy scoring (`fuzzy`):
+
+- Case is smart: a query with an uppercase byte matches case-sensitively, otherwise case-insensitively. Matching is bytewise.
+- A candidate falls in a tier, best first: Exact, Prefix, Substring, Subsequence, Typo. An edit is a substitution, a deletion, or an adjacent transposition. A `Pattern` allows `max_typos` edits, by default one per four query bytes. An edit at the head of the query must start on a word boundary.
+- The score is normalized to 0..1 whatever the query length, and `MATCH_THRESHOLD` is the lowest value kept.
+- Two filters run before the DP alignment and rule out only candidates that cannot align within the edit budget: a byte-presence count and, for queries of at most 64 bytes, a bit-parallel longest-common-subsequence bound. The bound is sound, so a filtered candidate would have failed the DP too.
+- Queries of at most 16 bytes with a small budget run the DP over all query positions at once in SIMD lanes (`#simd[16]i32`). Other queries use the scalar form, which gives the same results.
+- A `Pattern` compiles the query once and owns the DP rows, so scoring allocates nothing. The rows are call state, so each thread uses its own `Pattern`.
+- `Top_K` keeps the best K hits in a min-heap, so a candidate stream of any length uses memory bounded by K.
 
 ## 15. Deterministic repair
 
@@ -1165,6 +1215,8 @@ These values schedule work, size internal buffers, and time the harness's own th
 | `TOOL_SHELL_DEFAULT_TIMEOUT` | 120 s | default when the model gives none; no maximum |
 | `TOOL_WEB_SEARCH_DEFAULT_TIMEOUT` | 30 s | default when the model gives none; no maximum |
 | `TOOL_WEB_FETCH_DEFAULT_TIMEOUT` | 30 s | default when the model gives none; no maximum |
+| `TOOL_SEARCH_DEFAULT_TIMEOUT` | 60 s | default for `find` and `grep` when the model gives none; no maximum |
+| `APPROX_CAP` | 50 rows | typo-tolerant fallback rows of one grep search; find and exact rows are never capped (section 14.6) |
 | `TOOL_READ_DEFAULT_LINES` | 2000 lines | default when the model gives none; no maximum |
 | `TOOL_RESULT_PREVIEW_BYTES` | 32 KiB | what one result shows the model; the rest is kept in a file |
 | `TOOL_RESULT_NOTICE_TOKENS` | 128 | context reserved per later result in a batch |

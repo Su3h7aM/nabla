@@ -368,6 +368,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		call_id   = job.call_id,
 		workspace = chat.workspace,
 		allocator = job.allocator,
+		search    = chat.search_cache,
 		skills    = chat_skill_catalog(chat),
 		call      = job.call.call,
 	}
@@ -426,7 +427,7 @@ tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Obs
 		}
 	case .Jobs:
 		job.exec.background = &chat.background
-	case .Custom, .Read, .Write, .Edit, .Shell, .Skills, .Skill, .Compact, .Codemode, .MCP, .Web_Search, .Web_Fetch:
+	case .Custom, .Read, .Write, .Edit, .Shell, .Skills, .Skill, .Find, .Grep, .Compact, .Codemode, .MCP, .Web_Search, .Web_Fetch:
 	}
 
 	// A provider call is admitted here, from the text it arrived as. A Lua child call arrives
@@ -976,6 +977,8 @@ tool_jobs_commit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 	     Shell_Args,
 	     Skills_Args,
 	     Skill_Args,
+	     Find_Args,
+	     Grep_Args,
 	     Codemode_Args,
 	     Agent_Stop_Args,
 	     Agents_Args,

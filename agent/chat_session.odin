@@ -1,6 +1,7 @@
 package agent
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -11,6 +12,7 @@ import "core:unicode/utf8"
 import "nabla:agent/journal"
 import "nabla:agent/skills"
 import "nabla:ai"
+import "nabla:search"
 
 // Chat_Tool_Call is a validated tool call awaiting execution. call is the id its
 // tool.proposed record carries, which its admission and completion name.
@@ -169,6 +171,12 @@ Chat_Session :: struct {
 	calls_made:                   int, // tool executions in this turn
 	active_failed:                bool,
 	workspace:                    string, // owned; validated process directory
+	// search_cache is the session's find/grep index and frecency, heap-owned with
+	// an explicit destroy at session close. Admission performs no scan; every scan
+	// runs on a worker thread, and installs take one short guard with first-wins
+	// semantics. Workers borrow the cache and its home index; the index is
+	// replaced only by the query-time rescan, never copied.
+	search_cache:                 ^Search_Cache,
 	// tool_output_directory is where outputs larger than what the model is shown are kept
 	// whole; owned, and "" when none resolves.
 	tool_output_directory:        string,
@@ -312,6 +320,12 @@ chat_session_init :: proc(
 		tool_registry_destroy(&tools)
 		return {}, Tool_Registry_Error{kind = .Allocation}
 	}
+	search_cache, cache_error := search_cache_make(workspace, os.heap_allocator())
+	if cache_error != nil {
+		delete(owned_workspace, allocator)
+		tool_registry_destroy(&tools)
+		return {}, Tool_Registry_Error{kind = .Allocation}
+	}
 	chat := Chat_Session {
 		store = store,
 		session = session,
@@ -322,6 +336,7 @@ chat_session_init :: proc(
 		next_turn_id = 1,
 		next_operation_id = 1,
 		workspace = owned_workspace,
+		search_cache = search_cache,
 		background_stop = {parent = &process_interrupt},
 		tools = tools,
 	}
@@ -446,7 +461,9 @@ chat_session_replace_tools :: proc(chat: ^Chat_Session, replacement: ^Tool_Regis
 }
 
 // chat_session_apply_harness applies the launch's harness options to a session.
-// The options must outlive the session.
+// The options must outlive the session. It also starts the home-root prewarm:
+// the session is installed, so its first queries should find a warm index, and
+// the scan runs on its own thread while this returns at once.
 chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options) {
 	delete(chat.nabla_executable, chat.allocator)
 	delete(chat.nabla_config, chat.allocator)
@@ -463,6 +480,17 @@ chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options
 	chat.subagents_max_running = options.subagents_max_running
 	chat.compact_on_switch = options.compact_on_switch
 	chat.acp_agents = options.acp_agents
+	if directory := search_frecency_directory(chat.allocator); directory != "" {
+		defer delete(directory, chat.allocator)
+		if open_error := search_cache_frecency_open(chat.search_cache, directory, time.to_unix_seconds(time.now())); open_error != nil {
+			chat_runtime_message(
+				chat,
+				.Warning,
+				fmt.tprintf("find and grep will not remember recently used files: the frecency log could not be opened: %s", search.error_message(open_error)),
+			)
+		}
+	}
+	search_cache_prewarm(chat.search_cache)
 }
 
 chat_session_destroy :: proc(chat: ^Chat_Session) {
@@ -490,6 +518,10 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 		chat_skill_catalog_release(chat)
 		delete(chat.workspace, chat.allocator)
 		chat.workspace = ""
+		if chat.search_cache != nil {
+			search_cache_destroy(chat.search_cache)
+			chat.search_cache = nil
+		}
 	}
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
 	// An abandoned attempt took over the WebSocket it was using, so this one is unshared.

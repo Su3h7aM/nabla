@@ -37,6 +37,9 @@ Tool_Repair :: enum {
 	Url_Scheme_Added,
 	// A text argument had whitespace around it, which was dropped.
 	Text_Trimmed,
+	// A documented alias of another field was used, or was ignored beside the
+	// canonical field it names.
+	Field_Alias,
 }
 
 Tool_Repairs :: bit_set[Tool_Repair]
@@ -50,6 +53,7 @@ TOOL_REPAIR_NAMES := [Tool_Repair]string {
 	.Trailing_Comma             = "trailing_comma",
 	.Url_Scheme_Added           = "url_scheme_added",
 	.Text_Trimmed               = "text_trimmed",
+	.Field_Alias                = "field_alias",
 }
 
 Tool_Argument_Error_Kind :: enum {

@@ -65,6 +65,11 @@ Tool_Context :: struct {
 	call_id:          string,
 	workspace:        string,
 	control:          Tool_Control,
+	// search is the session's borrowed workspace index, or nil where no session
+	// owns one. Find and grep borrow it for the workspace root; any other root,
+	// and a nil search, is scanned into a one-shot index that the call destroys
+	// before returning.
+	search:           ^Search_Cache,
 	// stream is where the tool may show output live; the zero value is off.
 	stream:           Tool_Stream_Sink,
 	// arguments_json is the admitted argument text, exactly as the dispatch record
@@ -560,6 +565,8 @@ TOOL_DECLARED := [?]Tool_Definition {
 	TOOL_WRITE_DEFINITION,
 	TOOL_SKILLS_DEFINITION,
 	TOOL_SKILL_DEFINITION,
+	TOOL_FIND_DEFINITION,
+	TOOL_GREP_DEFINITION,
 	TOOL_COMPACT_DEFINITION,
 	TOOL_CODEMODE_DEFINITION,
 	TOOL_AGENT_DEFINITION,

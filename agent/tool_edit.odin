@@ -100,7 +100,10 @@ tool_edit_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 
 	for change, index in changes {
 		write_error, cancelled, target_written := patch_write(change, ctx.control, scratch)
-		if !cancelled && write_error == nil { continue }
+		if !cancelled && write_error == nil {
+			if change.operation != .Delete { search_record_access(ctx, change.target) }
+			continue
+		}
 		applied_files := index
 		if target_written { applied_files += 1 }
 		applied := Edit_Output {
