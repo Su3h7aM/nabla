@@ -32,6 +32,17 @@ Writer_State :: struct {
 	finished:   bool,
 }
 
+// Write_Error is why a frame was not queued. Closed covers a nil writer, a
+// missing stream, a closed or closing writer, and batch misuse. Encode is an
+// envelope json.marshal cannot represent. Allocation is any storage the frame
+// needed that could not be obtained.
+Write_Error :: enum {
+	None,
+	Closed,
+	Encode,
+	Allocation,
+}
+
 // Writer_Init_Thread_Error names a failure to create the writer's owner thread.
 Writer_Init_Thread_Error :: enum {
 	None,
@@ -58,7 +69,7 @@ writer_init :: proc(out: io.Writer, allocator := context.allocator) -> (Writer, 
 
 	previous_allocator := context.allocator
 	context.allocator = allocator
-	worker := thread.create(writer_run, name = "nabla-acp-writer")
+	worker := thread.create(writer_run, name = "acp-writer")
 	context.allocator = previous_allocator
 	if worker == nil {
 		free(state, allocator)
@@ -111,37 +122,125 @@ writer_failed :: proc(writer: ^Writer) -> bool {
 	return state.failed
 }
 
-// writer_submit_value serializes value and transfers its complete response frame to
-// the writer thread. True means queued, not written.
-@(private, require_results)
-writer_submit_value :: proc(writer: ^Writer, id: JSONRPC_Id, key: string, value: $T) -> bool {
-	state := writer.state
-	if state == nil { return false }
-	queued := false
-	defer if !queued { writer_latch_failure(state) }
-	body, marshal_error := json.marshal(value, allocator = context.temp_allocator)
-	if marshal_error != nil { return false }
-	defer delete(body, context.temp_allocator)
-	frame, encoded := writer_encode_frame(state, id, key, body)
-	if !encoded { return false }
-	queued = writer_submit_frame(state, frame, true)
-	return queued
-}
-
 @(private)
-writer_latch_failure :: proc(state: ^Writer_State) {
-	sync.mutex_guard(&state.mutex)
+writer_latch_failure_locked :: proc(state: ^Writer_State) {
 	state.failed = true
 	state.closed = true
 	state.closing = true
 	sync.cond_broadcast(&state.ready)
 }
 
-// writer_write_response serializes a result before transferring its complete frame to
-// the writer thread. True means queued, not written. False latches writer_failed.
+@(private)
+writer_latch_failure :: proc(state: ^Writer_State) {
+	sync.mutex_guard(&state.mutex)
+	writer_latch_failure_locked(state)
+}
+
+// write_encode_error classifies a failed envelope marshal. Only a failure is
+// classified: a data error is an envelope json cannot represent, and a stream
+// error is storage it could not obtain.
+@(private)
+write_encode_error :: proc(err: json.Marshal_Error) -> Write_Error {
+	if _, is_data := err.(json.Marshal_Data_Error); is_data { return .Encode }
+	return .Allocation
+}
+
+// write_normalize_id maps an explicit JSON null id to an absent one. Marshal
+// writes a null struct as {}, so only nil reaches the envelope as null.
+@(private)
+write_normalize_id :: proc(id: JSONRPC_Id) -> JSONRPC_Id {
+	if _, is_null := id.(JSONRPC_Null); is_null { return nil }
+	return id
+}
+
+// Response_Envelope is one result answer. The fields stay in wire order:
+// json.marshal writes them as declared.
+@(private)
+Response_Envelope :: struct($R: typeid) {
+	jsonrpc: string `json:"jsonrpc"`,
+	id:      JSONRPC_Id `json:"id"`,
+	result:  R `json:"result"`,
+}
+
+// Error_Envelope is one error answer, in the same field order.
+@(private)
+Error_Envelope :: struct {
+	jsonrpc: string `json:"jsonrpc"`,
+	id:      JSONRPC_Id `json:"id"`,
+	error:   RPC_Error_Wire `json:"error"`,
+}
+
+// Notification_Envelope is one notification, in the same field order.
+@(private)
+Notification_Envelope :: struct($P: typeid) {
+	jsonrpc: string `json:"jsonrpc"`,
+	method:  string `json:"method"`,
+	params:  P `json:"params"`,
+}
+
+// Request_Envelope is one request, in the same field order.
+@(private)
+Request_Envelope :: struct($P: typeid) {
+	jsonrpc: string `json:"jsonrpc"`,
+	id:      JSONRPC_Id `json:"id"`,
+	method:  string `json:"method"`,
+	params:  P `json:"params"`,
+}
+
+// write_submit marshals one envelope and queues its frame with a newline. A
+// response joins the open batch and latches the writer closed when anything is
+// lost, since its peer would wait for the answer forever; a notification or
+// request is always its own frame and is only reported.
+@(private, require_results)
+write_submit :: proc(writer: ^Writer, envelope: $E, response: bool) -> Write_Error {
+	state := writer.state
+	if state == nil { return .Closed }
+	body, marshal_error := json.marshal(envelope, allocator = context.temp_allocator)
+	if marshal_error != nil {
+		err := write_encode_error(marshal_error)
+		if response { writer_latch_failure(state) }
+		return err
+	}
+	defer delete(body, context.temp_allocator)
+	if frame_error := write_submit_bytes(state, body, response); frame_error != .None {
+		if response { writer_latch_failure(state) }
+		return frame_error
+	}
+	return .None
+}
+
+// write_submit_bytes queues one marshaled frame with its newline, joining the
+// open batch for a response. The queued copy is owned by the writer's
+// allocator; a queueing failure releases it.
+@(private, require_results)
+write_submit_bytes :: proc(state: ^Writer_State, body: []byte, response: bool) -> Write_Error {
+	builder, builder_error := strings.builder_make(state.allocator)
+	if builder_error != nil { return .Allocation }
+	if strings.write_bytes(&builder, body) != len(body) || strings.write_byte(&builder, '\n') != 1 {
+		strings.builder_destroy(&builder)
+		return .Allocation
+	}
+	frame := strings.to_string(builder)
+	transferred := false
+	defer if !transferred { delete(frame, state.allocator) }
+	sync.mutex_guard(&state.mutex)
+	if state.out.procedure == nil || state.closed || state.closing { return .Closed }
+	if response && state.batch_mode {
+		if append(&state.batch, frame) != 1 { return .Allocation }
+		transferred = true
+		return .None
+	}
+	if append(&state.queue, frame) != 1 { return .Allocation }
+	transferred = true
+	sync.cond_signal(&state.ready)
+	return .None
+}
+
+// write_response serializes a result and transfers its complete frame to the
+// writer thread. .None means queued, not written.
 @(require_results)
-writer_write_response :: proc(writer: ^Writer, id: JSONRPC_Id, result: $T) -> bool {
-	return writer_submit_value(writer, id, `"result":`, result)
+write_response :: proc(writer: ^Writer, id: JSONRPC_Id, result: $T) -> Write_Error {
+	return write_submit(writer, Response_Envelope(T){jsonrpc = "2.0", id = write_normalize_id(id), result = result}, true)
 }
 
 // RPC_Error_Wire is the error document an error answer carries.
@@ -150,173 +249,89 @@ RPC_Error_Wire :: struct {
 	message: string `json:"message"`,
 }
 
-// writer_write_error serializes an error before transferring its complete frame to the
-// writer thread. True means queued, not written. False latches writer_failed.
+// write_error serializes an error and transfers its complete frame to the
+// writer thread. .None means queued, not written.
 @(require_results)
-writer_write_error :: proc(writer: ^Writer, id: JSONRPC_Id, code: i64, message: string) -> bool {
-	return writer_submit_value(writer, id, `"error":`, RPC_Error_Wire{code = code, message = message})
+write_error :: proc(writer: ^Writer, id: JSONRPC_Id, code: i64, message: string) -> Write_Error {
+	return write_submit(writer, Error_Envelope{jsonrpc = "2.0", id = write_normalize_id(id), error = RPC_Error_Wire{code = code, message = message}}, true)
 }
 
-// writer_write_notification serializes a notification before transferring its complete
-// frame to the writer thread. Notifications remain separate frames during a batch.
+// write_notification serializes a notification and transfers its complete
+// frame to the writer thread. Notifications stay their own frame during a
+// batch. .None means queued, not written.
 @(require_results)
-writer_write_notification :: proc(writer: ^Writer, method: string, params: $T) -> bool {
+write_notification :: proc(writer: ^Writer, method: string, params: $T) -> Write_Error {
+	return write_submit(writer, Notification_Envelope(T){jsonrpc = "2.0", method = method, params = params}, false)
+}
+
+// write_request serializes a request and transfers its complete frame to the
+// writer thread. .None means queued, not written.
+@(require_results)
+write_request :: proc(writer: ^Writer, id: JSONRPC_Id, method: string, params: $T) -> Write_Error {
+	return write_submit(writer, Request_Envelope(T){jsonrpc = "2.0", id = write_normalize_id(id), method = method, params = params}, false)
+}
+
+@(require_results)
+writer_begin_batch :: proc(writer: ^Writer) -> Write_Error {
 	state := writer.state
-	if state == nil || state.out.procedure == nil { return false }
-	body, marshal_error := json.marshal(params, allocator = context.temp_allocator)
-	if marshal_error != nil { return false }
-	defer delete(body, context.temp_allocator)
-	frame, encoded := writer_encode_notification(state, method, body)
-	if !encoded { return false }
-	return writer_submit_frame(state, frame, false)
-}
-
-// writer_write_request serializes a request before transferring its complete frame to the
-// writer thread. True means queued, not written.
-@(require_results)
-writer_write_request :: proc(writer: ^Writer, id: i64, method: string, params: $T) -> bool {
-	state := writer.state
-	if state == nil || state.out.procedure == nil { return false }
-	body, marshal_error := json.marshal(params, allocator = context.temp_allocator)
-	if marshal_error != nil { return false }
-	defer delete(body, context.temp_allocator)
-	frame, encoded := writer_encode_request(state, id, method, body)
-	if !encoded { return false }
-	return writer_submit_frame(state, frame, false)
-}
-
-@(private, require_results)
-writer_encode_frame :: proc(state: ^Writer_State, id: JSONRPC_Id, key: string, body: []byte) -> (string, bool) {
-	builder, builder_error := strings.builder_make(state.allocator)
-	if builder_error != nil { return "", false }
-	if !writer_builder_string(&builder, `{"jsonrpc":"2.0","id":`) ||
-	   !writer_write_id(&builder, id) ||
-	   !writer_builder_byte(&builder, ',') ||
-	   !writer_builder_string(&builder, key) ||
-	   !writer_builder_bytes(&builder, body) ||
-	   !writer_builder_string(&builder, "}\n") {
-		strings.builder_destroy(&builder)
-		return "", false
-	}
-	return strings.to_string(builder), true
-}
-
-@(private, require_results)
-writer_encode_notification :: proc(state: ^Writer_State, method: string, body: []byte) -> (string, bool) {
-	builder, builder_error := strings.builder_make(state.allocator)
-	if builder_error != nil { return "", false }
-	if !writer_builder_string(&builder, `{"jsonrpc":"2.0","method":`) ||
-	   !writer_write_quoted(&builder, method) ||
-	   !writer_builder_string(&builder, `,"params":`) ||
-	   !writer_builder_bytes(&builder, body) ||
-	   !writer_builder_string(&builder, "}\n") {
-		strings.builder_destroy(&builder)
-		return "", false
-	}
-	return strings.to_string(builder), true
-}
-
-@(private, require_results)
-writer_encode_request :: proc(state: ^Writer_State, id: i64, method: string, body: []byte) -> (string, bool) {
-	builder, builder_error := strings.builder_make(state.allocator)
-	if builder_error != nil { return "", false }
-	if !writer_builder_string(&builder, `{"jsonrpc":"2.0","id":`) ||
-	   !writer_write_id(&builder, JSONRPC_Id(id)) ||
-	   !writer_builder_string(&builder, `,"method":`) ||
-	   !writer_write_quoted(&builder, method) ||
-	   !writer_builder_string(&builder, `,"params":`) ||
-	   !writer_builder_bytes(&builder, body) ||
-	   !writer_builder_string(&builder, "}\n") {
-		strings.builder_destroy(&builder)
-		return "", false
-	}
-	return strings.to_string(builder), true
-}
-
-// writer_submit_frame takes ownership of frame on both success and failure.
-@(private, require_results)
-writer_submit_frame :: proc(state: ^Writer_State, frame: string, response: bool) -> bool {
-	transferred := false
-	defer if !transferred { delete(frame, state.allocator) }
+	if state == nil { return .Closed }
 	sync.mutex_guard(&state.mutex)
-	if state.out.procedure == nil || state.closed || state.closing { return false }
-	if response && state.batch_mode {
-		if append(&state.batch, frame) != 1 { return false }
-		transferred = true
-		return true
-	}
-	if append(&state.queue, frame) != 1 { return false }
-	transferred = true
-	sync.cond_signal(&state.ready)
-	return true
-}
-
-@(require_results)
-writer_begin_batch :: proc(writer: ^Writer) -> bool {
-	state := writer.state
-	if state == nil { return false }
-	sync.mutex_guard(&state.mutex)
-	if state.closed || state.closing || state.batch_mode { return false }
+	if state.closed || state.closing || state.batch_mode { return .Closed }
 	state.batch_mode = true
-	return true
+	return .None
 }
 
+// writer_end_batch joins the batched responses into one array frame and queues
+// it, leaving notifications as their own frames. A batch holds responses, so
+// losing it latches the writer closed like any lost response, and the batch is
+// discarded either way.
 @(require_results)
-writer_end_batch :: proc(writer: ^Writer) -> bool {
+writer_end_batch :: proc(writer: ^Writer) -> Write_Error {
 	state := writer.state
-	if state == nil { return false }
+	if state == nil { return .Closed }
 	sync.mutex_guard(&state.mutex)
-	if !state.batch_mode { return false }
-	if state.closed || state.closing {
-		writer_batch_clear_locked(state)
-		state.batch_mode = false
-		return false
-	}
+	if !state.batch_mode { return .Closed }
+	if state.closed || state.closing { return writer_batch_fail_locked(state, .Closed) }
 	if len(state.batch) == 0 {
 		writer_batch_clear_locked(state)
 		state.batch_mode = false
-		return true
+		return .None
 	}
-
 	builder, builder_error := strings.builder_make(state.allocator)
-	if builder_error != nil {
-		writer_batch_clear_locked(state)
-		state.batch_mode = false
-		return false
-	}
-	defer strings.builder_destroy(&builder)
-	if strings.write_byte(&builder, '[') != 1 {
-		writer_batch_clear_locked(state)
-		state.batch_mode = false
-		return false
-	}
+	if builder_error != nil { return writer_batch_fail_locked(state, .Allocation) }
+	built := strings.write_byte(&builder, '[') == 1
 	for frame, index in state.batch {
-		if index > 0 && strings.write_byte(&builder, ',') != 1 {
-			writer_batch_clear_locked(state)
-			state.batch_mode = false
-			return false
-		}
-		if !writer_builder_string(&builder, frame[:len(frame) - 1]) {
-			writer_batch_clear_locked(state)
-			state.batch_mode = false
-			return false
-		}
+		if !built { break }
+		if index > 0 { built = strings.write_byte(&builder, ',') == 1 }
+		// Every queued frame ends in a newline, which the array members omit.
+		if built { built = strings.write_string(&builder, frame[:len(frame) - 1]) == len(frame) - 1 }
 	}
-	if !writer_builder_string(&builder, "]\n") {
-		writer_batch_clear_locked(state)
-		state.batch_mode = false
-		return false
+	if built { built = strings.write_string(&builder, "]\n") == len("]\n") }
+	if !built {
+		strings.builder_destroy(&builder)
+		return writer_batch_fail_locked(state, .Allocation)
 	}
 	batch_frame, clone_error := strings.clone(strings.to_string(builder), state.allocator)
-	writer_batch_clear_locked(state)
-	state.batch_mode = false
-	if clone_error != nil { return false }
+	strings.builder_destroy(&builder)
+	if clone_error != nil { return writer_batch_fail_locked(state, .Allocation) }
 	if append(&state.queue, batch_frame) != 1 {
 		delete(batch_frame, state.allocator)
-		return false
+		return writer_batch_fail_locked(state, .Allocation)
 	}
+	writer_batch_clear_locked(state)
+	state.batch_mode = false
 	sync.cond_signal(&state.ready)
-	return true
+	return .None
+}
+
+// writer_batch_fail_locked discards the batch, leaves batch mode, and latches
+// the writer closed for the responses the peer will never receive.
+@(private)
+writer_batch_fail_locked :: proc(state: ^Writer_State, err: Write_Error) -> Write_Error {
+	writer_batch_clear_locked(state)
+	state.batch_mode = false
+	writer_latch_failure_locked(state)
+	return err
 }
 
 @(private)
@@ -373,10 +388,10 @@ writer_run :: proc(thread_handle: ^thread.Thread) {
 		sync.mutex_unlock(&state.mutex)
 
 		frame_length := len(frame)
-		written, write_error := io.write_string(state.out, frame)
+		written, stream_error := io.write_string(state.out, frame)
 		delete(frame, state.allocator)
 		free_all(context.temp_allocator)
-		if write_error != nil || written != frame_length {
+		if stream_error != nil || written != frame_length {
 			sync.mutex_guard(&state.mutex)
 			state.closed = true
 			state.failed = true
@@ -389,46 +404,4 @@ writer_run :: proc(thread_handle: ^thread.Thread) {
 			return
 		}
 	}
-}
-
-@(private, require_results)
-writer_builder_string :: proc(builder: ^strings.Builder, value: string) -> bool {
-	return strings.write_string(builder, value) == len(value)
-}
-
-@(private, require_results)
-writer_builder_bytes :: proc(builder: ^strings.Builder, value: []byte) -> bool {
-	return strings.write_bytes(builder, value) == len(value)
-}
-
-@(private, require_results)
-writer_builder_byte :: proc(builder: ^strings.Builder, value: byte) -> bool {
-	return strings.write_byte(builder, value) == 1
-}
-
-@(private, require_results)
-writer_write_id :: proc(builder: ^strings.Builder, id: JSONRPC_Id) -> bool {
-	switch value in id {
-	case i64, f64:
-		body, err := json.marshal(value, allocator = context.temp_allocator)
-		if err != nil { return false }
-		defer delete(body, context.temp_allocator)
-		return writer_builder_bytes(builder, body)
-	case string:
-		return writer_write_quoted(builder, value)
-	case JSONRPC_Null:
-		return writer_builder_string(builder, "null")
-	case:
-		// An id the envelope parser would have refused cannot name a request, so a
-		// response to it is written as the JSON null a client can still match.
-		return writer_builder_string(builder, "null")
-	}
-}
-
-// writer_write_quoted writes one JSON string. It is the only place outbound text is
-// escaped, so every string the writer emits is valid whatever it contains.
-@(private, require_results)
-writer_write_quoted :: proc(builder: ^strings.Builder, value: string) -> bool {
-	_, err := io.write_quoted_string(strings.to_writer(builder), value, '"', nil, true)
-	return err == .None
 }

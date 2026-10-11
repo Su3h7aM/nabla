@@ -35,7 +35,7 @@ acp_serve :: proc(server: ^ACP_Server, input: io.Reader) -> bool {
 	if decoder_error != nil {
 		// A write error latches the writer, which acp_serve reports as the run's
 		// failure, so a reply's own result is not acted on here or below.
-		_ = acp.writer_write_error(&server.writer, nil, acp.ERROR_INTERNAL, "the ACP frame buffer could not be allocated")
+		_ = acp.write_error(&server.writer, nil, acp.ERROR_INTERNAL, "the ACP frame buffer could not be allocated")
 		return false
 	}
 	defer acp.frame_decoder_destroy(&decoder)
@@ -56,7 +56,7 @@ acp_serve :: proc(server: ^ACP_Server, input: io.Reader) -> bool {
 			if frame_err := acp.frame_decoder_feed(&decoder, buffer[:count], &frames); frame_err != .None {
 				// The message is dropped rather than half-read; the client is told what was
 				// wrong with it, and the conversation continues.
-				_ = acp.writer_write_error(&server.writer, nil, acp.ERROR_PARSE, acp.frame_error_text(frame_err))
+				_ = acp.write_error(&server.writer, nil, acp.ERROR_PARSE, acp.frame_error_text(frame_err))
 			}
 			for frame in frames {
 				// A session whose worker retired gives its slot back before the next request.
@@ -103,12 +103,12 @@ acp_handle_frame :: proc(server: ^ACP_Server, frame: string) {
 	frames, is_batch, batch_err := acp.parse_batch(frame, server.alloc)
 	if is_batch {
 		if batch_err != .None {
-			_ = acp.writer_write_error(&server.writer, nil, acp_frame_error_code(batch_err), acp.envelope_error_text(batch_err))
+			_ = acp.write_error(&server.writer, nil, acp_frame_error_code(batch_err), acp.envelope_error_text(batch_err))
 			for batch_frame in frames { delete(batch_frame, server.alloc) }
 			delete(frames)
 			return
 		}
-		if !acp.writer_begin_batch(&server.writer) {
+		if acp.writer_begin_batch(&server.writer) != .None {
 			for batch_frame in frames { delete(batch_frame, server.alloc) }
 			delete(frames)
 			return
@@ -118,7 +118,9 @@ acp_handle_frame :: proc(server: ^ACP_Server, frame: string) {
 			delete(batch_frame, server.alloc)
 		}
 		delete(frames)
-		_ = acp.writer_end_batch(&server.writer)
+		// A failed batch latched the writer, which acp_serve reports as the run's
+		// failure; the reader stops here and the loop drains on that latch.
+		if acp.writer_end_batch(&server.writer) != .None { return }
 		return
 	}
 	acp_handle_single_frame(server, frame)
@@ -128,7 +130,7 @@ acp_handle_batch_frame :: proc(server: ^ACP_Server, frame: string) {
 	envelope, envelope_err := acp.parse_envelope(frame, context.temp_allocator)
 	defer acp.destroy_envelope(&envelope, context.temp_allocator)
 	if envelope_err != .None {
-		_ = acp.writer_write_error(&server.writer, nil, acp_frame_error_code(envelope_err), acp.envelope_error_text(envelope_err))
+		_ = acp.write_error(&server.writer, nil, acp_frame_error_code(envelope_err), acp.envelope_error_text(envelope_err))
 		return
 	}
 	if envelope.kind == .Request {
@@ -141,7 +143,7 @@ acp_handle_batch_frame :: proc(server: ^ACP_Server, frame: string) {
 		     acp.METHOD_SESSION_PROMPT,
 		     acp.METHOD_SESSION_SET_MODEL,
 		     acp.METHOD_SESSION_SET_CONFIG_OPTION:
-			_ = acp.writer_write_error(&server.writer, envelope.id, acp.ERROR_INVALID_REQUEST, "lifecycle requests must not be sent in a JSON-RPC batch")
+			_ = acp.write_error(&server.writer, envelope.id, acp.ERROR_INVALID_REQUEST, "lifecycle requests must not be sent in a JSON-RPC batch")
 			return
 		}
 	}
@@ -154,7 +156,7 @@ acp_handle_single_frame :: proc(server: ^ACP_Server, frame: string) {
 	if envelope_err != .None {
 		// The message named nothing this agent can answer, so the error is written with a
 		// null id: the client matches it to the message it sent.
-		_ = acp.writer_write_error(&server.writer, nil, acp_frame_error_code(envelope_err), acp.envelope_error_text(envelope_err))
+		_ = acp.write_error(&server.writer, nil, acp_frame_error_code(envelope_err), acp.envelope_error_text(envelope_err))
 		return
 	}
 	switch envelope.kind {
@@ -196,7 +198,7 @@ acp_handle_request :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		acp_request_prompt(server, envelope)
 	case acp.METHOD_SESSION_SET_MODEL:
 		acp_request_set_model(server, envelope)
-	case acp.SESSION_CANCEL:
+	case acp.METHOD_SESSION_CANCEL:
 		acp_request_cancel(server, envelope)
 	case:
 		acp_reply_error(server, envelope, acp.ERROR_METHOD_NOT_FOUND, fmt.tprintf("nabla does not implement %s", envelope.method))
@@ -213,12 +215,12 @@ acp_request_cancel :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	if session := acp_session_find(server, params.session_id); session != nil { acp_cancel_session(session) }
-	_ = acp.writer_write_response(&server.writer, envelope.id, acp.Empty_Result{})
+	_ = acp.write_response(&server.writer, envelope.id, acp.Empty_Result{})
 }
 
 acp_handle_notification :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	switch envelope.method {
-	case acp.SESSION_CANCEL:
+	case acp.METHOD_SESSION_CANCEL:
 		params: acp.Session_Cancel_Params
 		if acp.params_decode(envelope.params, &params, context.temp_allocator) != .None { return }
 		if session := acp_session_find(server, params.session_id); session != nil { acp_cancel_session(session) }
@@ -229,7 +231,7 @@ acp_handle_notification :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 }
 
 acp_reply_error :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, code: i64, message: string) {
-	_ = acp.writer_write_error(&server.writer, envelope.id, code, message)
+	_ = acp.write_error(&server.writer, envelope.id, code, message)
 }
 
 @(require_results)
@@ -297,7 +299,7 @@ acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 			},
 			auth_methods = auth_methods,
 		}
-		_ = acp.writer_write_response(&server.writer, envelope.id, result)
+		_ = acp.write_response(&server.writer, envelope.id, result)
 		return
 	}
 	result := acp.Initialize_Result {
@@ -318,7 +320,7 @@ acp_request_initialize :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		auth_methods = auth_methods,
 		agent_info = {name = NABLA_ACP_NAME, title = "Nabla", version = NABLA_ACP_VERSION},
 	}
-	_ = acp.writer_write_response(&server.writer, envelope.id, result)
+	_ = acp.write_response(&server.writer, envelope.id, result)
 }
 
 // --- session requests --------------------------------------------------------
@@ -565,7 +567,7 @@ acp_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, cwd: stri
 	if len(stored) > ACP_SESSION_LIST_PAGE_SIZE {
 		next_cursor = acp_session_cursor_encode(stored[stored_count - 1].last_seq)
 	}
-	_ = acp.writer_write_response(&server.writer, envelope.id, acp.Session_List_Result{sessions = infos[:], next_cursor = next_cursor})
+	_ = acp.write_response(&server.writer, envelope.id, acp.Session_List_Result{sessions = infos[:], next_cursor = next_cursor})
 }
 
 acp_request_session_close :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {

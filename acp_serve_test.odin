@@ -350,7 +350,7 @@ test_acp_shutdown_settles_joined_sessions_and_retains_a_stuck_connection :: proc
 	testing.expect(t, server.sessions[1] == retained, "the unjoined session was freed")
 	testing.expect(
 		t,
-		acp.writer_write_response(&server.writer, i64(1), acp.Empty_Result{}),
+		acp.write_response(&server.writer, i64(1), acp.Empty_Result{}) == .None,
 		"the shared writer was destroyed while a worker could still enqueue",
 	)
 	sync.one_shot_event_signal(&state.release)
@@ -490,14 +490,15 @@ test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
 
 	testing.expect(
 		t,
-		acp.writer_write_notification(
+		acp.write_notification(
 			&server.writer,
 			"session/update",
 			acp.Session_Notification(acp.Session_Info_Update) {
 				session_id = "session-stalled",
 				update = acp.Session_Info_Update{session_update = acp.UPDATE_SESSION_INFO, title = "stall"},
 			},
-		),
+		) ==
+		.None,
 	)
 	acp_test_stalled_output_wait(t, &state)
 

@@ -56,16 +56,16 @@ test_writer_latches_response_serialization_failure :: proc(t: ^testing.T) {
 		defer test_writer_cleanup(&writer)
 		previous_allocator := context.temp_allocator
 		context.temp_allocator = mem.nil_allocator()
-		queued := false
+		queued := Write_Error.None
 		if error_reply {
-			queued = writer_write_error(&writer, i64(1), ERROR_INVALID_PARAMS, "invalid")
+			queued = write_error(&writer, i64(1), ERROR_INVALID_PARAMS, "invalid")
 		} else {
-			queued = writer_write_response(&writer, i64(1), Session_New_Result{session_id = "session"})
+			queued = write_response(&writer, i64(1), Session_New_Result{session_id = "session"})
 		}
 		context.temp_allocator = previous_allocator
-		testing.expect(t, !queued)
+		testing.expect(t, queued != .None)
 		testing.expect(t, writer_failed(&writer), "a response that could not be encoded must latch the writer failure")
-		testing.expect(t, !writer_write_response(&writer, i64(2), Empty_Result{}), "a failed writer must refuse later replies")
+		testing.expect(t, write_response(&writer, i64(2), Empty_Result{}) != .None, "a failed writer must refuse later replies")
 		test_writer_finish(t, &writer)
 	}
 }
@@ -127,11 +127,13 @@ Test_Writer_Send :: struct {
 
 test_writer_send_notification :: proc(thread_handle: ^thread.Thread) {
 	send := cast(^Test_Writer_Send)thread_handle.data
-	send.sent = writer_write_notification(
-		send.writer,
-		"session/update",
-		Session_Notification(Session_Info_Update){session_id = "s", update = Session_Info_Update{session_update = UPDATE_SESSION_INFO, title = "second"}},
-	)
+	send.sent =
+		write_notification(
+			send.writer,
+			"session/update",
+			Session_Notification(Session_Info_Update){session_id = "s", update = Session_Info_Update{session_update = UPDATE_SESSION_INFO, title = "second"}},
+		) ==
+		.None
 	sync.mutex_lock(&send.mutex)
 	send.done = true
 	sync.cond_broadcast(&send.cond)
@@ -155,11 +157,12 @@ test_writer_senders_do_not_wait_for_stalled_output_and_keep_order :: proc(t: ^te
 
 	testing.expect(
 		t,
-		writer_write_notification(
+		write_notification(
 			&writer,
 			"session/update",
 			Session_Notification(Session_Info_Update){session_id = "s", update = Session_Info_Update{session_update = UPDATE_SESSION_INFO, title = "first"}},
-		),
+		) ==
+		.None,
 	)
 	test_writer_wait_for_stall(t, &state)
 
@@ -212,11 +215,12 @@ test_writer_shutdown_abandons_a_stalled_output_within_patience :: proc(t: ^testi
 
 	testing.expect(
 		t,
-		writer_write_notification(
+		write_notification(
 			&writer,
 			"session/update",
 			Session_Notification(Session_Info_Update){session_id = "s", update = Session_Info_Update{session_update = UPDATE_SESSION_INFO, title = "queued"}},
-		),
+		) ==
+		.None,
 	)
 	test_writer_wait_for_stall(t, &state)
 	patience := 25 * time.Millisecond
@@ -242,8 +246,8 @@ test_writer_frames_response_error_and_notification :: proc(t: ^testing.T) {
 	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
 	defer test_writer_cleanup(&writer)
 
-	testing.expect(t, writer_write_response(&writer, i64(7), Session_New_Result{session_id = "sess_1"}))
-	testing.expect(t, writer_write_error(&writer, "req-1", ERROR_INVALID_PARAMS, "no such session"))
+	testing.expect(t, write_response(&writer, i64(7), Session_New_Result{session_id = "sess_1"}) == .None)
+	testing.expect(t, write_error(&writer, "req-1", ERROR_INVALID_PARAMS, "no such session") == .None)
 	update := Tool_Call {
 		session_update = UPDATE_TOOL_CALL,
 		tool_call_id   = "call_1",
@@ -251,7 +255,7 @@ test_writer_frames_response_error_and_notification :: proc(t: ^testing.T) {
 		kind           = tool_kind_name(.Read),
 		status         = tool_status_name(.Pending),
 	}
-	testing.expect(t, writer_write_notification(&writer, NOTIFICATION_SESSION_UPDATE, Session_Notification(Tool_Call){session_id = "sess_1", update = update}))
+	testing.expect(t, write_notification(&writer, METHOD_SESSION_UPDATE, Session_Notification(Tool_Call){session_id = "sess_1", update = update}) == .None)
 	test_writer_finish(t, &writer)
 
 	want :=
@@ -293,7 +297,7 @@ test_writer_includes_buzz_model_metadata :: proc(t: ^testing.T) {
 		config_options = config,
 		models         = state,
 	}
-	testing.expect(t, writer_write_response(&writer, i64(8), result))
+	testing.expect(t, write_response(&writer, i64(8), result) == .None)
 	test_writer_finish(t, &writer)
 	frame := bytes.buffer_to_string(&buffer)
 	testing.expect(
@@ -316,25 +320,26 @@ test_writer_batches_responses_and_keeps_notifications_as_own_frames :: proc(t: ^
 	if writer_err != nil { testing.fail_now(t, "the writer could not be created") }
 	defer test_writer_cleanup(&writer)
 
-	testing.expect(t, writer_begin_batch(&writer))
-	testing.expect(t, writer_write_response(&writer, i64(1), Session_New_Result{session_id = "sess_1"}))
-	testing.expect(t, writer_write_error(&writer, "two", ERROR_INVALID_PARAMS, "bad request"))
+	testing.expect(t, writer_begin_batch(&writer) == .None)
+	testing.expect(t, write_response(&writer, i64(1), Session_New_Result{session_id = "sess_1"}) == .None)
+	testing.expect(t, write_error(&writer, "two", ERROR_INVALID_PARAMS, "bad request") == .None)
 	testing.expect(
 		t,
-		writer_write_notification(
+		write_notification(
 			&writer,
 			"session/update",
 			Session_Notification(Session_Info_Update) {
 				session_id = "sess_1",
 				update = Session_Info_Update{session_update = "session_info_update", title = "kept"},
 			},
-		),
+		) ==
+		.None,
 	)
-	testing.expect(t, writer_end_batch(&writer))
+	testing.expect(t, writer_end_batch(&writer) == .None)
 
-	testing.expect(t, writer_begin_batch(&writer))
-	testing.expect(t, writer_write_response(&writer, i64(3), Empty_Result{}))
-	testing.expect(t, writer_end_batch(&writer))
+	testing.expect(t, writer_begin_batch(&writer) == .None)
+	testing.expect(t, write_response(&writer, i64(3), Empty_Result{}) == .None)
+	testing.expect(t, writer_end_batch(&writer) == .None)
 	test_writer_finish(t, &writer)
 
 	want :=
@@ -360,7 +365,7 @@ test_writer_frames_a_request :: proc(t: ^testing.T) {
 		session_id = "s",
 		prompt     = {{type = "text", text = "hi"}},
 	}
-	testing.expect(t, writer_write_request(&writer, 7, METHOD_SESSION_PROMPT, params))
+	testing.expect(t, write_request(&writer, i64(7), METHOD_SESSION_PROMPT, params) == .None)
 	test_writer_finish(t, &writer)
 
 	want :=
@@ -384,7 +389,7 @@ test_v2_initialize_result_uses_v2_capability_shape :: proc(t: ^testing.T) {
 		capabilities = {session = {prompt = {image = V2_Support{}, embedded_context = {}}, mcp = {stdio = {}}}},
 		auth_methods = {},
 	}
-	testing.expect(t, writer_write_response(&writer, i64(2), result))
+	testing.expect(t, write_response(&writer, i64(2), result) == .None)
 	test_writer_finish(t, &writer)
 	frame := bytes.buffer_to_string(&buffer)
 	testing.expect(t, strings.contains(frame, `"protocolVersion":2`))

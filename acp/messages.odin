@@ -34,12 +34,13 @@ METHOD_SESSION_REQUEST_PERMISSION :: "session/request_permission"
 // its model catalog. It is harmless for other ACP clients to ignore.
 METHOD_SESSION_SET_MODEL :: "session/set_model"
 
-// Notifications. A session update is the agent's only streaming channel: everything a
-// turn produces arrives as one of the update kinds below. Cancellation travels on the
-// same name in both directions: ACP defines it as a notification, but a few clients
-// send it as a request, and accepting that shape keeps cancellation draining.
-SESSION_CANCEL :: "session/cancel"
-NOTIFICATION_SESSION_UPDATE :: "session/update"
+// Methods an agent calls on its client. A session update is the agent's only
+// streaming channel: everything a turn produces arrives as one of the update kinds
+// below. Cancellation travels on the same name in both directions: ACP defines it as
+// a notification, but a few clients send it as a request, and accepting that shape
+// keeps cancellation draining.
+METHOD_SESSION_CANCEL :: "session/cancel"
+METHOD_SESSION_UPDATE :: "session/update"
 
 // JSON-RPC error codes: the specification's four, then the code ACP defines.
 ERROR_PARSE :: -32700

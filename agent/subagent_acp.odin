@@ -773,7 +773,7 @@ acp_send :: proc(connection: ^ACP_Connection, reply: ACP_Reply, method: string, 
 	if _, append_error := append(&connection.pending, request); append_error != nil { return "the pending ACP request could not be held" }
 	connection.next_id += 1
 	failed = false
-	if !acp.writer_write_request(&connection.writer, request.id, method, params) { return acp_ended(connection, "stopped reading its input") }
+	if acp.write_request(&connection.writer, request.id, method, params) != .None { return acp_ended(connection, "stopped reading its input") }
 	return ""
 }
 
@@ -1431,7 +1431,7 @@ acp_models_text :: proc(opened: ACP_Session_Opened) -> string {
 acp_call :: proc(connection: ^ACP_Connection, method: string, params: $P, result: ^$R) -> (problem: string) {
 	id := connection.next_id
 	connection.next_id += 1
-	if !acp.writer_write_request(&connection.writer, id, method, params) { return acp_ended(connection, "stopped reading its input") }
+	if acp.write_request(&connection.writer, id, method, params) != .None { return acp_ended(connection, "stopped reading its input") }
 	for {
 		envelope, next_problem := acp_next(connection)
 		if next_problem != "" { return next_problem }
@@ -1477,7 +1477,7 @@ acp_handle :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool 
 @(private, require_results)
 acp_notification :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
 	owner_wake_signal()
-	if connection.replaying || envelope.method != acp.NOTIFICATION_SESSION_UPDATE { return true }
+	if connection.replaying || envelope.method != acp.METHOD_SESSION_UPDATE { return true }
 	kind: acp.Session_Notification(acp.Update_Kind)
 	switch acp.params_decode(envelope.params, &kind, context.temp_allocator) {
 	case .None:
@@ -1585,14 +1585,14 @@ acp_replace :: proc(owned: ^string, value: string, allocator: mem.Allocator) -> 
 acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool {
 	// A write to the agent that fails ends the exchange: the next read reports it.
 	if envelope.method != acp.METHOD_SESSION_REQUEST_PERMISSION {
-		_ = acp.writer_write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method")
+		_ = acp.write_error(&connection.writer, envelope.id, acp.ERROR_METHOD_NOT_FOUND, "this client offers no such method")
 		return true
 	}
 	request: acp.Request_Permission_Params
 	switch acp.params_decode(envelope.params, &request, context.temp_allocator) {
 	case .None:
 	case .Invalid:
-		_ = acp.writer_write_error(&connection.writer, envelope.id, acp.ERROR_INVALID_PARAMS, "the permission request is not what ACP defines")
+		_ = acp.write_error(&connection.writer, envelope.id, acp.ERROR_INVALID_PARAMS, "the permission request is not what ACP defines")
 		return true
 	case .Allocation:
 		return false
@@ -1601,7 +1601,7 @@ acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool 
 		outcome = "cancelled",
 	}
 	if acp_stopped(connection) {
-		_ = acp.writer_write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
+		_ = acp.write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
 		return true
 	}
 	for kind in ([]string{"allow_once", "allow_always"}) {
@@ -1614,7 +1614,7 @@ acp_answer :: proc(connection: ^ACP_Connection, envelope: acp.Envelope) -> bool 
 			}
 		}
 	}
-	_ = acp.writer_write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
+	_ = acp.write_response(&connection.writer, envelope.id, acp.Request_Permission_Result{outcome = outcome})
 	return true
 }
 
@@ -1653,7 +1653,7 @@ acp_wait :: proc(connection: ^ACP_Connection) -> (problem: string) {
 			connection.cancel_sent = true
 			connection.stop_deadline = time.tick_add(time.tick_now(), TOOL_JOBS_STOP_PATIENCE)
 			if connection.session_id == "" { return "the subagent was stopped before its session opened" }
-			_ = acp.writer_write_notification(&connection.writer, acp.SESSION_CANCEL, acp.Session_Cancel_Params{session_id = connection.session_id})
+			_ = acp.write_notification(&connection.writer, acp.METHOD_SESSION_CANCEL, acp.Session_Cancel_Params{session_id = connection.session_id})
 		}
 		ended: bool
 		what := "exited"
