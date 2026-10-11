@@ -411,10 +411,6 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		if last := inbox_last_text(body); last != "" {
 			cause = last if cause == "" else fmt.tprintf("%s\n\n%s", cause, last)
 		}
-		cause = fmt.tprintf(
-			"%s\n\nThe subagent keeps its session. Continue it with agent action message, or action configure with another model or effort.",
-			cause,
-		)
 		return inbox_report(fmt.tprintf("%s failed", name), cause), .Agent
 	case .Subagent_Message:
 		if record.session != record.subagent { return inbox_report("orchestrator says", body), .Agent }

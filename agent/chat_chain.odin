@@ -804,11 +804,11 @@ chat_failure_message :: proc(reason: Request_Recovery_Reason, class: ai.Provider
 	case .Terminal_Failure:
 		switch class {
 		case .Authentication:
-			cause = "the provider refused the credentials; check the API key"
+			cause = "the provider refused the credentials"
 		case .Quota:
 			cause = "the provider account has no quota or credit left"
 		case .Not_Found:
-			cause = "the provider does not serve this model; choose another model"
+			cause = "the provider does not serve this model"
 		case .Content_Policy:
 			cause = "the provider refused the content under its usage policy"
 		case .Untrusted_Connection:
