@@ -1071,6 +1071,8 @@ A failed child's partial text is committed and reported with the failure, but pr
 
 - ACP commands: a created, loaded, or resumed session advertises only `compact` through `available_commands_update`; V2 setup responses include the same list. `/compact` uses the TUI command parser and compaction entry, including its follower refusal. It is not durable conversation input: V2 emits a live-only user message and acceptance with the same synthetic id, followed by running and idle state for an idle command, while V1 returns `end_turn`. During a V2 turn the command is handed to the owner's collection hook, coalesced with other compaction requests, and accepted when that hook consumes it, including while provider or tool work runs. The background summary does not delay the prompt response; pending commands canceled before collection or left at session close receive the unrun-work error. V1 retains its busy refusal for every prompt.
 
+- ACP model identity: the `model` configuration option advertises opaque, exact-match values `<provider>/<model id>` in both profiles, with the same qualified `currentValue`; `name` remains the readable model name. V1's `models` list, `currentModelId`, `session/set_model` request, and its response use those same qualified ids. `session/set_config_option` with `configId: model` selects the provider and model named by the full advertised value, including model ids containing slashes. Bare ids, changed case, and other unadvertised values are refused rather than resolved to a default provider.
+
 ## 23. Context, capacity, compaction
 
 ### 23.1 Capacity

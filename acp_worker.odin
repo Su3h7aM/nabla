@@ -253,6 +253,14 @@ acp_model_selection_config_failed :: proc(session: ^ACP_Session, selection: ^ACP
 	return session.app.run.connection
 }
 
+// acp_model_value returns an opaque wire identity owned by allocator, released with
+// delete. An unset selection returns an empty string; failure returns an allocation error.
+@(require_results)
+acp_model_value :: proc(provider_id, model_id: string, allocator := context.temp_allocator) -> (string, mem.Allocator_Error) {
+	if provider_id == "" || model_id == "" { return "", nil }
+	return strings.concatenate({provider_id, "/", model_id}, allocator)
+}
+
 // acp_model_request_resolve takes the newest reader handoff and resolves it once on the
 // session owner. The target owns its catalog-derived strings through installation.
 acp_model_request_resolve :: proc(session: ^ACP_Session) {
@@ -270,34 +278,31 @@ acp_model_request_resolve :: proc(session: ^ACP_Session) {
 		return
 	}
 	app := &session.app
-	provider_id := ""
-	provider_error := false
+	target: agent.Model_Selection
+	problem: string
+	value_error: mem.Allocator_Error
 	if sync.mutex_guard(&app.catalog_mu) {
-		for provider in app.setup.catalog.providers {
-			if _, found := agent.catalog_find_model(&app.setup.catalog, provider.id, request.model_id); !found { continue }
-			provider_copy, clone_error := strings.clone(provider.id, app.setup.alloc)
-			provider_id = provider_copy
-			provider_error = clone_error != nil
+		for model in app.setup.catalog.models {
+			value, allocation_error := acp_model_value(model.provider_id, model.id)
+			if allocation_error != nil {
+				value_error = allocation_error
+				break
+			}
+			matched := value == request.model_id
+			delete(value, context.temp_allocator)
+			if !matched { continue }
+			target, problem = agent.model_selection_resolve(&app.setup.catalog, model.provider_id, model.id, app.setup.alloc)
 			break
 		}
 	}
-	if provider_error {
-		acp_sent(session, acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INTERNAL, "the provider id could not be allocated"))
-		acp_model_request_destroy(&request, session.conn.alloc)
-		return
-	}
-	if provider_id == "" {
-		acp_sent(
-			session,
-			acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INVALID_PARAMS, fmt.tprintf("the model %q is not available", request.model_id)),
-		)
-		acp_model_request_destroy(&request, session.conn.alloc)
-		return
-	}
-	defer delete(provider_id, app.setup.alloc)
-	target, problem := selection_target_resolve(app, provider_id, request.model_id, app.setup.alloc)
 	defer if problem != "" { delete(problem, context.temp_allocator) }
+	if value_error != nil {
+		acp_sent(session, acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INTERNAL, "the model value could not be allocated"))
+		acp_model_request_destroy(&request, session.conn.alloc)
+		return
+	}
 	if target.provider_id == "" {
+		if problem == "" { problem = fmt.tprintf("the model value %q is not available", request.model_id) }
 		acp_sent(session, acp.writer_write_error(&session.conn.writer, request.id, acp.ERROR_INVALID_PARAMS, problem))
 		acp_model_request_destroy(&request, session.conn.alloc)
 		return
@@ -358,13 +363,14 @@ acp_model_selection_service :: proc(session: ^ACP_Session) -> ai.Provider_Connec
 			return session.app.run.connection
 		}
 		if acp_model_request_pending(session) { return session.app.run.connection }
-		model_id := selection.target.model_id
 		installed := selection_install(&session.app, selection.target, "", false)
 		if !installed {
 			acp_model_selection_error(session, selection, acp.ERROR_INTERNAL, "the selected model could not be installed durably")
 			return session.app.run.connection
 		}
 		if selection.kind == .Set_Model {
+			model_id, value_error := acp_model_value(selection.target.provider_id, selection.target.model_id)
+			if value_error != nil { return acp_model_selection_config_failed(session, selection) }
 			acp_sent(
 				session,
 				acp.writer_write_response(
@@ -1366,14 +1372,18 @@ acp_report_turn :: proc(session: ^ACP_Session) -> bool {
 acp_models_state :: proc(session: ^ACP_Session) -> (acp.Models_State, bool) {
 	if len(session.app.setup.catalog.models) == 0 { return {}, true }
 	result: acp.Models_State
-	result.current_model_id = session.app.setup.model_id
+	current, current_error := acp_model_value(session.app.setup.provider_id, session.app.setup.model_id)
+	if current_error != nil { return {}, false }
+	result.current_model_id = current
 	available, available_error := make([]acp.Model_Info, len(session.app.setup.catalog.models), context.temp_allocator)
 	if available_error != nil { return {}, false }
 	for model, index in session.app.setup.catalog.models {
 		name := model.id
 		if name_value, ok := model.display_name.?; ok && name_value != "" { name = name_value }
+		value, value_error := acp_model_value(model.provider_id, model.id)
+		if value_error != nil { return {}, false }
 		available[index] = acp.Model_Info {
-			model_id = model.id,
+			model_id = value,
 			name     = name,
 		}
 	}
@@ -1388,8 +1398,10 @@ acp_model_config_values :: proc(session: ^ACP_Session) -> ([]acp.Config_Value, b
 	for model, index in session.app.setup.catalog.models {
 		name := model.id
 		if name_value, ok := model.display_name.?; ok && name_value != "" { name = name_value }
+		value, value_error := acp_model_value(model.provider_id, model.id)
+		if value_error != nil { return nil, false }
 		values[index] = acp.Config_Value {
-			value = model.id,
+			value = value,
 			name  = name,
 		}
 	}
@@ -1428,12 +1440,14 @@ acp_model_config_options_v1 :: proc(session: ^ACP_Session) -> ([]acp.V1_Config_O
 	if model_count == 1 {
 		values, values_ok := acp_model_config_values(session)
 		if !values_ok { return nil, false }
+		current, current_error := acp_model_value(session.app.setup.provider_id, session.app.setup.model_id)
+		if current_error != nil { return nil, false }
 		options[index] = acp.V1_Config_Option {
 			id            = "model",
 			name          = "Model",
 			category      = "model",
 			type          = "select",
-			current_value = session.app.setup.model_id,
+			current_value = current,
 			options       = values,
 		}
 		index += 1
@@ -1462,12 +1476,14 @@ acp_model_config_options_v2 :: proc(session: ^ACP_Session) -> ([]acp.V2_Config_O
 	if model_count == 1 {
 		values, values_ok := acp_model_config_values(session)
 		if !values_ok { return nil, false }
+		current, current_error := acp_model_value(session.app.setup.provider_id, session.app.setup.model_id)
+		if current_error != nil { return nil, false }
 		options[index] = acp.V2_Config_Option {
 			config_id     = "model",
 			name          = "Model",
 			category      = "model",
 			type          = "select",
-			current_value = session.app.setup.model_id,
+			current_value = current,
 			options       = values,
 		}
 		index += 1

@@ -871,7 +871,12 @@ acp_test_session_protocol :: proc(t: ^testing.T, scenario: ACP_Test_Session_Scen
 	acp_test_client_send(&client, strings.to_string(opening))
 	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
 	if opened == "" { return }
-	if !acp_test_client_carries(t, opened, {`"configOptions"`, `"value":"testmodel"`, `"currentValue":"testmodel"`}, "the session answer") { return }
+	if !acp_test_client_carries(
+		t,
+		opened,
+		{`"configOptions"`, `"value":"testprovider/testmodel"`, `"currentValue":"testprovider/testmodel"`},
+		"the session answer",
+	) { return }
 	session_id := acp_test_client_session_id_from_frame(t, opened)
 	if session_id == "" { return }
 	defer delete(session_id, context.allocator)
@@ -1193,7 +1198,7 @@ test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T)
 	acp_test_client_send(&client, strings.to_string(opening))
 	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
 	if opening_frame == "" { return }
-	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2model"`) {
+	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2provider/v2model"`) {
 		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
 		return
 	}
@@ -1482,9 +1487,31 @@ test_acp_buzz_v2_request_uses_the_v1_wire_profile :: proc(t: ^testing.T) {
 	testing.expect(t, !strings.contains(frame, `"capabilities":{"session"`))
 }
 
+acp_test_model_change_message :: proc(builder: ^strings.Builder, id: int, session_id, value: string, kind: ACP_Model_Kind) {
+	fmt.sbprint(builder, `{"jsonrpc":"2.0","id":`, id)
+	if kind == .Set_Model {
+		strings.write_string(builder, `,"method":"session/set_model","params":{"sessionId":"`)
+	} else {
+		strings.write_string(builder, `,"method":"session/set_config_option","params":{"sessionId":"`)
+	}
+	strings.write_string(builder, session_id)
+	if kind == .Set_Model {
+		strings.write_string(builder, `","modelId":"`)
+	} else {
+		strings.write_string(builder, `","configId":"model","type":"select","value":"`)
+	}
+	strings.write_string(builder, value)
+	strings.write_string(builder, `"}}`)
+	acp_test_end(builder)
+}
+
 @(test)
-test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
+test_acp_provider_qualified_model_values_select_the_named_provider :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
+	for profile in ([]ACP_Wire_Profile{.V1, .V2}) { acp_test_qualified_model_selection(t, profile) }
+}
+
+acp_test_qualified_model_selection :: proc(t: ^testing.T, profile: ACP_Wire_Profile) {
 	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-model-workspace-*", context.allocator)
 	if workspace_err != nil {
 		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
@@ -1509,34 +1536,29 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
 	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
 	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 2, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id             = "buzzmodel",
-		context_window = 100000,
-		tools          = true,
+	replies := []string {
+		acp_test_stream_reply(
+			acp_test_sse_body(
+				{`{"choices":[{"delta":{"content":"initial answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+			),
+		),
 	}
-	models[1] = {
-		id             = "buzzmodel-next",
-		context_window = 100000,
-		tools          = true,
+	defer for reply in replies { delete(reply, context.allocator) }
+	provider: ACP_Test_Provider
+	if !acp_test_provider_start(t, &provider, replies) { return }
+	defer acp_test_provider_stop(t, &provider)
+	endpoint := fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator)
+	defer delete(endpoint, context.allocator)
+	models := [1]agent.Catalog_Model_Source{{id = "vendor/shared", display_name = "Shared Model", context_window = 100000, tools = true}}
+	sources := [2]agent.Catalog_Provider_Source {
+		{id = "buzzprovider", base_url = endpoint, api = "openai_chat_completions", api_key = "test-key", models = models[:]},
+		{id = "otherprovider", base_url = endpoint, api = "openai_chat_completions", api_key = "test-key", models = models[:]},
 	}
-	sources[0] = {
-		id       = "buzzprovider",
-		base_url = "http://127.0.0.1:1/v1",
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-
 	client: ACP_Test_Client
 	defer acp_test_client_destroy(&client)
 	run := ACP_Test_Run {
 		client  = &client,
-		sources = sources,
+		sources = sources[:],
 	}
 	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-model-run")
 	if run_thread == nil {
@@ -1554,45 +1576,96 @@ test_acp_buzz_set_model_switches_the_session_model :: proc(t: ^testing.T) {
 	}
 
 	handshake := strings.builder_make(context.temp_allocator)
-	acp_test_initialize_message(&handshake, 1)
+	if profile == .V1 {
+		acp_test_initialize_message(&handshake, 1)
+	} else {
+		strings.write_string(
+			&handshake,
+			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
+		)
+		acp_test_end(&handshake)
+	}
 	acp_test_client_send(&client, strings.to_string(handshake))
-	if acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered") == "" { return }
-
+	if acp_test_client_expect(t, &client, `"result"`, "initialize was not answered") == "" { return }
 	opening := strings.builder_make(context.temp_allocator)
 	acp_test_new_session_message(&opening, 2, workspace)
 	acp_test_client_send(&client, strings.to_string(opening))
 	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
 	if opened == "" { return }
-	if !acp_test_client_carries(t, opened, {`"currentModelId":"buzzmodel"`, `"modelId":"buzzmodel"`}, "the session answer") { return }
+	if !acp_test_client_carries(
+		t,
+		opened,
+		{
+			`"currentValue":"buzzprovider/vendor/shared"`,
+			`"value":"buzzprovider/vendor/shared","name":"Shared Model"`,
+			`"value":"otherprovider/vendor/shared","name":"Shared Model"`,
+		},
+		"the qualified model option",
+	) { return }
+	if profile == .V1 &&
+	   !acp_test_client_carries(
+			   t,
+			   opened,
+			   {`"currentModelId":"buzzprovider/vendor/shared"`, `"modelId":"otherprovider/vendor/shared","name":"Shared Model"`},
+			   "the qualified V1 model list",
+		   ) { return }
 	session_id := acp_test_client_session_id_from_frame(t, opened)
 	if session_id == "" { return }
 	defer delete(session_id, context.allocator)
 
+	prompting := strings.builder_make(context.temp_allocator)
+	acp_test_prompt_message(&prompting, 3, session_id, "establish history")
+	acp_test_client_send(&client, strings.to_string(prompting))
+	if profile == .V2 {
+		if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the prompt was not reported") == "" { return }
+		if acp_test_client_expect(t, &client, `"id":3,"result":{"messageId"`, "the prompt was not inserted") == "" { return }
+		if acp_test_client_expect(t, &client, `"state":"running"`, "the turn did not start") == "" { return }
+	}
+	if acp_test_client_expect(t, &client, "initial answer", "the initial model did not answer") == "" { return }
+	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the request did not report usage") == "" { return }
+	if acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the initial turn did not finish") == "" { return }
+
+	kind := ACP_Model_Kind.Set_Config_Option
+	if profile == .V1 { kind = .Set_Model }
 	switching := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&switching, `{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"`)
-	strings.write_string(&switching, session_id)
-	strings.write_string(&switching, `","modelId":"buzzmodel-next"}}`)
-	acp_test_end(&switching)
+	acp_test_model_change_message(&switching, 4, session_id, "otherprovider/vendor/shared", kind)
 	acp_test_client_send(&client, strings.to_string(switching))
-	switched := acp_test_client_expect(t, &client, `"modelId":"buzzmodel-next"`, "session/set_model was not answered")
-	if switched == "" { return }
+	expected := `"currentValue":"otherprovider/vendor/shared"`
+	if profile == .V1 { expected = `"modelId":"otherprovider/vendor/shared"` }
+	if acp_test_client_expect(t, &client, expected, "the named provider was not selected") == "" { return }
 
+	directory, directory_error := agent.xdg_directory(.State, context.allocator)
+	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
+	defer delete(directory, context.allocator)
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
+	defer delete(locks, context.allocator)
+	reader, open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
+	if !testing.expect_value(t, open_error, nil) { return }
+	defer _ = journal.close(reader)
+	session, session_ok := journal.session_id_parse(session_id)
+	if !testing.expect(t, session_ok) { return }
+	applied, found, read_error := journal.read_latest(reader, {session = session, kinds = {.Selection_Applied}}, context.temp_allocator)
+	defer journal.record_destroy(&applied, context.temp_allocator)
+	if !testing.expect_value(t, read_error, nil) || !testing.expect(t, found) { return }
+	testing.expect_value(t, applied.provider, "otherprovider")
+	testing.expect_value(t, applied.model, "vendor/shared")
+
+	for value, index in ([]string{"vendor/shared", "OTHERPROVIDER/vendor/shared", "unknown/vendor/shared"}) {
+		rejected := strings.builder_make(context.temp_allocator)
+		acp_test_model_change_message(&rejected, 5 + index, session_id, value, kind)
+		acp_test_client_send(&client, strings.to_string(rejected))
+		if acp_test_client_expect(t, &client, `"code":-32602`, "an unadvertised model value was not refused") == "" { return }
+	}
 	configuring := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&configuring, `{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"sessionId":"`)
-	strings.write_string(&configuring, session_id)
-	strings.write_string(&configuring, `","configId":"model","value":"buzzmodel"}}`)
-	acp_test_end(&configuring)
+	acp_test_model_change_message(&configuring, 8, session_id, "buzzprovider/vendor/shared", .Set_Config_Option)
 	acp_test_client_send(&client, strings.to_string(configuring))
-	configured := acp_test_client_expect(t, &client, `"currentValue":"buzzmodel"`, "the model config option was not applied")
-	if configured == "" { return }
-
-	unknown := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&unknown, `{"jsonrpc":"2.0","id":5,"method":"session/set_model","params":{"sessionId":"`)
-	strings.write_string(&unknown, session_id)
-	strings.write_string(&unknown, `","modelId":"no-such-model"}}`)
-	acp_test_end(&unknown)
-	acp_test_client_send(&client, strings.to_string(unknown))
-	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown model was not refused") == "" { return }
+	if acp_test_client_expect(t, &client, `"currentValue":"buzzprovider/vendor/shared"`, "the first provider was not selected again") == "" { return }
+	reapplied, reapplied_found, reread_error := journal.read_latest(reader, {session = session, kinds = {.Selection_Applied}}, context.temp_allocator)
+	defer journal.record_destroy(&reapplied, context.temp_allocator)
+	if !testing.expect_value(t, reread_error, nil) || !testing.expect(t, reapplied_found) { return }
+	testing.expect_value(t, reapplied.provider, "buzzprovider")
+	testing.expect_value(t, reapplied.model, "vendor/shared")
 }
 
 @(test)
@@ -1884,7 +1957,7 @@ test_acp_v2_running_prompt_is_inserted_as_steering :: proc(t: ^testing.T) {
 	acp_test_client_send(&client, strings.to_string(opening))
 	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
 	if opening_frame == "" { return }
-	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2model"`) {
+	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2provider/v2model"`) {
 		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
 		return
 	}
@@ -2053,7 +2126,7 @@ test_acp_v2_compact_command_starts_compaction_without_user_input :: proc(t: ^tes
 	acp_test_client_send(&client, strings.to_string(opening))
 	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
 	if opening_frame == "" { return }
-	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2model"`) {
+	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2provider/v2model"`) {
 		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
 		return
 	}
