@@ -186,3 +186,12 @@ That delay is 44 hours, 12 minutes and 9 seconds. The regular status response di
 The orchestrator stopped the session and reopened it with `openai/gpt-6.1-sol`. The configure tool confirmed that active selection. The agent subsequently reported a clean preflight and resumed implementation. The old stop notification arrived after the reopening receipt, again requiring the orchestrator to distinguish a historical event from the current state.
 
 This further occurrence supports the earlier requests to expose provider-backoff state and retry deadlines, bound interactive retry delays, and apply model changes without waiting for a long backoff timer. It does not establish whether the provider supplied the 159,129-second delay or the harness calculated it; the tool output did not identify that source.
+
+## 2026-10-16 Conjunctive multi-word search
+
+- Goal: find the lines that contain two separate terms, for example a line that writes `free_all` and also mentions `temp_allocator`.
+- Attempt: `grep` with both words in one plain pattern, in each word order, and regex alternatives such as `term_a.*term_b`. Lookahead as an AND, `(?=.*term_a)(?=.*term_b)`, was tried too.
+- Gap: `grep` matches line by line, so a regex can only require both terms on one line in the order written, and lookahead is refused as an invalid expression. Plain mode has no conjunction either. A two-word pattern that finds no exact phrase triggers the documented recovery: it retries without the leading word, so `free_all temp_allocator` returns the 1552 lines holding `temp_allocator`, and `temp_allocator free_all` returns the 61 lines holding `free_all`. The notice says the fallback ran, but the answer to the question asked, the lines with both, is not in the result. On a large tree this is 1552 rows where the true answer may be a handful.
+- Workaround: intersect file lists by hand. Grep each term with `output_mode="files_with_matches"`, intersect in Code Mode, then grep inside the intersection and confirm the second term in each row. Three or more calls per query, and the row set cannot be paged with a cursor.
+
+Requested improvement: a conjunction over plain terms, or a `patterns` list in which every element must match the line, each element keeping the case, regex, and glob behavior it already has. Nothing else is needed: an AND of independent terms covers the question, and lookahead stays out.
