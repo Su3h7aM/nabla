@@ -112,8 +112,9 @@ Provider_WebSocket_Connect :: proc(
 
 // Provider_WebSocket_Request performs one sequential Responses operation. A valid
 // terminal event completes the request while the socket remains open for reuse.
-// A reused socket the peer closed while it sat idle is replaced by a new connection
-// and the request is sent again, when none of the response had arrived on it.
+// A request that was sent is never sent again by this call: once bytes are on the
+// wire the response may already exist, so only a new request on an idle socket may
+// open a fresh connection.
 @(require_results)
 Provider_WebSocket_Request :: proc(
 	session: ^Provider_WebSocket_Session,
@@ -132,7 +133,6 @@ Provider_WebSocket_Request :: proc(
 	// cannot start is not fatal here: each wait then reports its own failure.
 	loop_held := nbio.acquire_thread_event_loop() == nil
 	defer if loop_held { nbio.release_thread_event_loop() }
-	reused := session.socket != nil
 	if connect_err := Provider_WebSocket_Connect(session, encoded, options); connect_err.kind != .None {
 		return connect_err
 	}
@@ -162,39 +162,23 @@ Provider_WebSocket_Request :: proc(
 	defer Provider_Stream_Destroy(&state.stream)
 	defer provider_state_release(&state)
 
-	for {
-		result, stale := provider_websocket_exchange(session, encoded, &state, options, reused)
-		if !stale { return result }
-		// Nothing of the response arrived, so the peer ended the idle connection before it
-		// read the request, and sending it again on a new connection is the retry RFC 9112
-		// section 9.3.1 allows. A new connection is never stale, so this runs once.
-		reused = false
-		if options.observer.report != nil {
-			options.observer.report(options.observer.user_data, Provider_Operation_Report{stage = .Reconnected, api = encoded.API, model = encoded.Model})
-		}
-		if dial_err := provider_websocket_dial(session, encoded, options); dial_err.kind != .None { return dial_err }
-	}
+	return provider_websocket_exchange(session, encoded, &state, options)
 }
 
-// provider_websocket_exchange sends the request and reads its response. stale is true,
-// with nothing reported to the callback, when a reused socket ended before any of the
-// response arrived; the socket is then dropped.
+// provider_websocket_exchange sends the request and reads its response. A failure
+// drops the socket and reports one error; the request is never sent again.
 @(private, require_results)
 provider_websocket_exchange :: proc(
 	session: ^Provider_WebSocket_Session,
 	encoded: Provider_Encoded_Request,
 	state: ^Provider_Request_Stream_State,
 	options: Provider_Operation_Options,
-	reused: bool,
-) -> (
-	result: Provider_Operation_Error,
-	stale: bool,
-) {
+) -> Provider_Operation_Error {
 	allocator := session.allocator
 	if write_err := websocket.write(session.socket, .Text, encoded.Body); write_err != .None {
 		provider_websocket_drop(session)
-		if reused && provider_websocket_ended(state, write_err) { return {}, true }
-		return provider_websocket_error(state, write_err, "the WebSocket request could not be sent", .Model_Send_Started), false
+		detail := fmt.tprintf("the WebSocket request could not be sent (%v)", write_err)
+		return provider_websocket_error(state, write_err, detail, .Model_Send_Started)
 	}
 	delivery := Provider_Delivery_State.Model_Send_Started
 
@@ -206,16 +190,16 @@ provider_websocket_exchange :: proc(
 		count, opcode, complete, read_err := websocket.read(session.socket, chunk[:])
 		if read_err != .None {
 			provider_websocket_drop(session)
-			if reused && delivery == .Model_Send_Started && provider_websocket_ended(state, read_err) { return {}, true }
 			if read_err == .Idle_Timeout {
-				detail := fmt.tprintf("no bytes were received from the WebSocket peer for %v", session.idle_timeout)
-				return provider_websocket_error(state, read_err, detail, delivery), false
+				detail := fmt.tprintf("no bytes were received from the WebSocket peer for %v (%v)", session.idle_timeout, read_err)
+				return provider_websocket_error(state, read_err, detail, delivery)
 			}
-			return provider_websocket_error(state, read_err, "the WebSocket response ended before a terminal event", delivery), false
+			detail := fmt.tprintf("the WebSocket response ended before a terminal event (%v)", read_err)
+			return provider_websocket_error(state, read_err, detail, delivery)
 		}
 		if opcode != .Text {
 			provider_websocket_drop(session)
-			return provider_websocket_error(state, .Protocol, "the Responses WebSocket sent a binary message", .Response_Observed), false
+			return provider_websocket_error(state, .Protocol, "the Responses WebSocket sent a binary message", .Response_Observed)
 		}
 		if count > 0 {
 			delivery = .Response_Observed
@@ -225,7 +209,7 @@ provider_websocket_exchange :: proc(
 				provider_drain_events(state)
 				failure := provider_terminal_error(state, .Allocation)
 				failure.delivery = delivery
-				return failure, false
+				return failure
 			}
 			state.response_bytes += u64(count)
 			if options.observer.report != nil {
@@ -246,22 +230,14 @@ provider_websocket_exchange :: proc(
 			provider_websocket_drop(session)
 			err := provider_terminal_error(state, .Stream)
 			err.delivery = delivery
-			return err, false
+			return err
 		}
 		if state.stream.Phase == .Completed && state.completion != nil {
 			provider_deliver(state, state.completion)
 			state.completion = nil
-			return {}, false
+			return {}
 		}
 	}
-}
-
-// provider_websocket_ended reports whether cause is the connection going away rather
-// than a protocol fault, a cancellation, or a deadline.
-@(private)
-provider_websocket_ended :: proc(state: ^Provider_Request_Stream_State, cause: websocket.Error) -> bool {
-	if cause != .Closed && cause != .Abnormal_Closure && cause != .Transport { return false }
-	return !interrupt_requested(state.interrupt) && !deadline_expired(state.deadline)
 }
 
 @(require_results)
@@ -346,6 +322,16 @@ provider_websocket_error :: proc(
 	detail: string,
 	delivery: Provider_Delivery_State,
 ) -> Provider_Operation_Error {
+	// Only a failure the transport itself reports names the connection: a protocol
+	// refusal is the peer's answer rather than a broken wire, and cancellation and
+	// an expired deadline are the caller's own decisions and carry no cause.
+	if !interrupt_requested(state.interrupt) && !deadline_expired(state.deadline) {
+		switch cause {
+		case .Closed, .Abnormal_Closure, .Transport, .Idle_Timeout:
+			state.transport_cause = .IO
+		case .None, .Protocol, .No_Room:
+		}
+	}
 	kind := Provider_Operation_Error_Kind.Transport
 	failure_kind := Provider_Error_Kind.Stream_Truncated
 	if interrupt_requested(state.interrupt) {

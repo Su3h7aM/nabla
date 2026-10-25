@@ -59,13 +59,16 @@ RESPONSES_WEBSOCKET_CLOSE :: "\x03\xE8"
 // Responses_WebSocket_Fixture_Mode is what the fixture's server does with the connections
 // its test asks it for.
 Responses_WebSocket_Fixture_Mode :: enum {
-	// Answer the first connection with the terminal event and end it, then answer the
-	// second: a peer that closed the connection it had just answered, which is what the
-	// request that follows finds.
+	// Answer the connection with the terminal event and end it: a peer that closed
+	// the connection it had just answered, which is what the request that follows
+	// finds.
 	End_After_Answering,
 	// End the one connection without answering it: a peer that dropped a connection none of
 	// the response arrived on.
 	Silence,
+	// Read each of two requests and close without answering either: a peer that took
+	// both sends and answered neither.
+	Abandon_Twice,
 	// Read the request and then send nothing, holding the connection open until the client
 	// ends it: a peer that went quiet after the request.
 	Hold,
@@ -143,7 +146,7 @@ responses_websocket_fixture_serve :: proc(thread: ^thread.Thread) {
 	fixture := cast(^Responses_WebSocket_Fixture)thread.data
 	defer net.close(fixture.listener)
 	connections := 1
-	if fixture.mode == .End_After_Answering { connections = 2 }
+	if fixture.mode == .Abandon_Twice { connections = 2 }
 	for index in 0 ..< connections {
 		socket, _, accept_err := net.accept_tcp(fixture.listener)
 		if accept_err != nil {
@@ -160,6 +163,18 @@ responses_websocket_fixture_serve :: proc(thread: ^thread.Thread) {
 			sync.sema_post(&fixture.answered_first)
 		}
 	}
+	if fixture.mode == .Abandon_Twice {
+		// A failed request is never sent again by its own call, so no third
+		// connection may arrive. A short wait keeps a redial from hanging the suite.
+		if net.set_option(fixture.listener, .Receive_Timeout, 500 * time.Millisecond) != .None {
+			fixture.failed = true
+			return
+		}
+		if probe, _, probe_err := net.accept_tcp(fixture.listener); probe_err == nil {
+			net.close(probe)
+			fixture.failed = true
+		}
+	}
 }
 
 // responses_websocket_fixture_connection serves one connection: it answers the upgrade,
@@ -171,6 +186,7 @@ responses_websocket_fixture_connection :: proc(fixture: ^Responses_WebSocket_Fix
 	fixture.connections += 1
 	if !responses_websocket_fixture_read_request(socket) { return false }
 	if fixture.mode == .Hold { return responses_websocket_fixture_hold(socket) }
+	if fixture.mode == .Abandon_Twice { return true }
 	if fixture.mode == .End_After_Answering {
 		if !responses_websocket_fixture_write_frame(socket, .Text, RESPONSES_WEBSOCKET_COMPLETION) { return false }
 	}
@@ -394,10 +410,11 @@ responses_websocket_request_run :: proc(test_case: ^Responses_WebSocket_Case, ob
 	outcome.error = Provider_WebSocket_Request(test_case.session, test_case.encoded, outcome, responses_websocket_outcome_event, options)
 }
 
-// A peer that ends the connection it has answered must not end the request: the session
-// replaces the socket and sends the same bytes again, once, on a new connection.
+// A peer that ends the connection it has answered ends the next request on it: a
+// request that was sent is never sent again, so the dead socket reports one
+// transport failure and the peer saw only its original request.
 @(test)
-test_responses_websocket_sends_again_when_a_reused_socket_ended :: proc(t: ^testing.T) {
+test_responses_websocket_ended_reused_socket_is_one_failure :: proc(t: ^testing.T) {
 	fixture: Responses_WebSocket_Fixture
 	if !responses_websocket_fixture_start(t, &fixture, .End_After_Answering) { return }
 	defer responses_websocket_fixture_stop(t, &fixture)
@@ -425,13 +442,38 @@ test_responses_websocket_sends_again_when_a_reused_socket_ended :: proc(t: ^test
 	second: Responses_WebSocket_Outcome
 	responses_websocket_request_run(&test_case, &observed, &second)
 	defer Provider_Operation_Error_Destroy(&second.error, context.allocator)
-	testing.expectf(t, second.error.kind == .None, "the request on the ended connection failed: %v %s", second.error.kind, second.error.detail)
-	testing.expect_value(t, second.completions, 1)
-	// One replacement, and both responses arrived whole: the ended socket was dropped
-	// rather than answered twice, and the request that was sent again was answered.
-	testing.expect_value(t, observed.reconnects, 1)
-	testing.expect_value(t, observed.chunks, 2)
-	testing.expect_value(t, observed.chunk_bytes, 2 * len(RESPONSES_WEBSOCKET_COMPLETION))
+	testing.expect_value(t, second.error.kind, Provider_Operation_Error_Kind.Transport)
+	testing.expect_value(t, second.error.transport_cause, Provider_Transport_Cause.IO)
+	testing.expect_value(t, second.error.failure_class, Provider_Failure_Class.Provider_Unavailable)
+	testing.expect_value(t, second.completions, 0)
+	testing.expect_value(t, fixture.connections, 1)
+}
+
+// A peer that reads a request and closes without responding ends that call with a
+// transport failure. A new request on the dropped socket may dial normally, but a
+// send that was attempted is never sent again, so no third socket is opened.
+@(test)
+test_responses_websocket_abandoned_requests_open_no_third_socket :: proc(t: ^testing.T) {
+	fixture: Responses_WebSocket_Fixture
+	if !responses_websocket_fixture_start(t, &fixture, .Abandon_Twice) { return }
+	defer responses_websocket_fixture_stop(t, &fixture)
+
+	test_case, opened := responses_websocket_case_open(t, fixture.port)
+	defer responses_websocket_case_destroy(&test_case)
+	if !opened { return }
+
+	observed: Transport_Observation
+	for _ in 0 ..< 2 {
+		outcome: Responses_WebSocket_Outcome
+		responses_websocket_request_run(&test_case, &observed, &outcome)
+		defer Provider_Operation_Error_Destroy(&outcome.error, context.allocator)
+		testing.expect_value(t, outcome.error.kind, Provider_Operation_Error_Kind.Transport)
+		testing.expect_value(t, outcome.error.transport_cause, Provider_Transport_Cause.IO)
+		testing.expect_value(t, outcome.error.failure_class, Provider_Failure_Class.Provider_Unavailable)
+		testing.expect(t, strings.contains(outcome.error.detail, "Abnormal_Closure"), outcome.error.detail)
+		testing.expect_value(t, outcome.completions, 0)
+	}
+	testing.expect_value(t, observed.chunks, 0)
 	testing.expect_value(t, fixture.connections, 2)
 }
 
@@ -455,7 +497,6 @@ test_responses_websocket_a_connection_that_never_answered_is_not_replaced :: pro
 
 	testing.expect_value(t, outcome.error.kind, Provider_Operation_Error_Kind.Transport)
 	testing.expect_value(t, outcome.completions, 0)
-	testing.expect_value(t, observed.reconnects, 0)
 	testing.expect_value(t, observed.chunks, 0)
 	testing.expect_value(t, fixture.connections, 1)
 }

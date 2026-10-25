@@ -386,7 +386,6 @@ Transport_Observation :: struct {
 	// transfer is what it reported. The operation's own error is a separate fact.
 	transfer_seen:   bool,
 	transfer:        Provider_Transfer_Summary,
-	reconnects:      int,
 }
 
 transport_observation_report :: proc(user_data: rawptr, report: Provider_Operation_Report) {
@@ -403,8 +402,6 @@ transport_observation_report :: proc(user_data: rawptr, report: Provider_Operati
 	case .Transfer:
 		observed.transfer_seen = true
 		observed.transfer = report.transfer
-	case .Reconnected:
-		observed.reconnects += 1
 	}
 }
 

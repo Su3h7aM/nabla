@@ -17,13 +17,10 @@ Provider_Event_Callback :: #type proc(user_data: rawptr, event: Provider_Event)
 // the only moment it exists: the operation frees it when it returns. Response_Body
 // carries a plaintext response chunk as it arrives, before it is parsed, which is
 // what a capture needs and what a byte count is counted from.
-// Reconnected says a reused WebSocket was found closed before any of the response
-// arrived, and the request is being sent again on a new connection.
 Provider_Operation_Stage :: enum {
 	Encoded,
 	Response_Body,
 	Transfer,
-	Reconnected,
 }
 
 // Provider_Transfer_Phase is where one provider request stopped at the HTTP
