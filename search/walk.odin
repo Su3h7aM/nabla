@@ -146,9 +146,9 @@ walk_batch_destroy :: proc(batch: ^Walk_Batch) {
 // file is appended to batch with its size, mtime, and binary flag; the
 // returned descend reports whether a directory is worth walking. Denylisted
 // directories are counted in the batch's skips and pruned; hidden
-// directories, .git, symlinks, other non-regular entries, and anything the
-// ignore sets ignore are dropped without a count. info and ignore are
-// borrowed. On an allocation failure err is set.
+// directories, VCS metadata files, symlinks, other non-regular entries, and
+// anything the ignore sets ignore are dropped without a count. info and
+// ignore are borrowed. On an allocation failure err is set.
 @(private)
 collect_entry :: proc(batch: ^Walk_Batch, info: os.File_Info, root: string, ignore: []Ignore_Set) -> (descend: bool, err: mem.Allocator_Error) {
 	#partial switch info.type {
@@ -164,7 +164,7 @@ collect_entry :: proc(batch: ^Walk_Batch, info: os.File_Info, root: string, igno
 			return false, nil
 		}
 		rel := strings.trim_prefix(strings.trim_prefix(info.fullpath, root), "/")
-		if rel == ".git" || strings.has_prefix(rel, ".git/") {
+		if info.name == ".git" {
 			return false, nil
 		}
 		if ignore_matches(ignore, info.fullpath, false) {

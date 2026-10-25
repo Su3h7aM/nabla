@@ -43,6 +43,24 @@ tool_search_touch_root :: proc(test: ^testing.T, tool_test: ^Tool_Test) {
 	}
 }
 
+@(test)
+test_search_defaults_empty_root_to_workspace :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+	tool_search_write(test, &tool_test, "workspace-target.txt", "workspace-needle\n")
+	Case :: struct {
+		tool: string,
+		args: string,
+	}
+	for entry in ([]Case{{TOOL_FIND_NAME, `{"query":"workspace-target"}`}, {TOOL_FIND_NAME, `{"query":"workspace-target","root":null}`}, {TOOL_FIND_NAME, `{"query":"workspace-target","root":""}`}, {TOOL_GREP_NAME, `{"pattern":"workspace-needle"}`}, {TOOL_GREP_NAME, `{"pattern":"workspace-needle","root":null}`}, {TOOL_GREP_NAME, `{"pattern":"workspace-needle","root":""}`}}) {
+		result := tool_run(test, &tool_test, entry.tool, entry.args)
+		testing.expect_value(test, result.outcome, journal.Tool_Outcome.Success)
+		testing.expect(test, strings.contains(result.content, "total_matches: 1"), "the session workspace is searched")
+		testing.expect(test, strings.contains(result.content, "workspace-target.txt"), "the result names the workspace file")
+	}
+}
+
 // Find matches root-relative paths, a lowercase word ignoring case, pages with
 // opaque cursors, and never descends into .git or denylisted directories.
 @(test)
@@ -553,6 +571,44 @@ test_search_default_scope_descends_into_nested_repos :: proc(test: ^testing.T) {
 	testing.expect(test, strings.contains(below.content, "total_matches: 1"), "a relative root narrows the search")
 	testing.expect(test, strings.contains(below.content, "flask/app.py"), "paths are relative to the root")
 	testing.expect(test, !strings.contains(below.content, "repos/flask"), "the root prefix is not repeated")
+}
+
+// Neither find nor grep descends into a version-control metadata directory:
+// Git, Jujutsu, Mercurial, Subversion, and Bazaar each keep theirs in a
+// dot-directory, and nothing below one is listed or read at any depth.
+@(test)
+test_search_never_descends_vcs_metadata :: proc(test: ^testing.T) {
+	tool_test: Tool_Test
+	tool_test_begin(test, &tool_test)
+	defer tool_test_end(test, &tool_test)
+
+	tool_search_write(test, &tool_test, "nested/repo/src/keep.txt", "ordinary line\n")
+	for metadata in ([?]string{".git", ".jj", ".hg", ".svn", ".bzr"}) {
+		name := strings.concatenate({"nested/repo/", metadata, "/vcsmeta-record"}, context.temp_allocator)
+		tool_search_write(test, &tool_test, name, "vcsmeta-payload\n")
+	}
+	// A submodule and a linked worktree keep their metadata in a `.git` file
+	// rather than a directory, and that name is metadata at any depth.
+	tool_search_write(test, &tool_test, "nested/repo/sub/.git", "vcsmeta-payload\n")
+
+	// The marker appears only below the metadata directories, so a zero proves
+	// the prune rather than a miss: without one, both calls would match exactly.
+	paths := tool_run(test, &tool_test, TOOL_FIND_NAME, `{"query":"vcsmeta"}`)
+	testing.expect_value(test, paths.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(paths.content, "total_matches: 0"), "find lists no path below a VCS metadata directory")
+
+	lines := tool_run(test, &tool_test, TOOL_GREP_NAME, `{"pattern":"vcsmeta-payload"}`)
+	testing.expect_value(test, lines.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(lines.content, "total_matches: 0"), "grep reads no file below a VCS metadata directory")
+
+	// The same scan does reach the sibling source tree, so the zeros above are
+	// the prune and not a scan that found nothing at all.
+	sibling := tool_run(test, &tool_test, TOOL_FIND_NAME, `{"query":"keep.txt"}`)
+	testing.expect_value(test, sibling.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(sibling.content, "nested/repo/src/keep.txt"), "find keeps the source file beside them")
+	content := tool_run(test, &tool_test, TOOL_GREP_NAME, `{"pattern":"ordinary line"}`)
+	testing.expect_value(test, content.outcome, journal.Tool_Outcome.Success)
+	testing.expect(test, strings.contains(content.content, "1: ordinary line"), "grep reads the source file beside them")
 }
 
 // Grep groups matches by file under one header naming the top file, with a

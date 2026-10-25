@@ -301,7 +301,7 @@ search_frecency_of :: proc(ctx: ^Tool_Context, root_key: string) -> ^search.Frec
 
 TOOL_FIND_NAME :: "find"
 
-TOOL_FIND_DESCRIPTION :: `Find files by path substring in the workspace or in any other directory (root). Use grep to search file contents and read to view a file. Several words must all occur in the path. Hidden directories and node_modules, target, and __pycache__ are not searched; hidden files are.
+TOOL_FIND_DESCRIPTION :: `Find files by path substring in the workspace or in any other directory (root). Omit root, pass null, or pass an empty string to search the session workspace; a supplied root must be a directory, and a file path is refused. To narrow to one file, keep the directory root and use glob for that file's name. Use grep to search file contents and read to view a file. Several words must all occur in the path. Hidden directories (including the VCS metadata directories .git, .jj, .hg, .svn, and .bzr), a .git file that names a submodule's or linked worktree's metadata, and node_modules, target, and __pycache__ are not searched; other hidden files are.
 
 The result gives total_matches and, when rows remain, next_cursor (pass it as cursor for the next page). After a blank line come the paths, best first, under a "→ Read" header naming the top path, marked "(exact match!)" when it names the query exactly. skipped counts files that could not be read, and denylist counts the pruned directories. When no path contains the query, a typo-tolerant search runs and notice labels its rows as approximate; a query nothing resembles returns total_matches 0 with no notice.
 
@@ -312,7 +312,7 @@ TOOL_FIND_SCHEMA ::
 	`"query":{"type":"string","description":"Words to look for in paths relative to the searched directory. Every word must occur in the path; a word with an uppercase letter matches case-sensitively, any other word ignores case."},` +
 	`"pattern":{"type":["string","null"],"description":"Alias of query; query wins when both are given. Leave out or pass null when query is given."},` +
 	`"glob":{"type":["string","null"],"description":"Shell pattern a path must match, tried against the path then its base name. Leave out or pass null for no filter."},` +
-	`"root":{"type":["string","null"],"description":"Directory to search, absolute or relative to the workspace. Leave out or pass null for the workspace itself."},` +
+	`"root":{"type":["string","null"],"description":"Directory to search, absolute or relative to the workspace. When supplied and non-empty, must be a directory; a file path is refused. Omit, pass null, or pass an empty string for the session workspace."},` +
 	`"cursor":{"type":["string","null"],"description":"Opaque cursor from a previous find or grep result's next_cursor. Leave out or pass null to start from the first match."},` +
 	`"limit":{"type":["integer","null"],"description":"Maximum matches to return. Leave out, pass 0, or pass a negative number for every match."},` +
 	`"timeout_ms":{"type":["integer","null"],"description":"Positive timeout in milliseconds, with no maximum. Leave out or pass null for the default the tool description states."}},"required":["query"],"additionalProperties":false}`
@@ -334,7 +334,7 @@ TOOL_FIND_DEFINITION :: Tool_Definition {
 
 TOOL_GREP_NAME :: "grep"
 
-TOOL_GREP_DESCRIPTION :: `Search file contents line by line in the workspace or in any other directory (root). Use find to locate a file by name and read to view a file. Hidden directories and node_modules, target, and __pycache__ are not searched; hidden files are.
+TOOL_GREP_DESCRIPTION :: `Search file contents line by line in the workspace or in any other directory (root). Omit root, pass null, or pass an empty string to search the session workspace; a supplied root must be a directory, and a file path is refused. To narrow to one file, keep the directory root and use glob for that file's name. Use find to locate a file by name and read to view a file. Hidden directories (including the VCS metadata directories .git, .jj, .hg, .svn, and .bzr), a .git file that names a submodule's or linked worktree's metadata, and node_modules, target, and __pycache__ are not searched; other hidden files are.
 
 The result gives total_matches and, when rows remain, next_cursor (pass it as cursor for the next page). After a blank line come the matches grouped by file under a "→ Read" header naming the best file: an "N: text" row per hit, an " N-text" row per context line, and "--" between files. output_mode "files_with_matches" lists one path per file instead. A line longer than 180 bytes is shown cut around the hit with … marking the cuts, and full_lines_in names the file holding the full lines. skipped counts binary, oversize, and unreadable files, and denylist counts the pruned directories. When no line matches exactly, a typo-tolerant search runs and notice labels its rows as approximate; a pattern nothing resembles returns total_matches 0 with no notice. An invalid regular expression is searched literally and notice says so.
 
@@ -347,7 +347,7 @@ TOOL_GREP_SCHEMA ::
 	`"case":{"type":["string","null"],"description":"\"smart\" folds case unless the pattern holds an uppercase letter, \"sensitive\" always matches case, \"insensitive\" always folds. Leave out or pass null for \"smart\"."},` +
 	`"output_mode":{"type":["string","null"],"description":"\"content\" for one row per hit, \"files_with_matches\" for one path per file with a hit. Leave out or pass null for \"content\"."},` +
 	`"glob":{"type":["string","null"],"description":"Shell pattern a path must match, tried against the path then its base name. Leave out or pass null for no filter."},` +
-	`"root":{"type":["string","null"],"description":"Directory to search, absolute or relative to the workspace. Leave out or pass null for the workspace itself."},` +
+	`"root":{"type":["string","null"],"description":"Directory to search, absolute or relative to the workspace. When supplied and non-empty, must be a directory; a file path is refused. Omit, pass null, or pass an empty string for the session workspace."},` +
 	`"context":{"type":["integer","null"],"description":"Lines of context around each hit. Default: 0."},` +
 	`"cursor":{"type":["string","null"],"description":"Opaque cursor from a previous find or grep result's next_cursor. Leave out or pass null to start from the first match."},` +
 	`"limit":{"type":["integer","null"],"description":"Maximum matches to return. Leave out, pass 0, or pass a negative number for every match."},` +
@@ -540,7 +540,7 @@ search_glob_arg :: proc(ctx: ^Tool_Context, arguments: json.Object) -> (glob: st
 }
 
 // search_root_arg reads the root field as a cleaned absolute key owned by the
-// caller's allocator. An absent or null root is the workspace and a relative
+// caller's allocator. An absent, null, or empty root is the workspace and a relative
 // root starts at the workspace; an absolute root may name any directory. The
 // key is lexical, so decoding does no I/O on the owner loop and checks
 // nothing: the worker indexes the root at execute time, where a missing or

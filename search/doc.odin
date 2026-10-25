@@ -8,10 +8,11 @@
 // One owner mutates an Index. Queries borrow it, may run on any thread, and never run concurrently with an update. The zero
 // Index is inert.
 //
-// A scan prunes hidden directories, .git, and the DENY_DIRS, indexes hidden files, and skips symlinks and other non-regular
-// files without following them. Binary, oversize, and unreadable files are skipped by grep and counted by cause in every
-// result's Skip_Breakdown; a skip never fails a query, and find still lists those files. glob_valid reports whether a glob
-// filter can be read, and find and grep return Invalid_Glob for one that cannot.
+// A scan prunes hidden directories, which include the VCS metadata directories .git, .jj, .hg, .svn, and .bzr, the
+// DENY_DIRS, and a .git file naming a submodule's or linked worktree's metadata; it indexes hidden files and skips symlinks
+// and other non-regular files without following them. Binary, oversize, and unreadable files are skipped by grep and counted
+// by cause in every result's Skip_Breakdown; a skip never fails a query, and find still lists those files. glob_valid reports
+// whether a glob filter can be read, and find and grep return Invalid_Glob for one that cannot.
 //
 // Inside a Git or Jujutsu repository, meaning a .git or .jj entry in the root, an ancestor, or a directory the scan reaches, a
 // scan also leaves out what .gitignore files and .git/info/exclude ignore, with Git's pattern syntax and precedence; an ignored
