@@ -1,6 +1,7 @@
 #+build linux
 package journal
 
+import "core:fmt"
 import "core:os"
 import "core:sys/linux"
 
@@ -38,12 +39,15 @@ claim_lock_drop :: proc(file: ^os.File) -> os.Error {
 }
 
 // claim_file_touch sets the access and modification times of file to now, which
-// raises IN_ATTRIB for every inotify watch on it. A null path makes utimensat act
-// on the descriptor, as futimens does.
+// raises IN_ATTRIB for every inotify watch on it. The path is the open descriptor,
+// so a renamed lock file is still the inode the watchers hold.
 @(private, require_results)
 claim_file_touch :: proc(file: ^os.File) -> os.Error {
 	times := [2]linux.Time_Spec{{time_nsec = linux.UTIME_NOW}, {time_nsec = linux.UTIME_NOW}}
-	if touch_error := linux.utimensat(linux.Fd(os.fd(file)), nil, raw_data(times[:]), {}); touch_error != .NONE {
+	raw: [64]u8
+	rendered := fmt.bprintf(raw[:], "/proc/self/fd/%d", int(os.fd(file)))
+	raw[len(rendered)] = 0
+	if touch_error := linux.utimensat(linux.AT_FDCWD, cstring(rawptr(&raw[0])), raw_data(times[:]), {}); touch_error != .NONE {
 		return os.Platform_Error(touch_error)
 	}
 	return nil
