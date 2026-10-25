@@ -65,7 +65,9 @@
 //   set_resize_wake wakes a caller blocked in poll on another descriptor and
 //   also ends a frame write that is waiting for the terminal: present then
 //   returns General_Error.Superseded, a normal result that asks for a full
-//   frame at the newest size. viewport remains authoritative.
+//   frame at the newest size. The caller's own wakes, passed to present and
+//   screen_present, end a waiting frame write the same way when newer output
+//   exists. viewport remains authoritative.
 // - Viewport also carries the cell area's size in pixels (zero when the
 //   terminal does not report it), for scaling an image to a cell placement.
 //

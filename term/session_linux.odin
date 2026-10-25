@@ -2,6 +2,7 @@
 #+private
 package term
 
+import "base:runtime"
 import "core:io"
 import "core:os"
 import "core:sync"
@@ -384,10 +385,18 @@ _session_close :: proc(session: ^Session) -> Error {
 }
 
 // _session_present writes bytes (a frame or another sequence) through the
-// shared write loop and reports the committed byte count. A supersedable write
-// stops with .Superseded when the resize wake becomes readable while it waits.
+// shared write loop and reports the committed byte count. wakes are generic
+// cancellation fds, usually eventfds a caller signals when newer output
+// exists; a supersedable write additionally watches the resize wake. Any
+// watched fd that is readable while the write waits stops it with
+// .Superseded and the bytes committed so far. A write with no wakes always
+// runs to the end, which is what setup, teardown, clipboard, and graphics
+// sequences need.
 @(require_results)
-_session_present :: proc(session: ^Session, bytes: []byte, supersedable := false) -> (committed: int, err: Error) {
+_session_present :: proc(session: ^Session, bytes: []byte, wakes: []int = nil, supersedable := false) -> (committed: int, err: Error) {
+	// Scratch below is temp-allocated; the guard frees it on return instead
+	// of relying on the caller's free_all discipline.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	if session.impl.file == nil {
 		return 0, General_Error.Not_Open
 	}
@@ -395,7 +404,11 @@ _session_present :: proc(session: ^Session, bytes: []byte, supersedable := false
 	if supersedable {
 		wake = linux.Fd(sync.atomic_load(&sigwinch_wake))
 	}
-	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes, wake)
+	fds := make([]linux.Fd, len(wakes), context.temp_allocator)
+	for wake_fd, i in wakes {
+		fds[i] = linux.Fd(wake_fd)
+	}
+	return _session_write_bytes(linux.Fd(os.fd(session.impl.file)), bytes, wake, fds)
 }
 
 // _session_write_bytes writes all of bytes to fd, retrying EINTR, waiting
@@ -405,11 +418,16 @@ _session_present :: proc(session: ^Session, bytes: []byte, supersedable := false
 // Nonzero write failures preserve their Platform_Error cause; a write that
 // returns zero while bytes remain is the one narrow Partial_Write case
 // (no errno exists to preserve). A negative wake is never polled; a
-// nonnegative wake is polled beside fd while the write waits, and once it is
-// readable the write stops with .Superseded, leaving the rest of bytes unwritten.
-// The wake is not read, so its owner still sees it.
+// nonnegative wake is polled beside fd while the write waits, as is every fd
+// in wakes, and once any of them is readable the write stops with
+// .Superseded, leaving the rest of bytes unwritten. No watched fd is read,
+// so each owner still sees its own signal: an owner that drains before
+// rechecking never spins on a stale abort, and a signal that lands after the
+// drain re-arms the next wait. A caller that gets .Superseded retries with
+// newer bytes; a frame caller forgets its diff snapshot first, so the retry
+// is a full frame.
 @(require_results)
-_session_write_bytes :: proc(fd: linux.Fd, bytes: []byte, wake := linux.Fd(-1)) -> (committed: int, err: Error) {
+_session_write_bytes :: proc(fd: linux.Fd, bytes: []byte, wake := linux.Fd(-1), wakes: []linux.Fd = nil) -> (committed: int, err: Error) {
 	offset := 0
 	for offset < len(bytes) {
 		when #config(NABLA_TERM_TEST_HOOKS, false) {
@@ -428,7 +446,7 @@ _session_write_bytes :: proc(fd: linux.Fd, bytes: []byte, wake := linux.Fd(-1)) 
 			case .EINTR:
 				continue
 			case .EAGAIN:
-				if wait_err := _session_poll_out(fd, wake); wait_err != nil {
+				if wait_err := _session_poll_out(fd, wake, wakes); wait_err != nil {
 					return offset, wait_err
 				}
 				continue
@@ -446,24 +464,47 @@ _session_write_bytes :: proc(fd: linux.Fd, bytes: []byte, wake := linux.Fd(-1)) 
 }
 
 // _session_poll_out waits (blocking) until the write can make progress. It returns
-// .Superseded when a nonnegative wake is readable, even if fd is ready too. A wake
-// that reports only an error or hang-up is unusable and returns EBADF, so the write
-// cannot spin on it. Any state of fd (writable, error, hang-up) returns nil, and the
-// next write reports its own outcome. A poll failure preserves its Platform_Error
-// cause; EINTR is retried. There is no separate public poll-error channel: the
-// write path surfaces this cause directly.
+// .Superseded when the wake or any fd in wakes is readable, even if fd is ready
+// too. A watched fd that reports only an error or hang-up is unusable and returns
+// EBADF, so the write cannot spin on it. Any state of fd (writable, error, hang-up)
+// returns nil, and the next write reports its own outcome. A poll failure preserves
+// its Platform_Error cause; EINTR is retried. There is no separate public poll-error
+// channel: the write path surfaces this cause directly. The poll set is sized by
+// the caller (fd, the wake, and every fd in wakes) in temp-allocated scratch
+// owned by the call; it is used synchronously and never escapes it.
 @(require_results)
-_session_poll_out :: proc(fd, wake: linux.Fd) -> Error {
+_session_poll_out :: proc(fd, wake: linux.Fd, wakes: []linux.Fd = nil) -> Error {
+	// Scratch below is temp-allocated; the guard frees it on return instead
+	// of relying on the caller's free_all discipline.
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	poll_descriptors := make([]linux.Poll_Fd, 2 + len(wakes), context.temp_allocator)
+	poll_descriptors[0] = {
+		fd     = fd,
+		events = {.OUT},
+	}
+	poll_descriptors[1] = {
+		fd     = wake,
+		events = {.IN},
+	}
+	for wake_fd, i in wakes {
+		poll_descriptors[2 + i] = {
+			fd     = wake_fd,
+			events = {.IN},
+		}
+	}
 	for {
-		poll_descriptors := [2]linux.Poll_Fd{{fd = fd, events = {.OUT}}, {fd = wake, events = {.IN}}}
 		// A negative fd is ignored by poll.
-		_, errno := linux.poll(poll_descriptors[:], -1)
+		_, errno := linux.poll(poll_descriptors, -1)
 		if errno == .NONE {
-			if .IN in poll_descriptors[1].revents {
-				return General_Error.Superseded
+			for descriptor in poll_descriptors[1:] {
+				if .IN in descriptor.revents {
+					return General_Error.Superseded
+				}
 			}
-			if poll_descriptors[1].revents != {} {
-				return Platform_Error(.EBADF)
+			for descriptor in poll_descriptors[1:] {
+				if descriptor.revents != {} {
+					return Platform_Error(.EBADF)
+				}
 			}
 			if poll_descriptors[0].revents != {} {
 				return nil

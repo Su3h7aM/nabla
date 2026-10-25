@@ -72,14 +72,18 @@ screen_begin :: proc(screen: ^Screen, columns, rows: int) -> (buffer: ^term.Fram
 // forgotten). A resize that stops the write returns term.General_Error.Superseded,
 // which is a failed present for this purpose: the snapshot is forgotten and the next
 // frame is a full one.
+//
+// wakes are generic cancellation fds the caller signals when newer output exists;
+// they are watched only while the write waits for the terminal. Any readable one
+// stops the write with term.General_Error.Superseded, handled exactly like a resize.
 @(require_results)
-screen_present :: proc(screen: ^Screen, session: ^term.Session, profile: term.Target_Profile, cursor: term.Cursor) -> term.Error {
+screen_present :: proc(screen: ^Screen, session: ^term.Session, profile: term.Target_Profile, cursor: term.Cursor, wakes: []int = nil) -> term.Error {
 	previous, have_previous := screen.previous.?
 	previous_frame := &previous if have_previous else nil
-	_, required, err := term.present(session, screen.buffer, profile, cursor, screen.output, previous_frame)
+	_, required, err := term.present(session, screen.buffer, profile, cursor, screen.output, previous_frame, wakes)
 	if err == term.General_Error.Presentation_Workspace_Too_Small {
 		_screen_reserve(&screen.output, required, screen.allocator) or_return
-		_, _, err = term.present(session, screen.buffer, profile, cursor, screen.output, previous_frame)
+		_, _, err = term.present(session, screen.buffer, profile, cursor, screen.output, previous_frame, wakes)
 	}
 	if err != nil {
 		screen.previous = nil

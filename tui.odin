@@ -288,9 +288,20 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	}
 	images_sync(app, storage)
 	app.frame_superseded = false
-	present_err := tui.screen_present(&storage.screen, app.terminal, term.profile_default(), cursor)
+	// The snapshot wake aborts a blocked frame write when newer output exists,
+	// so the next pass renders the newest state instead of finishing a stale
+	// frame. The abort leaves the wake readable, and the loop drains it before
+	// rechecking, so a pass either presents whole or aborts on a newer signal;
+	// it never spins on an already-drained wake.
+	wakes := [1]int{}
+	wake_count := 0
+	if wake, armed := app.run.wake.?; armed {
+		wakes[0] = wake
+		wake_count = 1
+	}
+	present_err := tui.screen_present(&storage.screen, app.terminal, term.profile_default(), cursor, wakes[:wake_count])
 	if present_err == term.General_Error.Superseded {
-		// A resize arrived mid-write. The loop renders the newest size next, so this is not an error.
+		// A resize or a newer snapshot arrived mid-write. The loop renders the newest state next, so this is not an error.
 		app.frame_superseded = true
 	} else if present_err != nil {
 		fmt.eprintln("nabla: present:", present_err)

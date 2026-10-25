@@ -99,13 +99,16 @@ encode :: proc(
 // frame as one buffered sequence and returns the number of bytes committed
 // before any transport failure.
 //
-// When the terminal is resized while the write waits for the terminal to accept
-// more bytes, present stops, leaves the rest of the frame unwritten, and returns
-// .Superseded with the bytes committed so far. That is not a failure: a newer
-// size exists, and the caller renders it. The terminal is left as after any
-// partial frame, so the caller's next present must be a full frame (previous
-// nil). Only present is supersedable; clipboard, graphics, open, and close
-// always write to the end. See set_resize_wake.
+// wakes are generic cancellation fds the caller signals when newer output exists;
+// the write also watches the resize wake. When the terminal is not accepting
+// bytes and any watched fd is readable, present stops, leaves the rest of the
+// frame unwritten, and returns .Superseded with the bytes committed so far.
+// That is not a failure: newer output exists, and the caller renders it. The
+// terminal is left as after any partial frame, so the caller's next present must
+// be a full frame (previous nil); a full frame begins with FRAME_RESET, which
+// also repairs a terminal left inside an escape sequence. No watched fd is read,
+// so each owner still sees its own signal. Clipboard, graphics, open, and close
+// pass no wakes and always write to the end. See set_resize_wake.
 @(require_results)
 present :: proc(
 	session: ^Session,
@@ -114,6 +117,7 @@ present :: proc(
 	cursor: Cursor,
 	output: []byte,
 	previous: ^Frame_Buffer = nil,
+	wakes: []int = nil,
 ) -> (
 	committed: int,
 	required: int,
@@ -127,7 +131,7 @@ present :: proc(
 	if err != nil || written == 0 {
 		return 0, required, err
 	}
-	committed_bytes, write_err := _session_present(session, output[:written], supersedable = true)
+	committed_bytes, write_err := _session_present(session, output[:written], wakes, supersedable = true)
 	return committed_bytes, required, write_err
 }
 
