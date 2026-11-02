@@ -177,6 +177,112 @@ User_Input :: struct {
 	attachments: []Attachment `json:"attachments,omitempty"`,
 }
 
+// Command_Kind is the closed set of commands a client appends to steer a running
+// session. The record's `kind` stores the stable name.
+Command_Kind :: enum u8 {
+	Cancel_Turn,
+	Select_Model,
+	Set_Effort,
+	Compact,
+}
+
+COMMAND_KIND_NAMES := [Command_Kind]string {
+	.Cancel_Turn  = "cancel_turn",
+	.Select_Model = "select_model",
+	.Set_Effort   = "set_effort",
+	.Compact      = "compact",
+}
+
+// Command is one action a client asks a running session to take. A command
+// reaches the server only through the journal, so it is a value a client builds
+// and appends; the server reads it back as the same union.
+Command :: union #no_nil {
+	Cancel_Turn,
+	Select_Model,
+	Set_Effort,
+	Compact,
+}
+
+Cancel_Turn :: struct {}
+
+Select_Model :: struct {
+	provider: string,
+	model:    string,
+}
+
+Set_Effort :: struct {
+	level: string, // "" for the provider default
+}
+
+Compact :: struct {}
+
+// User_Command is one command a client appended, stored flat with the fields its
+// kind uses: the payload is the boundary between the union above and JSON.
+User_Command :: struct {
+	version:  int,
+	kind:     string, // COMMAND_KIND_NAMES
+	provider: string,
+	model:    string,
+	level:    string,
+}
+
+// command_payload encodes one command as the payload user.command stores.
+command_payload :: proc(command: Command) -> (payload: User_Command) {
+	switch value in command {
+	case Cancel_Turn:
+		payload.kind = COMMAND_KIND_NAMES[.Cancel_Turn]
+	case Select_Model:
+		payload.kind = COMMAND_KIND_NAMES[.Select_Model]
+		payload.provider = value.provider
+		payload.model = value.model
+	case Set_Effort:
+		payload.kind = COMMAND_KIND_NAMES[.Set_Effort]
+		payload.level = value.level
+	case Compact:
+		payload.kind = COMMAND_KIND_NAMES[.Compact]
+	}
+	return
+}
+
+// command_decode reads the action a stored user.command names, false when its
+// kind is not a command. The result borrows payload.
+@(require_results)
+command_decode :: proc(payload: User_Command) -> (command: Command, known: bool) {
+	kind, found := enum_from_name(COMMAND_KIND_NAMES, payload.kind)
+	if !found { return {}, false }
+	switch kind {
+	case .Cancel_Turn:
+		return Cancel_Turn{}, true
+	case .Select_Model:
+		return Select_Model{provider = payload.provider, model = payload.model}, true
+	case .Set_Effort:
+		return Set_Effort{level = payload.level}, true
+	case .Compact:
+		return Compact{}, true
+	}
+	return {}, false
+}
+
+// Command_Outcome is what the session did with a command.
+Command_Outcome :: enum u8 {
+	Applied,
+	Refused,
+}
+
+COMMAND_OUTCOME_NAMES := [Command_Outcome]string {
+	.Applied = "applied",
+	.Refused = "refused",
+}
+
+// Command_Applied ends one command: command is the seq of its user.command, and
+// reason says why a refused command was not applied.
+Command_Applied :: struct {
+	version: int,
+	command: Journal_Seq,
+	outcome: string, // COMMAND_OUTCOME_NAMES
+	reason:  string,
+}
+
 // Turn_Completed ends a turn. reason is why its request chain stopped and cause
 // what kept the context from fitting, both "" when absent.
 Turn_Completed :: struct {

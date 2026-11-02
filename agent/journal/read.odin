@@ -135,6 +135,17 @@ read_inbox :: proc(journal: ^Journal, session: Session_Id, after: Journal_Seq, a
 	return query_records(journal, INBOX_QUERY, {db.Value(session[:]), db.Value(i64(after))}, allocator)
 }
 
+// read_pending_commands returns the `user.command` records of session that no
+// `command.applied` names yet, oldest first: the commands a client appended and the
+// server has not answered. The result is owned by allocator; release it with
+// records_destroy.
+@(require_results)
+read_pending_commands :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> (records: []Record, error: Error) {
+	assert(journal.open)
+	session := session
+	return query_records(journal, PENDING_COMMANDS_QUERY, {db.Value(session[:])}, allocator)
+}
+
 // read_latest returns the matching record with the highest seq, false when none
 // matches. Release it with record_destroy.
 @(require_results)
@@ -627,6 +638,15 @@ LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0
 // started in the background, and not when the call that started it ended in a failure
 // of its own, which its result already told the model; a call whose outcome is unknown
 // may have started the child, so its completion is still reported.
+@(private)
+PENDING_COMMANDS_QUERY ::
+	`SELECT ` +
+	RECORD_COLUMNS +
+	` FROM records AS pending WHERE pending.session = ?1 AND pending.kind = 'user.command'
+	AND NOT EXISTS (SELECT 1 FROM records AS answered WHERE answered.session = ?1 AND answered.kind = 'command.applied'
+		AND json_extract(answered.data, '$.command') = pending.seq)
+ORDER BY seq ASC`
+
 @(private)
 INBOX_QUERY ::
 	`SELECT ` +

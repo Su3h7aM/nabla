@@ -61,6 +61,8 @@ Record_Kind :: enum u8 {
 	Selection_Fit,
 	Selection_Applied,
 	Background_Completed,
+	User_Command,
+	Command_Applied,
 }
 
 RECORD_KIND_NAMES := [Record_Kind]string {
@@ -121,6 +123,8 @@ RECORD_KIND_NAMES := [Record_Kind]string {
 	.Selection_Fit          = "selection.fit",
 	.Selection_Applied      = "selection.applied",
 	.Background_Completed   = "background.completed",
+	.User_Command           = "user.command",
+	.Command_Applied        = "command.applied",
 }
 
 // Node_Kind is the closed set of committed conversational steps, stored in the

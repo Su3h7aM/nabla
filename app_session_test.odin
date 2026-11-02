@@ -4059,3 +4059,90 @@ test_serve_applies_session_environment_once :: proc(t: ^testing.T) {
 	if !testing.expect(t, serve_environment_sync(app), "syncing again must hold") { return }
 	testing.expect_value(t, len(app.setup.mcp_servers), 1)
 }
+
+// A client that follows a session commands it only through the journal: it appends a
+// user.command record and the server writes the command.applied that answers it.
+@(test)
+test_serve_applies_each_pending_command_once :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.owns_selection = true
+	app.setup.catalog = app_test_effort_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.setup.session.catalog = app_catalog_ref(&app)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+
+	// The client's side of the contract: a journal that follows the session the app runs.
+	client, client_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
+	if client_error != nil { testing.fail_now(t, "the client's journal could not open") }
+	defer if close_error := journal.close(client); close_error != nil { testing.fail_now(t, "the client's journal did not close") }
+	if follow_error := journal.follow(client, app.setup.session.session); follow_error != nil { testing.fail_now(t, "the client could not follow") }
+
+	// A cancel with no turn running is refused; one during a turn stops it.
+	if cancel_error := journal.append_command(client, journal.Cancel_Turn{}); cancel_error != nil { testing.fail_now(t, "the cancel was not appended") }
+	serve_commands_apply(&app, .Boundary)
+	testing.expect(t, !agent.turn_control_stop_requested(&app.run.control), "a cancel with no turn running stops nothing")
+	app.setup.session.state = .Requesting
+	if cancel_error := journal.append_command(client, journal.Cancel_Turn{}); cancel_error != nil { testing.fail_now(t, "the cancel was not appended") }
+	// Inside a turn only a command that changes nothing in flight applies; a selection
+	// waits for a boundary.
+	if effort_error := journal.append_command(client, journal.Set_Effort{level = "high"});
+	   effort_error != nil { testing.fail_now(t, "the effort was not appended") }
+	serve_commands_apply(&app, .Step)
+	testing.expect(t, agent.turn_control_stop_requested(&app.run.control), "the running turn was asked to stop")
+	testing.expect_value(t, app.setup.session.effort, "low")
+	serve_commands_apply(&app, .Boundary)
+	app.setup.session.state = .Idle
+	agent.turn_control_clear(&app.run.control)
+
+	// The effort the model states applied at that boundary, rewriting the session's selection.
+	testing.expect_value(t, app.setup.session.effort, "high")
+
+	// Each command is answered once, in seq order, and none stays pending.
+	commands, _, read_error := journal.read_records(client, {session = app.setup.session.session, kinds = {.User_Command}}, 0, 0, context.allocator)
+	if !testing.expect(t, read_error == nil, "the commands could not be read") { return }
+	defer journal.records_destroy(commands, context.allocator)
+	if !testing.expect_value(t, len(commands), 3) { return }
+	outcomes, _, answered_error := journal.read_records(client, {session = app.setup.session.session, kinds = {.Command_Applied}}, 0, 0, context.allocator)
+	if !testing.expect(t, answered_error == nil, "the answers could not be read") { return }
+	defer journal.records_destroy(outcomes, context.allocator)
+	if !testing.expect_value(t, len(outcomes), 3) { return }
+	for answered, index in outcomes {
+		applied: journal.Command_Applied
+		if !testing.expect_value(t, journal.payload_decode(answered.data, &applied, context.temp_allocator), nil) { return }
+		testing.expect_value(t, applied.command, commands[index].seq)
+		want := journal.COMMAND_OUTCOME_NAMES[.Applied] if index > 0 else journal.COMMAND_OUTCOME_NAMES[.Refused]
+		testing.expect_value(t, applied.outcome, want)
+	}
+	refused: journal.Command_Applied
+	testing.expect_value(t, journal.payload_decode(outcomes[0].data, &refused, context.temp_allocator), nil)
+	testing.expect(t, refused.reason != "", "a refused command says why")
+	pending, pending_error := journal.read_pending_commands(client, app.setup.session.session, context.temp_allocator)
+	testing.expect(t, pending_error == nil, "the pending commands could not be read")
+	testing.expect_value(t, len(pending), 0)
+	testing.expect(t, !serve_commands_pending(&app), "the server has no command left to apply")
+}
+
+// app_test_effort_catalog serves one model that states two effort levels.
+app_test_effort_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
+	sources := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			base_url = "http://127.0.0.1:1",
+			api = "openai_chat_completions",
+			api_key = "test-key",
+			models = []agent.Catalog_Model_Source {
+				{
+					id = "test-model",
+					context_window = 128_000,
+					max_output_tokens = 4_096,
+					tools = true,
+					thinking = agent.Catalog_Thinking_Source{present = true, supported = true, levels = []string{"low", "high"}},
+				},
+			},
+		},
+	}
+	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
+	return catalog
+}

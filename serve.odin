@@ -320,6 +320,10 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 		if chat.storage_failed {
 			return serve_storage_exit(chat)
 		}
+		serve_commands_apply(app, .Boundary)
+		if chat.storage_failed {
+			return serve_storage_exit(chat)
+		}
 		if app_compaction_pending(app) {
 			_ = app_compaction_tick(app, {})
 		}
@@ -369,7 +373,7 @@ Serve_Step :: enum {
 // request consumed. A continuation runs one turn over the same history, so the model
 // sees the recovered results and decides what to do. Environment means a newer
 // session.environment record is waiting while the session is idle, so it is applied
-// before any turn. Wait means a turn, tool job, subagent, or compaction is already
+// before any turn. Wait means a pending command, turn, tool job, subagent, or compaction is already
 // in progress. None means nothing of that is left, so the idle limit may run.
 // The records stay in temp memory until the caller resets it.
 @(require_results)
@@ -394,7 +398,7 @@ serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 		// idle deadline does not start while one is pending.
 		if agent.chat_continuation_pending(chat) { return .Turn, true }
 	}
-	if len(records) > 0 || chat.state != .Idle || agent.chat_session_workers_outstanding(chat) || app_compaction_pending(app) {
+	if len(records) > 0 || serve_commands_pending(app) || chat.state != .Idle || agent.chat_session_workers_outstanding(chat) || app_compaction_pending(app) {
 		return .Wait, true
 	}
 	return .None, true
@@ -410,6 +414,7 @@ serve_run_turn :: proc(app: ^App) -> bool {
 		agent.chat_runtime_message(chat, .Warning, warning)
 	}
 	chat.catalog = app_catalog_ref(app)
+	agent.turn_control_clear(&app.run.control)
 	// The origin is unused: an empty text adds no node of its own, and each
 	// staged record keeps the origin it was committed with.
 	switch agent.chat_session_accept_message(chat, "", .Agent, {}) {
@@ -423,7 +428,8 @@ serve_run_turn :: proc(app: ^App) -> bool {
 	case .Busy:
 		return true
 	}
-	_ = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), {}, nil)
+	steer := serve_steer_context(app)
+	_ = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), {}, &steer, &app.run.control)
 	if chat.storage_failed {
 		serve_storage_exit(chat)
 		return false

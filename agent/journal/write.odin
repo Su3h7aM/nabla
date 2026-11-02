@@ -148,6 +148,30 @@ append_environment :: proc(journal: ^Journal, environment: Session_Environment) 
 	return error
 }
 
+// append_command appends a `user.command` record for the followed session and commits
+// it, so a nil return means the session server will see the command. It is appended the
+// way a follow's input is, by a process that runs no turn of the session.
+@(require_results)
+append_command :: proc(journal: ^Journal, command: Command) -> Error {
+	assert(journal.open && !journal.read_only, "appends need a writable journal")
+	assert(journal.followed != {}, "append_command needs a followed session")
+	if journal.failure != nil { return journal.failure }
+	record_buffer(journal, Record{kind = .User_Command, session = journal.followed}, command_payload(command), nil)
+	_, error := commit(journal)
+	return error
+}
+
+// append_command_applied records what the session did with the command whose seq is
+// command: applied, or refused with the reason it was not.
+append_command_applied :: proc(journal: ^Journal, session: Session_Id, command: Journal_Seq, outcome: Command_Outcome, reason: string = "") {
+	append_record(
+		journal,
+		Record{kind = .Command_Applied, session = session},
+		Command_Applied{command = command, outcome = COMMAND_OUTCOME_NAMES[outcome], reason = reason},
+	)
+	_, _ = commit(journal)
+}
+
 @(private)
 record_buffer :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8) {
 	record := header
