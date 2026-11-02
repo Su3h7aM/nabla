@@ -983,3 +983,18 @@ row_enum :: proc(row: ^Row, names: [$Enum]string) -> Enum {
 	if !known { row.error = Journal_Error.Corrupt }
 	return value
 }
+
+// count_assistant_nodes returns how many assistant nodes session committed in
+// turn. A streamed message takes the count read when it begins as its ordinal,
+// so a retried attempt reuses the ordinal of the message it replaces.
+@(require_results)
+count_assistant_nodes :: proc(journal: ^Journal, session: Session_Id, turn: Turn_Id) -> (count: u32, error: Error) {
+	assert(journal.open)
+	session := session
+	value := query_int(
+		journal,
+		"SELECT COUNT(*) FROM nodes WHERE session = ? AND turn = ? AND kind = ?",
+		{db.Value(session[:]), db.Value(i64(turn)), NODE_KIND_NAMES[.Assistant]},
+	) or_return
+	return u32(value), nil
+}

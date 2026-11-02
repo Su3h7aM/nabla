@@ -167,6 +167,7 @@ serve_run :: proc(
 		run_setup_destroy(&app.setup)
 		abandoned = app.setup.workers_abandoned
 	}
+	defer serve_stream_destroy(&app.stream)
 
 	app.setup.mcp_servers = mcp_servers
 	// The launch's own servers stay the base a session.environment record extends.
@@ -185,6 +186,15 @@ serve_run :: proc(
 	ok, elsewhere := serve_session_open(&app.setup, options.session_id)
 	if elsewhere { return 0 }
 	if !ok { return 1 }
+	// The live stream is display-only: when its directory cannot be resolved the
+	// stream stays disabled and the server still serves.
+	stream_directory := ""
+	if resolved, stream_error := agent.stream_directory(app.setup.alloc); stream_error == .None {
+		stream_directory = resolved
+	}
+	serve_stream_init(&app.stream, stream_directory, app.setup.session.session, app.setup.alloc)
+	delete(stream_directory, app.setup.alloc)
+	serve_stream_drop(&app.stream)
 	if app.setup.watch_id == 0 {
 		fmt.eprintln("nabla: cannot watch the session, so lines other processes send it would not arrive")
 		return 1
@@ -428,8 +438,11 @@ serve_run_turn :: proc(app: ^App) -> bool {
 	case .Busy:
 		return true
 	}
+	observer, streaming := serve_stream_begin(&app.stream, chat.store, chat.session, chat.turn, {})
 	steer := serve_steer_context(app)
-	_ = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), {}, &steer, &app.run.control)
+	if streaming { steer.observe = serve_stream_observe }
+	_ = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
+	serve_stream_end(&app.stream)
 	if chat.storage_failed {
 		serve_storage_exit(chat)
 		return false

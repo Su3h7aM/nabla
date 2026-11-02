@@ -233,6 +233,8 @@ Interfaces are separate processes that connect to a session through the journal 
 - Subagents: a subagent is a session of its own with an ACP interface. The parent server starts that process as an ACP client. The process starts the subagent's server as its child, as an editor's ACP interface does. The chain is parent server, subagent ACP interface, subagent server.
 - Only one server holds a session at a time. Several interfaces may follow the same session.
 
+While a turn runs, the server appends its live deltas to one stream file per session beside the session locks: assistant begin, text, flush, and end frames carrying the turn, the message ordinal, and the text, and tool output frames carrying the call and the chunk. The ordinal is the number of assistant nodes the turn already committed when the message began, so a retried attempt reuses the ordinal of the message it replaces. The file is truncated when the turn starts, only appended while it runs, and removed once the turn's final message is committed; claiming the session removes a stale file left by a crash, and the server removes it again on exit. The journal stays the record: the file is display-only and a failure to write it never fails the turn.
+
 The rest of this section describes the threads of the server. The session server's main thread is the owner loop. The rows for the TUI and the ACP interface move with their interface code.
 
 ### 6.1 Threads and processes

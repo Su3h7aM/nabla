@@ -91,6 +91,7 @@ Run_Setup :: struct {
 
 App :: struct {
 	setup:                      Run_Setup,
+	stream:                     Serve_Stream, // the session's live turn stream, owned for the server's life
 	// compact_on_switch is the launch's fixed policy for fitting explicit model changes.
 	compact_on_switch:          bool,
 	// catalog_mu protects publication of a replacement catalog. A publication
