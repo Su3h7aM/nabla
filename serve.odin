@@ -356,11 +356,13 @@ Serve_Step :: enum {
 // serve_step is the idle decision. It is called on every wake. Turn means the inbox
 // after the last delivered message holds any inbound record (user.input,
 // background.completed, subagent.completed, or subagent.message) and the session is
-// idle, so one turn should deliver that batch. Wait means a turn, tool job, subagent,
-// or compaction is already in progress. None means nothing of that is left, so the
-// idle limit may run. An interrupted turn from an earlier process is not resumed:
-// recovery closed it when the session was claimed, and only an undelivered inbox
-// record starts a new one. The records stay in temp memory until the caller resets it.
+// idle, so one turn should deliver that batch. Turn also means the session is idle
+// and owes the model a continuation for what recovery settled: the last turn ended
+// Interrupted without a final assistant answer, or recovered results exist that no
+// request consumed. A continuation runs one turn over the same history, so the model
+// sees the recovered results and decides what to do. Wait means a turn, tool job,
+// subagent, or compaction is already in progress. None means nothing of that is left,
+// so the idle limit may run. The records stay in temp memory until the caller resets it.
 @(require_results)
 serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 	chat := &app.setup.session
@@ -369,7 +371,12 @@ serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 		fmt.eprintln("nabla: cannot read the session:", journal.error_text(read_error, context.temp_allocator))
 		return .None, false
 	}
-	if chat.state == .Idle && len(records) > 0 { return .Turn, true }
+	if chat.state == .Idle {
+		if len(records) > 0 { return .Turn, true }
+		// A continuation counts as a next step here, beside the inbox records, so the
+		// idle deadline does not start while one is pending.
+		if agent.chat_continuation_pending(chat) { return .Turn, true }
+	}
 	if len(records) > 0 || chat.state != .Idle || agent.chat_session_workers_outstanding(chat) || app_compaction_pending(app) {
 		return .Wait, true
 	}

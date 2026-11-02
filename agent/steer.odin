@@ -357,6 +357,113 @@ chat_inbox_reports_pending :: proc(chat: ^Chat_Session) -> bool {
 	return false
 }
 
+// chat_continuation_pending reports whether the model is owed a continuation request
+// for what recovery settled while this process holds the claim: the session's last
+// turn ended Interrupted when recovery closed it and left no final assistant answer,
+// or recovered completions exist that no response request has consumed. A continuation
+// is one ordinary turn over the same history, so the model sees the recovered results,
+// including Unknown and Not_Executed outcomes, and decides what to do. Nothing Unknown
+// is re-executed. A response request sent since recovery already continued it.
+chat_continuation_pending :: proc(chat: ^Chat_Session) -> bool {
+	if chat.storage_failed || !chat_journal_writable(chat) { return false }
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	recovered, recovered_found, recovered_error := journal.read_latest(
+		chat.store,
+		{session = chat.session, kinds = {.Session_Recovered}},
+		context.temp_allocator,
+	)
+	if recovered_error != nil || !recovered_found { return false }
+	defer journal.record_destroy(&recovered, context.temp_allocator)
+	if chat_response_since_recovery(chat, recovered.seq) { return false }
+	return chat_interrupted_without_answer(chat, recovered.seq) || chat_results_unconsumed(chat, recovered.seq)
+}
+
+// chat_response_since_recovery reports whether a response request was sent after
+// recovery settled the session. A compaction request does not count: it summarizes
+// instead of answering.
+@(private)
+chat_response_since_recovery :: proc(chat: ^Chat_Session, recovered: journal.Journal_Seq) -> bool {
+	sent, _, sent_error := journal.read_records(chat.store, {session = chat.session, kinds = {.Request_Sent}}, recovered, 0, context.temp_allocator)
+	if sent_error != nil { return false }
+	defer journal.records_destroy(sent, context.temp_allocator)
+	for record in sent {
+		purpose: journal.Request_Sent
+		if journal.payload_decode(record.data, &purpose, context.temp_allocator) != nil { continue }
+		if name, known := journal.enum_from_name(journal.REQUEST_PURPOSE_NAMES, purpose.purpose); known && name == .Response { return true }
+	}
+	return false
+}
+
+// chat_interrupted_without_answer reports whether the session's last turn ended
+// Interrupted when recovery closed it and left no final assistant answer: no newer
+// turn started, and the turn's newest assistant node still holds calls for the model
+// to see, is partial, or is missing. A call-free assistant node is the turn's final
+// answer, so the model already said its last word.
+@(private)
+chat_interrupted_without_answer :: proc(chat: ^Chat_Session, recovered: journal.Journal_Seq) -> bool {
+	completed, completed_found, completed_error := journal.read_latest(chat.store, {session = chat.session, kinds = {.Turn_Completed}}, context.temp_allocator)
+	if completed_error != nil || !completed_found { return false }
+	defer journal.record_destroy(&completed, context.temp_allocator)
+	ended: journal.Turn_Completed
+	if journal.payload_decode(completed.data, &ended, context.temp_allocator) != nil { return false }
+	outcome, known := journal.enum_from_name(journal.TURN_OUTCOME_NAMES, ended.outcome)
+	if !known || outcome != .Interrupted || completed.seq > recovered { return false }
+	started, started_found, started_error := journal.read_latest(chat.store, {session = chat.session, kinds = {.Turn_Started}}, context.temp_allocator)
+	if started_error != nil { return false }
+	defer if started_found { journal.record_destroy(&started, context.temp_allocator) }
+	if started_found && started.turn > completed.turn { return false }
+	assistant, assistant_found, assistant_error := journal.read_last_node(chat.store, chat.session, .Assistant, context.temp_allocator)
+	if assistant_error != nil { return false }
+	defer if assistant_found { journal.node_destroy(&assistant, context.temp_allocator) }
+	if !assistant_found || assistant.turn != completed.turn { return assistant.turn < completed.turn }
+	answer: journal.Assistant
+	if journal.payload_decode(assistant.data, &answer, context.temp_allocator) != nil { return false }
+	if answer.partial { return true }
+	ids := [1]journal.Node_Id{assistant.id}
+	proposed, _, proposed_error := journal.read_records(
+		chat.store,
+		{session = chat.session, kinds = {.Tool_Proposed}, nodes = ids[:]},
+		0,
+		1,
+		context.temp_allocator,
+	)
+	if proposed_error != nil { return false }
+	defer journal.records_destroy(proposed, context.temp_allocator)
+	return len(proposed) > 0
+}
+
+// chat_results_unconsumed reports whether recovery settled completions that no response
+// request has consumed yet: a completion committed at or before recovery, after the
+// latest response request. Those are the tool, background, subagent, Lua, and Task
+// completions recovery wrote for calls that never reported.
+@(private)
+chat_results_unconsumed :: proc(chat: ^Chat_Session, recovered: journal.Journal_Seq) -> bool {
+	requests, _, requests_error := journal.read_records(chat.store, {session = chat.session, kinds = {.Request_Sent}}, 0, 0, context.temp_allocator)
+	if requests_error != nil { return false }
+	defer journal.records_destroy(requests, context.temp_allocator)
+	answered: journal.Journal_Seq = 0
+	for record in requests {
+		purpose: journal.Request_Sent
+		if journal.payload_decode(record.data, &purpose, context.temp_allocator) != nil { continue }
+		if name, known := journal.enum_from_name(journal.REQUEST_PURPOSE_NAMES, purpose.purpose); known && name == .Response {
+			answered = max(answered, record.seq)
+		}
+	}
+	completed, _, completed_error := journal.read_records(
+		chat.store,
+		{session = chat.session, kinds = {.Tool_Completed, .Background_Completed, .Subagent_Completed, .Lua_Completed, .Task_Completed}},
+		answered,
+		0,
+		context.temp_allocator,
+	)
+	if completed_error != nil { return false }
+	defer journal.records_destroy(completed, context.temp_allocator)
+	for record in completed {
+		if record.seq <= recovered { return true }
+	}
+	return false
+}
+
 // user_input_origin is the origin a User_Input record names. An unreadable payload or
 // an unknown origin name reads as .Steering. It allocates only in the temporary
 // allocator.
