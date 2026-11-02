@@ -20,7 +20,11 @@ fork_exec :: proc(exec: Exec) -> (pid: int, err: os.Error) {
 	child, fork_errno := linux.fork()
 	if fork_errno != .NONE { return 0, os.Platform_Error(fork_errno) }
 	if child == 0 {
-		if linux.setpgid(0, 0) != .NONE { linux.exit_group(CHILD_SETUP_FAILED) }
+		if exec.new_session {
+			if _, errno := linux.setsid(); errno != .NONE { linux.exit_group(CHILD_SETUP_FAILED) }
+		} else {
+			if linux.setpgid(0, 0) != .NONE { linux.exit_group(CHILD_SETUP_FAILED) }
+		}
 		if exec.parent_death && !child_bind_parent(parent_pid) { linux.exit_group(CHILD_SETUP_FAILED) }
 		if input >= 0 {
 			if _, dup_errno := linux.dup2(input, 0); dup_errno != .NONE { linux.exit_group(CHILD_SETUP_FAILED) }

@@ -220,6 +220,20 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 
 ## 6. Runtime
 
+### 6.0 Processes
+
+A session has exactly one harness process, the one that holds its claim (section 8.1). The harness owns the state machine, runs the turns, starts tool jobs and subagents, and writes the journal. It has no user interface and no terminal.
+
+Interfaces are separate processes that connect to a session through the journal (section 8.6): the TUI, the ACP server an editor starts, and the headless prompt. An interface never runs a turn. It records commands, observes records, and shows them. Any number of interfaces may follow one session.
+
+- Starting: an interface that needs a session starts its harness as a child, unless the session already has a claim holder, in which case it follows. The harness starts in its own session (`setsid`) with no terminal, so closing the user's terminal does not reach it.
+- Lifetime: the harness runs while a turn, queued input, a tool job, or a subagent is active. When none of them is left, it waits `IDLE_EXIT` (10 minutes by default, set in configuration) and exits if nothing new arrived in that time. A connected interface does not extend the wait.
+- Interface loss: when an interface dies, the harness keeps working. The next interface to attach follows the session, or, once the harness has exited, starts a new harness, which recovers the session (section 9) without repeating any effect.
+- Subagents: a subagent is a session of its own with an ACP interface process. The parent harness starts that process as an ACP client. The process starts the subagent's harness as its child, as an editor's ACP process does. The chain is parent harness, subagent ACP process, subagent harness.
+- Only one harness holds a session at a time. Several interfaces may be connected to the same session.
+
+The rest of this section describes the threads of the harness. The rows for the TUI and ACP reader move with their interface code.
+
 ### 6.1 Threads and processes
 
 | Thread or process | Count | Blocks in (idle) | Owns |

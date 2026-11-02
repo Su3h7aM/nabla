@@ -45,6 +45,7 @@ Exec :: struct {
 	errors:       Fd,
 	report:       Fd,
 	parent_death: bool,
+	new_session:  bool,
 }
 
 // Desc describes the program a child runs.
@@ -65,6 +66,8 @@ Desc :: struct {
 	// parent_death asks the system to kill the child when the thread that started it exits.
 	// Linux only.
 	parent_death: bool,
+	// new_session starts the child in a new session without a controlling terminal.
+	new_session:  bool,
 }
 
 // Spawn is how far a start got. Only Exec_Failed proves the program never ran, which is what
@@ -153,6 +156,7 @@ start :: proc(desc: Desc) -> (child: Child, spawn: Spawn, err: os.Error) {
 			errors = fd(desc.stderr),
 			report = fd(report_write),
 			parent_death = desc.parent_death,
+			new_session = desc.new_session,
 		},
 	)
 	_ = os.close(report_write)

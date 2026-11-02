@@ -10,6 +10,21 @@ import "core:time"
 SUBPROCESS_TEST_BOUND :: 10 * time.Second
 
 @(test)
+test_new_session_has_no_controlling_terminal :: proc(t: ^testing.T) {
+	output_read, output_write, output_error := os.pipe()
+	if !testing.expect_value(t, output_error, nil) { return }
+	defer os.close(output_read)
+	defer os.close(output_write)
+	script := "read pid comm state ppid pgrp sid tty rest < /proc/self/stat; [ \"$pid\" = \"$sid\" ] && [ \"$pid\" = \"$pgrp\" ] && [ \"$tty\" = 0 ]"
+	child, spawn, spawn_error := start({argv = {"/bin/sh", "-c", script}, stdout = output_write, stderr = output_write, new_session = true})
+	if !testing.expect_value(t, spawn_error, nil) { return }
+	if !testing.expect_value(t, spawn, Spawn.Started) { return }
+	defer child_close(&child)
+	exited, exit_code, waited := child_reap(&child)
+	testing.expect(t, waited && exited && exit_code == 0)
+}
+
+@(test)
 test_command_child_reads_its_input_pipe :: proc(t: ^testing.T) {
 	input_read, input_write, input_error := os.pipe()
 	if !testing.expect_value(t, input_error, nil) { return }

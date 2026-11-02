@@ -8,6 +8,7 @@
 // The child leads a new process group, so `terminate_group` reaches the whole tree the child
 // started: SIGTERM, a grace period, then SIGKILL. `core:os.process_start` cannot do this, because
 // it has no pre-exec hook and a group made by the parent after exec fails with EACCES.
+// Set `Desc.new_session` to also start the child in a new session without a controlling terminal.
 //
 // Only Linux has a backend. Other targets report every start as unsupported.
 package subprocess
