@@ -296,21 +296,17 @@ Staged_Text :: struct {
 }
 
 // chat_inbox_stage buffers one User node per record, in seq order, and returns each
-// text with its origin in temp memory. It commits nothing.
+// text with its origin in temp memory. Files a user.input or background completion
+// names are copied onto that node. It commits nothing.
 chat_inbox_stage :: proc(chat: ^Chat_Session, records: []journal.Record) -> []Staged_Text {
 	staged, staged_error := make([]Staged_Text, len(records), context.temp_allocator)
 	if staged_error != nil { return nil }
 	for record, index in records {
 		text, origin := inbox_text(record)
 		user := journal.User {
-			origin  = journal.USER_ORIGIN_NAMES[origin],
-			message = record.seq,
-		}
-		if record.kind == .Background_Completed {
-			completed: journal.Background_Completed
-			if journal.payload_decode(record.data, &completed, context.temp_allocator) == nil {
-				user.attachments = completed.attachments
-			}
+			origin      = journal.USER_ORIGIN_NAMES[origin],
+			message     = record.seq,
+			attachments = inbox_attachments(record),
 		}
 		node := chat_node(chat, .User, user, transmute([]u8)text)
 		if node == 0 { return staged[:index] }
@@ -535,6 +531,21 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		return inbox_report(fmt.tprintf("%s asks", name), body), .Agent
 	}
 	return body, .Agent
+}
+
+// inbox_attachments is the files a user.input or background completion names, nil for any other record or a payload that cannot be read. The slice borrows the
+// temporary allocator.
+@(private)
+inbox_attachments :: proc(record: journal.Record) -> []journal.Attachment {
+	#partial switch record.kind {
+	case .User_Input:
+		input: journal.User_Input
+		if journal.payload_decode(record.data, &input, context.temp_allocator) == nil { return input.attachments }
+	case .Background_Completed:
+		completed: journal.Background_Completed
+		if journal.payload_decode(record.data, &completed, context.temp_allocator) == nil { return completed.attachments }
+	}
+	return nil
 }
 
 // inbox_report is heading and a colon, then body on the lines below it, or the heading

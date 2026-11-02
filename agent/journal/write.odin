@@ -8,6 +8,7 @@ import "core:slice"
 import "core:strings"
 import "core:time"
 
+import "nabla:ai"
 import "nabla:db"
 
 // The batch limits after which buffered observations are committed without
@@ -79,18 +80,57 @@ append_record :: proc(journal: ^Journal, header: Record, data: $Payload, body: [
 }
 
 // append_input appends a `user.input` record for the followed session and commits
-// it, so a nil return means the runner will see the line. Turn and branch stay
-// zero: the follower allocates no ids. This is the one append a journal makes
-// without a claim. On a busy database the record stays pending and the error is
-// returned; the caller commits again and does not append the line a second time.
+// it, so a nil return means the runner will see the line. text is the body and may
+// be empty when attachments is not. attachments are borrowed for the call; their
+// bytes are stored as attachment artifacts and the record names those digests.
+// Turn and branch stay zero: the follower allocates no ids. This is the one append
+// a journal makes without a claim. On a busy database the record stays pending and
+// the error is returned; the caller commits again and does not append the line a
+// second time. An allocation failure latches the journal.
 @(require_results)
-append_input :: proc(journal: ^Journal, text: string, origin: User_Origin) -> Error {
+append_input :: proc(journal: ^Journal, text: string, origin: User_Origin, attachments: []ai.Provider_Attachment = nil) -> Error {
 	assert(journal.open && !journal.read_only, "appends need a writable journal")
 	assert(journal.followed != {}, "append_input needs a followed session")
 	if journal.failure != nil { return journal.failure }
-	record_buffer(journal, Record{kind = .User_Input, session = journal.followed}, User_Input{origin = USER_ORIGIN_NAMES[origin]}, transmute([]u8)text)
+	recorded := input_attachments(journal, attachments)
+	if journal.failure != nil { return journal.failure }
+	record_buffer(
+		journal,
+		Record{kind = .User_Input, session = journal.followed},
+		User_Input{origin = USER_ORIGIN_NAMES[origin], attachments = recorded},
+		transmute([]u8)text,
+	)
 	_, error := commit(journal)
 	return error
+}
+
+// input_attachments stores each file as an attachment artifact and returns the references the record carries, in order. The references and their digest text
+// are owned by the journal's batch arena, which the next commit releases. A failure latches the journal and returns nil.
+@(private)
+input_attachments :: proc(journal: ^Journal, attachments: []ai.Provider_Attachment) -> []Attachment {
+	if len(attachments) == 0 || journal.failure != nil { return nil }
+	allocator := virtual.arena_allocator(&journal.batch)
+	recorded, error := make([]Attachment, len(attachments), allocator)
+	if error != nil {
+		latch(journal, error)
+		return nil
+	}
+	for attachment, index in attachments {
+		digest := put_artifact(journal, ATTACHMENT_ARTIFACT, attachment.Data)
+		if journal.failure != nil { return nil }
+		hex: [DIGEST_HEX_LENGTH]u8
+		cloned, clone_error := strings.clone(digest_to_hex(digest, hex[:]), allocator)
+		if clone_error != nil {
+			latch(journal, clone_error)
+			return nil
+		}
+		recorded[index] = {
+			media_type = ai.PROVIDER_MEDIA_TYPES[attachment.Media],
+			name       = attachment.Name,
+			digest     = cloned,
+		}
+	}
+	return recorded
 }
 
 @(private)

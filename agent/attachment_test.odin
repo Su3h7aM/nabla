@@ -70,3 +70,55 @@ test_accepted_prompt_with_only_an_image_reaches_the_projection :: proc(test: ^te
 	testing.expect_value(test, user.attachments[0].Name, "shot.png")
 	testing.expect_value(test, string(user.attachments[0].Data), string(bytes))
 }
+
+// A follower's user.input can be files and no text. The session server delivers that record through
+// chat_session_accept_message, and the User node and the request both carry the file.
+@(test)
+test_user_input_attachment_reaches_the_user_node_and_the_request :: proc(test: ^testing.T) {
+	fixture: Chat_Test
+	chat_test_begin(test, &fixture, tool_loop_workspace(test))
+	defer chat_test_end(test, &fixture)
+	chat := &fixture.chat
+
+	follower := follow_open(test, &fixture)
+	defer _ = journal.close(follower)
+
+	bytes := []u8{0x89, 'P', 'N', 'G', 1, 2, 3}
+	attachments := []ai.Provider_Attachment{{Media = .PNG, Name = "shot.png", Data = bytes}}
+	if input_error := journal.append_input(follower, "", .Prompt, attachments); input_error != nil {
+		testing.fail_now(test, "the line was not accepted")
+	}
+
+	chat.capacity.media = {.PNG, .JPEG, .GIF, .WebP, .PDF}
+	testing.expect_value(test, chat_session_accept_message(chat, "", .Agent, {}), Chat_Accept.Accepted)
+
+	node, found, node_error := journal.read_last_node(chat.store, chat.session, .User, context.temp_allocator)
+	testing.expect_value(test, node_error, nil)
+	if !testing.expect(test, found, "the input was delivered as a user node") { return }
+	testing.expect_value(test, string(node.body), "")
+	stored_user: journal.User
+	if decode_error := journal.payload_decode(node.data, &stored_user, context.temp_allocator); decode_error != nil {
+		testing.fail_now(test, "the user node could not be read")
+	}
+	testing.expect_value(test, stored_user.origin, journal.USER_ORIGIN_NAMES[.Prompt])
+	if !testing.expect_value(test, len(stored_user.attachments), 1) { return }
+	testing.expect_value(test, stored_user.attachments[0].name, "shot.png")
+	testing.expect_value(test, stored_user.attachments[0].media_type, ai.PROVIDER_MEDIA_TYPES[.PNG])
+	digest, valid := journal.digest_from_hex(stored_user.attachments[0].digest)
+	if !testing.expect(test, valid, "the attachment digest is hexadecimal") { return }
+	stored, stored_found, stored_error := journal.read_artifact(chat.store, digest, context.temp_allocator)
+	testing.expect_value(test, stored_error, nil)
+	if !testing.expect(test, stored_found, "the attachment bytes are stored") { return }
+	testing.expect_value(test, string(stored), string(bytes))
+
+	arena: virtual.Arena
+	preparation := request_test_prepare(test, chat, tool_loop_connection, &arena)
+	defer virtual.arena_destroy(&arena)
+	if !testing.expect(test, len(preparation.wire) > 0, "the request has a message") { return }
+	message := preparation.wire[len(preparation.wire) - 1]
+	testing.expect_value(test, message.Content, "")
+	if !testing.expect_value(test, len(message.Attachments), 1) { return }
+	testing.expect_value(test, message.Attachments[0].Name, "shot.png")
+	testing.expect_value(test, message.Attachments[0].Media, ai.Provider_Media.PNG)
+	testing.expect_value(test, string(message.Attachments[0].Data), string(bytes))
+}

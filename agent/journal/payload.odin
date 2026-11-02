@@ -166,12 +166,15 @@ Attachment :: struct {
 ATTACHMENT_ARTIFACT :: "attachment"
 
 // User_Input is one line a user sent a session, committed before anything acknowledges
-// it. The line is in the body. origin is a USER_ORIGIN_NAMES name, the origin of the
-// User node that delivers it. The record is not a node, so a session accepts it in any
-// phase; a User node whose message names its seq delivers it.
+// it. The line is in the body and may be empty when attachments is not. origin is a
+// USER_ORIGIN_NAMES name, the origin of the User node that delivers it. attachments
+// are the files the line carries, stored as attachment artifacts the same way a
+// background completion stores them. The record is not a node, so a session accepts
+// it in any phase; a User node whose message names its seq delivers it.
 User_Input :: struct {
-	version: int,
-	origin:  string,
+	version:     int,
+	origin:      string,
+	attachments: []Attachment `json:"attachments,omitempty"`,
 }
 
 // Turn_Completed ends a turn. reason is why its request chain stopped and cause
