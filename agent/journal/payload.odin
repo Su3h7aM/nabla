@@ -252,6 +252,43 @@ Session_Recovered :: struct {
 	results:  int,
 }
 
+// Session_Environment carries what an interface installed when it opened, loaded,
+// or resumed the session: the standing system instructions and the MCP server
+// list. It mirrors MCP_Server_Config in native structs, with the timeouts in
+// milliseconds, and the server converts it once at the journal boundary.
+Session_Environment :: struct {
+	version:      int,
+	instructions: string,
+	servers:      []Session_Environment_Server `json:"servers,omitempty"`,
+}
+
+// Session_Environment_Server is one configured MCP server of a
+// session.environment record.
+Session_Environment_Server :: struct {
+	id:                   string,
+	executable:           string,
+	arguments:            []string `json:"arguments,omitempty"`,
+	working_directory:    string `json:"working_directory,omitempty"`,
+	environment:          []Session_Environment_Variable `json:"environment,omitempty"`,
+	tools:                []Session_Environment_Tool `json:"tools,omitempty"`,
+	discovery_timeout_ms: i64,
+	call_timeout_ms:      i64,
+}
+
+// Session_Environment_Variable is one variable a server is launched with.
+Session_Environment_Variable :: struct {
+	name:  string,
+	value: string,
+}
+
+// Session_Environment_Tool overrides one discovered remote tool: an entry may
+// disable it or replace its model-visible name, never both.
+Session_Environment_Tool :: struct {
+	remote_name: string,
+	name:        string `json:"name,omitempty"`,
+	enabled:     bool,
+}
+
 // Selection_Changed has no session for the process-wide default. effort is the
 // provider's own level name, "" for its default.
 Selection_Changed :: struct {

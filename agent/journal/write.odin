@@ -133,6 +133,21 @@ input_attachments :: proc(journal: ^Journal, attachments: []ai.Provider_Attachme
 	return recorded
 }
 
+// append_environment appends a `session.environment` record for the followed session and commits
+// it, carrying the standing instructions and MCP server list the interface installed when it
+// opened, loaded, or resumed the session. The runner applies it before the first prompt. On a busy
+// database the record stays pending and the error is returned; the caller commits again and does
+// not append the environment a second time.
+@(require_results)
+append_environment :: proc(journal: ^Journal, environment: Session_Environment) -> Error {
+	assert(journal.open && !journal.read_only, "appends need a writable journal")
+	assert(journal.followed != {}, "append_environment needs a followed session")
+	if journal.failure != nil { return journal.failure }
+	record_buffer(journal, Record{kind = .Session_Environment, session = journal.followed}, environment, nil)
+	_, error := commit(journal)
+	return error
+}
+
 @(private)
 record_buffer :: proc(journal: ^Journal, header: Record, data: $Payload, body: []u8) {
 	record := header

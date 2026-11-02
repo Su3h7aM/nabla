@@ -20,66 +20,73 @@ import "nabla:tui"
 import "nabla:tui/widgets"
 
 Run_Setup :: struct {
-	harness_options:    agent.Harness_Options,
-	catalog:            agent.Catalog,
-	api:                ai.API_Kind,
-	credential:         string, // owned,
+	harness_options:     agent.Harness_Options,
+	catalog:             agent.Catalog,
+	api:                 ai.API_Kind,
+	credential:          string, // owned,
 	// store is the running session's journal, owned. Chat_Session borrows it, so it
 	// is replaced only together with the chat.
-	store:              ^journal.Journal,
-	journal_directory:  string, // owned
-	lock_directory:     string, // owned; where the journal takes session claims
-	run:                journal.Run_Id,
+	store:               ^journal.Journal,
+	journal_directory:   string, // owned
+	lock_directory:      string, // owned; where the journal takes session claims
+	run:                 journal.Run_Id,
 	// run_open says the running session's journal carries this launch's run.started, so
 	// run.finished is owed when the launch ends.
-	run_open:           bool,
-	session:            agent.Chat_Session,
-	workspace:          string, // owned; the directory sessions here run in
-	provider_id:        string, // owned,
-	model_id:           string, // owned,
+	run_open:            bool,
+	session:             agent.Chat_Session,
+	workspace:           string, // owned; the directory sessions here run in
+	provider_id:         string, // owned,
+	model_id:            string, // owned,
 	// resumed_provider and resumed_model are what the opened session last ran
 	// with. They are empty for a new session, and they are only a fallback for
 	// when no selection exists anywhere else.
-	resumed_provider:   string, // owned,
-	resumed_model:      string, // owned,
-	resumed_effort:     string, // owned,
+	resumed_provider:    string, // owned,
+	resumed_model:       string, // owned,
+	resumed_effort:      string, // owned,
 	// configured holds the provider ids the user's own configuration declares;
 	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
-	configured:         [dynamic]string, // owned,
+	configured:          [dynamic]string, // owned,
 	// owns_selection says whether this run's model choice is the user's. The
 	// interactive harness owns it: its choice is published to the front-end and
 	// remembered for the next launch. A headless or child run does not, because it
 	// selects a model for one job and must not change what the user starts with.
-	owns_selection:     bool,
+	owns_selection:      bool,
 	// shared_sessions says this front-end shows a session another process runs as a
 	// follower instead of refusing it, and watches the lock file of the session it shows
 	// so that other processes' commits and a dropped claim wake the worker. A headless
 	// resume sets it too and sends its line to the runner; the ACP server leaves it false
 	// and refuses a running session.
-	shared_sessions:    bool,
+	shared_sessions:     bool,
 	// follow is where the follower's reading of the journal stands. It is meaningful only
 	// while the running store follows.
-	follow:             agent.Follow,
+	follow:              agent.Follow,
 	// takeover_failed stops a follower from claiming again after a claim it won could not
 	// be used, so every later wake does not repeat the failure.
-	takeover_failed:    bool,
-	takeover_retryable: bool,
-	follow_pending:     []journal.Record, // owned until initial replay
-	follow_input_busy:  bool,
+	takeover_failed:     bool,
+	takeover_retryable:  bool,
+	follow_pending:      []journal.Record, // owned until initial replay
+	follow_input_busy:   bool,
 	// watch wakes the worker for changes of the shown session's lock file. watched is the
 	// session whose lock file it watches, and watch_id the kernel's name for it.
-	watch:              agent.Session_Watch,
-	watched:            journal.Session_Id,
-	watch_id:           agent.Session_Watch_Id,
+	watch:               agent.Session_Watch,
+	watched:             journal.Session_Id,
+	watch_id:            agent.Session_Watch_Id,
 	// mcp_servers is borrowed from the launch's configuration, which outlives the
 	// setup. mcp owns the running MCP clients and the bindings a tool definition may
 	// borrow, so it is released after the session that holds the registry.
-	mcp_servers:        []agent.MCP_Server_Config,
-	mcp:                MCP_Runtime,
+	mcp_servers:         []agent.MCP_Server_Config,
+	mcp:                 MCP_Runtime,
+	// environment_base is the launch's own MCP list, borrowed like mcp_servers was
+	// before the first applied record replaced it. environment_owned is the combined
+	// list an applied record installed, and environment_applied the seq of that
+	// record, 0 until one is applied.
+	environment_base:    []agent.MCP_Server_Config,
+	environment_owned:   [dynamic]agent.MCP_Server_Config,
+	environment_applied: journal.Journal_Seq,
 	// workers_abandoned stays set after a replaced session leaves a worker behind.
-	workers_abandoned:  bool,
-	alloc:              mem.Allocator,
+	workers_abandoned:   bool,
+	alloc:               mem.Allocator,
 }
 
 App :: struct {

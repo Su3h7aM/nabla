@@ -405,6 +405,7 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)
+	agent.MCP_Server_Configs_Destroy(&setup.environment_owned, setup.alloc)
 	if close_error := run_store_close(setup); close_error != nil {
 		detail := journal.error_text(close_error, context.temp_allocator)
 		fmt.eprintln("nabla: the session database could not be closed cleanly:", detail)

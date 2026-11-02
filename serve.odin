@@ -169,6 +169,8 @@ serve_run :: proc(
 	}
 
 	app.setup.mcp_servers = mcp_servers
+	// The launch's own servers stay the base a session.environment record extends.
+	app.setup.environment_base = mcp_servers
 	mcp_ok: bool
 	app.setup.mcp, mcp_ok = mcp_runtime_make(mcp_servers, app.setup.alloc)
 	if !mcp_ok {
@@ -325,6 +327,9 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 		step, step_ok := serve_step(app)
 		if !step_ok { return 1 }
 		switch step {
+		case .Environment:
+			idle_due = nil
+			if !serve_environment_sync(app) { return 1 }
 		case .Turn:
 			idle_due = nil
 			if !serve_run_turn(app) { return 1 }
@@ -346,10 +351,12 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 }
 
 // Serve_Step is the one answer to whether the server has a next step. Turn delivers
-// the pending inbox. Wait stays up for work already in progress. None is idle.
+// the pending inbox. Environment applies a session.environment record newer than
+// the last one applied. Wait stays up for work already in progress. None is idle.
 Serve_Step :: enum {
 	None,
 	Turn,
+	Environment,
 	Wait,
 }
 
@@ -360,9 +367,11 @@ Serve_Step :: enum {
 // and owes the model a continuation for what recovery settled: the last turn ended
 // Interrupted without a final assistant answer, or recovered results exist that no
 // request consumed. A continuation runs one turn over the same history, so the model
-// sees the recovered results and decides what to do. Wait means a turn, tool job,
-// subagent, or compaction is already in progress. None means nothing of that is left,
-// so the idle limit may run. The records stay in temp memory until the caller resets it.
+// sees the recovered results and decides what to do. Environment means a newer
+// session.environment record is waiting while the session is idle, so it is applied
+// before any turn. Wait means a turn, tool job, subagent, or compaction is already
+// in progress. None means nothing of that is left, so the idle limit may run.
+// The records stay in temp memory until the caller resets it.
 @(require_results)
 serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 	chat := &app.setup.session
@@ -370,6 +379,14 @@ serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 	if read_error != nil {
 		fmt.eprintln("nabla: cannot read the session:", journal.error_text(read_error, context.temp_allocator))
 		return .None, false
+	}
+	environment, environment_error := serve_environment_seq(app)
+	if environment_error != nil {
+		fmt.eprintln("nabla: cannot read the session environment:", journal.error_text(environment_error, context.temp_allocator))
+		return .None, false
+	}
+	if environment > app.setup.environment_applied && chat.state == .Idle && !agent.chat_session_workers_outstanding(chat) && !app_compaction_pending(app) {
+		return .Environment, true
 	}
 	if chat.state == .Idle {
 		if len(records) > 0 { return .Turn, true }

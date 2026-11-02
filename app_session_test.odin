@@ -4000,3 +4000,62 @@ test_follow_ups_are_sent_as_turns_end :: proc(t: ^testing.T) {
 	testing.expect_value(t, widgets.input_text(&app.input), "late line\n\nand the linter too\n\ndraft")
 	testing.expect_value(t, len(app.run.follow_ups.items), 0)
 }
+
+// An interface's session.environment record is the server's next step until it is
+// applied: the standing instructions and the MCP list install exactly once, and an
+// applied record is no step at all.
+@(test)
+test_serve_applies_session_environment_once :: proc(t: ^testing.T) {
+	app := new(App)
+	defer free(app)
+	directory := app_session_begin(t, app)
+	defer app_session_end(app, directory)
+
+	// The launch configures no server of its own; the runtime only reserves slots.
+	app.setup.environment_base = nil
+	mcp_ok: bool
+	app.setup.mcp, mcp_ok = mcp_runtime_make(nil, app.setup.alloc)
+	if !mcp_ok { testing.fail_now(t, "the MCP runtime could not be created") }
+	defer mcp_runtime_destroy(&app.setup.mcp)
+	defer agent.MCP_Server_Configs_Destroy(&app.setup.environment_owned, app.setup.alloc)
+
+	// The interface follows the session and commits the environment before the
+	// first prompt, the way an open, load, or resume does.
+	follower, follower_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write)
+	if follower_error != nil { testing.fail_now(t, "the follower journal could not be opened") }
+	defer _ = journal.close(follower)
+	if follow_error := journal.follow(follower, app.setup.session.session); follow_error != nil {
+		testing.fail_now(t, "the interface could not follow the session")
+	}
+
+	wanted, wanted_error := agent.MCP_Server_Config_From_Stdio("editor", "/bin/true", nil, nil, nil, context.allocator)
+	if wanted_error != .None { testing.fail_now(t, "the MCP server could not be configured") }
+	defer agent.MCP_Server_Config_Destroy(&wanted, context.allocator)
+	servers := make([dynamic]agent.MCP_Server_Config, context.allocator)
+	defer delete(servers)
+	if append(&servers, wanted) != 1 { testing.fail_now(t, "the server list could not be built") }
+
+	environment, environment_error := agent.session_environment_from_configs("speak plainly", servers[:], context.allocator)
+	if environment_error != .None { testing.fail_now(t, "the environment payload could not be built") }
+	defer agent.session_environment_destroy(&environment, context.allocator)
+	if append_error := journal.append_environment(follower, environment); append_error != nil {
+		testing.fail_now(t, "the interface could not append the environment")
+	}
+
+	step, step_ok := serve_step(app)
+	if !testing.expect(t, step_ok, "the server step must read") { return }
+	testing.expect_value(t, step, Serve_Step.Environment)
+	if !testing.expect(t, serve_environment_sync(app), "the environment must apply") { return }
+	testing.expect_value(t, app.setup.session.client_instructions, "speak plainly")
+	if !testing.expect_value(t, len(app.setup.mcp_servers), 1) { return }
+	testing.expect_value(t, app.setup.mcp_servers[0].id, "editor")
+	applied, applied_error := serve_environment_seq(app)
+	if applied_error != nil { testing.fail_now(t, "the applied record could not be read") }
+	testing.expect_value(t, app.setup.environment_applied, applied)
+
+	again, again_ok := serve_step(app)
+	if !testing.expect(t, again_ok, "the server step must read again") { return }
+	testing.expect(t, again != .Environment, "an applied environment is no next step")
+	if !testing.expect(t, serve_environment_sync(app), "syncing again must hold") { return }
+	testing.expect_value(t, len(app.setup.mcp_servers), 1)
+}

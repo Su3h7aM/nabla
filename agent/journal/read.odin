@@ -166,6 +166,29 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	}
 	return record, true, nil
 }
+
+// read_session_environment returns the payload of the latest `session.environment`
+// record of session with its seq, false when the session has none. The result is
+// owned by allocator; a corrupt payload reports Corrupt and names the record.
+@(require_results)
+read_session_environment :: proc(
+	journal: ^Journal,
+	session: Session_Id,
+	allocator: mem.Allocator,
+) -> (
+	environment: Session_Environment,
+	seq: Journal_Seq,
+	found: bool,
+	error: Error,
+) {
+	assert(journal.open)
+	record, has_record, read_error := read_latest(journal, Filter{session = session, kinds = {.Session_Environment}}, allocator)
+	if read_error != nil { return {}, 0, false, read_error }
+	if !has_record { return {}, 0, false, nil }
+	defer record_destroy(&record, allocator)
+	payload_decode(record.data, &environment, allocator, journal, record.session, record.seq) or_return
+	return environment, record.seq, true, nil
+}
 @(require_results)
 scan_node_checked :: proc(row: ^Row, allocator: mem.Allocator) -> (node: Node, session: Session_Id, seq: Journal_Seq, ok: bool) {
 	node = scan_node(row)
