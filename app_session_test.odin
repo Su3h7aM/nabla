@@ -753,6 +753,62 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 	selection_intent_clear(&app)
 }
 
+// A selection the server installs is what the follower shows. The footer, /status,
+// and the model menu read the setup and the session, so a selection.applied that
+// arrives after the follow began replaces the launch selection there.
+@(test)
+test_a_follower_shows_the_servers_selection :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.shared_sessions = true
+
+	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
+	runner, runner_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
+	if runner_open_error != nil { testing.fail_now(t, "the runner's journal could not open") }
+	defer _ = journal.close(runner)
+	if _, claim_error := journal.claim(runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
+
+	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
+	launch_provider, launch_provider_error := strings.clone("launch-provider", app.setup.alloc)
+	launch_model, launch_model_error := strings.clone("launch-model", app.setup.alloc)
+	session_provider, session_provider_error := strings.clone("launch-provider", app.setup.session.allocator)
+	session_model, session_model_error := strings.clone("launch-model", app.setup.session.allocator)
+	session_effort, session_effort_error := strings.clone("low", app.setup.session.allocator)
+	if launch_provider_error != nil ||
+	   launch_model_error != nil ||
+	   session_provider_error != nil ||
+	   session_model_error != nil ||
+	   session_effort_error != nil {
+		testing.fail_now(t, "the launch selection could not be stored")
+	}
+	app.setup.provider_id = launch_provider
+	app.setup.model_id = launch_model
+	app.setup.session.provider_id = session_provider
+	app.setup.session.model_id = session_model
+	app.setup.session.effort = session_effort
+	refresh_status(&app)
+	testing.expect_value(t, app.run.snap.status.model_id, "launch-model")
+
+	journal.append_record(
+		runner,
+		{kind = .Selection_Applied, session = id, provider = "session-provider", model = "session-model"},
+		journal.Selection_Applied{version = 1, api = "openai_responses", provider = "session-provider", model = "session-model", effort = "high"},
+	)
+	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit the selection") }
+
+	if !testing.expect(t, app_client_service(&app, run_observer(&app)), "the selection is new") { return }
+	refresh_status(&app)
+	testing.expect_value(t, app.setup.provider_id, "session-provider")
+	testing.expect_value(t, app.setup.model_id, "session-model")
+	testing.expect_value(t, app.setup.session.provider_id, "session-provider")
+	testing.expect_value(t, app.setup.session.model_id, "session-model")
+	testing.expect_value(t, app.setup.session.effort, "high")
+	testing.expect_value(t, app.run.snap.status.provider_id, "session-provider")
+	testing.expect_value(t, app.run.snap.status.model_id, "session-model")
+	testing.expect_value(t, app.run.snap.status.effort, "high")
+}
+
 // The runner's process ends and this one stays a follower. It does not claim the session,
 // does not recover the open turn, and leaves the line it sent in the inbox.
 @(test)

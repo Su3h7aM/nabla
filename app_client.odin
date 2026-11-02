@@ -343,7 +343,57 @@ app_client_poll :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	app.setup.follow = follow.cursor
 	app.setup.session.last_estimate = follow.cursor.estimate
 	if follow.cursor.window > 0 { app.setup.session.capacity.window = follow.cursor.window }
-	return follow.cursor != before
+	changed := follow.cursor != before
+	if client_selection_adopt(app) { changed = true }
+	return changed
+}
+
+// client_selection_adopt copies the followed session's latest selection.applied into
+// the setup and the session the footer, /status, and the model menu read. The server
+// already installed that selection; this process only shows it. False means the
+// selection was unchanged or could not be read.
+@(require_results)
+client_selection_adopt :: proc(app: ^App) -> bool {
+	store := app.setup.follow_client.store
+	session := app.setup.follow_client.session
+	if store == nil || session == {} { return false }
+	record, found, read_error := journal.read_latest(store, {session = session, kinds = {.Selection_Applied}}, context.temp_allocator)
+	if read_error != nil || !found { return false }
+	defer journal.record_destroy(&record, context.temp_allocator)
+	applied: journal.Selection_Applied
+	if journal.payload_decode(record.data, &applied, context.temp_allocator) != nil { return false }
+	chat := &app.setup.session
+	if app.setup.provider_id == applied.provider &&
+	   app.setup.model_id == applied.model &&
+	   chat.provider_id == applied.provider &&
+	   chat.model_id == applied.model &&
+	   chat.effort == applied.effort {
+		return false
+	}
+	provider, provider_error := strings.clone(applied.provider, app.setup.alloc)
+	model, model_error := strings.clone(applied.model, app.setup.alloc)
+	chat_provider, chat_provider_error := strings.clone(applied.provider, chat.allocator)
+	chat_model, chat_model_error := strings.clone(applied.model, chat.allocator)
+	effort, effort_error := strings.clone(applied.effort, chat.allocator)
+	if provider_error != nil || model_error != nil || chat_provider_error != nil || chat_model_error != nil || effort_error != nil {
+		delete(provider, app.setup.alloc)
+		delete(model, app.setup.alloc)
+		delete(chat_provider, chat.allocator)
+		delete(chat_model, chat.allocator)
+		delete(effort, chat.allocator)
+		return false
+	}
+	delete(app.setup.provider_id, app.setup.alloc)
+	app.setup.provider_id = provider
+	delete(app.setup.model_id, app.setup.alloc)
+	app.setup.model_id = model
+	delete(chat.provider_id, chat.allocator)
+	chat.provider_id = chat_provider
+	delete(chat.model_id, chat.allocator)
+	chat.model_id = chat_model
+	delete(chat.effort, chat.allocator)
+	chat.effort = effort
+	return true
 }
 
 // app_client_refusals shows a command the server refused. The reason is the notice.
