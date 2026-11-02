@@ -74,19 +74,16 @@ test_prompt_text_renders_blocks_and_refuses_unsupported_content :: proc(t: ^test
 }
 
 // acp_tool_title and acp_tool_kind are what a client shows for a call: the tool and the
-// file or command it concerns, and what kind of work it is. Both read the harness's own
-// names and hints, so the cases are the tools this harness ships.
+// file or command it concerns, and what kind of work it is. The kinds are what the tools
+// this harness ships read as, and Other is the honest answer for anything else.
 @(test)
 test_tool_presentation_uses_the_tools_own_names_and_hints :: proc(t: ^testing.T) {
-	// An empty session has an empty registry, which is the case for a call replayed
-	// before the tool inventory is rebuilt.
-	chat: agent.Chat_Session
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_READ_NAME), acp.Tool_Kind.Read)
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_WRITE_NAME), acp.Tool_Kind.Edit)
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_EDIT_NAME), acp.Tool_Kind.Edit)
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_SHELL_NAME), acp.Tool_Kind.Execute)
-	testing.expect_value(t, acp_tool_kind(&chat, agent.TOOL_CODEMODE_NAME), acp.Tool_Kind.Execute)
-	testing.expect_value(t, acp_tool_kind(&chat, "some_mcp_tool"), acp.Tool_Kind.Other)
+	testing.expect_value(t, acp_tool_kind(agent.TOOL_READ_NAME), acp.Tool_Kind.Read)
+	testing.expect_value(t, acp_tool_kind(agent.TOOL_WRITE_NAME), acp.Tool_Kind.Edit)
+	testing.expect_value(t, acp_tool_kind(agent.TOOL_EDIT_NAME), acp.Tool_Kind.Edit)
+	testing.expect_value(t, acp_tool_kind(agent.TOOL_SHELL_NAME), acp.Tool_Kind.Execute)
+	testing.expect_value(t, acp_tool_kind(agent.TOOL_CODEMODE_NAME), acp.Tool_Kind.Execute)
+	testing.expect_value(t, acp_tool_kind("some_mcp_tool"), acp.Tool_Kind.Other)
 
 	testing.expect_value(t, acp_tool_title(agent.TOOL_READ_NAME, `{"path":"/tmp/example.odin"}`), "read /tmp/example.odin")
 	testing.expect_value(t, acp_tool_title(agent.TOOL_SHELL_NAME, `{"command":"ls -la"}`), "shell ls -la")

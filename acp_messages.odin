@@ -57,11 +57,8 @@ acp_serve :: proc(server: ^ACP_Server, input: io.Reader) -> bool {
 	// End of input is how a client closes the conversation; any other error means the
 	// stream is gone either way.
 	read_failed := bufio.scanner_error(&scanner) != nil
-	// A turn still running is stopped before the workers are joined: it settles as
-	// cancelled, so the record says the session was interrupted rather than guessing.
-	for session in server.sessions {
-		if session != nil { acp_cancel_session(session) }
-	}
+	// Closing the connection only detaches: the session servers keep running without
+	// it, so their turns are never cancelled here.
 	return !read_failed && !acp.writer_failed(&server.writer)
 }
 
@@ -363,7 +360,7 @@ acp_request_session_load :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		return
 	}
 	session_title, meta_prompt := acp_session_meta(params.meta)
-	acp_enqueue_open_session(server, envelope, true, "", params.session_id, meta_prompt, session_title, params.mcp_servers, true)
+	acp_enqueue_open_session(server, envelope, true, header[0].workspace, params.session_id, meta_prompt, session_title, params.mcp_servers, true)
 }
 
 acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
@@ -403,7 +400,7 @@ acp_request_session_resume :: proc(server: ^ACP_Server, envelope: ^acp.Envelope)
 		replay = true
 	}
 	session_title, meta_prompt := acp_session_meta(params.meta)
-	acp_enqueue_open_session(server, envelope, true, "", params.session_id, meta_prompt, session_title, params.mcp_servers, replay)
+	acp_enqueue_open_session(server, envelope, true, header[0].workspace, params.session_id, meta_prompt, session_title, params.mcp_servers, replay)
 }
 
 acp_request_session_list :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
@@ -556,7 +553,6 @@ acp_request_session_close :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) 
 		id      = id,
 		variant = ACP_Work_Close_Session{},
 	}
-	acp_cancel_session(session)
 	// Marking the session closing refuses every later request for it, and the worker runs
 	// the close after what is already queued.
 	if sync.mutex_guard(&server.table_mu) {
@@ -912,7 +908,7 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	name, _ := command_split(text)
 	command, found := command_find(name)
 	compact := found && command.id == .Compact
-	if !compact && session.app.setup.model_id == "" {
+	if !compact && session.model_id == "" {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "no model is selected; configure a provider in nabla's config.lua")
 		return
 	}
@@ -932,20 +928,6 @@ acp_request_prompt :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 		}
 	}
 	queued = true
-	if compact {
-		submitted, kept := acp_compact_submit(session, work)
-		if submitted {
-			if !kept { acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the compaction request could not be queued") }
-			return
-		}
-	}
-	if !compact && acp_is_v2(server) && len(attachments) == 0 {
-		steered, kept := acp_steer_submit(session, work)
-		if steered {
-			if !kept { acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the steering request could not be queued") }
-			return
-		}
-	}
 	if !acp_enqueue(session, work) {
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
 	}
@@ -1011,8 +993,8 @@ acp_request_set_model :: proc(server: ^ACP_Server, envelope: ^acp.Envelope) {
 	acp_request_model_change(server, envelope, session, .Set_Model, params.model_id)
 }
 
-// acp_request_model_change hands a copied raw model id to the owner of session; catalog
-// resolution stays on that owner and does not hold the reader in session work.
+// acp_request_model_change hands a copied raw model id to the worker of session, which
+// appends it as a command and answers when the server applies it.
 acp_request_model_change :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, session: ^ACP_Session, kind: ACP_Model_Kind, model_id: string) {
 	owned_model_id, model_error := strings.clone(model_id, server.alloc)
 	if model_error != nil {
@@ -1025,22 +1007,13 @@ acp_request_model_change :: proc(server: ^ACP_Server, envelope: ^acp.Envelope, s
 		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request id could not be allocated")
 		return
 	}
-	request := ACP_Model_Request {
-		active   = true,
-		kind     = kind,
-		id       = id,
-		model_id = owned_model_id,
+	work := ACP_Work {
+		id = id,
+		variant = ACP_Work_Set_Model{kind = kind, model_id = owned_model_id},
 	}
-	acp_session_touch(session)
-	acp_model_request_submit(session, request)
-}
-
-// acp_cancel_session asks the running turn of session to stop. A cancellation for a
-// session that is idle is ignored, which is what the protocol expects: a turn that
-// already ended has nothing to cancel.
-acp_cancel_session :: proc(session: ^ACP_Session) {
-	acp_model_cancel_signal(session)
-	if acp_session_has_work(session) { agent.turn_control_stop(&session.app.run.control) }
+	if !acp_enqueue(session, work) {
+		acp_reply_error(server, envelope, acp.ERROR_INTERNAL, "the request could not be queued")
+	}
 }
 
 // acp_enqueue hands one request to the worker of session. It owns work on both paths: on

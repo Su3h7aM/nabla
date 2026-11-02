@@ -14,10 +14,11 @@ import "nabla:agent"
 import "nabla:agent/journal"
 
 // The ACP connection holds what every session of it shares, and a table of the sessions
-// themselves. Each ACP_Session has exactly one owner, its worker thread: the worker holds
-// the session's journal, chat, Turn_Control and MCP runtime. The reader submits work and
-// steering through guarded queues. The reader thread alone creates, finds, and frees sessions, so a
-// session it found stays valid for the request it is handling.
+// themselves. Each ACP_Session is followed by its worker thread: the worker appends the
+// session's input and commands to the journal and polls what the session server commits.
+// The reader submits work through the guarded queue and never touches the journal. The
+// reader thread alone creates, finds, and frees sessions, so a session it found stays
+// valid for the request it is handling.
 
 // ACP_MAX_SESSIONS is how many sessions one connection runs at once. Opening one more
 // closes the least recently used idle session, and is refused when all are busy.
@@ -25,65 +26,70 @@ ACP_MAX_SESSIONS :: 8
 
 // ACP_Session is one conversation of a connection.
 //
-// Its App is a view over the connection's: app.setup shares the following fields by
-// shallow copy, borrows them from the connection's own setup, and never frees them:
-// harness_options, catalog, configured, journal_directory, lock_directory, run, and alloc.
-// The catalog is safe to share because an ACP connection never refreshes or replaces it.
-// owns_selection and shared_sessions stay false and run_open stays true: the connection
-// records run.started and run.finished once, so no session's journal does.
+// id, title, workspace, closing, worker_active, and last_used are guarded by
+// conn.table_mu: the reader finds a session by its id and the worker publishes them
+// after an open. A session opened from a stored id carries that id before it is open,
+// so a request for it queues behind the open.
 //
-// Everything else in app.setup is the session's own: store, session, workspace, the
-// resumed_* strings, provider_id, model_id, api, credential, mcp, and mcp_servers.
-// acp_session_make is the one place the shared fields are copied.
+// Everything else is the worker's: the journal it follows, the server handle it
+// started, the follow cursor it polls, and the selection it last saw applied. The
+// worker alone appends records and reads the cursor, so no lock guards them.
 ACP_Session :: struct {
 	conn:              ^ACP_Server,
-	app:               App,
-	// id, title, workspace, closing, owner_active, and last_used are guarded by conn.table_mu: the
-	// reader finds a session by its id and the owner publishes them after an open. A
-	// session opened from a stored id carries that id before it is open, so a request
-	// for it queues behind the open.
-	id:                string, // owned by conn.alloc
+	id:                string, // owned by conn.alloc; hex session id
 	title:             string, // owned; the client-supplied title
 	workspace:         string, // owned; copied for the session list
 	closing:           bool, // a close or eviction began; no new request may be queued
-	owner_active:      bool, // owner servicing a turn or a request, including across owner waits
+	worker_active:     bool, // worker servicing a request, including across waits
 	last_used:         u64, // conn.use_clock at the last open or request
-	// opened and released are the owner's: the session holds its conversation, and the
+	// opened and released are the worker's: the session holds its conversation, and the
 	// conversation has been given back.
 	opened:            bool,
 	released:          bool,
 	// retired is set atomically by the worker as its last decision, so the reader
 	// knows to reap the session.
 	retired:           bool,
-	mcp_servers_owned: [dynamic]agent.MCP_Server_Config, // owned active list when a client supplied servers
 	work:              ACP_Work_Chan,
 	worker:            ^thread.Thread,
 	worker_done:       sync.One_Shot_Event, // signaled by the worker as its last action
 	// queue_mu guards pending_work.
 	queue_mu:          sync.Mutex,
 	pending_work:      int,
-	// steer_mu guards turn_running and steering RPCs. It precedes the queue lock.
-	steer_mu:          sync.Mutex,
-	steer:             agent.Steer_Queue,
-	turn_running:      bool,
-	steer_requests:    [dynamic]ACP_Work,
-	compact_pending:   bool, // guarded by steer_mu; coalesced owner intent
-	compact_requests:  [dynamic]ACP_Work, // guarded by steer_mu; each RPC is answered
-	steer_after:       journal.Journal_Seq, // owner only
-	user_occurrences:  int, // owner only; stable live/replay user message ids
-	// model_mu guards only the single pending reader-to-owner handoff.
-	model_mu:          sync.Mutex,
-	model_request:     ACP_Model_Request,
-	model_cancel:      bool, // owner should settle all current model-selection RPCs
-	model_selection:   ACP_Model_Selection, // owner only
-	// message_seq numbers process-local fallback messages. The v2 live assistant id
-	// is derived from the durable turn and request instead, so replay can reproduce it.
+	// cancel_mu guards cancel_requested. The reader sets it; the worker appends the
+	// command, because only the worker touches the journal.
+	cancel_mu:         sync.Mutex,
+	cancel_requested:  bool,
+	// store follows the session another process runs. It is open from the first
+	// open to the release.
+	store:             ^journal.Journal,
+	follow:            Client_Follow,
+	server:            Client_Server,
+	session_id:        journal.Session_Id,
+	// provider_id, model_id, and effort are the serving identity the session last
+	// saw applied, owned by conn.alloc. They answer prompts and option listings
+	// without reading the journal.
+	provider_id:       string,
+	model_id:          string,
+	effort:            string,
+	// message_seq numbers process-local live message ids. Replay uses its own ids
+	// from the durable turn and request, so it can reproduce them.
 	message_seq:       u64,
 	active_message_id: string, // owned by conn.alloc; the v2 answer being streamed
+	// pending_text borrows the prompt the worker waits to see echoed. The echo is the
+	// user message the prompt's acceptance names, and accept_message carries its id,
+	// owned by conn.alloc. The two can never disagree.
+	pending_text:      string,
+	pending_accept:    bool,
+	accept_message:    string,
+	// tool_calls maps a journal call to the provider's id the announcement carried,
+	// owned by conn.alloc, so the result settles the call the client was shown. The
+	// follow observer reports every committed call exactly once as pending and exactly
+	// once as settled, so every result finds its announcement.
+	tool_calls:        map[journal.Call_Id]string,
 }
 
-// ACP_Server is the connection: the writer, the wire profile, the setup every session
-// shares, and the session table. The table's slots are written by the reader thread only.
+// ACP_Server is the connection: the writer, the wire surface the profile names, and the
+// session table. The table's slots are written by the reader thread only.
 ACP_Server :: struct {
 	// app.setup carries the shared catalog, configuration, directories, and run id, and
 	// the connection's own default selection in provider_id and model_id. It holds no
@@ -102,7 +108,7 @@ ACP_Server :: struct {
 	sessions:         [ACP_MAX_SESSIONS]^ACP_Session,
 	use_clock:        u64,
 	// worker_stuck and memory_leaked say a session could not be released: a worker thread
-	// that did not stop, or a tool worker that still borrows the session. Reader only.
+	// that did not stop. Reader only.
 	worker_stuck:     bool,
 	memory_leaked:    bool,
 }
@@ -184,7 +190,7 @@ acp_default_selection :: proc(conn: ^ACP_Server, selection: Applied_Selection, f
 acp_default_install :: proc(conn: ^ACP_Server, provider_id, model_id, effort: string) -> bool {
 	setup := &conn.app.setup
 	target, problem := selection_target_resolve(&conn.app, provider_id, model_id, setup.alloc)
-	defer if problem != "" { delete(problem, context.temp_allocator) }
+	defer if problem != "" { delete(problem, setup.alloc) }
 	if target.model_id == "" { return false }
 	defer agent.model_selection_destroy(&target, setup.alloc)
 	provider, provider_error := strings.clone(target.provider_id, setup.alloc)
@@ -203,12 +209,12 @@ acp_default_install :: proc(conn: ^ACP_Server, provider_id, model_id, effort: st
 }
 
 // acp_server_destroy stops and joins every session before draining the writer. False
-// means a worker or abandoned child still borrows the connection: the caller must retain
-// conn, its writer, and all shared setup allocations until process exit.
+// means a worker still borrows the connection: the caller must retain conn, its
+// writer, and all shared setup allocations until process exit. A closed connection
+// only detaches: the session servers keep running without it.
 acp_server_destroy :: proc(conn: ^ACP_Server, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	for session in conn.sessions {
 		if session == nil { continue }
-		acp_cancel_session(session)
 		chan.close(&session.work)
 	}
 	agent.owner_wake_signal()
@@ -225,13 +231,9 @@ acp_server_destroy :: proc(conn: ^ACP_Server, patience := SHUTDOWN_JOIN_PATIENCE
 		acp_session_shutdown(session)
 		acp_session_release(session)
 		conn.sessions[index] = nil
-		if session.app.setup.workers_abandoned {
-			conn.memory_leaked = true
-			continue
-		}
 		acp_session_free(session)
 	}
-	if conn.worker_stuck || conn.memory_leaked {
+	if conn.worker_stuck {
 		// Late worker callbacks can still enqueue frames, so the writer stays alive.
 		return false
 	}
@@ -244,10 +246,7 @@ acp_server_destroy :: proc(conn: ^ACP_Server, patience := SHUTDOWN_JOIN_PATIENCE
 
 // --- the table ---------------------------------------------------------------
 
-// acp_session_make allocates a session with its queue and the shared view of the
-// connection's setup, and starts nothing. preset_id is the id a stored session is opened
-// by, or empty for a new one. It is the only place a session copies the connection's
-// shared fields, and so the only place that changes if the setup is ever split.
+// acp_session_make allocates a session with its queue and starts nothing.
 @(require_results)
 acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP_Session, ok: bool) {
 	made, new_error := new(ACP_Session, conn.alloc)
@@ -266,24 +265,6 @@ acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP
 	made.conn = conn
 	made.id = id
 	made.work = channel
-	made.steer = agent.steer_queue_init(conn.alloc)
-	made.steer_requests.allocator = conn.alloc
-	made.compact_requests.allocator = conn.alloc
-	shared := &conn.app.setup
-	setup := &made.app.setup
-	setup.harness_options = shared.harness_options
-	setup.catalog = shared.catalog
-	setup.configured = shared.configured
-	setup.journal_directory = shared.journal_directory
-	setup.lock_directory = shared.lock_directory
-	setup.run = shared.run
-	setup.alloc = shared.alloc
-	setup.run_open = true
-	setup.owns_selection = false
-	setup.shared_sessions = false
-	setup.mcp_servers = conn.base_mcp_servers
-	made.app.run.alloc = conn.alloc
-	made.app.compact_on_switch = conn.app.compact_on_switch
 	return made, true
 }
 
@@ -292,19 +273,23 @@ acp_session_make :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP
 acp_session_free :: proc(session: ^ACP_Session) {
 	alloc := session.conn.alloc
 	if session.work != {} { chan.destroy(&session.work) }
-	agent.steer_queue_destroy(&session.steer)
-	delete(session.steer_requests)
-	delete(session.compact_requests)
 	delete(session.id, alloc)
 	delete(session.title, alloc)
 	delete(session.workspace, alloc)
+	delete(session.provider_id, alloc)
+	delete(session.model_id, alloc)
+	delete(session.effort, alloc)
+	delete(session.accept_message, alloc)
 	delete(session.active_message_id, alloc)
+	for _, provider_id in session.tool_calls { delete(provider_id, alloc) }
+	delete(session.tool_calls)
 	free(session, alloc)
 }
 
-// acp_session_create gives the connection a new session and starts its worker. A full table
-// closes the least recently used idle session to make room; with none idle the reason says
-// so. A session created from a stored id carries that id at once. Reader thread only.
+// acp_session_create gives the connection a new session and starts its worker. A full
+// table closes the least recently used idle session to make room; with none idle the
+// reason says so. A session created from a stored id carries that id at once. Reader
+// thread only.
 @(require_results)
 acp_session_create :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^ACP_Session, reason: string) {
 	acp_sessions_reap(conn)
@@ -340,7 +325,7 @@ acp_session_create :: proc(conn: ^ACP_Server, preset_id: string) -> (session: ^A
 		acp_session_free(made)
 		return nil, "this connection is running its maximum number of sessions and all of them are busy; wait for one to finish or close one"
 	}
-	// The evicted session gives its claim back before the new one can ask for it.
+	// The evicted session detaches before the new one can ask for its slot.
 	if victim != nil { acp_session_drop(conn, victim) }
 
 	worker := thread.create(acp_worker, name = "nabla-acp-worker")
@@ -374,27 +359,38 @@ acp_session_touch :: proc(session: ^ACP_Session) {
 	session.last_used = session.conn.use_clock
 }
 
-// acp_session_idle reports whether a session has no turn running and no request queued.
+// acp_session_idle reports whether a session has no request running and none queued.
 // Called with table_mu held.
 @(require_results)
 acp_session_idle :: proc(session: ^ACP_Session) -> bool {
-	return !session.owner_active && !acp_session_has_work(session) && !acp_model_owner_work_pending(session)
+	return !session.worker_active && !acp_session_has_work(session)
 }
 
-// acp_owner_service_begin reserves background servicing against reader eviction.
+// acp_session_is_closing reports whether the reader began closing the session.
 @(require_results)
-acp_owner_service_begin :: proc(session: ^ACP_Session) -> bool {
+acp_session_is_closing :: proc(session: ^ACP_Session) -> bool {
 	sync.mutex_guard(&session.conn.table_mu)
-	if session.closing { return false }
-	session.owner_active = true
-	return true
+	return session.closing
 }
 
-// acp_owner_service_end keeps unfinished owner-only service protected across waits.
-acp_owner_service_end :: proc(session: ^ACP_Session) {
-	active := acp_owner_service_pending(session)
-	sync.mutex_guard(&session.conn.table_mu)
-	session.owner_active = active
+// acp_cancel_session asks the running turn of session to stop. It only records the
+// intent; the worker appends the command, because only the worker touches the journal.
+// A cancellation for a session that is idle is ignored by the server, which is what the
+// protocol expects: a turn that already ended has nothing to cancel.
+acp_cancel_session :: proc(session: ^ACP_Session) {
+	if sync.mutex_guard(&session.cancel_mu) {
+		session.cancel_requested = true
+	}
+	agent.owner_wake_signal()
+}
+
+// acp_cancel_take claims a pending cancellation for the worker that appends it.
+@(require_results)
+acp_cancel_take :: proc(session: ^ACP_Session) -> bool {
+	sync.mutex_guard(&session.cancel_mu)
+	requested := session.cancel_requested
+	session.cancel_requested = false
+	return requested
 }
 
 // acp_session_retire is the worker's last decision: the session has nothing left to serve.
@@ -418,10 +414,10 @@ acp_sessions_reap :: proc(conn: ^ACP_Server) {
 }
 
 // acp_session_drop stops a session that is no longer in the table, joins its worker, and
-// frees it. A worker that does not stop, or a tool worker that still borrows the session,
-// leaves the session unfreed and is reported at teardown. Reader thread only.
+// frees it. A worker that does not stop leaves the session unfreed and is reported at
+// teardown. Only detaching: the session server keeps running without this connection.
+// Reader thread only.
 acp_session_drop :: proc(conn: ^ACP_Server, session: ^ACP_Session) {
-	acp_cancel_session(session)
 	chan.close(&session.work)
 	agent.owner_wake_signal()
 	if !join_retiring(session.worker, &session.worker_done) {
@@ -431,15 +427,11 @@ acp_session_drop :: proc(conn: ^ACP_Server, session: ^ACP_Session) {
 	session.worker = nil
 	acp_session_shutdown(session)
 	acp_session_release(session)
-	if session.app.setup.workers_abandoned {
-		conn.memory_leaked = true
-		return
-	}
 	acp_session_free(session)
 }
 
-// acp_session_shutdown answers what a session never ran: requests still queued, and a
-// model selection still pending. The worker has retired.
+// acp_session_shutdown answers what a session never ran: requests still queued. The
+// worker has retired.
 acp_session_shutdown :: proc(session: ^ACP_Session) {
 	alloc := session.conn.alloc
 	for {
@@ -448,66 +440,36 @@ acp_session_shutdown :: proc(session: ^ACP_Session) {
 		_ = acp.write_error(&session.conn.writer, queued.id, acp.ERROR_INVALID_REQUEST, "the session closed before the request could run")
 		acp_work_destroy(&queued, alloc)
 	}
-	acp_steer_cancel(session, "the session closed before the request could run")
-	acp_compact_cancel(session, "the session closed before the request could run")
-	request := acp_model_request_take(session)
-	if request.active {
-		_ = acp.write_error(
-			&session.conn.writer,
-			request.id,
-			acp.ERROR_INVALID_REQUEST,
-			"the ACP session is closing before the model selection could be applied",
-		)
-		acp_model_request_destroy(&request, alloc)
-	}
-	if session.model_selection.active {
-		acp_model_selection_error(
-			session,
-			&session.model_selection,
-			acp.ERROR_INVALID_REQUEST,
-			"the ACP session is closing before the model selection could be applied",
-		)
-	}
 }
 
-// acp_session_release gives back what the session's conversation holds: the chat, its
-// journal and claim, the MCP runtime, and the model's strings. It may run twice, once by a
-// close on the worker and once by whoever frees the session. The tool registry borrowed the
-// runtime's bindings, so the chat goes first and the MCP clients second.
+// acp_session_release gives back what the session holds: the follow, the server handle,
+// the journal, and the model's strings. It may run twice, once by a close on the worker
+// and once by whoever frees the session. A closed connection only detaches: the session
+// server keeps running without it.
 acp_session_release :: proc(session: ^ACP_Session) {
 	if session.released { return }
 	session.released = true
-	setup := &session.app.setup
-	agent.chat_session_destroy(&setup.session)
-	setup.workers_abandoned = setup.workers_abandoned || setup.session.workers_retained
-	if setup.workers_abandoned { return }
-	// A release failure is recorded rather than answered: the session is already
-	// destroyed, so the close stands either way.
-	if close_error := session_store_close(setup.store); close_error != nil {
-		fmt.eprintln("nabla: the session database could not be closed cleanly:", journal.error_text(close_error, context.temp_allocator))
+	client_follow_close(&session.follow)
+	client_server_close(&session.server)
+	if session.store != nil {
+		if close_error := session_store_close(session.store); close_error != nil {
+			fmt.eprintln("nabla: the session database could not be closed cleanly:", journal.error_text(close_error, context.temp_allocator))
+		}
+		session.store = nil
 	}
-	setup.store = nil
-	mcp_runtime_destroy(&setup.mcp)
-	agent.MCP_Server_Configs_Destroy(&session.mcp_servers_owned, session.conn.alloc)
-	setup.mcp_servers = session.conn.base_mcp_servers
-	snapshot_destroy(&session.app)
-	catalog_run_destroy(&session.app)
-	delete(setup.workspace, setup.alloc)
-	delete(setup.resumed_provider, setup.alloc)
-	delete(setup.resumed_model, setup.alloc)
-	delete(setup.resumed_effort, setup.alloc)
-	delete(setup.credential, setup.alloc)
-	delete(setup.provider_id, setup.alloc)
-	delete(setup.model_id, setup.alloc)
-	setup.workspace = ""
-	setup.resumed_provider = ""
-	setup.resumed_model = ""
-	setup.resumed_effort = ""
-	setup.credential = ""
-	setup.provider_id = ""
-	setup.model_id = ""
+	delete(session.provider_id, session.conn.alloc)
+	delete(session.model_id, session.conn.alloc)
+	delete(session.effort, session.conn.alloc)
+	session.provider_id = ""
+	session.model_id = ""
+	session.effort = ""
+	delete(session.accept_message, session.conn.alloc)
+	session.accept_message = ""
 	delete(session.active_message_id, session.conn.alloc)
 	session.active_message_id = ""
+	for _, provider_id in session.tool_calls { delete(provider_id, session.conn.alloc) }
+	delete(session.tool_calls)
+	session.tool_calls = nil
 	sync.mutex_guard(&session.conn.table_mu)
 	delete(session.id, session.conn.alloc)
 	session.id = ""

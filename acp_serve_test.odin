@@ -2,10 +2,10 @@
 #+private file
 package main
 
-import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
 import "core:io"
+import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strconv"
@@ -19,11 +19,10 @@ import "nabla:acp"
 import "nabla:agent"
 import "nabla:agent/journal"
 
-// The ACP frontend is driven the way a client drives it: a scripted provider behind a
-// socket, a client that writes one message and reads one answer at a time, and the run
-// living on its own thread in between. That is what the real thing is, so the test covers
-// the parts only a live conversation reaches: the reader answering while the worker runs a
-// turn, updates streaming out of the turn, and a loaded conversation replayed.
+// The ACP interface never runs a turn: its worker appends the session's input and
+// commands to the journal and polls what the session server commits. The tests below
+// drive that contract directly: committed journal records translated through the follow
+// observer, and one threaded prompt answered by the server steps the serve tests use.
 //
 // The suite also holds the frontend to its teardown. The test runner reports anything a
 // run did not release, so an unclosed store, an unjoined worker, or a leaked frame shows
@@ -35,20 +34,6 @@ import "nabla:agent/journal"
 // reads a brace as a directive, and these documents are full of them.
 
 ACP_TEST_BOUND :: 10 * time.Second
-
-@(test)
-test_acp_model_selection_does_not_mark_foreground_work_busy :: proc(t: ^testing.T) {
-	session: ACP_Session
-	session.model_request.active = true
-	testing.expect(t, !acp_session_has_work(&session), "a pending model RPC is not foreground work")
-	session.model_request = {}
-	session.model_selection.active = true
-	testing.expect(t, !acp_session_has_work(&session), "a model switch waiting for compaction is not foreground work")
-	session.model_selection = {}
-	acp_queue_add(&session)
-	testing.expect(t, acp_session_has_work(&session), "queued foreground work remains busy")
-	acp_queue_remove(&session)
-}
 
 @(test)
 test_request_params_decode_errors_use_json_rpc_internal_for_allocation :: proc(t: ^testing.T) {
@@ -75,165 +60,6 @@ test_acp_session_meta_reads_client_title_and_system_prompt_extensions :: proc(t:
 	testing.expect_value(t, prompt, "")
 }
 
-// --- messages on the wire ----------------------------------------------------
-
-// acp_test_end closes one message with the newline the framing requires.
-acp_test_end :: proc(builder: ^strings.Builder) {
-	strings.write_byte(builder, '\n')
-}
-
-acp_test_initialize_message :: proc(builder: ^strings.Builder, id: int) {
-	fmt.sbprint(builder, `{"jsonrpc":"2.0","id":`, id)
-	strings.write_string(builder, `,"method":"initialize","params":{"protocolVersion":1}}`)
-	acp_test_end(builder)
-}
-
-acp_test_new_session_message :: proc(builder: ^strings.Builder, id: int, cwd: string) {
-	fmt.sbprint(builder, `{"jsonrpc":"2.0","id":`, id)
-	strings.write_string(builder, `,"method":"session/new","params":{"cwd":"`)
-	strings.write_string(builder, cwd)
-	strings.write_string(builder, `","mcpServers":[]}}`)
-	acp_test_end(builder)
-}
-
-acp_test_load_session_message :: proc(builder: ^strings.Builder, id: int, session_id, cwd: string) {
-	fmt.sbprint(builder, `{"jsonrpc":"2.0","id":`, id)
-	strings.write_string(builder, `,"method":"session/load","params":{"sessionId":"`)
-	strings.write_string(builder, session_id)
-	strings.write_string(builder, `","cwd":"`)
-	strings.write_string(builder, cwd)
-	strings.write_string(builder, `","mcpServers":[]}}`)
-	acp_test_end(builder)
-}
-
-acp_test_prompt_message :: proc(builder: ^strings.Builder, id: int, session_id, text: string) {
-	fmt.sbprint(builder, `{"jsonrpc":"2.0","id":`, id)
-	strings.write_string(builder, `,"method":"session/prompt","params":{"sessionId":"`)
-	strings.write_string(builder, session_id)
-	strings.write_string(builder, `","prompt":[{"type":"text","text":"`)
-	strings.write_string(builder, text)
-	strings.write_string(builder, `"}]}}`)
-	acp_test_end(builder)
-}
-
-// acp_test_sse_body is one provider response body, from its event documents. It is built
-// in the test's scratch memory, because it is wrapped into a reply as soon as it exists.
-acp_test_sse_body :: proc(events: []string) -> string {
-	builder := strings.builder_make(context.temp_allocator)
-	for event in events {
-		strings.write_string(&builder, "data: ")
-		strings.write_string(&builder, event)
-		strings.write_string(&builder, "\n\n")
-	}
-	strings.write_string(&builder, "data: [DONE]\n\n")
-	return strings.to_string(builder)
-}
-
-// acp_test_stream_reply wraps a response body as the HTTP reply a provider sends.
-acp_test_stream_reply :: proc(body: string, allocator := context.allocator) -> string {
-	return fmt.aprintf("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: %d\r\n\r\n%s", len(body), body, allocator = allocator)
-}
-
-// --- a scripted provider -----------------------------------------------------
-
-// ACP_Test_Provider answers one canned HTTP response per connection, in order. It stands
-// in for a provider endpoint, so a turn runs for real: the harness sends requests, reads
-// streams, and records results exactly as it would against a server.
-ACP_Test_Provider :: struct {
-	listener:         net.TCP_Socket,
-	port:             int,
-	replies:          []string,
-	served:           int,
-	lock:             sync.Mutex,
-	failed:           bool,
-	thread:           ^thread.Thread,
-	first_reply_gate: ^sync.One_Shot_Event,
-	request_ready:    sync.Cond,
-}
-
-acp_test_provider_start :: proc(t: ^testing.T, provider: ^ACP_Test_Provider, replies: []string) -> bool {
-	provider.replies = replies
-	listener, listen_err := net.listen_tcp(net.Endpoint{address = net.IP4_Address{127, 0, 0, 1}, port = 0})
-	if listen_err != nil { return testing.expectf(t, false, "the provider socket could not be opened: %v", listen_err) }
-	provider.listener = listener
-	endpoint, endpoint_err := net.bound_endpoint(listener)
-	if endpoint_err != nil { return testing.expectf(t, false, "the provider address could not be read: %v", endpoint_err) }
-	provider.port = endpoint.port
-	provider.thread = thread.create(acp_test_provider_serve, name = "nabla-acp-test-provider")
-	if provider.thread == nil { return testing.expectf(t, false, "the provider thread could not be started") }
-	provider.thread.data = provider
-	thread.start(provider.thread)
-	return true
-}
-
-acp_test_provider_stop :: proc(t: ^testing.T, provider: ^ACP_Test_Provider) {
-	// Closing a listener in another thread does not wake a blocked Linux accept.
-	_ = net.shutdown(provider.listener, .Both)
-	net.close(provider.listener)
-	if provider.thread != nil {
-		thread.join(provider.thread)
-		thread.destroy(provider.thread)
-		provider.thread = nil
-	}
-	sync.mutex_lock(&provider.lock)
-	served, failed := provider.served, provider.failed
-	sync.mutex_unlock(&provider.lock)
-	testing.expectf(t, !failed, "the provider fixture failed")
-	testing.expectf(t, served == len(provider.replies), "the provider served %d of %d replies", served, len(provider.replies))
-}
-
-acp_test_provider_serve :: proc(thread_handle: ^thread.Thread) {
-	provider := cast(^ACP_Test_Provider)thread_handle.data
-	for index in 0 ..< len(provider.replies) {
-		client, _, accept_err := net.accept_tcp(provider.listener)
-		if accept_err != nil { return }
-		acp_test_provider_answer(provider, client, provider.replies[index])
-	}
-}
-
-// acp_test_provider_answer reads one whole request before answering it, so the harness is
-// never still writing when the connection closes.
-acp_test_provider_answer :: proc(provider: ^ACP_Test_Provider, client: net.TCP_Socket, reply: string) {
-	defer net.close(client)
-	_ = net.set_option(client, .Receive_Timeout, ACP_TEST_BOUND)
-
-	request := make([dynamic]u8, 0, 4096, context.temp_allocator)
-	defer delete(request)
-	header_end := -1
-	for header_end < 0 {
-		buffer: [4096]u8
-		read, read_err := net.recv_tcp(client, buffer[:])
-		if read_err != nil || read <= 0 {
-			sync.mutex_lock(&provider.lock)
-			provider.failed = true
-			sync.mutex_unlock(&provider.lock)
-			return
-		}
-		append(&request, ..buffer[:read])
-		header_end = strings.index(string(request[:]), "\r\n\r\n")
-	}
-	body_length := 0
-	headers := string(request[:header_end])
-	remaining := headers
-	for line in strings.split_lines_iterator(&remaining) {
-		if !strings.has_prefix(strings.to_lower(line), "content-length:") { continue }
-		if parsed, ok := strconv.parse_int(strings.trim_space(line[len("content-length:"):])); ok { body_length = parsed }
-	}
-	for len(request) < header_end + 4 + body_length {
-		buffer: [4096]u8
-		read, read_err := net.recv_tcp(client, buffer[:])
-		if read_err != nil || read <= 0 { break }
-		append(&request, ..buffer[:read])
-	}
-
-	sync.mutex_lock(&provider.lock)
-	provider.served += 1
-	first := provider.served == 1
-	sync.cond_broadcast(&provider.request_ready)
-	sync.mutex_unlock(&provider.lock)
-	if first && provider.first_reply_gate != nil { sync.one_shot_event_wait(provider.first_reply_gate) }
-	_, _ = net.send_tcp(client, transmute([]u8)reply)
-}
 
 // --- the client --------------------------------------------------------------
 
@@ -260,39 +86,6 @@ acp_test_client_output :: proc(client: ^ACP_Test_Client) -> io.Writer {
 	return io.Writer{data = client, procedure = acp_test_client_stream}
 }
 
-ACP_Test_Stalled_Output :: struct {
-	mutex:   sync.Mutex,
-	cond:    sync.Cond,
-	entered: bool,
-	release: bool,
-	output:  [dynamic]u8,
-}
-
-acp_test_stalled_output :: proc(state: ^ACP_Test_Stalled_Output) -> io.Writer {
-	return io.Writer {
-		data = state,
-		procedure = proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
-			state := cast(^ACP_Test_Stalled_Output)data
-			switch mode {
-			case .Write:
-				sync.mutex_lock(&state.mutex)
-				state.entered = true
-				sync.cond_broadcast(&state.cond)
-				for !state.release { sync.cond_wait(&state.cond, &state.mutex) }
-				append(&state.output, ..p)
-				sync.mutex_unlock(&state.mutex)
-				return i64(len(p)), nil
-			case .Query:
-				return i64(io.Stream_Mode_Set{.Write}), nil
-			case .Close, .Flush, .Destroy:
-				return 0, nil
-			case .Read, .Seek, .Read_At, .Write_At, .Size:
-				return 0, .Unsupported
-			}
-			return 0, .Unsupported
-		},
-	}
-}
 
 acp_test_writer_cleanup :: proc(writer: ^acp.Writer) {
 	_ = acp.writer_destroy(writer, time.Second)
@@ -375,10 +168,8 @@ test_acp_cancellation_routes_to_the_named_session :: proc(t: ^testing.T) {
 	second: ACP_Session
 	first.conn = &server
 	first.id = "session-first"
-	first.pending_work = 1
 	second.conn = &server
 	second.id = "session-second"
-	second.pending_work = 1
 	server.sessions[0] = &first
 	server.sessions[1] = &second
 	params, parse_error := json.parse_string(`{"sessionId":"session-second"}`, .JSON, true, context.allocator)
@@ -389,9 +180,14 @@ test_acp_cancellation_routes_to_the_named_session :: proc(t: ^testing.T) {
 		id     = i64(1),
 		params = params,
 	}
+	writer, writer_error := acp.writer_init({}, context.allocator)
+	if writer_error != nil { testing.fail_now(t, "the test writer could not be created") }
+	server.writer = writer
+	defer acp_test_writer_cleanup(&server.writer)
 	acp_request_cancel(&server, &envelope)
-	testing.expect(t, !agent.turn_control_stop_requested(&first.app.run.control), "cancellation stopped the wrong session")
-	testing.expect(t, agent.turn_control_stop_requested(&second.app.run.control), "cancellation did not stop the named session")
+	testing.expect(t, !acp_cancel_take(&first), "cancellation stopped the wrong session")
+	testing.expect(t, acp_cancel_take(&second), "cancellation did not stop the named session")
+	testing.expect(t, !acp_cancel_take(&second), "cancellation was not claimed exactly once")
 }
 
 @(test)
@@ -439,106 +235,28 @@ test_acp_idle_sessions_are_evicted_by_lru_and_can_be_loaded_again :: proc(t: ^te
 	testing.expect(t, acp_session_find(&server, "session-1") != nil, "the reloaded session was not published")
 }
 
-acp_test_stalled_output_wait :: proc(t: ^testing.T, state: ^ACP_Test_Stalled_Output) {
-	sync.mutex_lock(&state.mutex)
-	deadline := time.tick_add(time.tick_now(), time.Second)
-	for !state.entered {
-		remaining := time.tick_diff(time.tick_now(), deadline)
-		if remaining <= 0 { break }
-		_ = sync.cond_wait_with_timeout(&state.cond, &state.mutex, remaining)
-	}
-	entered := state.entered
-	sync.mutex_unlock(&state.mutex)
-	testing.expect(t, entered, "the writer did not enter its blocked output call")
-}
-
-ACP_Test_Cancel_Run :: struct {
-	server:   ^ACP_Server,
-	envelope: acp.Envelope,
-	mutex:    sync.Mutex,
-	cond:     sync.Cond,
-	done:     bool,
-}
-
-acp_test_cancel_request :: proc(thread_handle: ^thread.Thread) {
-	run := cast(^ACP_Test_Cancel_Run)thread_handle.data
-	acp_request_cancel(run.server, &run.envelope)
-	sync.mutex_lock(&run.mutex)
-	run.done = true
-	sync.cond_broadcast(&run.cond)
-	sync.mutex_unlock(&run.mutex)
-}
-
 @(test)
-test_acp_cancel_request_returns_while_stdout_is_stalled :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	state: ACP_Test_Stalled_Output
-	output, output_error := make([dynamic]u8, 0, 0, context.allocator)
-	if output_error != nil { testing.fail_now(t, "the test output buffer could not be created") }
-	state.output = output
-	defer delete(state.output)
+test_acp_cancel_records_intent_for_the_worker :: proc(t: ^testing.T) {
 	server: ACP_Server
-	server.alloc = context.allocator
 	session: ACP_Session
 	session.conn = &server
 	session.id = "session-stalled"
-	session.pending_work = 1
 	server.sessions[0] = &session
-	writer, writer_error := acp.writer_init(acp_test_stalled_output(&state), server.alloc)
-	if writer_error != nil { testing.fail_now(t, "the writer could not be created") }
-	server.writer = writer
-	defer acp_test_writer_cleanup(&server.writer)
-	defer {
-		sync.mutex_lock(&state.mutex)
-		state.release = true
-		sync.cond_broadcast(&state.cond)
-		sync.mutex_unlock(&state.mutex)
-	}
-
-	testing.expect(
-		t,
-		acp.write_notification(
-			&server.writer,
-			"session/update",
-			acp.Session_Notification(acp.Session_Info_Update) {
-				session_id = "session-stalled",
-				update = acp.Session_Info_Update{session_update = acp.UPDATE_SESSION_INFO, title = "stall"},
-			},
-		) ==
-		.None,
-	)
-	acp_test_stalled_output_wait(t, &state)
-
+	// A cancellation records the intent for the worker, which owns the journal: it
+	// touches no turn control and answers without waiting for anything.
+	acp_cancel_session(&session)
+	testing.expect(t, acp_cancel_take(&session), "the cancellation was not recorded")
+	testing.expect(t, !acp_cancel_take(&session), "the cancellation was not claimed exactly once")
 	params, parse_error := json.parse_string(`{"sessionId":"session-stalled"}`, .JSON, true, context.allocator)
 	if parse_error != nil { testing.fail_now(t, "the cancellation parameters could not be parsed") }
 	defer json.destroy_value(params, context.allocator)
-	run := ACP_Test_Cancel_Run {
-		server = &server,
-		envelope = acp.Envelope{kind = .Request, id = i64(1), params = params},
+	notification := acp.Envelope {
+		kind   = .Notification,
+		method = acp.METHOD_SESSION_CANCEL,
+		params = params,
 	}
-	cancel_thread := thread.create(acp_test_cancel_request, name = "nabla-test-acp-cancel")
-	if cancel_thread == nil { testing.fail_now(t, "the cancellation thread could not be created") }
-	cancel_thread.data = &run
-	thread.start(cancel_thread)
-	sync.mutex_lock(&run.mutex)
-	deadline := time.tick_add(time.tick_now(), 200 * time.Millisecond)
-	for !run.done {
-		remaining := time.tick_diff(time.tick_now(), deadline)
-		if remaining <= 0 { break }
-		_ = sync.cond_wait_with_timeout(&run.cond, &run.mutex, remaining)
-	}
-	completed_while_stalled := run.done
-	sync.mutex_unlock(&run.mutex)
-
-	sync.mutex_lock(&state.mutex)
-	state.release = true
-	sync.cond_broadcast(&state.cond)
-	sync.mutex_unlock(&state.mutex)
-	thread.join(cancel_thread)
-	thread.destroy(cancel_thread)
-	testing.expect(t, completed_while_stalled, "the cancellation handler waited for stdout")
-	testing.expect(t, agent.turn_control_stop_requested(&session.app.run.control), "the cancellation did not stop the turn")
-	testing.expect(t, acp.writer_destroy(&server.writer, time.Second), "the released writer should retire")
+	acp_handle_notification(&server, &notification)
+	testing.expect(t, acp_cancel_take(&session), "the cancel notification was not recorded")
 }
 
 // acp_test_client_stream serves both ends of the client: a read takes the next message the
@@ -639,43 +357,6 @@ acp_test_client_expect :: proc(t: ^testing.T, client: ^ACP_Test_Client, needle, 
 	return frame
 }
 
-// acp_test_client_carries holds one frame to every fact it must state. The frame is read
-// once and checked whole, because one update carries the call's id, kind, status, and
-// arguments together.
-acp_test_client_carries :: proc(t: ^testing.T, frame: string, facts: []string, what: string) -> bool {
-	for fact in facts {
-		if !testing.expectf(t, strings.contains(frame, fact), "%s: %s", what, frame) { return false }
-	}
-	return true
-}
-
-// acp_test_client_session_id reads the id a session/new answer names.
-acp_test_client_session_id_from_frame :: proc(t: ^testing.T, frame: string, allocator := context.allocator) -> string {
-	answer: struct {
-		result: struct {
-			session_id: string `json:"sessionId"`,
-		} `json:"result"`,
-	}
-	if unmarshal_err := json.unmarshal(transmute([]u8)frame, &answer, allocator = allocator); unmarshal_err != nil {
-		testing.expectf(t, false, "the session/new answer could not be read: %s", frame)
-		return ""
-	}
-	_, valid := journal.session_id_parse(answer.result.session_id)
-	if !testing.expectf(t, valid && len(answer.result.session_id) == journal.SESSION_ID_HEX_LENGTH, "session/new returned an invalid journal id: %s", frame) {
-		delete(answer.result.session_id, allocator)
-		return ""
-	}
-	return answer.result.session_id
-}
-
-acp_test_client_session_id :: proc(t: ^testing.T, client: ^ACP_Test_Client, allocator := context.allocator) -> string {
-	frame := acp_test_client_receive(client)
-	if frame == "" {
-		testing.expectf(t, false, "session/new: the run did not answer")
-		return ""
-	}
-	return acp_test_client_session_id_from_frame(t, frame, allocator = allocator)
-}
 
 // --- environment -------------------------------------------------------------
 
@@ -711,299 +392,6 @@ ACP_Test_Run :: struct {
 acp_test_run_thread :: proc(thread_handle: ^thread.Thread) {
 	run := cast(^ACP_Test_Run)thread_handle.data
 	run.served = acp_run(run.sources, {}, {}, acp_test_client_input(run.client), acp_test_client_output(run.client))
-}
-
-@(test)
-test_acp_serves_a_turn_and_replays_a_loaded_session :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	acp_test_session_protocol(t, .Independent)
-}
-
-@(test)
-test_acp_refused_claim_keeps_an_existing_session_usable :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	acp_test_session_protocol(t, .Refused_Claim)
-}
-
-@(test)
-test_acp_evicted_persisted_session_replays_and_accepts_another_prompt :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	acp_test_session_protocol(t, .Persisted_Eviction)
-}
-
-ACP_Test_Session_Scenario :: enum {
-	Independent,
-	Refused_Claim,
-	Persisted_Eviction,
-}
-
-acp_test_session_protocol :: proc(t: ^testing.T, scenario: ACP_Test_Session_Scenario) {
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(workspace)
-		delete(workspace, context.allocator)
-	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	// The catalog cache is pointed at the state directory too: a run must never read or
-	// write the user's own cache.
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-
-	note := fmt.aprintf("%s/note.txt", workspace, allocator = context.allocator)
-	defer delete(note, context.allocator)
-	if write_err := os.write_entire_file(note, "the file the tool reads\n"); write_err != nil {
-		testing.expectf(t, false, "the note could not be written: %v", write_err)
-		return
-	}
-
-	// The provider answers the first request with a tool call for the note, and the second
-	// with the answer the turn ends on. The call's arguments are a JSON document inside a
-	// JSON string, so the encoder writes them.
-	arguments, arguments_err := json.marshal(struct {
-			path: string `json:"path"`,
-		}{path = note}, allocator = context.temp_allocator)
-	if arguments_err != nil {
-		testing.expectf(t, false, "the tool arguments could not be built: %v", arguments_err)
-		return
-	}
-	quoted_arguments, quoted_err := json.marshal(string(arguments), allocator = context.temp_allocator)
-	if quoted_err != nil {
-		testing.expectf(t, false, "the tool arguments could not be quoted: %v", quoted_err)
-		return
-	}
-	call_event := strings.builder_make(context.temp_allocator)
-	strings.write_string(&call_event, `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":`)
-	strings.write_string(&call_event, string(quoted_arguments))
-	strings.write_string(&call_event, `}}]},"finish_reason":null}]}`)
-	replies := []string {
-		acp_test_stream_reply(acp_test_sse_body({strings.to_string(call_event), `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`})),
-		acp_test_stream_reply(
-			acp_test_sse_body(
-				{`{"choices":[{"delta":{"content":"the note says so"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
-			),
-		),
-		acp_test_stream_reply(
-			acp_test_sse_body(
-				{
-					`{"choices":[{"delta":{"content":"the second session answered"},"finish_reason":null}]}`,
-					`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
-				},
-			),
-		),
-	}
-	defer for reply in replies { delete(reply, context.allocator) }
-
-	provider: ACP_Test_Provider
-	if !acp_test_provider_start(t, &provider, replies) { return }
-	defer acp_test_provider_stop(t, &provider)
-
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id                = "testmodel",
-		context_window    = 100000,
-		max_output_tokens = 4096,
-		tools             = true,
-	}
-	sources[0] = {
-		id       = "testprovider",
-		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-	defer delete(sources[0].base_url.?, context.allocator)
-
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources,
-	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-test-run")
-	if run_thread == nil {
-		testing.expectf(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		// Hanging up ends the run, and joining it releases everything the run owns. It runs
-		// first among the cleanups, so the client's own buffers outlive the run that reads
-		// them, and the teardown is checked on a failing path too.
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
-
-	// initialize: the answer is the agent's own protocol version, and one message carries
-	// everything the client learns from it.
-	handshake := strings.builder_make(context.temp_allocator)
-	acp_test_initialize_message(&handshake, 1)
-	acp_test_client_send(&client, strings.to_string(handshake))
-	hello := acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered")
-	if hello == "" { return }
-	testing.expectf(t, strings.contains(hello, `"loadSession":true`), "initialize did not announce loadSession: %s", hello)
-	testing.expectf(t, strings.contains(hello, `"sessionCapabilities":{"list":{}}`), "initialize did not announce session/list: %s", hello)
-	testing.expectf(t, strings.contains(hello, `"embeddedContext":true`), "initialize did not announce embedded context: %s", hello)
-	listing := strings.builder_make(context.temp_allocator)
-	strings.write_string(&listing, `{"jsonrpc":"2.0","id":6,"method":"session/list","params":{}}`)
-	strings.write_byte(&listing, '\n')
-	acp_test_client_send(&client, strings.to_string(listing))
-	if acp_test_client_expect(t, &client, `"sessions":[]`, "v1 session/list was not answered") == "" { return }
-
-	// session/new: the client gets the id it will name from then on, with the model
-	// selector it may switch.
-	opening := strings.builder_make(context.temp_allocator)
-	acp_test_new_session_message(&opening, 2, workspace)
-	acp_test_client_send(&client, strings.to_string(opening))
-	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
-	if opened == "" { return }
-	if !acp_test_client_carries(
-		t,
-		opened,
-		{`"configOptions"`, `"value":"testprovider/testmodel"`, `"currentValue":"testprovider/testmodel"`},
-		"the session answer",
-	) { return }
-	session_id := acp_test_client_session_id_from_frame(t, opened)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-
-	// session/prompt: every request the turn makes reports what it used, so the frame order
-	// is the context meter, the call announced, the call settled with the file's text, the
-	// model's answer, and the answer to the prompt.
-	prompting := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&prompting, 3, session_id, "read the note")
-	acp_test_client_send(&client, strings.to_string(prompting))
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the request did not report its usage") == "" { return }
-	announced := acp_test_client_expect(t, &client, `"sessionUpdate":"tool_call"`, "the call was not announced")
-	if announced == "" { return }
-	if !acp_test_client_carries(t, announced, {`"toolCallId":"call_1"`, `"kind":"read"`, `"status":"pending"`, note}, "the announcement") { return }
-	settled := acp_test_client_expect(t, &client, `"sessionUpdate":"tool_call_update"`, "the call was not settled")
-	if settled == "" { return }
-	if !acp_test_client_carries(t, settled, {`"toolCallId":"call_1"`, `"status":"completed"`, "the file the tool reads"}, "the settle") { return }
-	if acp_test_client_expect(t, &client, "the note says so", "the model's answer did not reach the client") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the second request did not report its usage") == "" { return }
-	if acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the turn was not answered") == "" { return }
-
-	// session/load: the conversation the turn left behind replays before the load is
-	// answered. A session is stored once it has a conversation, so this is the first point
-	// at which the id names something a client could come back to.
-	reloading := strings.builder_make(context.temp_allocator)
-	acp_test_load_session_message(&reloading, 4, session_id, workspace)
-	acp_test_client_send(&client, strings.to_string(reloading))
-	replayed_user := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message_chunk"`, "the conversation did not replay the user's message")
-	if replayed_user == "" { return }
-	if !acp_test_client_carries(t, replayed_user, {"read the note"}, "the replayed message") { return }
-	replayed_call := acp_test_client_expect(t, &client, `"sessionUpdate":"tool_call"`, "the conversation did not replay the tool call")
-	if replayed_call == "" { return }
-	if !acp_test_client_carries(t, replayed_call, {`"toolCallId":"call_1"`, `"status":"completed"`, "the file the tool reads"}, "the replayed call") { return }
-	if acp_test_client_expect(t, &client, "the note says so", "the conversation did not replay the answer") == "" { return }
-	if acp_test_client_expect(t, &client, `"id":4,"result":{}`, "session/load was not answered") == "" { return }
-
-	// session/load of a name the store does not hold is refused rather than answered with
-	// a fresh session the client did not ask for.
-	missing := strings.builder_make(context.temp_allocator)
-	acp_test_load_session_message(&missing, 5, "00000000000000000000000000000000", workspace)
-	acp_test_client_send(&client, strings.to_string(missing))
-	if acp_test_client_expect(t, &client, `"code":-32602`, "loading an unknown session was not refused") == "" { return }
-
-	if scenario == .Refused_Claim {
-		directory, directory_error := agent.xdg_directory(.State, context.allocator)
-		if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
-		defer delete(directory, context.allocator)
-		locks, _, locks_error := agent.session_lock_directory(context.allocator)
-		if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
-		defer delete(locks, context.allocator)
-		other, other_open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Write, context.allocator)
-		if !testing.expect_value(t, other_open_error, nil) { return }
-		defer _ = journal.close(other)
-		target, create_error := journal.create_session(other, {workspace = workspace})
-		if !testing.expect_value(t, create_error, nil) { return }
-		_, commit_error := journal.commit(other)
-		if !testing.expect_value(t, commit_error, nil) { return }
-		refused := strings.builder_make(context.temp_allocator)
-		target_text: [32]u8
-		acp_test_load_session_message(&refused, 20, journal.session_id_to_hex(target, target_text[:]), workspace)
-		acp_test_client_send(&client, strings.to_string(refused))
-		refusal := acp_test_client_expect(t, &client, `"id":20,"error":`, "loading a claimed session was not refused")
-		if refusal == "" { return }
-		if !testing.expect(t, strings.contains(refusal, `"code":-32602`), "the claim refusal did not use invalid parameters") { return }
-	}
-	if scenario == .Persisted_Eviction {
-		for i in 0 ..< ACP_MAX_SESSIONS {
-			opening_idle := strings.builder_make(context.temp_allocator)
-			acp_test_new_session_message(&opening_idle, 10 + i, workspace)
-			acp_test_client_send(&client, strings.to_string(opening_idle))
-			if acp_test_client_expect(t, &client, fmt.tprintf(`"id":%d,"result":`, 10 + i), "an idle session did not open") == "" { return }
-		}
-		unknown := strings.builder_make(context.temp_allocator)
-		acp_test_prompt_message(&unknown, 20, session_id, "the evicted id must be unknown")
-		acp_test_client_send(&client, strings.to_string(unknown))
-		if acp_test_client_expect(t, &client, `"id":20,"error":`, "the evicted session id was still routed") == "" { return }
-		reload_evicted := strings.builder_make(context.temp_allocator)
-		acp_test_load_session_message(&reload_evicted, 21, session_id, workspace)
-		acp_test_client_send(&client, strings.to_string(reload_evicted))
-		replayed := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message_chunk"`, "the evicted session did not replay its history")
-		if !acp_test_client_carries(t, replayed, {session_id, "read the note"}, "the evicted session replay") { return }
-		if acp_test_client_expect(t, &client, `"sessionUpdate":"tool_call"`, "the evicted session did not replay its completed call") == "" { return }
-		if acp_test_client_expect(t, &client, "the note says so", "the evicted session did not replay its answer") == "" { return }
-		if acp_test_client_expect(t, &client, `"id":21,"result":{}`, "the evicted session did not finish loading") == "" { return }
-	}
-	if scenario != .Independent {
-		still_usable := strings.builder_make(context.temp_allocator)
-		acp_test_prompt_message(&still_usable, 22, session_id, "answer after the session lifecycle change")
-		acp_test_client_send(&client, strings.to_string(still_usable))
-		answer := acp_test_client_expect(t, &client, "the second session answered", "the earlier session could not answer another prompt")
-		if !acp_test_client_carries(t, answer, {session_id}, "the surviving session answer") { return }
-		if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the surviving session did not report usage") == "" { return }
-		if acp_test_client_expect(t, &client, `"id":22,"result":`, "the surviving session prompt was not answered") == "" { return }
-		return
-	}
-
-	second_opening := strings.builder_make(context.temp_allocator)
-	acp_test_new_session_message(&second_opening, 7, workspace)
-	acp_test_client_send(&client, strings.to_string(second_opening))
-	second_opened := acp_test_client_expect(t, &client, `"sessionId"`, "the second session was not opened")
-	if second_opened == "" { return }
-	second_session_id := acp_test_client_session_id_from_frame(t, second_opened)
-	if second_session_id == "" { return }
-	defer delete(second_session_id, context.allocator)
-	if !testing.expect(t, second_session_id != session_id, "independent opens returned the same session id") { return }
-
-	second_prompt := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&second_prompt, 8, second_session_id, "answer from the second session")
-	acp_test_client_send(&client, strings.to_string(second_prompt))
-	second_answer := acp_test_client_expect(t, &client, "the second session answered", "the second session prompt was routed incorrectly")
-	if second_answer == "" { return }
-	if !strings.contains(second_answer, second_session_id) {
-		testing.expectf(t, false, "the second session answer named the wrong session: %s", second_answer)
-		return
-	}
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the second session did not report usage") == "" { return }
-	second_result := acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the second session prompt was not answered")
-	if second_result == "" { return }
-	testing.expectf(t, strings.contains(second_result, `"id":8`), "the second session prompt response used the wrong request id: %s", second_result)
 }
 
 @(test)
@@ -1104,324 +492,9 @@ test_acp_v2_negotiates_and_exposes_the_session_surface :: proc(t: ^testing.T) {
 	strings.write_string(&closed_listing, `{"jsonrpc":"2.0","id":5,"method":"session/list","params":{}}`)
 	strings.write_byte(&closed_listing, '\n')
 	acp_test_client_send(&client, strings.to_string(closed_listing))
-	closed_frame := acp_test_client_expect(t, &client, `"sessions":[]`, "v2 session/list after close was not answered")
+	closed_frame := acp_test_client_expect(t, &client, `"sessions"`, "v2 session/list after close was not answered")
 	if closed_frame == "" { return }
-	testing.expectf(t, !strings.contains(closed_frame, session_id), "v2 session/list retained an unprompted session: %s", closed_frame)
-}
-
-@(test)
-test_acp_v2_prompt_reports_insertion_state_and_completion :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-prompt-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(workspace)
-		delete(workspace, context.allocator)
-	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-
-	replies := []string {
-		acp_test_stream_reply(
-			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
-		),
-		acp_test_stream_reply(
-			acp_test_sse_body(
-				{
-					`{"choices":[{"delta":{"content":"partial answer"},"finish_reason":null}]}`,
-					`{"error":{"code":"insufficient_quota","message":"provider failure after partial answer"}}`,
-				},
-			),
-		),
-	}
-	defer for reply in replies { delete(reply, context.allocator) }
-	provider: ACP_Test_Provider
-	if !acp_test_provider_start(t, &provider, replies) { return }
-	defer acp_test_provider_stop(t, &provider)
-
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id                = "v2model",
-		context_window    = 100000,
-		max_output_tokens = 4096,
-		tools             = true,
-	}
-	sources[0] = {
-		id       = "v2provider",
-		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-	defer delete(sources[0].base_url.?, context.allocator)
-
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources,
-	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-prompt-run")
-	if run_thread == nil {
-		testing.expect(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
-
-	handshake := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(
-		&handshake,
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
-	)
-	strings.write_byte(&handshake, '\n')
-	acp_test_client_send(&client, strings.to_string(handshake))
-	v2_hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
-	if v2_hello == "" { return }
-	testing.expectf(t, strings.contains(v2_hello, `"image":{}`), "v2 initialize did not announce image prompts: %s", v2_hello)
-
-	opening := strings.builder_make(context.temp_allocator)
-	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
-	strings.write_string(&opening, workspace)
-	strings.write_string(&opening, `","mcpServers":[]}}`)
-	strings.write_byte(&opening, '\n')
-	acp_test_client_send(&client, strings.to_string(opening))
-	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
-	if opening_frame == "" { return }
-	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2provider/v2model"`) {
-		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
-		return
-	}
-	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-
-	prompting := strings.builder_make(context.temp_allocator)
-	strings.write_string(&prompting, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"`)
-	strings.write_string(&prompting, session_id)
-	strings.write_string(&prompting, `","prompt":[{"type":"text","text":"say hello"}]}}`)
-	strings.write_byte(&prompting, '\n')
-	acp_test_client_send(&client, strings.to_string(prompting))
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "v2 did not acknowledge the user message") == "" { return }
-	if acp_test_client_expect(t, &client, `"result":{"messageId":"msg-user-1-1"}`, "v2 did not return the inserted message id") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"state_update","state":"running"`, "v2 did not report running state") == "" { return }
-	agent_frame := acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "v2 did not stream the agent message")
-	if agent_frame == "" { return }
-	if !strings.contains(agent_frame, "v2 answer") {
-		testing.expectf(t, false, "v2 did not deliver the model text: %s", agent_frame)
-		return
-	}
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "v2 did not report usage") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"`, "v2 did not report completion") ==
-	   "" { return }
-
-	resuming := strings.builder_make(context.temp_allocator)
-	strings.write_string(&resuming, `{"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":"`)
-	strings.write_string(&resuming, session_id)
-	strings.write_string(&resuming, `","cwd":"`)
-	strings.write_string(&resuming, workspace)
-	strings.write_string(&resuming, `","mcpServers":[],"replayFrom":{"type":"start"}}}`)
-	strings.write_byte(&resuming, '\n')
-	acp_test_client_send(&client, strings.to_string(resuming))
-	replayed_user := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "v2 replay did not include the user message")
-	if replayed_user == "" || !strings.contains(replayed_user, `"messageId":"msg-user-1-1"`) {
-		testing.expectf(t, false, "v2 replay changed the user message id: %s", replayed_user)
-		return
-	}
-	replayed_assistant := acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message"`, "v2 replay did not include the assistant message")
-	if replayed_assistant == "" || !strings.contains(replayed_assistant, `"messageId":"msg-assistant-1-1"`) {
-		testing.expectf(t, false, "v2 replay changed the assistant message id: %s", replayed_assistant)
-		return
-	}
-	if acp_test_client_expect(t, &client, `"id":4,"result"`, "v2 resume did not answer after replay") == "" { return }
-
-	plain_resume := strings.builder_make(context.temp_allocator)
-	strings.write_string(&plain_resume, `{"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":"`)
-	strings.write_string(&plain_resume, session_id)
-	strings.write_string(&plain_resume, `","cwd":"`)
-	strings.write_string(&plain_resume, workspace)
-	strings.write_string(&plain_resume, `","mcpServers":[]}}`)
-	strings.write_byte(&plain_resume, '\n')
-	acp_test_client_send(&client, strings.to_string(plain_resume))
-	if acp_test_client_expect(t, &client, `"id":5,"result"`, "v2 plain resume did not answer") == "" { return }
-	failing_prompt := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&failing_prompt, 6, session_id, "answer before failing")
-	acp_test_client_send(&client, strings.to_string(failing_prompt))
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "v2 did not insert the failing prompt") == "" { return }
-	if acp_test_client_expect(t, &client, `"id":6,"result":{"messageId":`, "v2 did not accept the failing prompt") == "" { return }
-	if acp_test_client_expect(t, &client, `"state":"running"`, "v2 did not start the failing turn") == "" { return }
-	partial_frame := acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "v2 did not stream the partial answer")
-	if partial_frame == "" { return }
-	testing.expect(t, strings.contains(partial_frame, `"text":"partial answer"`))
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the failed request did not report usage") == "" { return }
-	failure_frame := acp_test_client_expect(
-		t,
-		&client,
-		`"sessionUpdate":"state_update","state":"idle","stopReason":"error"`,
-		"v2 did not report the failed turn",
-	)
-	if failure_frame == "" { return }
-	testing.expectf(t, strings.contains(failure_frame, `"error":{"code":-32603,"message":`), "v2 did not report an internal error: %s", failure_frame)
-	testing.expectf(t, strings.contains(failure_frame, "provider failure after partial answer"), "v2 omitted the failure text: %s", failure_frame)
-	testing.expectf(t, !strings.contains(failure_frame, `"data"`), "v2 sent absent error data: %s", failure_frame)
-}
-
-// A prompt with an image block reaches the session as a user message carrying one PNG attachment, whatever mimeType said.
-@(test)
-test_acp_prompt_records_an_image_block_as_an_attachment :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-image-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(workspace)
-		delete(workspace, context.allocator)
-	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-image-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-
-	replies := []string {
-		acp_test_stream_reply(
-			acp_test_sse_body({`{"choices":[{"delta":{"content":"seen"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
-		),
-	}
-	defer for reply in replies { delete(reply, context.allocator) }
-	provider: ACP_Test_Provider
-	if !acp_test_provider_start(t, &provider, replies) { return }
-	defer acp_test_provider_stop(t, &provider)
-
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id                = "imagemodel",
-		context_window    = 100000,
-		max_output_tokens = 4096,
-		tools             = true,
-	}
-	sources[0] = {
-		id       = "imageprovider",
-		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-	defer delete(sources[0].base_url.?, context.allocator)
-
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources,
-	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-image-run")
-	if run_thread == nil {
-		testing.expect(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
-
-	handshake := strings.builder_make(context.temp_allocator)
-	acp_test_initialize_message(&handshake, 1)
-	acp_test_client_send(&client, strings.to_string(handshake))
-	hello := acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered")
-	if hello == "" { return }
-	testing.expectf(t, strings.contains(hello, `"image":true`), "initialize did not announce image prompts: %s", hello)
-
-	opening := strings.builder_make(context.temp_allocator)
-	acp_test_new_session_message(&opening, 2, workspace)
-	acp_test_client_send(&client, strings.to_string(opening))
-	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
-	if opened == "" { return }
-	session_id := acp_test_client_session_id_from_frame(t, opened)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-
-	png := transmute([]u8)string("\x89PNG\r\n\x1a\nnot a real image")
-	encoded, encode_error := base64.encode(png, allocator = context.temp_allocator)
-	if !testing.expect_value(t, encode_error, nil) { return }
-	prompting := strings.builder_make(context.temp_allocator)
-	strings.write_string(&prompting, `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"`)
-	strings.write_string(&prompting, session_id)
-	strings.write_string(&prompting, `","prompt":[{"type":"text","text":"what is this"},{"type":"image","mimeType":"image/jpeg","data":"`)
-	strings.write_string(&prompting, encoded)
-	strings.write_string(&prompting, `"}]}}`)
-	acp_test_end(&prompting)
-	acp_test_client_send(&client, strings.to_string(prompting))
-	if acp_test_client_expect(t, &client, "seen", "the model's answer did not reach the client") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the request did not report its usage") == "" { return }
-	if acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the image prompt was not answered") == "" { return }
-
-	directory, directory_error := agent.xdg_directory(.State, context.allocator)
-	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
-	defer delete(directory, context.allocator)
-	locks, _, locks_error := agent.session_lock_directory(context.allocator)
-	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
-	defer delete(locks, context.allocator)
-	reader, reader_open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
-	if !testing.expect_value(t, reader_open_error, nil) { return }
-	defer _ = journal.close(reader)
-	session, session_ok := journal.session_id_parse(session_id)
-	if !testing.expect(t, session_ok, "the session id is not a journal id") { return }
-	node, found, read_error := journal.read_last_node(reader, session, .User, context.temp_allocator)
-	if !testing.expect_value(t, read_error, nil) { return }
-	if !testing.expect(t, found, "the turn left no user node") { return }
-	payload, has_payload := node.payload.?
-	user, is_user := payload.(journal.User)
-	if !testing.expect(t, has_payload && is_user, "the user node has a typed payload") { return }
-	if !testing.expect_value(t, len(user.attachments), 1) { return }
-	testing.expect_value(t, user.attachments[0].media_type, "image/png")
-	testing.expect_value(t, string(node.body), "what is this")
+	testing.expectf(t, strings.contains(closed_frame, session_id), "v2 session/list lost the detached session: %s", closed_frame)
 }
 
 @(test)
@@ -1540,305 +613,8 @@ test_acp_v2_version_with_v1_fields_uses_the_v1_wire_profile_and_a_malformed_v1_r
 	acp_test_client_expect(t, &client, `"id":10,"error":{"code":-32601`, "an extension request was not answered as not found")
 }
 
-acp_test_model_change_message :: proc(builder: ^strings.Builder, id: int, session_id, value: string, kind: ACP_Model_Kind) {
-	fmt.sbprint(builder, `{"jsonrpc":"2.0","id":`, id)
-	if kind == .Set_Model {
-		strings.write_string(builder, `,"method":"session/set_model","params":{"sessionId":"`)
-	} else {
-		strings.write_string(builder, `,"method":"session/set_config_option","params":{"sessionId":"`)
-	}
-	strings.write_string(builder, session_id)
-	if kind == .Set_Model {
-		strings.write_string(builder, `","modelId":"`)
-	} else {
-		strings.write_string(builder, `","configId":"model","type":"id","value":"`)
-	}
-	strings.write_string(builder, value)
-	strings.write_string(builder, `"}}`)
-	acp_test_end(builder)
-}
-
 @(test)
-test_acp_provider_qualified_model_values_select_the_named_provider :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	for profile in ([]ACP_Wire_Profile{.V1, .V2}) { acp_test_qualified_model_selection(t, profile) }
-}
-
-acp_test_qualified_model_selection :: proc(t: ^testing.T, profile: ACP_Wire_Profile) {
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-model-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(workspace)
-		delete(workspace, context.allocator)
-	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-model-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-	replies := []string {
-		acp_test_stream_reply(
-			acp_test_sse_body(
-				{`{"choices":[{"delta":{"content":"initial answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
-			),
-		),
-	}
-	defer for reply in replies { delete(reply, context.allocator) }
-	provider: ACP_Test_Provider
-	if !acp_test_provider_start(t, &provider, replies) { return }
-	defer acp_test_provider_stop(t, &provider)
-	endpoint := fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator)
-	defer delete(endpoint, context.allocator)
-	models := [1]agent.Catalog_Model_Source{{id = "vendor/shared", display_name = "Shared Model", context_window = 100000, tools = true}}
-	sources := [2]agent.Catalog_Provider_Source {
-		{id = "buzzprovider", base_url = endpoint, api = "openai_chat_completions", api_key = "test-key", models = models[:]},
-		{id = "otherprovider", base_url = endpoint, api = "openai_chat_completions", api_key = "test-key", models = models[:]},
-	}
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources[:],
-	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-model-run")
-	if run_thread == nil {
-		testing.expect(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
-
-	handshake := strings.builder_make(context.temp_allocator)
-	if profile == .V1 {
-		acp_test_initialize_message(&handshake, 1)
-	} else {
-		strings.write_string(
-			&handshake,
-			`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
-		)
-		acp_test_end(&handshake)
-	}
-	acp_test_client_send(&client, strings.to_string(handshake))
-	if acp_test_client_expect(t, &client, `"result"`, "initialize was not answered") == "" { return }
-	opening := strings.builder_make(context.temp_allocator)
-	acp_test_new_session_message(&opening, 2, workspace)
-	acp_test_client_send(&client, strings.to_string(opening))
-	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
-	if opened == "" { return }
-	if !acp_test_client_carries(
-		t,
-		opened,
-		{
-			`"currentValue":"buzzprovider/vendor/shared"`,
-			`"name":"Shared Model","value":"buzzprovider/vendor/shared"`,
-			`"name":"Shared Model","value":"otherprovider/vendor/shared"`,
-		},
-		"the qualified model option",
-	) { return }
-	if profile == .V1 &&
-	   !acp_test_client_carries(
-			   t,
-			   opened,
-			   {`"currentModelId":"buzzprovider/vendor/shared"`, `"modelId":"otherprovider/vendor/shared","name":"Shared Model"`},
-			   "the qualified V1 model list",
-		   ) { return }
-	session_id := acp_test_client_session_id_from_frame(t, opened)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-
-	prompting := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&prompting, 3, session_id, "establish history")
-	acp_test_client_send(&client, strings.to_string(prompting))
-	if profile == .V2 {
-		if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the prompt was not reported") == "" { return }
-		if acp_test_client_expect(t, &client, `"id":3,"result":{"messageId"`, "the prompt was not inserted") == "" { return }
-		if acp_test_client_expect(t, &client, `"state":"running"`, "the turn did not start") == "" { return }
-	}
-	if acp_test_client_expect(t, &client, "initial answer", "the initial model did not answer") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the request did not report usage") == "" { return }
-	if acp_test_client_expect(t, &client, `"stopReason":"end_turn"`, "the initial turn did not finish") == "" { return }
-
-	kind := ACP_Model_Kind.Set_Config_Option
-	if profile == .V1 { kind = .Set_Model }
-	switching := strings.builder_make(context.temp_allocator)
-	acp_test_model_change_message(&switching, 4, session_id, "otherprovider/vendor/shared", kind)
-	acp_test_client_send(&client, strings.to_string(switching))
-	expected := `"currentValue":"otherprovider/vendor/shared"`
-	if profile == .V1 { expected = `"modelId":"otherprovider/vendor/shared"` }
-	if acp_test_client_expect(t, &client, expected, "the named provider was not selected") == "" { return }
-
-	directory, directory_error := agent.xdg_directory(.State, context.allocator)
-	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
-	defer delete(directory, context.allocator)
-	locks, _, locks_error := agent.session_lock_directory(context.allocator)
-	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
-	defer delete(locks, context.allocator)
-	reader, open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
-	if !testing.expect_value(t, open_error, nil) { return }
-	defer _ = journal.close(reader)
-	session, session_ok := journal.session_id_parse(session_id)
-	if !testing.expect(t, session_ok) { return }
-	applied, found, read_error := journal.read_latest(reader, {session = session, kinds = {.Selection_Applied}}, context.temp_allocator)
-	defer journal.record_destroy(&applied, context.temp_allocator)
-	if !testing.expect_value(t, read_error, nil) || !testing.expect(t, found) { return }
-	testing.expect_value(t, applied.provider, "otherprovider")
-	testing.expect_value(t, applied.model, "vendor/shared")
-
-	for value, index in ([]string{"vendor/shared", "OTHERPROVIDER/vendor/shared", "unknown/vendor/shared"}) {
-		rejected := strings.builder_make(context.temp_allocator)
-		acp_test_model_change_message(&rejected, 5 + index, session_id, value, kind)
-		acp_test_client_send(&client, strings.to_string(rejected))
-		if acp_test_client_expect(t, &client, `"code":-32602`, "an unadvertised model value was not refused") == "" { return }
-	}
-	configuring := strings.builder_make(context.temp_allocator)
-	acp_test_model_change_message(&configuring, 8, session_id, "buzzprovider/vendor/shared", .Set_Config_Option)
-	acp_test_client_send(&client, strings.to_string(configuring))
-	if acp_test_client_expect(t, &client, `"currentValue":"buzzprovider/vendor/shared"`, "the first provider was not selected again") == "" { return }
-	reapplied, reapplied_found, reread_error := journal.read_latest(reader, {session = session, kinds = {.Selection_Applied}}, context.temp_allocator)
-	defer journal.record_destroy(&reapplied, context.temp_allocator)
-	if !testing.expect_value(t, reread_error, nil) || !testing.expect(t, reapplied_found) { return }
-	testing.expect_value(t, reapplied.provider, "buzzprovider")
-	testing.expect_value(t, reapplied.model, "vendor/shared")
-}
-
-@(test)
-test_acp_buzz_effort_option_selects_thinking_level :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-effort-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(workspace)
-		delete(workspace, context.allocator)
-	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-effort-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-
-	levels := make([]string, 2, context.allocator)
-	levels[0] = "low"
-	levels[1] = "high"
-	defer delete(levels, context.allocator)
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id = "effortmodel",
-		context_window = 100000,
-		tools = true,
-		thinking = agent.Catalog_Thinking_Source{present = true, levels = levels},
-	}
-	sources[0] = {
-		id       = "effortprovider",
-		base_url = "http://127.0.0.1:1/v1",
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources,
-	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-effort-run")
-	if run_thread == nil {
-		testing.expect(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
-
-	handshake := strings.builder_make(context.temp_allocator)
-	acp_test_initialize_message(&handshake, 1)
-	acp_test_client_send(&client, strings.to_string(handshake))
-	if acp_test_client_expect(t, &client, `"protocolVersion":1`, "initialize was not answered") == "" { return }
-
-	opening := strings.builder_make(context.temp_allocator)
-	acp_test_new_session_message(&opening, 2, workspace)
-	acp_test_client_send(&client, strings.to_string(opening))
-	opened := acp_test_client_expect(t, &client, `"sessionId"`, "session/new was not answered")
-	if opened == "" { return }
-	if !acp_test_client_carries(
-		t,
-		opened,
-		{`"category":"thought_level"`, `"id":"effort"`, `"value":"low"`, `"value":"high"`},
-		"the thought level option",
-	) { return }
-	session_id := acp_test_client_session_id_from_frame(t, opened)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-
-	selecting := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&selecting, `{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"sessionId":"`)
-	strings.write_string(&selecting, session_id)
-	strings.write_string(&selecting, `","configId":"effort","value":"high"}}`)
-	acp_test_end(&selecting)
-	acp_test_client_send(&client, strings.to_string(selecting))
-	selected := acp_test_client_expect(t, &client, `"currentValue":"high"`, "the effort level was not applied")
-	if selected == "" { return }
-
-	rejected := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&rejected, `{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"sessionId":"`)
-	strings.write_string(&rejected, session_id)
-	strings.write_string(&rejected, `","configId":"effort","value":"extreme"}}`)
-	acp_test_end(&rejected)
-	acp_test_client_send(&client, strings.to_string(rejected))
-	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown effort level was not refused") == "" { return }
-
-	unknown_option := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(&unknown_option, `{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"`)
-	strings.write_string(&unknown_option, session_id)
-	strings.write_string(&unknown_option, `","configId":"no-such-option","value":"high"}}`)
-	acp_test_end(&unknown_option)
-	acp_test_client_send(&client, strings.to_string(unknown_option))
-	if acp_test_client_expect(t, &client, `"code":-32602`, "an unknown config option was not refused") == "" { return }
-}
-@(test)
-test_acp_owner_activity_prevents_eviction_until_idle :: proc(t: ^testing.T) {
+test_acp_worker_activity_prevents_eviction_until_idle :: proc(t: ^testing.T) {
 	server: ACP_Server
 	if !acp_test_server_init(t, &server) { return }
 	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
@@ -1847,28 +623,29 @@ test_acp_owner_activity_prevents_eviction_until_idle :: proc(t: ^testing.T) {
 		if !testing.expect(t, made, "the fixture session could not be allocated") { return }
 		server.sessions[i] = session
 		acp_session_touch(session)
-		testing.expect(t, acp_owner_service_begin(session), "the owner could not reserve background servicing")
+		if sync.mutex_guard(&server.table_mu) {
+			session.worker_active = true
+		}
 	}
 	first := server.sessions[0]
-	first.model_selection.active = true
-	acp_owner_service_end(first)
 	refused, reason := acp_session_create(&server, "session-ninth")
-	testing.expect(t, refused == nil, "owner activity or a pending model selection allowed eviction")
+	testing.expect(t, refused == nil, "worker activity allowed eviction")
 	testing.expect(t, strings.contains(reason, "all of them are busy"), "the refusal did not report busy sessions")
-	first.model_selection.active = false
-	acp_owner_service_end(first)
+	if sync.mutex_guard(&server.table_mu) {
+		first.worker_active = false
+	}
 	opened, open_reason := acp_session_create(&server, "session-ninth")
 	testing.expectf(t, opened != nil, "restored idle did not allow eviction: %s", open_reason)
 	testing.expect(t, acp_session_find(&server, "session-0") == nil, "the restored idle session was not evicted")
 	closing := server.sessions[1]
-	sync.mutex_lock(&server.table_mu)
-	closing.closing = true
-	sync.mutex_unlock(&server.table_mu)
-	testing.expect(t, !acp_owner_service_begin(closing), "background servicing began after closing")
+	if sync.mutex_guard(&server.table_mu) {
+		closing.closing = true
+	}
+	testing.expect(t, acp_session_is_closing(closing), "closing was not observed")
 }
 
 @(test)
-test_acp_idle_v2_store_session_stays_evictable_after_an_owner_wake :: proc(t: ^testing.T) {
+test_acp_idle_workers_stay_evictable_after_a_wake :: proc(t: ^testing.T) {
 	server: ACP_Server
 	if !acp_test_server_init(t, &server) { return }
 	defer testing.expect(t, acp_server_destroy(&server), "the ACP test server did not shut down")
@@ -1881,14 +658,6 @@ test_acp_idle_v2_store_session_stays_evictable_after_an_owner_wake :: proc(t: ^t
 			acp_session_free(session)
 			return
 		}
-		store, allocation_error := new(journal.Journal, server.alloc)
-		if allocation_error != nil {
-			thread.destroy(worker)
-			acp_session_free(session)
-			testing.fail_now(t, "the fixture store could not be allocated")
-		}
-		store.allocator = server.alloc
-		session.app.setup.store = store
 		worker.data = session
 		session.worker = worker
 		server.sessions[i] = session
@@ -1904,377 +673,949 @@ test_acp_idle_v2_store_session_stays_evictable_after_an_owner_wake :: proc(t: ^t
 	testing.expect(t, acp_session_find(&server, "session-ninth") != nil, "the new session was not published")
 }
 
-@(test)
-test_acp_v2_running_prompt_is_inserted_as_steering :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-prompt-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(workspace)
-		delete(workspace, context.allocator)
-	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
+// --- the follower --------------------------------------------------------------
 
-	replies := []string {
-		acp_test_stream_reply(
-			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
-		),
-		acp_test_stream_reply(
-			acp_test_sse_body(
-				{`{"choices":[{"delta":{"content":"steered answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
-			),
-		),
-	}
-	defer for reply in replies { delete(reply, context.allocator) }
-	release_first: sync.One_Shot_Event
-	provider := ACP_Test_Provider {
-		first_reply_gate = &release_first,
-	}
-	if !acp_test_provider_start(t, &provider, replies) { return }
-	defer acp_test_provider_stop(t, &provider)
+// ACP_Test_Buffer collects the frames the writer thread produces, so a test reads what
+// the editor would have been sent.
+ACP_Test_Buffer :: struct {
+	mu:     sync.Mutex,
+	cond:   sync.Cond,
+	frames: [dynamic]u8,
+}
 
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id                = "v2model",
-		context_window    = 100000,
-		max_output_tokens = 4096,
-		tools             = true,
-	}
-	sources[0] = {
-		id       = "v2provider",
-		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-	defer delete(sources[0].base_url.?, context.allocator)
+acp_test_buffer_writer :: proc(buffer: ^ACP_Test_Buffer) -> io.Writer {
+	return io.Writer{data = buffer, procedure = acp_test_buffer_stream}
+}
 
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources,
+acp_test_buffer_stream :: proc(data: rawptr, mode: io.Stream_Mode, p: []byte, offset: i64, whence: io.Seek_From) -> (n: i64, err: io.Error) {
+	buffer := cast(^ACP_Test_Buffer)data
+	switch mode {
+	case .Write:
+		sync.mutex_lock(&buffer.mu)
+		append(&buffer.frames, ..p)
+		sync.cond_broadcast(&buffer.cond)
+		sync.mutex_unlock(&buffer.mu)
+		return i64(len(p)), nil
+	case .Query:
+		return i64(io.Stream_Mode_Set{.Write}), nil
+	case .Close, .Destroy, .Flush:
+		return 0, nil
+	case .Read, .Seek, .Read_At, .Write_At, .Size:
+		return 0, .Unsupported
 	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-prompt-run")
-	if run_thread == nil {
-		testing.expect(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		sync.one_shot_event_signal(&release_first)
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
+	return 0, .Unsupported
+}
 
-	handshake := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(
-		&handshake,
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
-	)
-	strings.write_byte(&handshake, '\n')
-	acp_test_client_send(&client, strings.to_string(handshake))
-	v2_hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
-	if v2_hello == "" { return }
-	testing.expectf(t, strings.contains(v2_hello, `"image":{}`), "v2 initialize did not announce image prompts: %s", v2_hello)
+acp_test_buffer_text :: proc(buffer: ^ACP_Test_Buffer, allocator := context.temp_allocator) -> string {
+	sync.mutex_lock(&buffer.mu)
+	defer sync.mutex_unlock(&buffer.mu)
+	return strings.clone(string(buffer.frames[:]), allocator)
+}
 
-	opening := strings.builder_make(context.temp_allocator)
-	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
-	strings.write_string(&opening, workspace)
-	strings.write_string(&opening, `","mcpServers":[]}}`)
-	strings.write_byte(&opening, '\n')
-	acp_test_client_send(&client, strings.to_string(opening))
-	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
-	if opening_frame == "" { return }
-	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2provider/v2model"`) {
-		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
-		return
-	}
-	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-	prompting := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&prompting, 3, session_id, "say hello")
-	acp_test_client_send(&client, strings.to_string(prompting))
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the first prompt was not reported") == "" { return }
-	if acp_test_client_expect(t, &client, `"result":{"messageId":"msg-user-1-1"}`, "the first prompt was not inserted") == "" { return }
-	if acp_test_client_expect(t, &client, `"state":"running"`, "the turn did not start") == "" { return }
-
-	if sync.mutex_guard(&provider.lock) {
-		for provider.served == 0 {
-			if !testing.expect(
-				t,
-				sync.cond_wait_with_timeout(&provider.request_ready, &provider.lock, ACP_TEST_BOUND),
-				"the first request did not reach the provider",
-			) { return }
+// acp_test_buffer_wait blocks until the buffer holds needle, so a test reads what the
+// writer thread had not flushed yet. False means the wait ran out, and the test fails.
+acp_test_buffer_wait :: proc(t: ^testing.T, buffer: ^ACP_Test_Buffer, needle, what: string) -> bool {
+	deadline := time.tick_add(time.tick_now(), ACP_TEST_BOUND)
+	for {
+		sync.mutex_lock(&buffer.mu)
+		found := strings.contains(string(buffer.frames[:]), needle)
+		if found {
+			sync.mutex_unlock(&buffer.mu)
+			return true
 		}
-	}
-
-	steering := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&steering, 4, session_id, "use the other file")
-	// The reader answers this only after it has handled the preceding prompt.
-	strings.write_string(&steering, `{"jsonrpc":"2.0","id":5,"method":"session/list","params":{}}`)
-	acp_test_end(&steering)
-	acp_test_client_send(&client, strings.to_string(steering))
-	barrier := acp_test_client_receive(&client)
-	if !testing.expectf(t, strings.contains(barrier, `"id":5,"result"`), "steering was answered before insertion: %s", barrier) { return }
-	sync.one_shot_event_signal(&release_first)
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "the first answer did not stream") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the first request did not report usage") == "" { return }
-	inserted := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the steering message was not reported")
-	if !testing.expect(t, strings.contains(inserted, "use the other file")) { return }
-	accepted := acp_test_client_expect(t, &client, `"id":4,"result"`, "the steering prompt was not accepted")
-	if !testing.expect(t, strings.contains(accepted, `"messageId":"msg-user-1-2"`)) { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "the steering answer did not stream") == "" { return }
-	if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the steering request did not report usage") == "" { return }
-	if acp_test_client_expect(t, &client, `"state":"idle","stopReason":"end_turn"`, "the steered turn did not finish") == "" { return }
-
-	directory, directory_error := agent.xdg_directory(.State, context.allocator)
-	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
-	defer delete(directory, context.allocator)
-	locks, _, locks_error := agent.session_lock_directory(context.allocator)
-	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
-	defer delete(locks, context.allocator)
-	reader, open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
-	if !testing.expect_value(t, open_error, nil) { return }
-	defer _ = journal.close(reader)
-	session, session_ok := journal.session_id_parse(session_id)
-	if !testing.expect(t, session_ok) { return }
-	records, _, read_error := journal.read_records(reader, {session = session, kinds = {.User_Input, .Turn_Started}}, 0, 0, context.temp_allocator)
-	if !testing.expect_value(t, read_error, nil) { return }
-	defer journal.records_destroy(records, context.temp_allocator)
-	turns, steering_count := 0, 0
-	for record in records {
-		if record.kind == .Turn_Started { turns += 1 }
-		if record.kind == .User_Input && string(record.body) == "use the other file" {
-			steering_count += 1
-			testing.expect_value(t, agent.user_input_origin(record), journal.User_Origin.Steering)
-			testing.expect_value(t, i64(record.turn), i64(1))
+		remaining := time.tick_diff(time.tick_now(), deadline)
+		if remaining <= 0 {
+			sync.mutex_unlock(&buffer.mu)
+			break
 		}
+		sync.cond_wait_with_timeout(&buffer.cond, &buffer.mu, remaining)
+		sync.mutex_unlock(&buffer.mu)
 	}
-	testing.expect_value(t, steering_count, 1)
-	testing.expect_value(t, turns, 1)
+	return testing.expectf(t, false, "%s: timed out waiting for %q", what, needle)
+}
+
+// acp_test_interface is a hand-built connection for tests that drive the worker
+// directly: no reader thread, no session table insert, no server process. The catalog
+// is borrowed, so the caller keeps it alive and destroys it.
+ACP_Test_Interface :: struct {
+	server: ACP_Server,
+	buffer: ACP_Test_Buffer,
+}
+
+acp_test_interface_init :: proc(t: ^testing.T, iface: ^ACP_Test_Interface, profile: ACP_Wire_Profile, catalog: ^agent.Catalog) {
+	iface.server.alloc = context.allocator
+	iface.server.profile = profile
+	iface.buffer.frames.allocator = context.allocator
+	iface.server.app.setup.alloc = context.allocator
+	iface.server.app.setup.catalog = catalog^
+	writer, writer_error := acp.writer_init(acp_test_buffer_writer(&iface.buffer), context.allocator)
+	if writer_error != nil { testing.fail_now(t, "the test writer could not be created") }
+	iface.server.writer = writer
+}
+
+acp_test_interface_destroy :: proc(iface: ^ACP_Test_Interface) {
+	acp_test_writer_cleanup(&iface.server.writer)
+	delete(iface.buffer.frames)
 }
 
 @(test)
-test_acp_v2_compact_command_starts_compaction_without_user_input :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	workspace, workspace_err := os.make_directory_temp("", "nabla-acp-v2-prompt-workspace-*", context.allocator)
-	if workspace_err != nil {
-		testing.expectf(t, false, "could not create a temporary workspace: %v", workspace_err)
-		return
+test_acp_model_values_identify_the_named_provider :: proc(t: ^testing.T) {
+	catalog := acp_test_catalog(context.allocator)
+	defer agent.catalog_destroy(&catalog)
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V1, &catalog)
+	defer acp_test_interface_destroy(&iface)
+	session: ACP_Session
+	session.conn = &iface.server
+	provider, model, found := acp_model_identify(&session, "test-provider/test-model")
+	testing.expect(t, found, "the catalog value was not identified")
+	testing.expect_value(t, provider, "test-provider")
+	testing.expect_value(t, model, "test-model")
+	_, _, missing := acp_model_identify(&session, "test-provider/no-such-model")
+	testing.expect(t, !missing, "an unknown model value was identified")
+	_, _, malformed := acp_model_identify(&session, "no-separator")
+	testing.expect(t, !malformed, "a value without a provider was identified")
+}
+
+@(test)
+test_acp_effort_allowed_follows_the_models_levels :: proc(t: ^testing.T) {
+	catalog := acp_test_effort_catalog(context.allocator)
+	defer agent.catalog_destroy(&catalog)
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V1, &catalog)
+	defer acp_test_interface_destroy(&iface)
+	session: ACP_Session
+	session.conn = &iface.server
+	// An empty level clears the override back to the provider default and is always allowed.
+	testing.expect(t, acp_effort_allowed(&session, "test-provider", "test-model", ""), "the default effort was refused")
+	testing.expect(t, acp_effort_allowed(&session, "test-provider", "test-model", "high"), "a stated level was refused")
+	testing.expect(t, !acp_effort_allowed(&session, "test-provider", "test-model", "enormous"), "an unstated level was allowed")
+	testing.expect(t, !acp_effort_allowed(&session, "test-provider", "no-such-model", "high"), "a level of an unknown model was allowed")
+}
+
+// acp_test_open_work builds an owned resume request for session id. The caller releases
+// it with acp_work_destroy.
+acp_test_open_work :: proc(
+	t: ^testing.T,
+	session_id: journal.Session_Id,
+	workspace: string,
+	servers: [dynamic]agent.MCP_Server_Config,
+	allocator: mem.Allocator,
+) -> ACP_Work_Open_Session {
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	session_ref, ref_error := strings.clone(journal.session_id_to_hex(session_id, hex[:]), allocator)
+	if ref_error != nil { testing.fail_now(t, "the session reference could not be held") }
+	owned_workspace, workspace_error := strings.clone(workspace, allocator)
+	if workspace_error != nil { testing.fail_now(t, "the workspace could not be held") }
+	prompt, prompt_error := strings.clone("speak plainly", allocator)
+	if prompt_error != nil { testing.fail_now(t, "the instructions could not be held") }
+	title, title_error := strings.clone("editor title", allocator)
+	if title_error != nil { testing.fail_now(t, "the title could not be held") }
+	return {
+		workspace = owned_workspace,
+		session_ref = session_ref,
+		mcp_servers = servers,
+		system_prompt = prompt,
+		session_title = title,
+		start = Start_Resume_Id(session_ref),
+		replay = true,
 	}
+}
+
+@(test)
+test_acp_open_records_environment_and_follows :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	state, previous, had_previous := acp_test_state_isolate(t)
+	defer acp_test_state_restore(state, previous, had_previous)
+	workspace, workspace_error := os.make_directory_temp("", "nabla-acp-open-workspace-*", context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "could not create a temporary workspace") }
 	defer {
 		_ = os.remove_all(workspace)
 		delete(workspace, context.allocator)
 	}
-	state, state_err := os.make_directory_temp("", "nabla-acp-v2-prompt-state-*", context.allocator)
-	if state_err != nil {
-		testing.expectf(t, false, "could not create a temporary state directory: %v", state_err)
-		return
-	}
-	defer {
-		_ = os.remove_all(state)
-		delete(state, context.allocator)
-	}
-	previous_state, had_state := acp_test_env(t, "XDG_STATE_HOME", state)
-	defer acp_test_env_restore("XDG_STATE_HOME", previous_state, had_state)
-	previous_runtime, had_runtime := acp_test_env(t, "XDG_RUNTIME_DIR", state)
-	defer acp_test_env_restore("XDG_RUNTIME_DIR", previous_runtime, had_runtime)
-	previous_cache, had_cache := acp_test_env(t, "XDG_CACHE_HOME", state)
-	defer acp_test_env_restore("XDG_CACHE_HOME", previous_cache, had_cache)
-
-	replies: [7]string
-	for &reply in replies {
-		reply = acp_test_stream_reply(
-			acp_test_sse_body({`{"choices":[{"delta":{"content":"v2 answer"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`}),
-		)
-	}
-
-	defer for reply in replies { delete(reply, context.allocator) }
-	provider: ACP_Test_Provider
-	if !acp_test_provider_start(t, &provider, replies[:]) { return }
-	defer acp_test_provider_stop(t, &provider)
-
-	sources := make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	defer delete(sources, context.allocator)
-	models := make([]agent.Catalog_Model_Source, 1, context.allocator)
-	defer delete(models, context.allocator)
-	models[0] = {
-		id                = "v2model",
-		context_window    = 100000,
-		max_output_tokens = 4096,
-		tools             = true,
-	}
-	sources[0] = {
-		id       = "v2provider",
-		base_url = fmt.aprintf("http://127.0.0.1:%d/v1", provider.port, allocator = context.allocator),
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-		models   = models,
-	}
-	defer delete(sources[0].base_url.?, context.allocator)
-
-	client: ACP_Test_Client
-	defer acp_test_client_destroy(&client)
-	run := ACP_Test_Run {
-		client  = &client,
-		sources = sources,
-	}
-	run_thread := thread.create(acp_test_run_thread, name = "nabla-acp-v2-prompt-run")
-	if run_thread == nil {
-		testing.expect(t, false, "the run thread could not be started")
-		return
-	}
-	run_thread.data = &run
-	thread.start(run_thread)
-	defer {
-		acp_test_client_hang_up(&client)
-		thread.join(run_thread)
-		testing.expect(t, run.served, "the run did not end cleanly")
-		thread.destroy(run_thread)
-		free_all(context.temp_allocator)
-	}
-
-	handshake := strings.builder_make(context.temp_allocator)
-	fmt.sbprint(
-		&handshake,
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"acp-test","version":"1"}}}`,
-	)
-	strings.write_byte(&handshake, '\n')
-	acp_test_client_send(&client, strings.to_string(handshake))
-	v2_hello := acp_test_client_expect(t, &client, `"protocolVersion":2`, "v2 initialize was not answered")
-	if v2_hello == "" { return }
-	testing.expectf(t, strings.contains(v2_hello, `"image":{}`), "v2 initialize did not announce image prompts: %s", v2_hello)
-
-	opening := strings.builder_make(context.temp_allocator)
-	strings.write_string(&opening, `{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"`)
-	strings.write_string(&opening, workspace)
-	strings.write_string(&opening, `","mcpServers":[]}}`)
-	strings.write_byte(&opening, '\n')
-	acp_test_client_send(&client, strings.to_string(opening))
-	opening_frame := acp_test_client_expect(t, &client, `"sessionId"`, "v2 session/new was not answered")
-	if opening_frame == "" { return }
-	if !strings.contains(opening_frame, `"configId":"model"`) || !strings.contains(opening_frame, `"value":"v2provider/v2model"`) {
-		testing.expectf(t, false, "v2 session/new did not expose the model catalog: %s", opening_frame)
-		return
-	}
-	session_id := acp_test_client_session_id_from_frame(t, opening_frame)
-	if session_id == "" { return }
-	defer delete(session_id, context.allocator)
-	commands := acp_test_client_receive(&client, include_commands = true)
-	if !testing.expectf(
-		t,
-		strings.contains(commands, `"sessionUpdate":"available_commands_update"`),
-		"the session did not advertise commands: %s",
-		commands,
-	) { return }
-	advertised: struct {
-		params: acp.Session_Notification(acp.Available_Commands_Update) `json:"params"`,
-	}
-	if !testing.expect_value(t, json.unmarshal(transmute([]u8)commands, &advertised, allocator = context.temp_allocator), nil) { return }
-	if !testing.expect_value(t, len(advertised.params.update.available_commands), 1) { return }
-	testing.expect_value(t, advertised.params.update.available_commands[0].name, "compact")
-	testing.expect(t, strings.contains(opening_frame, `"availableCommands":[{"name":"compact"`), "the V2 setup result omitted compact")
-
-	// Twelve history entries leave a prefix beyond the ten messages kept verbatim.
-	for index in 0 ..< 6 {
-		prompting := strings.builder_make(context.temp_allocator)
-		acp_test_prompt_message(&prompting, 3 + index, session_id, "say hello")
-		acp_test_client_send(&client, strings.to_string(prompting))
-		if acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the history prompt was not reported") == "" { return }
-		if acp_test_client_expect(t, &client, `"result":{"messageId"`, "the history prompt was not inserted") == "" { return }
-		if acp_test_client_expect(t, &client, `"state":"running"`, "the history turn did not start") == "" { return }
-		if acp_test_client_expect(t, &client, `"sessionUpdate":"agent_message_chunk"`, "the history answer did not stream") == "" { return }
-		if acp_test_client_expect(t, &client, `"sessionUpdate":"usage_update"`, "the history request did not report usage") == "" { return }
-		if acp_test_client_expect(t, &client, `"state":"idle","stopReason":"end_turn"`, "the history turn did not finish") == "" { return }
-	}
-
-	compacting := strings.builder_make(context.temp_allocator)
-	acp_test_prompt_message(&compacting, 9, session_id, " /CoMpAcT ignored ")
-	acp_test_client_send(&client, strings.to_string(compacting))
-	command_frame := acp_test_client_expect(t, &client, `"sessionUpdate":"user_message"`, "the command was not reported as live-only input")
-	if !testing.expect(t, strings.contains(command_frame, " /CoMpAcT ignored ")) { return }
-	accepted_frame := acp_test_client_expect(t, &client, `"id":9,"result":{"messageId"`, "the command was not accepted")
-	if accepted_frame == "" { return }
-	accepted: struct {
-		result: acp.Prompt_Accepted_Result `json:"result"`,
-	}
-	if !testing.expect_value(t, json.unmarshal(transmute([]u8)accepted_frame, &accepted, allocator = context.temp_allocator), nil) { return }
-	testing.expect(
-		t,
-		accepted.result.message_id != "" && strings.contains(command_frame, accepted.result.message_id),
-		"the live command and acceptance must share a message id",
-	)
-	if acp_test_client_expect(t, &client, `"state":"running"`, "the command did not report running state") == "" { return }
-	if acp_test_client_expect(t, &client, "background compaction started: requested", "the command did not start background compaction") == "" { return }
-	if acp_test_client_expect(t, &client, `"state":"idle","stopReason":"end_turn"`, "the command did not complete independently of compaction") ==
-	   "" { return }
-	if sync.mutex_guard(&provider.lock) {
-		for provider.served < len(replies) {
-			if !testing.expect(
-				t,
-				sync.cond_wait_with_timeout(&provider.request_ready, &provider.lock, ACP_TEST_BOUND),
-				"the compaction request did not reach the provider",
-			) { return }
-		}
-	}
-
-	directory, directory_error := agent.xdg_directory(.State, context.allocator)
-	if !testing.expect_value(t, directory_error, agent.XDG_Error.None) { return }
-	defer delete(directory, context.allocator)
+	// Another process runs the session: its store holds the claim, so the connection
+	// follows it and starts no server of its own.
 	locks, _, locks_error := agent.session_lock_directory(context.allocator)
-	if !testing.expect_value(t, locks_error, agent.XDG_Error.None) { return }
+	if locks_error != .None { testing.fail_now(t, "the lock directory could not be resolved") }
 	defer delete(locks, context.allocator)
-	reader, open_error := journal.open(directory, locks, journal.run_id_create(), .Read_Only, context.allocator)
-	if !testing.expect_value(t, open_error, nil) { return }
-	defer _ = journal.close(reader)
-	session, session_ok := journal.session_id_parse(session_id)
-	if !testing.expect(t, session_ok) { return }
-	records, _, read_error := journal.read_records(reader, {session = session, kinds = {.User_Input, .Compaction_Started}}, 0, 0, context.temp_allocator)
-	if !testing.expect_value(t, read_error, nil) { return }
-	defer journal.records_destroy(records, context.temp_allocator)
-	inputs, compactions := 0, 0
-	for record in records {
-		if record.kind == .User_Input {
-			inputs += 1
-			testing.expect_value(t, string(record.body), "say hello")
-		} else {
-			compactions += 1
-			started, started_ok := journal.payload_as(record, journal.Compaction_Started)
-			if !testing.expect(t, started_ok) { return }
-			testing.expect_value(t, started.trigger, "user_command")
-		}
+	runner, runner_error := journal.open(state, locks, journal.run_id_create(), .Read_Write, context.allocator)
+	if runner_error != nil { testing.fail_now(t, "the runner journal could not open") }
+	defer _ = journal.close(runner)
+	session_id, create_error := journal.create_session(runner, {workspace = workspace, role = .Main})
+	if create_error != nil { testing.fail_now(t, "the session could not be created") }
+	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the session could not be committed") }
+
+	catalog := acp_test_catalog(context.allocator)
+	defer agent.catalog_destroy(&catalog)
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V2, &catalog)
+	defer acp_test_interface_destroy(&iface)
+	server := &iface.server
+	server.app.setup.journal_directory = strings.clone(state, context.allocator)
+	defer delete(server.app.setup.journal_directory, context.allocator)
+	server.app.setup.lock_directory = strings.clone(locks, context.allocator)
+	defer delete(server.app.setup.lock_directory, context.allocator)
+	server.app.setup.run = journal.run_id_create()
+	server.app.setup.provider_id = strings.clone("test-provider", context.allocator)
+	defer delete(server.app.setup.provider_id, context.allocator)
+	server.app.setup.model_id = strings.clone("test-model", context.allocator)
+	defer delete(server.app.setup.model_id, context.allocator)
+
+	mcp_servers := make([dynamic]agent.MCP_Server_Config, 0, 1, context.allocator)
+	mcp_server, mcp_error := agent.MCP_Server_Config_From_Stdio("editor", "/bin/true", nil, nil, nil, context.allocator)
+	if mcp_error != .None { testing.fail_now(t, "the MCP server could not be configured") }
+	if append(&mcp_servers, mcp_server) != 1 { testing.fail_now(t, "the server list could not be built") }
+	work := acp_test_open_work(t, session_id, workspace, mcp_servers, context.allocator)
+	item := ACP_Work {
+		id      = i64(1),
+		variant = work,
 	}
-	testing.expect_value(t, inputs, 0)
-	testing.expect_value(t, compactions, 1)
-	node, found, node_error := journal.read_last_node(reader, session, .User, context.temp_allocator)
-	if !testing.expect_value(t, node_error, nil) { return }
-	if !testing.expect(t, found) { return }
-	defer journal.node_destroy(&node, context.temp_allocator)
-	testing.expect(t, string(node.body) == "say hello", "the command must not become a conversation node")
+	defer acp_work_destroy(&item, context.allocator)
+	session: ACP_Session
+	session.conn = server
+	acp_work_open_session(&session, i64(1), work)
+	if !testing.expect(t, session.opened, "the session did not open") { return }
+	defer acp_session_release(&session)
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	testing.expect_value(t, session.id, journal.session_id_to_hex(session_id, hex[:]))
+
+	frames := acp_test_buffer_text(&iface.buffer)
+	if !testing.expect(t, strings.contains(frames, `"configOptions"`), "the open answer has no config options") { return }
+	testing.expect(t, strings.contains(frames, "test-provider/test-model"), "the open answer names no serving identity")
+	testing.expect(t, strings.contains(frames, `"availableCommands"`), "the open answer advertises no commands")
+
+	environment, _, env_found, env_error := journal.read_session_environment(session.store, session_id, context.temp_allocator)
+	if !testing.expect(t, env_error == nil, "the environment could not be read") { return }
+	if !testing.expect(t, env_found, "the interface recorded no environment") { return }
+	defer agent.session_environment_destroy(&environment, context.temp_allocator)
+	testing.expect_value(t, environment.instructions, "speak plainly")
+	if testing.expect_value(t, len(environment.servers), 1) {
+		testing.expect_value(t, environment.servers[0].id, "editor")
+	}
+
+	// Opening the same session again records its environment again and answers again.
+	again_servers := make([dynamic]agent.MCP_Server_Config, context.allocator)
+	again := acp_test_open_work(t, session_id, workspace, again_servers, context.allocator)
+	again_item := ACP_Work {
+		id      = i64(2),
+		variant = again,
+	}
+	defer acp_work_destroy(&again_item, context.allocator)
+	acp_work_open_session(&session, i64(2), again)
+	testing.expect(t, session.opened, "the session did not stay open")
+}
+
+// --- driving a turn ------------------------------------------------------------
+
+// acp_test_app_begin claims a session in a fresh directory and builds the running chat
+// over it, the way the session server holds one. The caller ends it with
+// acp_test_app_end. Only the subsystems a turn needs are initialized: no transcript,
+// menu, or Code Mode state, which no driven turn touches.
+acp_test_app_begin :: proc(t: ^testing.T, app: ^App, lock_directory := "") -> (directory, workspace: string) {
+	state_directory, state_error := os.make_directory_temp("", "nabla-acp-test-*", context.allocator)
+	if state_error != nil { testing.fail_now(t, "could not create a temporary directory") }
+	work_directory, work_error := os.make_directory_temp("", "nabla-acp-test-workspace-*", context.allocator)
+	if work_error != nil { testing.fail_now(t, "could not create a temporary workspace") }
+	directory = state_directory
+	workspace = work_directory
+	locks := lock_directory if lock_directory != "" else directory
+
+	app.run.alloc = context.allocator
+	app.setup.alloc = context.allocator
+	app.run.snap.entries = make([dynamic]Entry, 0, 4, app.run.alloc)
+
+	app.setup.journal_directory = strings.clone(directory, app.setup.alloc)
+	app.setup.lock_directory = strings.clone(locks, app.setup.alloc)
+	app.setup.run = journal.run_id_create()
+	store_open_error: journal.Error
+	app.setup.store, store_open_error = journal.open(directory, locks, app.setup.run, .Read_Write, app.setup.alloc)
+	if store_open_error != nil { testing.fail_now(t, "the journal could not open") }
+	id, create_error := journal.create_session(app.setup.store, {workspace = workspace, role = .Main})
+	if create_error != nil { testing.fail_now(t, "the session could not be created") }
+	if _, commit_error := journal.commit(app.setup.store); commit_error != nil { testing.fail_now(t, "the session could not be committed") }
+	app.setup.workspace = strings.clone(workspace, app.setup.alloc)
+	tool_error: agent.Tool_Registry_Error
+	app.setup.session, tool_error = agent.chat_session_init(app.setup.store, id, journal.INITIAL_BRANCH, 0, workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "the tool registry could not be created") }
+	app.setup.session.skill_instructions = agent.test_skill_instructions(&app.setup.session)
+	return directory, workspace
+}
+
+acp_test_app_end :: proc(app: ^App, directory, workspace: string) {
+	journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
+	agent.chat_session_destroy(&app.setup.session)
+	delete(app.setup.workspace, app.setup.alloc)
+	app.setup.workspace = ""
+	agent.session_watch_stop(&app.setup.watch)
+	_ = session_store_close(app.setup.store)
+	app.setup.store = nil
+	for &entry in app.run.snap.entries {
+		delete(entry.stream)
+		if entry.text != nil { delete(entry.text) }
+	}
+	delete(app.run.snap.entries)
+	delete(app.run.snap.status.provider_id, app.run.alloc)
+	delete(app.run.snap.status.model_id, app.run.alloc)
+	delete(app.run.snap.status.effort, app.run.alloc)
+	delete(app.run.snap.status.cwd, app.run.alloc)
+	for level in app.run.snap.status.effort_levels { delete(level, app.run.alloc) }
+	delete(app.run.snap.status.effort_levels)
+	delete(app.run.snap.setup_error, app.run.alloc)
+	catalog_run_destroy(app)
+	_ = os.remove_all(workspace)
+	delete(workspace, app.setup.alloc)
+	delete(app.setup.resumed_provider, app.setup.alloc)
+	delete(app.setup.resumed_model, app.setup.alloc)
+	delete(app.setup.resumed_effort, app.setup.alloc)
+	delete(app.setup.provider_id, app.setup.alloc)
+	delete(app.setup.model_id, app.setup.alloc)
+	delete(app.setup.credential, app.setup.alloc)
+	delete(app.setup.journal_directory, app.setup.alloc)
+	delete(app.setup.lock_directory, app.setup.alloc)
+	_ = os.remove_all(directory)
+	delete(directory, context.allocator)
+}
+
+// acp_test_catalog is the smallest catalog a selection installs: one usable provider
+// with a literal credential, and one model that states its window and supports tools.
+acp_test_catalog :: proc(allocator: mem.Allocator, base_url := "http://127.0.0.1:1") -> agent.Catalog {
+	sources := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			base_url = base_url,
+			api = "openai_chat_completions",
+			api_key = "test-key",
+			models = []agent.Catalog_Model_Source{{id = "test-model", context_window = 128_000, max_output_tokens = 4_096, tools = true}},
+		},
+	}
+	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
+	return catalog
+}
+
+// acp_test_effort_catalog serves one model that states two effort levels.
+acp_test_effort_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
+	sources := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			base_url = "http://127.0.0.1:1",
+			api = "openai_chat_completions",
+			api_key = "test-key",
+			models = []agent.Catalog_Model_Source {
+				{
+					id = "test-model",
+					context_window = 128_000,
+					max_output_tokens = 4_096,
+					tools = true,
+					thinking = agent.Catalog_Thinking_Source{present = true, supported = true, levels = []string{"low", "high"}},
+				},
+			},
+		},
+	}
+	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
+	return catalog
+}
+
+// acp_test_state_isolate points the state and runtime directories at a temporary
+// directory, so a test that follows a session through its lock file cannot touch the
+// user's own files. It returns the previous state value, which acp_test_state_restore
+// puts back. The variables are process-wide, so tests using this helper run isolated in
+// a child of the test binary.
+acp_test_state_isolate :: proc(t: ^testing.T) -> (state: string, previous: string, had_previous: bool) {
+	directory, directory_error := os.make_directory_temp("", "nabla-acp-test-state-*", context.allocator)
+	if directory_error != nil { testing.fail_now(t, "could not create a temporary state directory") }
+	previous, had_previous = os.lookup_env("XDG_STATE_HOME", context.allocator)
+	if os.set_env("XDG_STATE_HOME", directory) != nil { testing.fail_now(t, "could not set the state root") }
+	if os.set_env("XDG_RUNTIME_DIR", directory) != nil { testing.fail_now(t, "could not set the runtime root") }
+	return directory, previous, had_previous
+}
+
+acp_test_state_restore :: proc(state, previous: string, had_previous: bool) {
+	// The process is the isolated child this suite runs in, so a restore that fails
+	// changes nothing that outlives it.
+	if had_previous {
+		_ = os.set_env("XDG_STATE_HOME", previous)
+	} else {
+		_ = os.unset_env("XDG_STATE_HOME")
+	}
+	delete(previous, context.allocator)
+	_ = os.remove_all(state)
+	delete(state, context.allocator)
+}
+
+// acp_test_stub_replies answers each incoming request with the next reply, in order. It
+// stands in for a provider endpoint, so a turn runs for real: the harness sends
+// requests, reads streams, and records results exactly as it would against a server.
+ACP_Test_Replies :: struct {
+	listener: net.TCP_Socket,
+	replies:  []string,
+	served:   int,
+	failed:   bool,
+}
+
+acp_test_stub_thread :: proc(thread_handle: ^thread.Thread) {
+	stub := cast(^ACP_Test_Replies)thread_handle.data
+	// The thread serves the replies in order and then exits, so a turn that asks for
+	// more hangs nothing: its extra requests are refused. The test closes the
+	// listener before joining, which releases a thread still waiting for a request
+	// the turn never made.
+	for stub.served < len(stub.replies) {
+		client, _, accept_error := net.accept_tcp(stub.listener)
+		if accept_error != nil { return }
+		if !acp_test_stub_answer(client, stub.replies[stub.served]) {
+			stub.failed = true
+			return
+		}
+		stub.served += 1
+	}
+}
+
+// acp_test_stub_answer reads one whole request before answering it, so the harness is
+// never still writing when the connection closes.
+acp_test_stub_answer :: proc(client: net.TCP_Socket, reply: string) -> bool {
+	defer net.close(client)
+	_ = net.set_option(client, .Receive_Timeout, ACP_TEST_BOUND)
+	request := make([dynamic]u8, 0, 4096, context.temp_allocator)
+	defer delete(request)
+	header_end := -1
+	for header_end < 0 {
+		buffer: [4096]u8
+		read, read_error := net.recv_tcp(client, buffer[:])
+		if read_error != nil || read <= 0 { return false }
+		append(&request, ..buffer[:read])
+		header_end = strings.index(string(request[:]), "\r\n\r\n")
+	}
+	body_length := 0
+	headers := string(request[:header_end])
+	remaining := headers
+	for line in strings.split_lines_iterator(&remaining) {
+		if !strings.has_prefix(strings.to_lower(line), "content-length:") { continue }
+		if parsed, ok := strconv.parse_int(strings.trim_space(line[len("content-length:"):]), 10); ok { body_length = parsed }
+	}
+	for len(request) < header_end + 4 + body_length {
+		buffer: [4096]u8
+		read, read_error := net.recv_tcp(client, buffer[:])
+		if read_error != nil || read <= 0 { return false }
+		append(&request, ..buffer[:read])
+	}
+	_, _ = net.send_tcp(client, transmute([]u8)reply)
+	return true
+}
+
+// acp_test_stream_reply wraps one event stream as the HTTP reply a provider sends. The
+// body is built in the test's scratch memory, because it is served as soon as it exists.
+acp_test_stream_reply :: proc(events: []string, allocator := context.temp_allocator) -> string {
+	body := strings.builder_make(allocator)
+	for event in events {
+		strings.write_string(&body, "data: ")
+		strings.write_string(&body, event)
+		strings.write_string(&body, "\n\n")
+	}
+	strings.write_string(&body, "data: [DONE]\n\n")
+	stream := strings.to_string(body)
+	reply := fmt.aprintf("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: %d\r\n\r\n%s", len(stream), stream, allocator = allocator)
+	delete(body.buf)
+	return reply
+}
+
+// acp_test_tool_reply builds the two replies of a turn that reads one file: the tool
+// call for it, then the answer the turn ends on. The arguments are a JSON document
+// inside a JSON string, so the encoder writes them.
+acp_test_tool_reply :: proc(t: ^testing.T, note: string, allocator := context.temp_allocator) -> (first, second: string) {
+	arguments, arguments_error := json.marshal(struct {
+			path: string,
+		}{path = note}, allocator = allocator)
+	if arguments_error != nil { testing.fail_now(t, "the tool arguments could not be built") }
+	quoted, quoted_error := json.marshal(string(arguments), allocator = allocator)
+	if quoted_error != nil { testing.fail_now(t, "the tool arguments could not be quoted") }
+	call_event := strings.builder_make(allocator)
+	strings.write_string(&call_event, `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":`)
+	strings.write_string(&call_event, string(quoted))
+	strings.write_string(&call_event, `}}]},"finish_reason":null}]}`)
+	first = acp_test_stream_reply({strings.to_string(call_event), `{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`}, allocator)
+	second = acp_test_stream_reply(
+		{`{"choices":[{"delta":{"content":"the note says so"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+		allocator,
+	)
+	return first, second
+}
+
+// acp_test_stub_endpoint listens on a loopback port no other test uses, for the stub
+// provider thread to serve.
+acp_test_stub_endpoint :: proc(t: ^testing.T) -> (listener: net.TCP_Socket, endpoint: net.Endpoint) {
+	sock, sock_error := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
+	if sock_error != nil { testing.fail_now(t, fmt.tprintf("the stub endpoint could not listen: %v", sock_error)) }
+	bound, bound_error := net.bound_endpoint(sock)
+	if bound_error != nil { testing.fail_now(t, fmt.tprintf("the stub endpoint address could not be read: %v", bound_error)) }
+	listener = sock
+	endpoint = bound
+	return listener, endpoint
+}
+
+// acp_test_client_session_id_from_frame reads the session id out of a session/new
+// answer frame. The reader tests only need the id to name later requests.
+acp_test_client_session_id_from_frame :: proc(t: ^testing.T, frame: string) -> string {
+	marker := `"sessionId":"`
+	at := strings.index(frame, marker)
+	if at < 0 { testing.fail_now(t, "the session/new frame had no session id") }
+	rest := frame[at + len(marker):]
+	end := strings.index_byte(rest, '"')
+	if end < 0 { testing.fail_now(t, "the session/new frame had no session id") }
+	return strings.clone(rest[:end], context.allocator)
+}
+
+@(test)
+test_acp_follower_translates_committed_records :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	listener, endpoint := acp_test_stub_endpoint(t)
+	app: App
+	directory, workspace := acp_test_app_begin(t, &app)
+	defer acp_test_app_end(&app, directory, workspace)
+	note := fmt.aprintf("%s/note.txt", workspace, allocator = context.allocator)
+	defer delete(note, context.allocator)
+	if write_error := os.write_entire_file(note, "the file the tool reads\n"); write_error != nil {
+		testing.fail_now(t, "the note could not be written")
+	}
+	first, second := acp_test_tool_reply(t, note)
+	replies := []string{first, second}
+	stub := ACP_Test_Replies {
+		listener = listener,
+		replies  = replies,
+	}
+	provider := thread.create(acp_test_stub_thread, name = "nabla-acp-test-provider")
+	if provider == nil { testing.fail_now(t, "the stub thread could not be created") }
+	provider.data = &stub
+	thread.start(provider)
+	defer {
+		_ = net.shutdown(listener, .Both)
+		net.close(listener)
+		thread.join(provider)
+		thread.destroy(provider)
+		testing.expect(t, !stub.failed, "the stub provider failed")
+		testing.expect_value(t, stub.served, len(replies))
+	}
+
+	base_url := fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.allocator)
+	defer delete(base_url, context.allocator)
+	app.setup.catalog = acp_test_catalog(app.setup.alloc, base_url)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", ""), "the stub model could not be selected") {
+		return
+	}
+	chat := &app.setup.session
+	id := chat.session
+
+	// The follower appends the line and polls what the runner commits, the way the
+	// interface worker does.
+	follower, follower_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
+	if follower_error != nil { testing.fail_now(t, "the follower journal could not open") }
+	if follow_error := journal.follow(follower, id); follow_error != nil { testing.fail_now(t, "the follower could not follow") }
+	cursor, cursor_error := agent.follow_start(follower, id)
+	if cursor_error != nil { testing.fail_now(t, "the follow could not start") }
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V2, &app.setup.catalog)
+	defer acp_test_interface_destroy(&iface)
+	session := ACP_Session {
+		conn = &iface.server,
+		store = follower,
+		session_id = id,
+		follow = Client_Follow{store = follower, session = id, cursor = cursor},
+	}
+	defer acp_session_release(&session)
+	input, appended := acp_append_input(&session, "read the note", .Prompt, nil)
+	if !testing.expect(t, appended, "the line was not appended") { return }
+	session.follow.cursor.input = input
+
+	// The runner delivers the line and runs one turn to its end.
+	if accepted := agent.chat_session_accept_message(chat, "", .Agent, {}); !testing.expect(t, accepted == .Accepted, "the line was not accepted") { return }
+	if !testing.expect(
+		t,
+		agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), {}, nil, nil),
+		"the turn did not complete",
+	) { return }
+
+	if poll_error := client_follow_poll(&session.follow, acp_observer(&session));
+	   !testing.expect(t, poll_error == nil, "the follow could not be polled") { return }
+	testing.expect(t, session.follow.cursor.ended, "the turn did not end the wait")
+	testing.expect_value(t, session.follow.cursor.outcome, journal.Turn_Outcome.Completed)
+
+	// Every committed record arrives as the session/update notification that carries
+	// it: the echoed line, the answer, the announced call and its result, and usage.
+	if !acp_test_buffer_wait(t, &iface.buffer, `"sessionUpdate":"tool_call_update"`, "the tool result") { return }
+	frames := acp_test_buffer_text(&iface.buffer)
+	if !testing.expect(t, strings.contains(frames, `"sessionUpdate":"user_message"`), "the line was not echoed") { return }
+	testing.expect(t, strings.contains(frames, "read the note"), "the echo lost the line")
+	testing.expect(t, strings.contains(frames, `"sessionUpdate":"agent_message_chunk"`), "the answer did not stream")
+	testing.expect(t, strings.contains(frames, "the note says so"), "the answer lost its text")
+	testing.expect(t, strings.contains(frames, `"status":"pending"`), "the call was not announced")
+	testing.expect(t, strings.contains(frames, `"toolCallId":"call_1"`), "the call lost its provider id")
+	testing.expect(t, strings.contains(frames, note), "the call lost its arguments")
+	testing.expect(t, strings.contains(frames, "the file the tool reads"), "the result lost its content")
+	testing.expect(t, strings.contains(frames, `"sessionUpdate":"usage_update"`), "usage was not reported")
+}
+
+// test_acp_replay_reports_committed_history loads a finished turn and checks that the
+// replay sends the committed user line, the answer, and the stored call.
+@(test)
+test_acp_replay_reports_committed_history :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	listener, endpoint := acp_test_stub_endpoint(t)
+	app: App
+	directory, workspace := acp_test_app_begin(t, &app)
+	defer acp_test_app_end(&app, directory, workspace)
+	note := fmt.aprintf("%s/note.txt", workspace, allocator = context.allocator)
+	defer delete(note, context.allocator)
+	if write_error := os.write_entire_file(note, "the file the tool reads\n"); write_error != nil {
+		testing.fail_now(t, "the note could not be written")
+	}
+	first, second := acp_test_tool_reply(t, note)
+	replies := []string{first, second}
+	stub := ACP_Test_Replies {
+		listener = listener,
+		replies  = replies,
+	}
+	provider := thread.create(acp_test_stub_thread, name = "nabla-acp-test-provider")
+	if provider == nil { testing.fail_now(t, "the stub thread could not be created") }
+	provider.data = &stub
+	thread.start(provider)
+	defer {
+		_ = net.shutdown(listener, .Both)
+		net.close(listener)
+		thread.join(provider)
+		thread.destroy(provider)
+		testing.expect(t, !stub.failed, "the stub provider failed")
+		testing.expect_value(t, stub.served, len(replies))
+	}
+
+	base_url := fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.allocator)
+	defer delete(base_url, context.allocator)
+	app.setup.catalog = acp_test_catalog(app.setup.alloc, base_url)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", ""), "the stub model could not be selected") {
+		return
+	}
+	chat := &app.setup.session
+	id := chat.session
+	if accepted := agent.chat_session_accept_user(chat, "read the note"); !testing.expect(t, accepted == .Accepted, "the prompt was not accepted") { return }
+	if !testing.expect(
+		t,
+		agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), {}, nil, nil),
+		"the turn did not complete",
+	) { return }
+
+	// A load replays the committed history through the same updates a live turn
+	// streams: full user and assistant messages, and each stored call with the
+	// result it produced. The store stays the app's until the replay has read it;
+	// release must not close that store, because the app closes it.
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V2, &app.setup.catalog)
+	defer acp_test_interface_destroy(&iface)
+	session := ACP_Session {
+		conn       = &iface.server,
+		store      = app.setup.store,
+		session_id = id,
+	}
+	defer {
+		session.store = nil
+		acp_session_release(&session)
+	}
+	acp_replay_session(&session)
+	if !acp_test_buffer_wait(t, &iface.buffer, `"sessionUpdate":"agent_message"`, "the replayed answer") { return }
+	frames := acp_test_buffer_text(&iface.buffer)
+	testing.expect(t, strings.contains(frames, `"sessionUpdate":"user_message"`), "the replayed line is missing")
+	testing.expect(t, strings.contains(frames, "read the note"), "the replay lost the line")
+	testing.expect(t, strings.contains(frames, "the note says so"), "the replay lost the answer")
+	testing.expect(t, strings.contains(frames, `"sessionUpdate":"tool_call_update"`), "the replayed call is missing")
+	testing.expect(t, strings.contains(frames, `"toolCallId":"call_1"`), "the replayed call lost its id")
+	testing.expect(t, strings.contains(frames, `"status":"completed"`), "the replay lost the call outcome")
+}
+
+// --- serving a turn ------------------------------------------------------------
+
+// ACP_Test_Prompt drives one prompt through the worker while the test thread serves
+// the session the way the session server does.
+ACP_Test_Prompt :: struct {
+	session: ^ACP_Session,
+	id:      acp.JSONRPC_Id,
+	text:    string,
+}
+
+acp_test_prompt_thread :: proc(thread_handle: ^thread.Thread) {
+	waiter := cast(^ACP_Test_Prompt)thread_handle.data
+	context.allocator = waiter.session.conn.alloc
+	work := ACP_Work_Prompt {
+		text = waiter.text,
+	}
+	acp_work_prompt(waiter.session, waiter.id, work)
+	delete(work.text, waiter.session.conn.alloc)
+}
+
+// acp_test_fake_server marks the session as watched without starting a process: the
+// test thread applies the server steps itself. The waiter then polls the journal the
+// same way it would under a real server.
+acp_test_fake_server :: proc(session: ^ACP_Session) {
+	state := new(Client_Server_State, session.conn.alloc)
+	session.server.state = state
+}
+
+acp_test_fake_server_destroy :: proc(session: ^ACP_Session) {
+	free(session.server.state, session.conn.alloc)
+	session.server.state = nil
+}
+
+// acp_test_await_inbox waits until the session holds an undelivered line, so the test
+// thread can serve the turn the waiter appended.
+@(require_results)
+acp_test_await_inbox :: proc(t: ^testing.T, store: ^journal.Journal, id: journal.Session_Id) -> bool {
+	deadline := time.tick_add(time.tick_now(), ACP_TEST_BOUND)
+	for {
+		seen := agent.owner_wake_seen()
+		inbox, inbox_error := journal.read_inbox(store, id, 0, context.temp_allocator)
+		defer free_all(context.temp_allocator)
+		if inbox_error != nil {
+			testing.expectf(t, false, "the inbox could not be read: %s", journal.error_text(inbox_error, context.temp_allocator))
+			return false
+		}
+		if len(inbox) > 0 { return true }
+		if time.tick_diff(time.tick_now(), deadline) <= 0 {
+			testing.expect(t, false, "the appended line never reached the inbox")
+			return false
+		}
+		agent.owner_wake_wait(seen, time.tick_add(time.tick_now(), 100 * time.Millisecond))
+	}
+}
+
+// acp_test_prompt_roundtrip runs one prompt through the worker while the test thread
+// serves its turn, and holds the served answer to the stop reason the profile reports.
+acp_test_prompt_roundtrip :: proc(t: ^testing.T, profile: ACP_Wire_Profile, name: string) {
+	if !test_isolate_process(t, name) { return }
+	state, previous, had_previous := acp_test_state_isolate(t)
+	defer acp_test_state_restore(state, previous, had_previous)
+	listener, endpoint := acp_test_stub_endpoint(t)
+	defer net.close(listener)
+	reply := acp_test_stream_reply(
+		[]string{`{"choices":[{"delta":{"content":"hello"},"finish_reason":null}]}`, `{"choices":[{"delta":{},"finish_reason":"stop"}]}`},
+		context.allocator,
+	)
+	defer delete(reply, context.allocator)
+	stub := ACP_Test_Replies {
+		listener = listener,
+		replies  = []string{reply},
+	}
+	provider := thread.create(acp_test_stub_thread, name = "nabla-acp-test-provider")
+	if provider == nil { testing.fail_now(t, "the stub thread could not be created") }
+	provider.data = &stub
+	thread.start(provider)
+	defer {
+		_ = net.shutdown(listener, .Both)
+		net.close(listener)
+		thread.join(provider)
+		thread.destroy(provider)
+		testing.expect(t, !stub.failed, "the stub provider failed")
+		testing.expect_value(t, stub.served, len(stub.replies))
+	}
+
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if locks_error != .None { testing.fail_now(t, "the lock directory could not be resolved") }
+	defer delete(locks, context.allocator)
+	app: App
+	directory, workspace := acp_test_app_begin(t, &app, locks)
+	defer acp_test_app_end(&app, directory, workspace)
+	base_url := fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.allocator)
+	defer delete(base_url, context.allocator)
+	app.setup.catalog = acp_test_catalog(app.setup.alloc, base_url)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", ""), "the stub model could not be selected") {
+		return
+	}
+	chat := &app.setup.session
+	id := chat.session
+
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, profile, &app.setup.catalog)
+	defer acp_test_interface_destroy(&iface)
+	server := &iface.server
+	server.app.setup.journal_directory = strings.clone(directory, context.allocator)
+	defer delete(server.app.setup.journal_directory, context.allocator)
+	server.app.setup.lock_directory = strings.clone(locks, context.allocator)
+	defer delete(server.app.setup.lock_directory, context.allocator)
+	server.app.setup.run = journal.run_id_create()
+
+	store, store_error := journal.open(directory, locks, journal.run_id_create(), .Read_Write, context.allocator)
+	if store_error != nil { testing.fail_now(t, "the follower journal could not open") }
+	session := ACP_Session {
+		conn       = server,
+		store      = store,
+		session_id = id,
+	}
+	follow, follow_error := client_follow_open(session.store, session.session_id)
+	if follow_error.kind != .None { testing.fail_now(t, "the session could not be followed") }
+	session.follow = follow
+	provider_id, provider_error := strings.clone("test-provider", context.allocator)
+	model_id, model_error := strings.clone("test-model", context.allocator)
+	if provider_error != nil || model_error != nil { testing.fail_now(t, "the serving identity could not be held") }
+	session.provider_id = provider_id
+	session.model_id = model_id
+	acp_test_fake_server(&session)
+	defer {
+		acp_test_fake_server_destroy(&session)
+		acp_session_release(&session)
+	}
+
+	text, text_error := strings.clone("say hello", context.allocator)
+	if text_error != nil { testing.fail_now(t, "the prompt could not be held") }
+	waiter := ACP_Test_Prompt {
+		session = &session,
+		id      = i64(1),
+		text    = text,
+	}
+	prompt_thread := thread.create(acp_test_prompt_thread, name = "nabla-acp-test-prompt")
+	if prompt_thread == nil { testing.fail_now(t, "the prompt thread could not be created") }
+	prompt_thread.data = &waiter
+	thread.start(prompt_thread)
+	defer {
+		thread.join(prompt_thread)
+		thread.destroy(prompt_thread)
+	}
+	if !acp_test_await_inbox(t, app.setup.store, id) { return }
+	step, step_ok := serve_step(&app)
+	if !testing.expect(t, step_ok, "the server step must read") { return }
+	testing.expect_value(t, step, Serve_Step.Turn)
+	testing.expect(t, serve_run_turn(&app), "the server turn did not run")
+
+	if profile == .V2 {
+		if !acp_test_buffer_wait(t, &iface.buffer, `"state":"idle"`, "the idle state") { return }
+		frames := acp_test_buffer_text(&iface.buffer)
+		testing.expect(t, strings.contains(frames, `"sessionUpdate":"user_message"`), "the prompt was not echoed")
+		testing.expect(t, strings.contains(frames, `"state":"running"`), "the turn was not announced as running")
+		testing.expect(t, strings.contains(frames, `"stopReason":"end_turn"`), "the turn did not report end_turn")
+	} else {
+		if !acp_test_buffer_wait(t, &iface.buffer, `"stopReason":"end_turn"`, "the prompt result") { return }
+	}
+	frames := acp_test_buffer_text(&iface.buffer)
+	testing.expect(t, strings.contains(frames, "hello"), "the answer lost its text")
+}
+
+@(test)
+test_acp_prompt_end_to_end_v1 :: proc(t: ^testing.T) {
+	acp_test_prompt_roundtrip(t, .V1, "test_acp_prompt_end_to_end_v1")
+}
+
+@(test)
+test_acp_prompt_end_to_end_v2 :: proc(t: ^testing.T) {
+	acp_test_prompt_roundtrip(t, .V2, "test_acp_prompt_end_to_end_v2")
+}
+
+// ACP_Test_Command drives one config change through the worker while the test thread
+// applies it the way the session server does.
+ACP_Test_Command :: struct {
+	session: ^ACP_Session,
+	id:      acp.JSONRPC_Id,
+	config:  ACP_Work_Set_Config_Option,
+	done:    bool,
+}
+
+acp_test_command_thread :: proc(thread_handle: ^thread.Thread) {
+	commander := cast(^ACP_Test_Command)thread_handle.data
+	context.allocator = commander.session.conn.alloc
+	acp_work_set_config_option(commander.session, commander.id, commander.config)
+	delete(commander.config.config_id, commander.session.conn.alloc)
+	delete(commander.config.config_value, commander.session.conn.alloc)
+	sync.atomic_store(&commander.done, true)
+}
+
+// acp_test_apply_command runs one config change through the worker while the test
+// thread applies the pending commands. It holds the worker's answer.
+acp_test_apply_command :: proc(t: ^testing.T, app: ^App, session: ^ACP_Session, id: i64, config_id, config_value: string) {
+	owned_id, id_error := strings.clone(config_id, context.allocator)
+	if id_error != nil { testing.fail_now(t, "the config id could not be held") }
+	owned_value, value_error := strings.clone(config_value, context.allocator)
+	if value_error != nil { testing.fail_now(t, "the config value could not be held") }
+	commander := ACP_Test_Command {
+		session = session,
+		id = id,
+		config = ACP_Work_Set_Config_Option{config_id = owned_id, config_value = owned_value},
+	}
+	command_thread := thread.create(acp_test_command_thread, name = "nabla-acp-test-command")
+	if command_thread == nil { testing.fail_now(t, "the command thread could not be created") }
+	command_thread.data = &commander
+	thread.start(command_thread)
+	defer {
+		thread.join(command_thread)
+		thread.destroy(command_thread)
+	}
+	deadline := time.tick_add(time.tick_now(), ACP_TEST_BOUND)
+	for !sync.atomic_load(&commander.done) {
+		seen := agent.owner_wake_seen()
+		pending, pending_error := journal.read_pending_commands(app.setup.store, session.session_id, context.temp_allocator)
+		defer free_all(context.temp_allocator)
+		if pending_error != nil { testing.fail_now(t, "the pending commands could not be read") }
+		if len(pending) > 0 {
+			serve_commands_apply(app, .Boundary)
+		}
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(t, "the command was never answered") }
+		agent.owner_wake_wait(seen, time.tick_add(time.tick_now(), 100 * time.Millisecond))
+	}
+}
+
+// acp_test_command_roundtrip applies one model change and one effort change through the
+// worker while the test thread applies the pending commands. It holds the applied
+// serving identity and the answers the worker gives for them.
+@(test)
+test_acp_command_roundtrip :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	state, previous, had_previous := acp_test_state_isolate(t)
+	defer acp_test_state_restore(state, previous, had_previous)
+
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if locks_error != .None { testing.fail_now(t, "the lock directory could not be resolved") }
+	defer delete(locks, context.allocator)
+	app: App
+	directory, workspace := acp_test_app_begin(t, &app, locks)
+	defer acp_test_app_end(&app, directory, workspace)
+	app.setup.catalog = acp_test_effort_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", ""), "the catalog model could not be selected") {
+		return
+	}
+	id := app.setup.session.session
+
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V2, &app.setup.catalog)
+	defer acp_test_interface_destroy(&iface)
+	server := &iface.server
+	server.app.setup.journal_directory = strings.clone(directory, context.allocator)
+	defer delete(server.app.setup.journal_directory, context.allocator)
+	server.app.setup.lock_directory = strings.clone(locks, context.allocator)
+	defer delete(server.app.setup.lock_directory, context.allocator)
+	server.app.setup.run = journal.run_id_create()
+
+	store, store_error := journal.open(directory, locks, journal.run_id_create(), .Read_Write, context.allocator)
+	if store_error != nil { testing.fail_now(t, "the follower journal could not open") }
+	session := ACP_Session {
+		conn       = server,
+		store      = store,
+		session_id = id,
+	}
+	follow, follow_error := client_follow_open(session.store, session.session_id)
+	if follow_error.kind != .None { testing.fail_now(t, "the session could not be followed") }
+	session.follow = follow
+	provider_id, provider_error := strings.clone("test-provider", context.allocator)
+	model_id, model_error := strings.clone("test-model", context.allocator)
+	if provider_error != nil || model_error != nil { testing.fail_now(t, "the serving identity could not be held") }
+	session.provider_id = provider_id
+	session.model_id = model_id
+	acp_test_fake_server(&session)
+	defer {
+		acp_test_fake_server_destroy(&session)
+		acp_session_release(&session)
+	}
+
+	acp_test_apply_command(t, &app, &session, 1, "model", "test-provider/test-model")
+	acp_test_apply_command(t, &app, &session, 2, "effort", "high")
+	frames := acp_test_buffer_text(&iface.buffer)
+	testing.expect(t, strings.contains(frames, `"currentValue":"test-provider/test-model"`), "the applied model was not answered")
+	testing.expect(t, strings.contains(frames, `"currentValue":"high"`), "the applied effort was not answered")
+	testing.expect_value(t, session.provider_id, "test-provider")
+	testing.expect_value(t, session.model_id, "test-model")
+	testing.expect_value(t, session.effort, "high")
 }

@@ -435,6 +435,61 @@ session_follow :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (message: 
 	return "", true
 }
 
+// session_recorded_selection reads the model the session last ran with: the serving
+// identity its latest selection.applied installed, otherwise the provider and model its
+// latest turn started with. Every string is owned by allocator. Found is false when the
+// session never recorded one. selection_stage tells which read an error belongs to: true
+// for the selection record, false for the turn fallback. held means the strings could
+// not be held, so the caller reports that instead of the error.
+@(require_results)
+session_recorded_selection :: proc(
+	store: ^journal.Journal,
+	id: journal.Session_Id,
+	allocator: mem.Allocator,
+) -> (
+	provider, model, effort: string,
+	found: bool,
+	selection_stage: bool,
+	error: journal.Error,
+	held: bool,
+) {
+	record, has_record, read_error := journal.read_latest(store, {session = id, kinds = {.Selection_Applied}}, allocator)
+	if read_error != nil { return "", "", "", false, true, read_error, false }
+	if has_record {
+		defer journal.record_destroy(&record, allocator)
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
+		applied, is_applied := record.payload.?.(journal.Selection_Applied)
+		if !is_applied { return "", "", "", false, true, journal.Journal_Error.Corrupt, false }
+		held_provider, held_provider_error := strings.clone(record.provider, allocator)
+		held_model, held_model_error := strings.clone(record.model, allocator)
+		held_effort, held_effort_error := strings.clone(applied.effort, allocator)
+		if held_provider_error != nil || held_model_error != nil || held_effort_error != nil {
+			failed := held_provider_error
+			if held_model_error != nil { failed = held_model_error }
+			if held_effort_error != nil { failed = held_effort_error }
+			delete(held_provider, allocator)
+			delete(held_model, allocator)
+			delete(held_effort, allocator)
+			return "", "", "", false, true, failed, true
+		}
+		return held_provider, held_model, held_effort, true, true, nil, false
+	}
+	latest, has_latest, latest_error := journal.read_latest(store, {session = id, kinds = {.Turn_Started}}, allocator)
+	if latest_error != nil { return "", "", "", false, false, latest_error, false }
+	defer journal.record_destroy(&latest, allocator)
+	if !has_latest { return "", "", "", false, false, nil, false }
+	turn_provider, turn_provider_error := strings.clone(latest.provider, allocator)
+	turn_model, turn_model_error := strings.clone(latest.model, allocator)
+	if turn_provider_error != nil || turn_model_error != nil {
+		failed := turn_provider_error
+		if turn_model_error != nil { failed = turn_model_error }
+		delete(turn_provider, allocator)
+		delete(turn_model, allocator)
+		return "", "", "", false, false, failed, true
+	}
+	return turn_provider, turn_model, "", true, false, nil, false
+}
+
 // session_settle completes an opened session whose store holds the claim or follows it.
 // A claimed session first settles what an earlier run left open and counts the lines it
 // accepted and never delivered; either way it reads the session's head and the selection
@@ -499,48 +554,19 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 		if opened.following { opened.pending = waiting } else { journal.records_destroy(waiting, allocator) }
 	}
 
-	selection_record, selection_found, read_error := journal.read_latest(store, {session = id, kinds = {.Selection_Applied}}, allocator)
-	if read_error != nil {
-		opened.settle_busy = journal.error_is_busy(read_error)
-		return session_error_message("cannot read the session selection", read_error, allocator), false
-	}
-	if selection_found {
-		defer journal.record_destroy(&selection_record, allocator)
-		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		selected, is_selected := selection_record.payload.?.(journal.Selection_Applied)
-		if !is_selected {
-			return session_error_message("cannot read the session selection", journal.Journal_Error.Corrupt, allocator), false
-		}
-		provider, provider_error := strings.clone(selection_record.provider, allocator)
-		model, model_error := strings.clone(selection_record.model, allocator)
-		effort, effort_error := strings.clone(selected.effort, allocator)
-		if provider_error != nil || model_error != nil || effort_error != nil {
-			delete(provider, allocator)
-			delete(model, allocator)
-			delete(effort, allocator)
+	provider, model, effort, selection_found, selection_stage, selection_error, held := session_recorded_selection(store, id, allocator)
+	if selection_error != nil {
+		if held {
 			return fmt.aprintf("the session's model could not be stored", allocator = allocator), false
 		}
+		if journal.error_is_busy(selection_error) { opened.settle_busy = true }
+		what := "cannot read the session selection" if selection_stage else "cannot read the session"
+		return session_error_message(what, selection_error, allocator), false
+	}
+	if selection_found {
 		opened.provider = provider
 		opened.model = model
 		opened.effort = effort
-	} else {
-		latest, found, turn_read_error := journal.read_latest(opened.store, {session = id, kinds = {.Turn_Started}}, allocator)
-		if turn_read_error != nil {
-			opened.settle_busy = journal.error_is_busy(turn_read_error)
-			return session_error_message("cannot read the session", turn_read_error, allocator), false
-		}
-		defer journal.record_destroy(&latest, allocator)
-		if found {
-			provider, provider_error := strings.clone(latest.provider, allocator)
-			model, model_error := strings.clone(latest.model, allocator)
-			if provider_error != nil || model_error != nil {
-				delete(provider, allocator)
-				delete(model, allocator)
-				return fmt.aprintf("the session's model could not be stored", allocator = allocator), false
-			}
-			opened.provider = provider
-			opened.model = model
-		}
 	}
 	owned_workspace, workspace_error := strings.clone(workspace, allocator)
 	if workspace_error != nil {
@@ -694,18 +720,6 @@ session_error_message :: proc(what: string, error: journal.Error, allocator: mem
 	message, join_error := strings.concatenate({what, ": ", detail}, allocator)
 	if join_error != nil { return fmt.aprintf("%s: out of memory", what, allocator = allocator) }
 	return message
-}
-
-// report_recovery says what an earlier run left behind, so a resumed session
-// starts knowing which calls have an outcome the harness never saw and which lines it
-// accepted and never delivered.
-report_recovery :: proc(recovery: journal.Recovery, queued: int) {
-	if recovery.calls > 0 {
-		fmt.eprintf("nabla: %d tool call(s) never reported a result; their results say whether they ran\n", recovery.calls)
-	}
-	if queued > 0 {
-		fmt.eprintf("nabla: %d queued line(s) will go with your next prompt\n", queued)
-	}
 }
 
 // selection_latest reads the model the user last chose, owned by allocator.
