@@ -152,11 +152,8 @@ session_client_names :: proc(opened: ^Opened_Session, provider, model, effort: s
 	return "", true
 }
 
-// session_client_install makes opened the running session and follows it. It does not
-// claim the session and does not start the server. A problem, static text, leaves the
-// running session intact.
 @(require_results)
-session_client_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem: string) {
+session_client_prepare :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (Client_Follow, agent.Chat_Session, string) {
 	follow, follow_error := client_follow_open(opened.store, opened.id)
 	if follow_error.kind == .Watch {
 		// The lock file is not there yet, so there is nothing to watch. The follow
@@ -164,7 +161,7 @@ session_client_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (p
 		cursor, cursor_error := agent.follow_start(opened.store, opened.id)
 		if cursor_error != nil {
 			opened_session_destroy(opened, setup.alloc)
-			return "the session could not be followed"
+			return {}, {}, "the session could not be followed"
 		}
 		follow = {
 			store   = opened.store,
@@ -173,7 +170,7 @@ session_client_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (p
 		}
 	} else if follow_error.kind != .None {
 		opened_session_destroy(opened, setup.alloc)
-		return "the session could not be followed"
+		return {}, {}, "the session could not be followed"
 	}
 	new_session, tool_error := agent.chat_session_init(
 		opened.store,
@@ -187,8 +184,18 @@ session_client_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (p
 	if tool_error.kind != .None {
 		client_follow_close(&follow)
 		opened_session_destroy(opened, setup.alloc)
-		return "the tool registry could not be allocated"
+		return {}, {}, "the tool registry could not be allocated"
 	}
+	return follow, new_session, ""
+}
+
+// session_client_install makes opened the running session and follows it. It does not
+// claim the session and does not start the server. A problem, static text, leaves the
+// running session intact.
+@(require_results)
+session_client_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem: string) {
+	follow, new_session, prepare_problem := session_client_prepare(setup, opened)
+	if prepare_problem != "" { return prepare_problem }
 
 	client_follow_close(&setup.follow_client)
 	if setup.store != nil {
@@ -398,20 +405,13 @@ app_client_steer :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 		_ = app_client_poll(app, observer)
 		return true
 	}
-	rest, rest_error := make([dynamic]string, 0, len(taken) - sent, app.run.steer.allocator)
+	rest, rest_error := make([dynamic]string, len(taken) - sent, app.run.steer.allocator)
 	if rest_error != nil {
 		agent.steer_taken_destroy(&app.run.steer, taken)
 		snap_append(app, .Warning, "a steering line could not be kept")
 		return true
 	}
-	for line in taken[sent:] {
-		if _, append_error := append(&rest, line); append_error != nil {
-			agent.steer_taken_destroy(&app.run.steer, taken)
-			agent.steer_taken_destroy(&app.run.steer, rest)
-			snap_append(app, .Warning, "a steering line could not be kept")
-			return true
-		}
-	}
+	copy(rest[:], taken[sent:])
 	for line in taken[:sent] { delete(line, app.run.steer.allocator) }
 	delete(taken)
 	if !agent.steer_requeue(&app.run.steer, rest) { snap_append(app, .Warning, "a steering line could not be kept") }

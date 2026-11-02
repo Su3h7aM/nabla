@@ -793,14 +793,14 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 		transmute([]u8)string("an answer"),
 	)
 	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit") }
-	testing.expect(t, app_follow_service(&app, observer), "the runner's answer is new")
+	testing.expect(t, app_client_service(&app, observer), "the runner's answer is new")
 	testing.expect(t, app_following(&app), "a claim that fails leaves the process a follower")
 	app_client_prompt(&app, "queued line", observer)
 	testing.expect_value(t, app_entries_count(&app, "queued line"), 1)
 
 	if close_error := journal.close(runner); close_error != nil { testing.fail_now(t, "the runner's journal did not close") }
 	runner = nil
-	testing.expect(t, app_follow_service(&app, observer), "the claim dropped")
+	testing.expect(t, app_client_service(&app, observer), "the claim dropped")
 	testing.expect(t, app_following(&app), "closing the runner does not make this process the owner")
 	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
 	testing.expect_value(t, app.setup.store.followed, id)
@@ -2210,44 +2210,6 @@ test_resume_restores_an_installed_selection_without_a_later_turn :: proc(t: ^tes
 	testing.expect_value(t, app.run.connection.API, ai.API_Kind.OpenAI_Responses)
 }
 
-@(test)
-test_follower_attachment_replays_captured_pending_input_once :: proc(t: ^testing.T) {
-	app: App
-	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
-	app.setup.shared_sessions = true
-	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner, runner_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
-	if runner_error != nil { testing.fail_now(t, "runner open failed") }
-	defer _ = journal.close(runner)
-	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
-	sender, sender_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
-	if sender_error != nil { testing.fail_now(t, "sender open failed") }
-	defer _ = journal.close(sender)
-	if error := journal.follow(sender, id); error != nil { testing.fail_now(t, "sender follow failed") }
-	if error := journal.append_input(sender, "captured pending line", .Prompt); error != nil { testing.fail_now(t, "input failed") }
-	waiting, error := journal.read_inbox(runner, id, 0, context.temp_allocator)
-	if !testing.expect(t, error == nil && len(waiting) == 1) { return }
-	opened, message, ok := session_open(&app.setup, Start_Resume_Id(app_session_id_text(id)), app.setup.workspace)
-	defer delete(message, app.setup.alloc)
-	defer opened_session_destroy(&opened, app.setup.alloc)
-	if !testing.expect(t, ok) { return }
-	_, head, head_error := journal.session_head(runner, id)
-	if !testing.expect(t, head_error == nil) { return }
-	_ = journal.append_node(
-		runner,
-		{session = id, branch = journal.INITIAL_BRANCH, parent = head, kind = .User},
-		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt], message = waiting[0].seq},
-		transmute([]u8)string("captured pending line"),
-	)
-	if _, error := journal.commit(runner); error != nil { testing.fail_now(t, "delivery failed") }
-	if !testing.expect(t, session_install(&app.setup, &opened) == "") { return }
-	session_opened_show(&app)
-	_ = app_follow_poll(&app, run_observer(&app))
-	testing.expect_value(t, app_entries_count(&app, "captured pending line"), 1)
-	testing.expect_value(t, len(app.setup.follow_pending), 0)
-}
-
 // A turn that ends with calls still running settles their boxes as unknown, and the script's
 // running inner lines with them.
 @(test)
@@ -2352,7 +2314,7 @@ test_a_follower_shows_the_calls_running_when_it_attached :: proc(t: ^testing.T) 
 		transmute([]u8)string("a harness note"),
 	)
 	if _, error := journal.commit(runner); error != nil { testing.fail_now(t, "completion commit failed") }
-	_ = app_follow_poll(&app, run_observer(&app))
+	_ = app_client_poll(&app, run_observer(&app))
 	testing.expect_value(t, app_entries_count(&app, "a harness note"), 1)
 	boxes := 0
 	for entry in app_entries(&app) {
@@ -2408,7 +2370,7 @@ test_a_follower_does_not_repeat_a_result_the_replay_showed :: proc(t: ^testing.T
 	if !testing.expect(t, read_error == nil && len(completed) == 1) { return }
 	app.setup.follow.last = completed[0].seq - 1
 	app.setup.follow_client.cursor.last = completed[0].seq - 1
-	_ = app_follow_poll(&app, run_observer(&app))
+	_ = app_client_poll(&app, run_observer(&app))
 	boxes := 0
 	for entry in app_entries(&app) {
 		if entry.kind != .Tool { continue }
@@ -2441,8 +2403,8 @@ test_busy_follower_input_retries_once_and_keeps_order :: proc(t: ^testing.T) {
 	deadline, present := journal.flush_deadline(app.setup.store).?
 	testing.expect(t, present && time.tick_diff(time.tick_now(), deadline) > 0, "Busy must rearm a future deadline")
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
-	_ = app_follow_service(&app, observer)
-	_ = app_follow_service(&app, observer)
+	_ = app_client_service(&app, observer)
+	_ = app_client_service(&app, observer)
 	testing.expect_value(t, app_entries_count(&app, "first pending line"), 1)
 	testing.expect_value(t, app_entries_count(&app, "second pending line"), 1)
 	waiting, error := journal.read_inbox(runner, id, 0, context.temp_allocator)
@@ -2470,13 +2432,13 @@ test_busy_takeover_retries_only_on_new_submit :: proc(t: ^testing.T) {
 	observer := run_observer(&app)
 	app_client_prompt(&app, "retained during takeover", observer)
 	if error := journal.release(runner); error != nil { testing.fail_now(t, "runner release failed") }
-	_ = app_follow_service(&app, observer)
+	_ = app_client_service(&app, observer)
 	testing.expect(t, app_following(&app), "a busy release does not take the claim")
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
-	_ = app_follow_service(&app, observer)
+	_ = app_client_service(&app, observer)
 	testing.expect(t, app_following(&app), "a later wake does not take the claim")
 	app_client_prompt(&app, "explicit retry", observer)
-	_ = app_follow_service(&app, observer)
+	_ = app_client_service(&app, observer)
 	testing.expect(t, app_following(&app), "a new line does not take the claim")
 	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
 	testing.expect_value(t, app_entries_count(&app, "retained during takeover"), 1)
@@ -2502,7 +2464,7 @@ test_takeover_shows_input_first_committed_by_recovery :: proc(t: ^testing.T) {
 	app_client_prompt(&app, "first committed in recovery", observer)
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
 	if error := journal.release(runner); error != nil { testing.fail_now(t, "runner release failed") }
-	testing.expect(t, app_follow_service(&app, observer), "the committed line is new")
+	testing.expect(t, app_client_service(&app, observer), "the committed line is new")
 	testing.expect(t, app_following(&app), "showing the line does not take the claim")
 	testing.expect_value(t, app_entries_count(&app, "first committed in recovery"), 1)
 }
@@ -3484,9 +3446,7 @@ steer_test_render :: proc(t: ^testing.T, app: ^App, storage: ^Frame_Storage) {
 	testing.expect_value(t, image_test_frame(app, storage), Render_Status.None)
 }
 
-// A line typed during a turn shows above the prompt for as long as the session has not
-// delivered it, driven through the worker's own steering step and the frame the terminal draws.
-// A click selects a message and a second click expands it.
+// A queued line shows above the prompt. A click selects it and a second click expands it.
 @(test)
 test_queued_steering_shows_until_delivered :: proc(t: ^testing.T) {
 	app: App
@@ -3494,15 +3454,13 @@ test_queued_steering_shows_until_delivered :: proc(t: ^testing.T) {
 	defer steer_test_end(&app, directory)
 	storage := frame_storage_new(context.allocator)
 	defer frame_storage_destroy(storage)
-	steer := app_steer_context(&app)
 
 	steer_test_render(t, &app, storage)
 	testing.expect_value(t, app_row_with(storage, "Queued"), -1)
 
-	// The prompt's own path queues the line; the worker looks at it while a request is in flight.
+	// The prompt queues the line while a request is in flight.
 	steer_test_submit(t, &app, "use the other file\nand mind the tests")
 	app.setup.session.state = .Requesting
-	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
 	steer_test_render(t, &app, storage)
 	row := app_row_with(storage, "use the other file")
 	if !testing.expect(t, row >= 0, "the queued line stays above the prompt while a request is in flight") { return }
@@ -3522,12 +3480,6 @@ test_queued_steering_shows_until_delivered :: proc(t: ^testing.T) {
 	steer_test_render(t, &app, storage)
 	testing.expect(t, app_row_with(storage, "and mind the tests") < 0, "another click collapses it")
 
-	// A message leaves the component when the worker delivers it, at a settled point.
-	app.setup.session.state = .Preparing
-	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
-	testing.expect(t, len(app.run.steer.items) == 0, "the delivered line left the queue")
-	steer_test_render(t, &app, storage)
-	testing.expect_value(t, app_row_with(storage, "Queued"), -1)
 }
 
 // The Alt+Up and Alt+Down encodings terminals send: the CSI form with the Alt modifier and
@@ -3646,14 +3598,13 @@ test_alt_keys_move_the_selection_and_escape_clears_it :: proc(t: ^testing.T) {
 	testing.expect_value(t, widgets.input_text(&app.input), "")
 }
 
-// Escape during an edit leaves the message as it was, gives the prompt its draft back, and
-// lets the session deliver the message again. An empty text saved over a message removes it.
+// Escape during an edit leaves the message as it was and gives the prompt its draft back.
+// An empty text saved over a message removes it.
 @(test)
 test_cancelling_an_edit_restores_the_draft_and_an_empty_edit_removes_the_message :: proc(t: ^testing.T) {
 	app: App
 	directory := steer_test_app(t, &app)
 	defer steer_test_end(&app, directory)
-	steer := app_steer_context(&app)
 
 	steer_test_submit(t, &app, "Good")
 	steer_test_submit(t, &app, "Two")
@@ -3678,37 +3629,6 @@ test_cancelling_an_edit_restores_the_draft_and_an_empty_edit_removes_the_message
 	testing.expect_value(t, steer_test_queued(t, &app), "Two")
 	testing.expect_value(t, widgets.input_text(&app.input), "my draft")
 
-	// A message released by the cancel is delivered like any other.
-	app.setup.session.state = .Preparing
-	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
-	testing.expect(t, len(app.run.steer.items) == 0)
-}
-
-// While a message is edited the session does not deliver it with its old text or let the
-// messages behind it overtake it. After the edit is saved, the new text and the rest are
-// delivered in order.
-@(test)
-test_delivery_waits_for_the_message_being_edited :: proc(t: ^testing.T) {
-	app: App
-	directory := steer_test_app(t, &app)
-	defer steer_test_end(&app, directory)
-	steer := app_steer_context(&app)
-
-	for message in ([]string{"a", "b", "c"}) { steer_test_submit(t, &app, message) }
-	app_type_bytes(t, &app, ALT_UP[1])
-	app_type_bytes(t, &app, ALT_UP[1])
-	handle_event(&app, input.Key_Event{code = .Enter})
-	testing.expect_value(t, widgets.input_text(&app.input), "b")
-
-	app.setup.session.state = .Preparing
-	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
-	testing.expect_value(t, steer_test_queued(t, &app), "b|c")
-	testing.expect(t, widgets.input_replace(&app.input, "b edited") == nil)
-	handle_event(&app, input.Key_Event{code = .Enter})
-	testing.expect_value(t, steer_test_queued(t, &app), "b edited|c")
-	app.setup.session.state = .Preparing
-	agent.chat_steering_observe(&app.setup.session, run_observer(&app), &steer)
-	testing.expect_value(t, steer_test_queued(t, &app), "")
 }
 
 // A turn that ends during an edit saves the edit as the message, so it is sent with the new

@@ -253,15 +253,6 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	refresh_status(app)
 }
 
-// app_steer_context is the input a turn of the running session consumes: the queue the
-// prompt pushes into and the hooks the front-end installs at the turn's boundaries.
-app_steer_context :: proc(app: ^App) -> agent.Steer_Context {
-	return {queue = &app.run.steer, apply = app_steer_apply, observe = app_steer_observe, apply_data = app}
-}
-
-app_steer_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Observer) {
-}
-
 // app_command_compact runs compaction for a session this process owns. The ACP worker
 // calls it. The TUI sends Compact instead and does not run the summary.
 app_command_compact :: proc(app: ^App, observer: agent.Chat_Observer) {
@@ -280,27 +271,6 @@ app_follow_flush :: proc(app: ^App) -> bool {
 		snap_append(app, .Error, fmt.tprintf("pending input was not sent: %s", journal.error_text(error, context.temp_allocator)))
 	}
 	return error == nil
-}
-
-// app_follow_poll shows what the runner committed since the last poll and takes the size
-// of its newest request for the footer. It reports whether anything moved.
-app_follow_poll :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
-	setup := &app.setup
-	if setup.follow_client.store != nil { return app_client_poll(app, observer) }
-	before := setup.follow
-	if error := agent.follow_poll(setup.store, setup.session.session, &setup.follow, observer); error != nil {
-		snap_append(app, .Error, fmt.tprintf("cannot read the session: %s", journal.error_text(error, context.temp_allocator)))
-	}
-	// The follower runs no request, so the estimate and window it shows are the runner's.
-	setup.session.last_estimate = setup.follow.estimate
-	if setup.follow.window > 0 { setup.session.capacity.window = setup.follow.window }
-	return setup.follow != before
-}
-
-// app_follow_service shows what the runner committed. It does not take the claim.
-app_follow_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
-	_ = app_follow_flush(app)
-	return app_follow_poll(app, observer)
 }
 
 // app_catalog_ref is the catalog subagents resolve models from, with the lock it is
