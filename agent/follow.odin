@@ -134,10 +134,6 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		if journal.payload_decode(record.data, &message, context.temp_allocator) != nil { return nil }
 		kind := Chat_Message_Kind.Warning if message.level == journal.RUNTIME_LEVEL_NAMES[.Warning] else .Error
 		_observer_message(observer, kind, message.text)
-	case .Selection_Applied:
-		applied: journal.Selection_Applied
-		if journal.payload_decode(record.data, &applied, context.temp_allocator) != nil { return nil }
-		_observer_message(observer, .Notice, fmt.tprintf("the session runs %s / %s", applied.provider, applied.model))
 	}
 	return nil
 }

@@ -327,14 +327,13 @@ session_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	return session_client_switch(app, start)
 }
 
-// session_opened_show says that the session is followed and shows the lines the runner has not delivered, consuming follow_pending.
+// session_opened_show shows the lines the runner has not delivered, consuming follow_pending.
 session_opened_show :: proc(app: ^App) {
 	defer {
 		journal.records_destroy(app.setup.follow_pending, app.setup.alloc)
 		app.setup.follow_pending = nil
 	}
 	if app.setup.session.store.followed == {} { return }
-	snap_append(app, .Notice, "the session runs in another process; this one follows it")
 	for record in app.setup.follow_pending {
 		if record.kind == .User_Input {
 			snap_append(app, user_entry_kind(agent.user_input_origin(record)), string(record.body))

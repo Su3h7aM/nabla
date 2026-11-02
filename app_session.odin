@@ -1008,7 +1008,7 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 	}
 	if app.setup.owns_selection {
 		sync.mutex_guard(&app.run.mu)
-		selection_publish_locked(app, target.provider_id, target.model_id, announce)
+		selection_publish_locked(app, target.provider_id, target.model_id)
 	}
 
 	return true
@@ -1030,7 +1030,7 @@ selection_apply_direct :: proc(app: ^App, provider_id, model_id, effort: string,
 // caller holds the runtime mutex, because the status block is what the frame
 // reads; a headless run has no frame and never calls this.
 @(private)
-selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, announce := true) {
+selection_publish_locked :: proc(app: ^App, provider_id, model_id: string) {
 	running := &app.setup.session
 	status := &app.run.snap.status
 	snap_status_replace(app, &status.provider_id, provider_id)
@@ -1058,7 +1058,6 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string, annou
 	delete(app.run.snap.setup_error, app.run.alloc)
 	app.run.snap.setup_error = ""
 	app.run.snap.setup_error_failed = false
-	if announce { snap_append_locked(app, .Notice, fmt.tprintf("model set to %s / %s", provider_id, model_id)) }
 	snap_publish_locked(app)
 }
 
