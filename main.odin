@@ -385,7 +385,12 @@ chat_main :: proc() -> int {
 	args := os.args[1:]
 	// The ACP agent is a front-end of its own: it takes over the process's standard
 	// streams, so it is a subcommand rather than a launch option.
-	if len(args) > 0 && args[0] == "acp" { return acp_main(args[1:]) }
+	// The subagent child is this same subcommand, so it is named for its role.
+	if len(args) > 0 && args[0] == "acp" {
+		process_name_set(PROCESS_NAME_AGENT)
+		return acp_main(args[1:])
+	}
+	process_name_set(PROCESS_NAME_MAIN)
 
 	options, parse_error := chat_cli_parse(args)
 	if parse_error != .None {

@@ -238,6 +238,8 @@ Zero means absent for every ID. IDs render as lowercase hex or decimal only at b
 
 An idle process has the main, owner, and watcher threads (plus the ACP reader) asleep in the calls above and nothing else. The table names the Linux mechanisms; another platform supplies its equivalents behind the same package-local procedures (section 3.5).
 
+The process names itself through `prctl(PR_SET_NAME)`, so a process monitor lists `nabla` for the main process and `nabla-agent` for each subagent child, which is the `acp` subcommand. Only the process's first thread is renamed, so the name describes the process and not one of its workers.
+
 ### 6.2 Owner loop
 
 ```odin
