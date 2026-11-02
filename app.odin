@@ -103,9 +103,6 @@ Status :: struct {
 	// because some finished requests reported no cache usage.
 	session_hit_partial:  bool,
 	running:              bool,
-	// following says the session runs in another process: this front-end shows it and
-	// sends lines to it, and running then reports that process's turn.
-	following:            bool,
 	// working_since spans the complete execution of one accepted prompt, across
 	// every provider request and tool call, until the session returns to idle.
 	working_since:        time.Tick,
@@ -676,9 +673,9 @@ tui_run :: proc(
 			present_frame(app, app.storage)
 		}
 
-		// Signals stop this process's turn before exit. A follower owns no remote turn,
-		// so it leaves without waiting for the runner.
-		if agent.process_interrupted() && (!runtime_busy(app) || runtime_following(app)) {
+		// A signal stops this front-end. The turn it would have waited for belongs to
+		// the session server, which keeps running.
+		if agent.process_interrupted() {
 			app.quit = true
 			break
 		}

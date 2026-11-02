@@ -725,8 +725,6 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.setup.store.followed, id)
 	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
 	testing.expect(t, app_following(&app), "the session runs in the other journal")
-	refresh_status(&app)
-	testing.expect(t, runtime_following(&app), "the front-end is told to show a follower")
 
 	observer := run_observer(&app)
 	app_client_prompt(&app, "from the follower", observer)

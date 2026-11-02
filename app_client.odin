@@ -104,7 +104,6 @@ session_client_resume :: proc(
 	waiting, waiting_error := journal.read_inbox(opened.store, opened.id, delivered, allocator)
 	if waiting_error != nil { return session_error_message("cannot read the session", waiting_error, allocator), false }
 	opened.pending = waiting
-	opened.following = true
 	return "", true
 }
 

@@ -480,10 +480,9 @@ refresh_status :: proc(app: ^App) {
 	}
 	snap_status_replace(app, &status.cwd, running.workspace)
 	was_running := status.running
-	following := app_following(app)
-	status.following = following
-	// A follower runs no turn of its own; it is working while the runner's turn is.
-	status.running = running.state != .Idle || (following && app.setup.follow.working)
+	// The session's own state stays Idle while another process runs it, so the follow is
+	// where that process's turn shows.
+	status.running = running.state != .Idle || app.setup.follow.working
 	if status.running && !was_running {
 		status.working_since = time.tick_now()
 	}
@@ -527,14 +526,6 @@ set_running :: proc(app: ^App, running: bool) {
 runtime_busy :: proc(app: ^App) -> bool {
 	sync.mutex_guard(&app.run.mu)
 	return app.run.snap.status.running
-}
-
-// runtime_following reports whether the session runs in another process, under the lock
-// the worker publishes the status with.
-@(require_results)
-runtime_following :: proc(app: ^App) -> bool {
-	sync.mutex_guard(&app.run.mu)
-	return app.run.snap.status.following
 }
 
 // runtime_model_selected reports whether a model is in effect, under the lock the

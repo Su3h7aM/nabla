@@ -621,7 +621,7 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem:
 }
 
 // app_following reports whether the running session is one another process runs. Owner
-// thread only: the front-end reads Status.following instead.
+// thread only.
 @(require_results)
 app_following :: proc(app: ^App) -> bool {
 	store := app.setup.store
@@ -997,8 +997,8 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 		delete(app.setup.model_id, app.setup.alloc)
 		app.setup.model_id = setup_model
 	}
-	// A follower never records a selection: it would rewrite the user's default model
-	// for a session whose model it does not choose.
+	// The record names the process-wide default, and only the claim holder may append
+	// it: a followed store appends nothing but its own lines.
 	if app.setup.owns_selection && announce && !app_following(app) {
 		if default_error := selection_record(app.setup.store, target.provider_id, target.model_id, running.effort); default_error != nil {
 			running.storage_failed = true
