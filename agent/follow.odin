@@ -11,19 +11,26 @@ import "nabla:agent/journal"
 // Follow is what a process showing a session another process runs keeps between polls.
 // last is the highest seq rendered, so nothing is shown twice.
 Follow :: struct {
-	last:     journal.Journal_Seq,
-	working:  bool,
+	last:                   journal.Journal_Seq,
+	working:                bool,
 	// estimate and window are the size of the newest response request and the window
 	// it was checked against, zero before one.
-	estimate: int,
-	window:   int,
+	estimate:               int,
+	window:                 int,
 	// input is the seq of a `user.input` line the caller waits to see answered, zero
 	// for none. follow_poll sets turn when the delivering User node is read, and ended
 	// and outcome at that turn's `turn.completed`.
-	input:    journal.Journal_Seq,
-	turn:     journal.Turn_Id,
-	ended:    bool,
-	outcome:  journal.Turn_Outcome,
+	input:                  journal.Journal_Seq,
+	turn:                   journal.Turn_Id,
+	ended:                  bool,
+	outcome:                journal.Turn_Outcome,
+	// assistant_message, when set, runs as a committed assistant message is delivered.
+	// turn is that message's turn. ordinal counts the assistant nodes of the turn in
+	// delivery order, from zero. text is the committed body. Returning true means the
+	// callback showed the message. A nil callback, or false, shows the whole text
+	// through the observer as one message, as before.
+	assistant_message:      proc(user_data: rawptr, turn: journal.Turn_Id, ordinal: u32, text: string) -> bool,
+	assistant_message_data: rawptr,
 }
 
 // follow_start positions a follow at the end of the journal. working and the estimate
@@ -45,8 +52,10 @@ follow_start :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (f
 // observer, in seq order, and advances follow. Each record is reported as the live view
 // reports the same fact: a Code Mode child's proposal and result carry its script's call
 // as parent_call, as the live view reports them. Records whose payload cannot be decoded
-// are skipped. A journal error stops the poll with follow.last at the last record
-// rendered. Nothing here writes the journal.
+// are skipped. When assistant_message is set, an assistant message is handed to it with
+// its turn and ordinal instead of being shown here, and a true result means it was shown.
+// A journal error stops the poll with follow.last at the last record rendered. Nothing
+// here writes the journal.
 @(require_results)
 follow_poll :: proc(store: ^journal.Journal, session: journal.Session_Id, follow: ^Follow, observer: Chat_Observer) -> journal.Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -166,6 +175,15 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 			_observer_message(observer, .Notice, body)
 		}
 	case .Assistant:
+		if follow.assistant_message == nil {
+			if body == "" { return nil }
+			_observer_assistant_begin(observer)
+			_observer_assistant_text(observer, body)
+			_observer_assistant_end(observer)
+			return nil
+		}
+		ordinal := follow_assistant_ordinal(store, record) or_return
+		if follow.assistant_message(follow.assistant_message_data, node.turn, ordinal, body) { return nil }
 		if body == "" { return nil }
 		_observer_assistant_begin(observer)
 		_observer_assistant_text(observer, body)
@@ -176,6 +194,26 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 		_observer_message(observer, .Notice, "(earlier turns are summarized)")
 	}
 	return nil
+}
+
+// follow_assistant_ordinal is the 0-based place of record among the assistant nodes of
+// its turn, counting those delivered before it.
+@(private = "file", require_results)
+follow_assistant_ordinal :: proc(store: ^journal.Journal, record: journal.Record) -> (ordinal: u32, error: journal.Error) {
+	records, _ := journal.read_records(
+		store,
+		{session = record.session, kinds = {.Node_Committed}, turn = record.turn},
+		0,
+		0,
+		context.temp_allocator,
+	) or_return
+	for earlier in records {
+		if earlier.seq >= record.seq { continue }
+		committed: journal.Node_Committed
+		if journal.payload_decode(earlier.data, &committed, context.temp_allocator) != nil { continue }
+		if committed.kind == journal.NODE_KIND_NAMES[.Assistant] { ordinal += 1 }
+	}
+	return ordinal, nil
 }
 
 // follow_delivered_input reports whether the inbox record a User node delivers is a

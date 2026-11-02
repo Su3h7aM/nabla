@@ -161,10 +161,25 @@ client_ensure_server :: proc(
 }
 
 Client_Follow :: struct {
-	store:   ^journal.Journal,
-	session: journal.Session_Id,
-	cursor:  agent.Follow,
-	watch:   ^agent.Session_Watch,
+	store:     ^journal.Journal,
+	session:   journal.Session_Id,
+	cursor:    agent.Follow,
+	watch:     ^agent.Session_Watch,
+	// offset is the next unread byte of the session's stream file.
+	offset:    i64,
+	// delivered is how far each assistant message has been shown from the stream.
+	// open means begin was reported and end has not been.
+	delivered: map[Client_Stream_Key]Client_Stream_Message,
+}
+
+Client_Stream_Key :: struct {
+	turn:    journal.Turn_Id,
+	ordinal: u32,
+}
+
+Client_Stream_Message :: struct {
+	delivered: int,
+	open:      bool,
 }
 
 client_follow_open :: proc(store: ^journal.Journal, session: journal.Session_Id) -> (follow: Client_Follow, error: Client_Error) {
@@ -178,20 +193,66 @@ client_follow_open :: proc(store: ^journal.Journal, session: journal.Session_Id)
 		free(watch)
 		return {}, {kind = .Watch, system = watch_error}
 	}
+	streams, streams_error := agent.stream_directory(context.allocator)
+	if streams_error != .None {
+		agent.session_watch_stop(watch)
+		free(watch)
+		return {}, {kind = .Path}
+	}
+	defer delete(streams)
+	if agent.xdg_directory_create(streams) != .None {
+		agent.session_watch_stop(watch)
+		free(watch)
+		return {}, {kind = .Path}
+	}
+	hex: [journal.SESSION_ID_HEX_LENGTH]u8
+	if _, directory_error := agent.session_watch_add_directory(watch, streams, journal.session_id_to_hex(session, hex[:])); directory_error != nil {
+		agent.session_watch_stop(watch)
+		free(watch)
+		return {}, {kind = .Watch, system = directory_error}
+	}
 	cursor, follow_error := agent.follow_start(store, session)
 	if follow_error != nil {
 		agent.session_watch_stop(watch)
 		free(watch)
 		return {}, {kind = .Follow, journal = follow_error}
 	}
-	return {store, session, cursor, watch}, {}
+	delivered := make(map[Client_Stream_Key]Client_Stream_Message, context.allocator)
+	return {store = store, session = session, cursor = cursor, watch = watch, delivered = delivered}, {}
 }
 
+// client_follow_poll shows what the followed session has produced since the last poll.
+// Stream frames are applied first, through the same observer callbacks a runner's front-end
+// gets for live text: assistant begin, text, flush, and end, and tool_output. A missing or
+// removed stream file is no stream. A file shorter than the offset already read is a new
+// file, and reading starts over at its beginning. Journal records follow the frames. An
+// assistant message is matched by its place in the turn and by prefix: text the stream
+// already showed is not shown again, and only the suffix of the committed text is
+// delivered, or the whole text when nothing was streamed. The stream text of a message is
+// never shown twice. A begin for a message that already has a counter closes that attempt
+// and starts another, as a dropped attempt does, and resets the counter. tool_output is
+// progress only; the tool_result committed for the call stays the complete result and
+// replaces that progress.
 client_follow_poll :: proc(follow: ^Client_Follow, observer: agent.Chat_Observer) -> journal.Error {
+	client_follow_drain(follow, observer)
+	show := Client_Follow_Show {
+		follow   = follow,
+		observer = observer,
+	}
+	follow.cursor.assistant_message = client_follow_assistant
+	follow.cursor.assistant_message_data = &show
+	defer {
+		follow.cursor.assistant_message = nil
+		follow.cursor.assistant_message_data = nil
+	}
 	return agent.follow_poll(follow.store, follow.session, &follow.cursor, observer)
 }
 client_follow_close :: proc(follow: ^Client_Follow) {
-	if follow.watch != nil { agent.session_watch_stop(follow.watch); free(follow.watch) }
+	if follow.watch != nil {
+		agent.session_watch_stop(follow.watch)
+		free(follow.watch)
+	}
+	delete(follow.delivered)
 	follow^ = {}
 }
 client_send_input :: proc(follow: ^Client_Follow, text: string, origin: journal.User_Origin) -> (seq: journal.Journal_Seq, error: journal.Error) {
@@ -199,4 +260,135 @@ client_send_input :: proc(follow: ^Client_Follow, text: string, origin: journal.
 	seq = follow.store.last_seq
 	if error != nil && journal.error_is_busy(error) { seq, error = journal.commit(follow.store) }
 	return
+}
+
+Client_Follow_Show :: struct {
+	follow:   ^Client_Follow,
+	observer: agent.Chat_Observer,
+}
+
+@(private)
+client_follow_assistant :: proc(user_data: rawptr, turn: journal.Turn_Id, ordinal: u32, text: string) -> bool {
+	show := cast(^Client_Follow_Show)user_data
+	key := Client_Stream_Key{turn, ordinal}
+	message, had := show.follow.delivered[key]
+	if !had {
+		if text != "" {
+			client_show_begin(show.observer)
+			client_show_text(show.observer, text)
+			client_show_end(show.observer)
+		}
+		return true
+	}
+	shown := message.delivered
+	if shown > len(text) { shown = len(text) }
+	suffix := text[shown:]
+	if suffix != "" {
+		if !message.open { client_show_begin(show.observer) }
+		client_show_text(show.observer, suffix)
+		message.open = true
+	}
+	if message.open { client_show_end(show.observer) }
+	delete_key(&show.follow.delivered, key)
+	return true
+}
+
+@(private)
+client_follow_drain :: proc(follow: ^Client_Follow, observer: agent.Chat_Observer) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	directory, directory_error := agent.stream_directory(context.temp_allocator)
+	if directory_error != .None { return }
+	path, path_error := agent.stream_path(directory, follow.session, context.temp_allocator)
+	if path_error != nil { return }
+	length, exists, length_error := client_stream_length(path)
+	if length_error != nil || !exists { return }
+	if length < follow.offset { follow.offset = 0 }
+	for {
+		kind, payload, next, found, read_error := agent.stream_read(path, follow.offset)
+		if read_error != nil || !found {
+			delete(payload)
+			return
+		}
+		client_follow_frame(follow, observer, kind, payload)
+		delete(payload)
+		follow.offset = next
+	}
+}
+
+@(private)
+client_stream_length :: proc(path: string) -> (length: i64, exists: bool, error: os.Error) {
+	file, open_error := os.open(path)
+	if open_error == os.General_Error.Not_Exist { return 0, false, nil }
+	if open_error != nil { return 0, false, open_error }
+	defer _ = os.close(file)
+	length, error = os.file_size(file)
+	if error != nil { return 0, false, error }
+	exists = true
+	return
+}
+
+@(private)
+client_follow_frame :: proc(follow: ^Client_Follow, observer: agent.Chat_Observer, kind: agent.Stream_Kind, payload: []u8) {
+	switch kind {
+	case .Assistant_Begin, .Assistant_Text, .Assistant_Flush, .Assistant_End:
+		turn_id, ordinal, text, ok := agent.stream_decode_assistant(payload)
+		if !ok || turn_id > u64(max(u32)) { return }
+		client_follow_assistant_frame(follow, observer, kind, journal.Turn_Id(u32(turn_id)), ordinal, transmute(string)text)
+	case .Tool_Output:
+		call, parent, chunk, ok := agent.stream_decode_tool_output(payload)
+		if !ok || observer.tool_output == nil { return }
+		observer.tool_output(observer.user_data, journal.Call_Id(call), journal.Call_Id(parent), transmute(string)chunk)
+	}
+}
+
+@(private)
+client_follow_assistant_frame :: proc(
+	follow: ^Client_Follow,
+	observer: agent.Chat_Observer,
+	kind: agent.Stream_Kind,
+	turn: journal.Turn_Id,
+	ordinal: u32,
+	text: string,
+) {
+	key := Client_Stream_Key{turn, ordinal}
+	message := follow.delivered[key]
+	switch kind {
+	case .Assistant_Begin:
+		if message.open { client_show_end(observer) }
+		message.delivered = 0
+		message.open = true
+		client_show_begin(observer)
+	case .Assistant_Text:
+		if !message.open {
+			client_show_begin(observer)
+			message.open = true
+		}
+		client_show_text(observer, text)
+		message.delivered += len(text)
+	case .Assistant_Flush:
+		if observer.assistant_flush != nil { observer.assistant_flush(observer.user_data) }
+		return
+	case .Assistant_End:
+		if !message.open { return }
+		client_show_end(observer)
+		message.open = false
+	case .Tool_Output:
+		return
+	}
+	follow.delivered[key] = message
+}
+
+@(private)
+client_show_begin :: proc(observer: agent.Chat_Observer) {
+	if observer.assistant_begin != nil { observer.assistant_begin(observer.user_data) }
+}
+
+@(private)
+client_show_text :: proc(observer: agent.Chat_Observer, text: string) {
+	if text != "" && observer.assistant_text != nil { observer.assistant_text(observer.user_data, text) }
+}
+
+@(private)
+client_show_end :: proc(observer: agent.Chat_Observer) {
+	if observer.assistant_end != nil { observer.assistant_end(observer.user_data) }
 }

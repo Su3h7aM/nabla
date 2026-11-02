@@ -15,6 +15,10 @@ session_watch_add :: proc(watch: ^Session_Watch, lock_path: string) -> (id: Sess
 	return 0, io.Error.Unsupported
 }
 
+session_watch_add_directory :: proc(watch: ^Session_Watch, directory, name: string) -> (id: Session_Watch_Id, error: os.Error) {
+	return 0, io.Error.Unsupported
+}
+
 session_watch_remove :: proc(watch: ^Session_Watch, id: Session_Watch_Id) {  }
 
 session_watch_stop :: proc(watch: ^Session_Watch) {  }

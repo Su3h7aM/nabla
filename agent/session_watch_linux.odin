@@ -2,6 +2,7 @@
 package agent
 
 import "base:runtime"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -13,6 +14,10 @@ import "core:thread"
 // closes.
 SESSION_WATCH_MASK :: linux.Inotify_Event_Mask{.ATTRIB, .CLOSE_WRITE, .CLOSE_NOWRITE}
 
+// STREAM_WATCH_MASK is what a streams directory raises while a turn writes its stream file:
+// the file is created, written, and removed.
+STREAM_WATCH_MASK :: linux.Inotify_Event_Mask{.CREATE, .MODIFY, .DELETE}
+
 // Session_Watch_Id names one watched lock file until session_watch_remove.
 Session_Watch_Id :: distinct i32
 
@@ -23,10 +28,14 @@ Session_Watch_Id :: distinct i32
 // thread, and session_watch_stop ends it. A queue overflow is an event like another, so it
 // wakes too. A Session_Watch must not move while its thread runs.
 Session_Watch :: struct {
-	mutex:   sync.Mutex, // guards the fields below, never held across a wait
-	inotify: linux.Fd,
-	stop:    linux.Fd,
-	worker:  ^thread.Thread,
+	mutex:       sync.Mutex, // guards the fields below, never held across a wait
+	inotify:     linux.Fd,
+	stop:        linux.Fd,
+	worker:      ^thread.Thread,
+	// stream_id is the streams-directory watch, zero when there is none, and stream_name
+	// is the one directory entry it wakes for. The watch owns stream_name. Guarded by mutex.
+	stream_id:   Session_Watch_Id,
+	stream_name: string,
 }
 
 // session_watch_add watches the lock file at lock_path and returns its id. The watch is
@@ -44,11 +53,41 @@ session_watch_add :: proc(watch: ^Session_Watch, lock_path: string) -> (id: Sess
 	return Session_Watch_Id(wd), nil
 }
 
+// session_watch_add_directory watches directory for creates, writes, and deletes, and
+// returns its id. name is the only directory entry whose events wake the owner; an event
+// that carries no name, or a queue overflow, wakes anyway, because the name was not
+// available. The directory must exist. The watch owns the copy of name until remove or
+// stop. Adding a directory that is already watched returns the same id.
+session_watch_add_directory :: proc(watch: ^Session_Watch, directory, name: string) -> (id: Session_Watch_Id, error: os.Error) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	path := strings.clone_to_cstring(directory, context.temp_allocator) or_return
+	inotify := session_watch_start(watch) or_return
+	wd, add_error := linux.inotify_add_watch(inotify, path, STREAM_WATCH_MASK)
+	if add_error != .NONE { return 0, os.Platform_Error(add_error) }
+	owned, clone_error := strings.clone(name)
+	if clone_error != nil {
+		_ = linux.inotify_rm_watch(inotify, wd)
+		return 0, clone_error
+	}
+	sync.lock(&watch.mutex)
+	delete(watch.stream_name)
+	id = Session_Watch_Id(wd)
+	watch.stream_id = id
+	watch.stream_name = owned
+	sync.unlock(&watch.mutex)
+	return id, nil
+}
+
 // session_watch_remove stops watching the file id names. An id the kernel no longer knows,
 // because the file was removed or the watch never started, is ignored: removal is teardown
 // and has nothing left to undo.
 session_watch_remove :: proc(watch: ^Session_Watch, id: Session_Watch_Id) {
 	sync.guard(&watch.mutex)
+	if id == watch.stream_id {
+		delete(watch.stream_name)
+		watch.stream_name = ""
+		watch.stream_id = 0
+	}
 	if watch.worker == nil { return }
 	_ = linux.inotify_rm_watch(watch.inotify, linux.Wd(id))
 }
@@ -72,6 +111,9 @@ session_watch_stop :: proc(watch: ^Session_Watch) {
 	// The descriptors are teardown: a close that fails leaves nothing to retry.
 	_ = linux.close(inotify)
 	_ = linux.close(stop)
+	delete(watch.stream_name)
+	watch.stream_name = ""
+	watch.stream_id = 0
 }
 
 // session_watch_start creates the descriptors and the thread on first use and returns the
@@ -112,8 +154,8 @@ session_watch_thread :: proc(worker: ^thread.Thread) {
 	watch := (^Session_Watch)(worker.data)
 	// The descriptors are fixed from before the thread starts until stop joins it.
 	inotify, stop := watch.inotify, watch.stop
-	// inotify_event is 16 bytes plus a name; a lock file watch carries no name, and the
-	// buffer is only drained, never parsed.
+	// inotify_event is 16 bytes plus a name. A lock-file watch carries no name. A directory
+	// watch names the entry, and only the followed session's name wakes.
 	events: [4096]u8
 	fds := [2]linux.Poll_Fd{{fd = inotify, events = {.IN}}, {fd = stop, events = {.IN}}}
 	for {
@@ -129,10 +171,51 @@ session_watch_thread :: proc(worker: ^thread.Thread) {
 		if fds[0].revents == {} { continue }
 		// One read takes the events queued so far, and the signal follows it, so an event
 		// raised after the read is still queued for the next pass.
-		if _, read_error := linux.read(inotify, events[:]); read_error != .NONE && read_error != .EAGAIN && read_error != .EINTR {
+		count, read_error := linux.read(inotify, events[:])
+		if read_error != .NONE && read_error != .EAGAIN && read_error != .EINTR {
 			owner_wake_signal()
 			return
 		}
-		owner_wake_signal()
+		if read_error != .NONE || count <= 0 { continue }
+		if session_watch_wake(watch, events[:count]) { owner_wake_signal() }
 	}
+}
+
+// session_watch_wake reports whether any event in buf is one the owner should recheck.
+// A name that is present and is not the watched entry does not wake. A name that cannot
+// be read, an event with no name, and a queue overflow do wake.
+@(private = "file")
+session_watch_wake :: proc(watch: ^Session_Watch, buf: []u8) -> bool {
+	header := size_of(linux.Inotify_Event)
+	#assert(size_of(linux.Inotify_Event) == 16)
+	offset := 0
+	wake := false
+	for offset < len(buf) {
+		if len(buf) - offset < header { return true }
+		event := mem.reinterpret_copy(linux.Inotify_Event, rawptr(&buf[offset]))
+		name_len := int(event.len)
+		if len(buf) - offset - header < name_len { return true }
+		name: string
+		if name_len > 0 {
+			raw := buf[offset + header:][:name_len]
+			end := 0
+			for end < len(raw) && raw[end] != 0 { end += 1 }
+			name = string(raw[:end])
+		}
+		if session_watch_event_wakes(watch, event.wd, name) { wake = true }
+		offset += header + name_len
+	}
+	return wake
+}
+
+// session_watch_event_wakes reports whether one event should wake the owner. A streams
+// event whose name is present and is not the followed session does not. Every other
+// event does, including a lock-file event and one whose name is not available.
+@(private = "file")
+session_watch_event_wakes :: proc(watch: ^Session_Watch, wd: linux.Wd, name: string) -> bool {
+	sync.lock(&watch.mutex)
+	streams := watch.stream_id != 0 && Session_Watch_Id(wd) == watch.stream_id
+	matches := !streams || name == "" || name == watch.stream_name
+	sync.unlock(&watch.mutex)
+	return matches
 }
