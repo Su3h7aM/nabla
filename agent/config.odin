@@ -14,6 +14,8 @@ import lua "vendor:lua/5.4"
 // responsive; it caps nothing the model asked for.
 CONFIG_INSTRUCTIONS :: 200000
 
+IDLE_EXIT_SECONDS_DEFAULT :: 600
+
 Config_Error :: enum {
 	None,
 	Missing,
@@ -30,6 +32,10 @@ Harness_Options :: struct {
 	nabla_config:                 string,
 	disable_project_instructions: bool,
 	compact_on_switch:            bool,
+	// idle_exit_seconds is how long the session server waits with nothing to do before
+	// it exits. Zero means unset, which is IDLE_EXIT_SECONDS_DEFAULT. A loaded value is
+	// at least one.
+	idle_exit_seconds:            int,
 	// subagents_max_running is the configured subagent concurrency; zero means unset, which
 	// is SUBAGENTS_MAX_RUNNING. A loaded value is always at least one.
 	subagents_max_running:        int,
@@ -553,6 +559,13 @@ load_harness_options :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.
 		value, ok := lua_bool(state, -1)
 		if !ok { return {}, .Invalid, config_field_detail("compact_on_switch", "boolean", state, -1, allocator) }
 		options.compact_on_switch = value
+	}
+	lua.settop(state, base)
+	lua_field(state, root_idx, "idle_exit_seconds")
+	if lua.type(state, -1) != .NIL {
+		value, ok := lua_int(state, -1)
+		if !ok || value < 1 { return {}, .Invalid, config_field_detail("idle_exit_seconds", "positive integer", state, -1, allocator) }
+		options.idle_exit_seconds = value
 	}
 	lua.settop(state, base)
 	lua_field(state, root_idx, "subagents_max_running")

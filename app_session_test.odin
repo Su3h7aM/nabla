@@ -4,7 +4,6 @@ package main
 
 import "core:fmt"
 import "core:io"
-import "core:math"
 import "core:mem"
 import "core:mem/virtual"
 import "core:net"
@@ -1995,74 +1994,6 @@ stub_content_length :: proc(headers: string) -> int {
 	return 0
 }
 
-// Turn_Run is one headless turn on its own thread, so the test thread is free to
-// answer the request the turn makes.
-Turn_Run :: struct {
-	app:       ^App,
-	prompt:    string,
-	out:       ^Headless_Output,
-	completed: bool,
-}
-
-headless_turn_run :: proc(thread_handle: ^thread.Thread) {
-	run := cast(^Turn_Run)thread_handle.data
-	run.completed = run_prompt_turn(run.app, run.prompt, run.out)
-}
-
-// A headless run is the interactive one without a terminal, so a turn driven
-// through it has to reach a provider, decode the stream, record the turn, and
-// report the answer. A stub endpoint on loopback is what lets that run end to
-// end: the same code path, without a paid model.
-@(test)
-test_a_headless_turn_answers_against_an_endpoint :: proc(t: ^testing.T) {
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
-	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
-	defer net.close(listener)
-	if block_err := net.set_blocking(listener, false); block_err != nil {
-		testing.fail_now(t, "the stub endpoint could not be made non-blocking")
-	}
-	endpoint, endpoint_err := net.bound_endpoint(listener)
-	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
-
-	app: App
-	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
-	// The chat is configured the way selection_install would leave it, because this
-	// test is about the turn rather than about choosing a model.
-	app.setup.session.provider_id = strings.clone("test-provider", app.setup.session.allocator)
-	app.setup.session.model_id = strings.clone("test-model", app.setup.session.allocator)
-	app_session_capacity(&app, 128_000)
-	app.run.connection = ai.Provider_Connection {
-		API        = .OpenAI_Chat_Completions,
-		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),
-		Credential = "test-key",
-	}
-
-	answer: strings.Builder
-	defer strings.builder_destroy(&answer)
-	out := Headless_Output {
-		answer = strings.to_writer(&answer),
-	}
-	run := Turn_Run {
-		app    = &app,
-		prompt = "hello",
-		out    = &out,
-	}
-	worker := thread.create(headless_turn_run, name = "nabla-headless-turn")
-	if worker == nil { testing.fail_now(t, "the turn thread could not be created") }
-	worker.data = &run
-	thread.start(worker)
-
-	served := stub_serve(listener, COMPLETION_RESPONSE)
-	thread.join(worker)
-	thread.destroy(worker)
-
-	if !testing.expect(t, served, "the turn never made its request") { return }
-	if !testing.expect(t, run.completed, "the turn should complete") { return }
-	// The answer is the model's text and one trailing newline, and nothing else.
-	testing.expect_value(t, strings.to_string(answer), "hello\n")
-}
-
 // Input typed while a turn is running is queued for the next request boundary
 // instead of being dropped or starting a second turn. The front-end's own input
 // path puts it in the queue; the agent drains it where it is safe.
@@ -2103,87 +2034,6 @@ test_input_during_a_turn_is_steered_not_dropped :: proc(t: ^testing.T) {
 	testing.expect_value(t, work.text, "hello")
 	work_destroy(&app, work)
 }
-
-// The Messages API answers with a different event stream, so a turn has to reach
-// the same place through the adapter: encode, stream, decode, record, and report
-// the answer. The stub ignores the path, so this also exercises the endpoint
-// suffix and the key header the provider layer adds.
-@(test)
-test_a_headless_turn_answers_against_an_anthropic_endpoint :: proc(t: ^testing.T) {
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
-	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
-	defer net.close(listener)
-	if block_err := net.set_blocking(listener, false); block_err != nil {
-		testing.fail_now(t, "the stub endpoint could not be made non-blocking")
-	}
-	endpoint, endpoint_err := net.bound_endpoint(listener)
-	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
-
-	app: App
-	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
-	app.setup.session.provider_id = strings.clone("anthropic", app.setup.session.allocator)
-	app.setup.session.model_id = strings.clone("claude-sonnet-5", app.setup.session.allocator)
-	app_session_capacity(&app, 200_000, 1024)
-	// The price a resolved selection would carry, so the turn prices the usage it
-	// commits from the session's own copy.
-	app.setup.session.cost = agent.Catalog_Cost {
-		input       = 3,
-		output      = 15,
-		cache_read  = 0.3,
-		cache_write = 3.75,
-	}
-	app.run.connection = ai.Provider_Connection {
-		API        = .Anthropic_Messages,
-		Endpoint   = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator),
-		Credential = "test-key",
-	}
-
-	answer: strings.Builder
-	defer strings.builder_destroy(&answer)
-	out := Headless_Output {
-		answer = strings.to_writer(&answer),
-	}
-	run := Turn_Run {
-		app    = &app,
-		prompt = "hello",
-		out    = &out,
-	}
-	worker := thread.create(headless_turn_run, name = "nabla-anthropic-turn")
-	if worker == nil { testing.fail_now(t, "the turn thread could not be created") }
-	worker.data = &run
-	thread.start(worker)
-
-	served := stub_serve(listener, ANTHROPIC_COMPLETION_RESPONSE)
-	thread.join(worker)
-	thread.destroy(worker)
-
-	if !testing.expect(t, served, "the turn never made its request") { return }
-	if !testing.expect(t, run.completed, "the turn should complete") { return }
-	testing.expect_value(t, strings.to_string(answer), "hello\n")
-
-	// The turn recorded the usage the adapter normalized, so the cache accounting
-	// sees a total rather than only the uncached part.
-	totals, usage_error := journal.usage_totals(app.setup.store, app.setup.session.session)
-	if !testing.expect_value(t, usage_error, nil) { return }
-	testing.expect_value(t, totals.requests, 1)
-	testing.expect_value(t, totals.input, i64(1050))
-	testing.expect_value(t, totals.cache_read, i64(900))
-	testing.expect_value(t, totals.priced_requests, 1)
-	// The input total is 100 uncached, 900 read, and 50 written tokens, and the
-	// response reported 3 output tokens: 100*3 + 900*0.3 + 50*3.75 + 3*15 dollars
-	// per million tokens.
-	testing.expectf(t, math.abs(totals.cost - 0.0008025) < 1e-12, "expected $0.0008025, got %v", totals.cost)
-}
-
-ANTHROPIC_COMPLETION_RESPONSE ::
-	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
-	"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900,\"cache_creation_input_tokens\":50,\"output_tokens\":1}}}\n\n" +
-	"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
-	"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
-	"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
-	"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
-	"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
 // --- tool refresh -------------------------------------------------------------
 

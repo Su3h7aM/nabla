@@ -29,6 +29,9 @@ chat_cli_options :: struct {
 	prompt:      string,
 	help:        bool,
 	list:        bool,
+	// serve is the internal entry a prompt client passes when it starts the session
+	// server. It is not a user command.
+	serve:       bool,
 }
 
 @(require_results)
@@ -36,6 +39,10 @@ chat_cli_parse :: proc(args: []string) -> (chat_cli_options, CLI_Parse_Error) {
 	result: chat_cli_options
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
+		if result.serve || arg == "--serve" {
+			result.serve = true
+			continue
+		}
 		if arg == "--help" || arg == "-h" {
 			result.help = true
 			continue
@@ -190,60 +197,14 @@ headless_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text:
 	}
 }
 
-// run_prompt_turn accepts one prompt on an opened session and runs it to completion,
-// reporting through out. False means the turn did not complete, and the observer has
-// already said why, so the caller only needs the exit code. It is the whole of what a
-// headless run does with a prompt, and the launch around it is shared.
-@(require_results)
-run_prompt_turn :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
-	// Tools are refreshed between turns, while the session is idle, so the registry a
-	// turn dispatches against is the one it was advertised with.
-	if warning := app_tools_refresh(app); warning != "" { fmt.eprintln("nabla:", warning) }
-	observer := headless_observer(out)
-	switch agent.chat_session_accept_user(&app.setup.session, prompt, observer) {
-	case .Accepted:
-	case .Storage_Failed:
-		fmt.eprintln("nabla:", agent.chat_session_last_error(&app.setup.session))
-		return false
-	case .Busy:
-		fmt.eprintln("nabla: the session is already running")
-		return false
-	}
-	chat := &app.setup.session
-	chat.catalog = app_catalog_ref(app)
-	completed := agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
-	// A headless run ends when its work does, so it waits for the subagents it started in the
-	// background and answers each report with a turn of its own.
-	for completed && agent.chat_background_wait(chat, nil) {
-		accepted, had_message := agent.chat_session_accept_agent_message(chat, observer)
-		if !had_message {
-			// The report the wait promised was taken elsewhere; there is nothing
-			// left to run a turn for.
-			break
-		}
-		if accepted != .Accepted {
-			fmt.eprintln("nabla:", agent.chat_session_last_error(chat))
-			return false
-		}
-		completed = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, nil)
-	}
-	if agent.chat_background_report_failure(chat, observer) { return false }
-	if out.write_failed {
-		fmt.eprintln("nabla: the answer could not be written")
-		return false
-	}
-	return completed
-}
-
 // run_prompt_follow sends prompt to the process that runs the session app follows and
-// waits for the turn that answers it, reporting through out like run_prompt_turn. The
-// line is committed as a `user.input` record, and the turn is the one whose User node
-// delivers that record. Its assistant messages are the answer; everything else the runner
-// commits meanwhile goes to stderr. It runs no turn and never claims the session, so a
-// runner whose claim drops leaves it waiting for the next one. Only an interrupt ends the
-// wait early, and no timeout does. False means the line was not sent, the session could
-// not be read, the run was interrupted, or the turn did not complete; the observer has
-// said why for a turn that failed.
+// waits for the turn that answers it. The line is committed as a `user.input` record,
+// and the turn is the one whose User node delivers that record. Its assistant messages
+// are the answer; everything else the runner commits meanwhile goes to stderr. It runs
+// no turn and never claims the session, so a runner whose claim drops leaves it waiting
+// for the next one. Only an interrupt ends the wait early, and no timeout does. False
+// means the line was not sent, the session could not be read, the run was interrupted,
+// or the turn did not complete; the observer has said why for a turn that failed.
 @(require_results)
 run_prompt_follow :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
 	setup := &app.setup
@@ -286,63 +247,10 @@ run_prompt_follow :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> b
 	return setup.follow.outcome == .Completed
 }
 
-// run_prompt executes one prompt without a terminal and returns the process exit code. It
-// shares the launch path with the interactive harness, so only the front-end differs and a
-// headless run is the same conversation rather than a second implementation of one.
 session_start_from_options :: proc(resume: bool, resume_id: string) -> Session_Start {
 	if !resume { return Start_Fresh{} }
 	if resume_id != "" { return Start_Resume_Id(resume_id) }
 	return Start_Resume_Latest{}
-}
-
-run_prompt :: proc(
-	sources: []agent.Catalog_Provider_Source,
-	mcp_servers: []agent.MCP_Server_Config,
-	harness_options: agent.Harness_Options,
-	options: chat_cli_options,
-	answer: io.Writer,
-) -> int {
-	app, app_error := new(App)
-	if app_error != nil { return 1 }
-	defer if !app.setup.workers_abandoned && !agent.chat_session_workers_outstanding(&app.setup.session) { free(app) }
-	app.run.alloc = context.allocator
-	// The headless run shows nothing, but a refusal or a selection notice still
-	// reaches the transcript, so it owns its allocator here too.
-	snapshot_transcript_own(app)
-
-	start := session_start_from_options(options.resume, options.resume_id)
-	// A resumed session another process runs is followed rather than refused.
-	app.setup.shared_sessions = options.resume
-	app.setup.harness_options = harness_options
-	app.setup.alloc = context.allocator
-	if !run_catalog(sources, mcp_servers, &app.setup, start) { return 1 }
-	// The model this run picks belongs to the job, not to the user: a headless run
-	// must not change what the interactive harness starts with.
-	app.setup.owns_selection = false
-	defer {
-		snapshot_destroy(app)
-		// A tool worker that ignored its stop may still use the tool backends, so the
-		// process exits with them rather than freeing them under it.
-		if !agent.chat_session_workers_outstanding(&app.setup.session) {
-			run_setup_destroy(&app.setup)
-		}
-	}
-
-	out := Headless_Output {
-		answer = answer,
-	}
-	// A follower runs no turn, so it needs no model and records no selection.
-	if app_following(app) { return run_prompt_follow(app, options.prompt, &out) ? 0 : 1 }
-	if !apply_startup_selection(app, options.provider_id, options.model_id) {
-		fmt.eprintln("nabla:", setup_error_text(app))
-		return 1
-	}
-	if app.setup.model_id == "" {
-		fmt.eprintln("nabla: no model is selected; give --provider and --model, or run the interactive harness once")
-		return 1
-	}
-
-	return run_prompt_turn(app, options.prompt, &out) ? 0 : 1
 }
 
 // --- entry point ------------------------------------------------------------
@@ -390,9 +298,14 @@ chat_main :: proc() -> int {
 		process_name_set(PROCESS_NAME_AGENT)
 		return acp_main(args[1:])
 	}
-	process_name_set(PROCESS_NAME_MAIN)
 
 	options, parse_error := chat_cli_parse(args)
+	// --serve is the internal entry a prompt client passes when it starts the session
+	// server. serve_main names the process; this path does not.
+	if options.serve {
+		return serve_main(args)
+	}
+	process_name_set(PROCESS_NAME_MAIN)
 	if parse_error != .None {
 		switch parse_error {
 		case .Unknown_Option:
@@ -455,7 +368,9 @@ chat_main :: proc() -> int {
 		fmt.eprintln("nabla: --provider and --model must be given together")
 		return 2
 	}
-	if options.prompt != "" { return run_prompt(sources[:], mcp_servers[:], harness_options, options, stdout_writer()) }
+	if options.prompt != "" {
+		return run_prompt(harness_options.nabla_executable, options, harness_options.nabla_config, stdout_writer())
+	}
 
 	start := session_start_from_options(options.resume, options.resume_id)
 	return tui_run(sources[:], mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
