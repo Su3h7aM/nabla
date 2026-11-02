@@ -3921,6 +3921,53 @@ test_serve_applies_each_pending_command_once :: proc(t: ^testing.T) {
 	testing.expect(t, !serve_commands_pending(&app), "the server has no command left to apply")
 }
 
+// A Stop_Server command stops the running turn through the same control a cancel uses, is
+// answered once, and ends the server: the idle decision reports the exit once that turn has
+// ended, and leaves stopping the rest of the work to the exit's own teardown.
+@(test)
+test_serve_stop_server_ends_the_turn_and_the_server :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+	app.setup.owns_selection = true
+	app.setup.catalog = app_test_effort_catalog(app.setup.alloc)
+	defer agent.catalog_destroy(&app.setup.catalog)
+	app.setup.session.catalog = app_catalog_ref(&app)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+
+	client, client_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
+	if client_error != nil { testing.fail_now(t, "the client's journal could not open") }
+	defer if close_error := journal.close(client); close_error != nil { testing.fail_now(t, "the client's journal did not close") }
+	if follow_error := journal.follow(client, app.setup.session.session); follow_error != nil { testing.fail_now(t, "the client could not follow") }
+
+	if stop_error := journal.append_command(client, journal.Stop_Server{}); stop_error != nil { testing.fail_now(t, "the stop was not appended") }
+	app.setup.session.state = .Requesting
+	serve_commands_apply(&app, .Step)
+	testing.expect(t, agent.turn_control_stop_requested(&app.run.control), "the running turn was asked to stop")
+	testing.expect(t, app.stop_server, "the server was asked to stop")
+	// The turn it stopped has not ended, so the server waits rather than exiting. A tool job
+	// or a subagent still running does not hold it: the exit stops those itself.
+	step, step_ok := serve_step(&app)
+	testing.expect(t, step_ok, "the server step must read")
+	testing.expect_value(t, step, Serve_Step.Wait)
+
+	app.setup.session.state = .Idle
+	agent.turn_control_clear(&app.run.control)
+	ended, ended_ok := serve_step(&app)
+	testing.expect(t, ended_ok, "the server step must read again")
+	testing.expect_value(t, ended, Serve_Step.Stop)
+
+	// The command is answered once, and neither it nor the inbox holds anything else.
+	outcomes, _, answered_error := journal.read_records(client, {session = app.setup.session.session, kinds = {.Command_Applied}}, 0, 0, context.allocator)
+	if !testing.expect(t, answered_error == nil, "the answers could not be read") { return }
+	defer journal.records_destroy(outcomes, context.allocator)
+	if !testing.expect_value(t, len(outcomes), 1) { return }
+	applied: journal.Command_Applied
+	if !testing.expect_value(t, journal.payload_decode(outcomes[0].data, &applied, context.temp_allocator), nil) { return }
+	testing.expect_value(t, applied.outcome, journal.COMMAND_OUTCOME_NAMES[.Applied])
+	testing.expect(t, !serve_commands_pending(&app), "the stopped server has no command left to apply")
+}
+
 // app_test_effort_catalog serves one model that states two effort levels.
 app_test_effort_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
 	sources := []agent.Catalog_Provider_Source {

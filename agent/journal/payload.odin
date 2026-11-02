@@ -184,6 +184,7 @@ Command_Kind :: enum u8 {
 	Select_Model,
 	Set_Effort,
 	Compact,
+	Stop_Server,
 }
 
 COMMAND_KIND_NAMES := [Command_Kind]string {
@@ -191,6 +192,7 @@ COMMAND_KIND_NAMES := [Command_Kind]string {
 	.Select_Model = "select_model",
 	.Set_Effort   = "set_effort",
 	.Compact      = "compact",
+	.Stop_Server  = "stop_server",
 }
 
 // Command is one action a client asks a running session to take. A command
@@ -201,6 +203,7 @@ Command :: union #no_nil {
 	Select_Model,
 	Set_Effort,
 	Compact,
+	Stop_Server,
 }
 
 Cancel_Turn :: struct {}
@@ -215,6 +218,9 @@ Set_Effort :: struct {
 }
 
 Compact :: struct {}
+
+// Stop_Server asks the session server to stop its turn and exit.
+Stop_Server :: struct {}
 
 // User_Command is one command a client appended, stored flat with the fields its
 // kind uses: the payload is the boundary between the union above and JSON.
@@ -240,6 +246,8 @@ command_payload :: proc(command: Command) -> (payload: User_Command) {
 		payload.level = value.level
 	case Compact:
 		payload.kind = COMMAND_KIND_NAMES[.Compact]
+	case Stop_Server:
+		payload.kind = COMMAND_KIND_NAMES[.Stop_Server]
 	}
 	return
 }
@@ -259,6 +267,8 @@ command_decode :: proc(payload: User_Command) -> (command: Command, known: bool)
 		return Set_Effort{level = payload.level}, true
 	case .Compact:
 		return Compact{}, true
+	case .Stop_Server:
+		return Stop_Server{}, true
 	}
 	return {}, false
 }

@@ -360,6 +360,8 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 			}
 			free_all(context.temp_allocator)
 			agent.owner_wake_wait(seen, idle_due)
+		case .Stop:
+			return 0
 		}
 	}
 }
@@ -367,11 +369,13 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 // Serve_Step is the one answer to whether the server has a next step. Turn delivers
 // the pending inbox. Environment applies a session.environment record newer than
 // the last one applied. Wait stays up for work already in progress. None is idle.
+// Stop is a Stop_Server command whose turn has ended, so the server exits.
 Serve_Step :: enum {
 	None,
 	Turn,
 	Environment,
 	Wait,
+	Stop,
 }
 
 // serve_step is the idle decision. It is called on every wake. Turn means the inbox
@@ -384,7 +388,9 @@ Serve_Step :: enum {
 // sees the recovered results and decides what to do. Environment means a newer
 // session.environment record is waiting while the session is idle, so it is applied
 // before any turn. Wait means a pending command, turn, tool job, subagent, or compaction is already
-// in progress. None means nothing of that is left, so the idle limit may run.
+// in progress. Stop means a Stop_Server command whose turn has ended, so the server exits now
+// and its teardown stops whatever else is still running. None means nothing of that is left, so
+// the idle limit may run.
 // The records stay in temp memory until the caller resets it.
 @(require_results)
 serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
@@ -393,6 +399,11 @@ serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 	if read_error != nil {
 		fmt.eprintln("nabla: cannot read the session:", journal.error_text(read_error, context.temp_allocator))
 		return .None, false
+	}
+	// A Stop_Server command ends the server as soon as the turn it stopped has ended. The
+	// exit's teardown interrupts and settles tool jobs and subagents, so they hold nothing up.
+	if app.stop_server {
+		return .Stop if chat.state == .Idle else .Wait, true
 	}
 	environment, environment_error := serve_environment_seq(app)
 	if environment_error != nil {

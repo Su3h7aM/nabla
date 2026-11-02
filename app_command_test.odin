@@ -130,6 +130,7 @@ test_editing_starts_a_new_cycle :: proc(t: ^testing.T) {
 	testing.expect(t, widgets.input_insert(&app.input, "/") == nil)
 	complete_command(&app)
 	complete_command(&app)
+	complete_command(&app)
 	testing.expect_value(t, widgets.input_text(&app.input), "/help")
 
 	// Backspace is an edit, so the cycle ends. The next Tab matches what is left on

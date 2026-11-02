@@ -95,6 +95,9 @@ Run_Setup :: struct {
 App :: struct {
 	setup:                      Run_Setup,
 	stream:                     Serve_Stream, // the session's live turn stream, owned for the server's life
+	// stop_server is set by a Stop_Server command. The server takes no new step while it
+	// is set and exits once the turn it stopped has ended.
+	stop_server:                bool,
 	// compact_on_switch is the launch's fixed policy for fitting explicit model changes.
 	compact_on_switch:          bool,
 	// catalog_mu protects publication of a replacement catalog. A publication

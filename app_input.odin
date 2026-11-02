@@ -6,6 +6,7 @@ import "core:strings"
 import "core:sync"
 
 import "nabla:agent"
+import "nabla:agent/journal"
 import input "nabla:input"
 import "nabla:layout"
 import "nabla:term"
@@ -19,6 +20,7 @@ import "nabla:tui/widgets"
 // on; everything else about a command lives in its table row.
 Command_Id :: enum {
 	Quit,
+	Detach,
 	Help,
 	New_Session,
 	Resume,
@@ -41,7 +43,8 @@ Command :: struct {
 
 @(rodata)
 COMMANDS := [?]Command {
-	Command{id = .Quit, name = "/quit", summary = "exit; during a turn, cancel it first"},
+	Command{id = .Quit, name = "/quit", summary = "stop the session server and exit"},
+	Command{id = .Detach, name = "/detach", summary = "exit and leave the session server running"},
 	Command{id = .Help, name = "/help", summary = "list the commands"},
 	Command{id = .New_Session, name = "/new", summary = "start a new session"},
 	Command{id = .Resume, name = "/resume", summary = "choose a session to resume", open_menu = menu_open_session},
@@ -177,6 +180,7 @@ command_help :: proc(app: ^App) {
 	snap_append(app, .Notice, "  tab completes a command and cycles through the matches")
 	snap_append(app, .Notice, "  a command that names a list opens it when given no argument")
 	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
+	snap_append(app, .Notice, "  ctrl+c, ctrl+d, end of input, and a signal detach without stopping the session server")
 	snap_append(app, .Notice, "  the wheel and page up/page down scroll the transcript")
 	snap_append(app, .Notice, "  dragging over the transcript copies the rows it covers")
 	snap_append(app, .Notice, "tool boxes show their first lines; click a box to expand and select it, and click the selected box again to collapse it")
@@ -695,6 +699,9 @@ dispatch_command :: proc(app: ^App, text: string) -> bool {
 	}
 	switch command.id {
 	case .Quit:
+		_ = app_command_send(app, journal.Stop_Server{})
+		app.quit = true
+	case .Detach:
 		app.quit = true
 	case .Help:
 		command_help(app)

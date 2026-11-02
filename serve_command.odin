@@ -67,7 +67,7 @@ serve_command_changes_selection :: proc(command: journal.Command) -> bool {
 	switch _ in command {
 	case journal.Select_Model, journal.Set_Effort:
 		return true
-	case journal.Cancel_Turn, journal.Compact:
+	case journal.Cancel_Turn, journal.Compact, journal.Stop_Server:
 		return false
 	}
 	return false
@@ -83,6 +83,12 @@ serve_command_apply :: proc(app: ^App, command: journal.Command) -> (result: Ser
 		// harness uses; with nothing running there is nothing to stop.
 		if chat.state == .Idle { return .Refused, "no turn was running" }
 		agent.turn_control_stop(&app.run.control)
+		return .Applied, ""
+	case journal.Stop_Server:
+		// The server stops the turn it runs through the same control Cancel_Turn uses and
+		// exits once that turn has ended. With nothing running there is nothing to stop.
+		if chat.state != .Idle { agent.turn_control_stop(&app.run.control) }
+		app.stop_server = true
 		return .Applied, ""
 	case journal.Select_Model:
 		chat.catalog = app_catalog_ref(app)
