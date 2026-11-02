@@ -6,10 +6,9 @@ import "core:fmt"
 import "core:io"
 import "core:mem"
 import "core:mem/virtual"
-import "core:net"
 import "core:os"
-import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:sync/chan"
 import "core:testing"
 import "core:thread"
@@ -114,6 +113,8 @@ attach_setup_destroy :: proc(setup: ^Run_Setup) {
 	journal.records_destroy(setup.follow_pending, setup.alloc)
 	agent.chat_session_destroy(&setup.session)
 	agent.session_watch_stop(&setup.watch)
+	client_follow_close(&setup.follow_client)
+	client_server_close(&setup.server)
 	// The launch's own teardown; a close failure changes nothing the test reads.
 	_ = run_store_close(setup)
 	setup.store = nil
@@ -145,7 +146,6 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	defer attach_setup_destroy(&first_setup)
 	if !testing.expect(t, run_session_attach_test(&first_setup, workspace, Start_Fresh{}, &err_text)) { return }
 	first := first_setup.session.session
-	app_session_turn(t, &first_setup)
 	attach_setup_destroy(&first_setup)
 
 	// Closing and reopening in one directory asks for a fresh conversation. A
@@ -157,7 +157,6 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	defer attach_setup_destroy(&second_setup)
 	if !testing.expect(t, run_session_attach_test(&second_setup, workspace, Start_Fresh{}, &err_text)) { return }
 	second := second_setup.session.session
-	app_session_turn(t, &second_setup)
 	attach_setup_destroy(&second_setup)
 	testing.expect(t, first != second, "a second launch must start a second session")
 
@@ -323,12 +322,6 @@ app_session_count :: proc(test: ^testing.T, setup: ^Run_Setup, workspace: string
 	return len(sessions)
 }
 
-app_session_turn :: proc(test: ^testing.T, setup: ^Run_Setup) {
-	if accepted := agent.chat_session_accept_user(&setup.session, "hello"); accepted != .Accepted {
-		testing.fail_now(test, "the prompt was not accepted")
-	}
-}
-
 app_session_accept :: proc(test: ^testing.T, app: ^App, text: string) {
 	accepted := agent.chat_session_accept_user(&app.setup.session, text)
 	if !testing.expect_value(test, accepted, agent.Chat_Accept.Accepted) { return }
@@ -448,9 +441,7 @@ test_a_launch_without_resume_starts_a_new_session :: proc(t: ^testing.T) {
 	testing.expect_value(t, first.model, "")
 }
 
-// A session is recorded by its first prompt, not by the launch. Opening the
-// harness in a directory and closing it without typing leaves nothing behind: no
-// row, nothing to list, and nothing for a later resume to find.
+// A launch records the session before the first prompt and does not hold its claim.
 @(test)
 test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
 	if !test_isolate_process(t, #procedure) { return }
@@ -468,13 +459,76 @@ test_a_launch_that_is_never_prompted_leaves_no_session :: proc(t: ^testing.T) {
 	defer attach_setup_destroy(&setup)
 	if !testing.expect(t, run_session_attach_test(&setup, workspace, Start_Fresh{}, &err_text)) { return }
 
-	// Choosing a model or an effort is not interaction, and neither is stored with
-	// the session, so a launch that only did that has nothing in the store.
-	testing.expect_value(t, app_session_count(t, &setup, workspace), 0)
-
-	// The first prompt is what records it, whether or not a request follows.
-	app_session_turn(t, &setup)
 	testing.expect_value(t, app_session_count(t, &setup, workspace), 1)
+	testing.expect_value(t, setup.store.claimed, journal.Session_Id{})
+	testing.expect_value(t, setup.store.followed, setup.session.session)
+}
+
+// A client launch records the session and follows it. It does not hold the claim, and a
+// command it sends is a user.command the server answers.
+@(test)
+test_a_client_launch_follows_without_claiming :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	err_text: strings.Builder
+	defer strings.builder_destroy(&err_text)
+	state, previous, had_previous := app_state_isolate(t)
+	defer app_state_restore(state, previous, had_previous)
+
+	workspace, workspace_err := os.get_working_directory(context.allocator)
+	if workspace_err != nil { testing.fail_now(t, "could not read the working directory") }
+	defer delete(workspace, context.allocator)
+
+	app: App
+	app.setup.alloc = context.allocator
+	app.run.alloc = context.allocator
+	defer snapshot_destroy(&app)
+	defer attach_setup_destroy(&app.setup)
+	if !testing.expect(t, run_session_attach_test(&app.setup, workspace, Start_Fresh{}, &err_text)) { return }
+	testing.expect_value(t, app_session_count(t, &app.setup, workspace), 1)
+	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
+	testing.expect_value(t, app.setup.store.followed, app.setup.session.session)
+
+	app_client_prompt(&app, "hello", run_observer(&app))
+	inputs, _, input_error := journal.read_records(app.setup.store, {session = app.setup.session.session, kinds = {.User_Input}}, 0, 0, context.temp_allocator)
+	testing.expect(t, input_error == nil, "the prompt could not be read")
+	if !testing.expect_value(t, len(inputs), 1) { return }
+
+	testing.expect(t, app_command_send(&app, journal.Cancel_Turn{}))
+	commands, _, command_error := journal.read_records(
+		app.setup.store,
+		{session = app.setup.session.session, kinds = {.User_Command}},
+		0,
+		0,
+		context.temp_allocator,
+	)
+	testing.expect(t, command_error == nil, "the command could not be read")
+	if !testing.expect_value(t, len(commands), 1) { return }
+
+	holder, holder_error := journal.open(app.setup.journal_directory, app.setup.lock_directory, journal.run_id_create(), .Read_Write, context.allocator)
+	if holder_error != nil { testing.fail_now(t, "the server journal could not open") }
+	defer _ = journal.close(holder)
+	if _, claim_error := journal.claim(holder, app.setup.session.session); claim_error != nil {
+		testing.fail_now(t, "the server could not claim the session")
+	}
+	branch, head, head_error := journal.session_head(holder, app.setup.session.session)
+	if head_error != nil { testing.fail_now(t, "the server could not read the session") }
+	server: App
+	server.setup.alloc = context.allocator
+	server.run.alloc = context.allocator
+	chat, tool_error := agent.chat_session_init(holder, app.setup.session.session, branch, head, workspace, context.allocator)
+	if tool_error.kind != .None { testing.fail_now(t, "the server session could not be created") }
+	defer agent.chat_session_destroy(&chat)
+	server.setup.session = chat
+	server.setup.store = holder
+	step, step_ok := serve_step(&server)
+	testing.expect(t, step_ok, "the server step must read")
+	testing.expect_value(t, step, Serve_Step.Turn)
+	serve_commands_apply(&server, .Boundary)
+	testing.expect(t, app_client_refusals(&app))
+	if !testing.expect(t, len(app.run.snap.entries) > 0) { return }
+	last := app.run.snap.entries[len(app.run.snap.entries) - 1]
+	testing.expect_value(t, last.kind, Entry_Kind.Notice)
+	testing.expect_value(t, string(last.text[:]), "no turn was running")
 }
 
 // A bare --resume is scoped to the directory it is run from, and the newest
@@ -617,9 +671,8 @@ test_a_switch_to_a_missing_directory_keeps_the_running_session :: proc(t: ^testi
 	app_session_accept(t, &app, "after the refusal")
 }
 
-// A front-end that cannot follow, such as a headless run or the ACP server, refuses a
-// target another process is running, and the session that was on screen stays usable
-// rather than being closed by the attempt.
+// The TUI follows a session another process already runs. It does not claim that
+// session, and it does not keep a claim on the one it left.
 @(test)
 test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	app: App
@@ -627,7 +680,6 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	defer app_session_end(&app, directory)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	running := app.setup.session.session
 
 	// A second store claiming the target is what a second process running it
 	// looks like from here.
@@ -636,22 +688,15 @@ test_a_busy_target_keeps_the_running_session :: proc(t: ^testing.T) {
 	defer _ = journal.close(other)
 	if _, claim_error := journal.claim(other, id); claim_error != nil { testing.fail_now(t, "the second journal could not claim the target") }
 
-	testing.expect(t, !session_switch(&app, Start_Resume_Id(app_session_id_text(id))))
-	testing.expect_value(t, app.setup.session.session, running)
-	testing.expect_value(t, app.setup.store.claimed, running)
-
-	// The refusal must not have disturbed the running session: it is still claimed
-	// and still writable, not merely named the same.
-	app_session_accept(t, &app, "after the refusal")
-
-	// The running session was never released during the attempt, so another
-	// process still cannot take it. A third store holds no claim of its own, so
-	// its refusal can only come from the running session being locked.
+	testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id))))
+	testing.expect_value(t, app.setup.session.session, id)
+	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
+	testing.expect_value(t, app.setup.store.followed, id)
 	prober, prober_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
 	if prober_open_error != nil { testing.fail_now(t, "third journal could not open") }
 	defer _ = journal.close(prober)
-	_, running_claim_error := journal.claim(prober, running)
-	testing.expect_value(t, running_claim_error, journal.Journal_Error.Claimed)
+	_, claim_error := journal.claim(prober, id)
+	testing.expect_value(t, claim_error, journal.Journal_Error.Claimed)
 }
 
 // The TUI opens a session another process runs as a follower: it does not claim or
@@ -684,7 +729,7 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 	testing.expect(t, runtime_following(&app), "the front-end is told to show a follower")
 
 	observer := run_observer(&app)
-	app_follow_submit(&app, "from the follower", observer)
+	app_client_prompt(&app, "from the follower", observer)
 	lines, lines_error := journal.read_inbox(runner, id, 0, context.temp_allocator)
 	testing.expect(t, lines_error == nil, "the runner could not read its inbox")
 	if !testing.expect_value(t, len(lines), 1) { return }
@@ -702,40 +747,22 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 	testing.expect(t, selection_error == nil, "the selection could not be read")
 	testing.expect(t, !recorded, "a follower must not rewrite the default model")
 
-	// What only the runner's process can do is refused with a notice.
-	notices := len(app.run.snap.entries)
+	// Cancel and a model change are commands for the server, not local refusals.
 	stop_turn(&app)
 	selection_request(&app, "test-provider", "test-model")
-	testing.expect_value(t, len(app.run.snap.entries), notices + 2)
-	testing.expect(t, app.run.pending == nil, "a refused model change is not pending")
+	testing.expect(t, sync.atomic_load(&app.run.cancel_requested))
+	testing.expect(t, app.run.pending != nil, "the model change waits for the worker to send it")
+	selection_intent_clear(&app)
 }
 
-// The runner's process ends: the follower claims the session, recovery records what the
-// runner left open, the transcript on screen stays, and the line the follower sent that
-// no turn had read is delivered to the model once. A follower that tries while the runner
-// lives stays a follower.
+// The runner's process ends and this one stays a follower. It does not claim the session,
+// does not recover the open turn, and leaves the line it sent in the inbox.
 @(test)
 test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	state, previous, had_previous := app_state_isolate(t)
-	defer app_state_restore(state, previous, had_previous)
-
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
-	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
-	defer net.close(listener)
-	if block_err := net.set_blocking(listener, false); block_err != nil { testing.fail_now(t, "the stub endpoint could not be made non-blocking") }
-	endpoint, endpoint_err := net.bound_endpoint(listener)
-	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
-
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
 	app.setup.shared_sessions = true
-	app.setup.owns_selection = true
-	app.setup.catalog = app_test_catalog(app.setup.alloc, fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.temp_allocator))
-	defer agent.catalog_destroy(&app.setup.catalog)
-	app.run.steer = agent.steer_queue_init(app.run.alloc)
-	defer agent.steer_queue_destroy(&app.run.steer)
 
 	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
 	runner, runner_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
@@ -756,7 +783,6 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 
 	testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id))))
 	testing.expect(t, app_following(&app), "the session runs in the other journal")
-	testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", true))
 	observer := run_observer(&app)
 
 	// What the runner commits after the follow began is shown without a restart.
@@ -769,45 +795,25 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit") }
 	testing.expect(t, app_follow_service(&app, observer), "the runner's answer is new")
 	testing.expect(t, app_following(&app), "a claim that fails leaves the process a follower")
-	app_follow_submit(&app, "queued line", observer)
-	shown := app_entries_count(&app, "queued line")
-	testing.expect_value(t, shown, 1)
-
-	serve := Stub_Serve {
-		listener = listener,
-		response = COMPLETION_RESPONSE,
-	}
-	server := thread.create(stub_serve_thread, name = "nabla-stub-provider")
-	if server == nil { testing.fail_now(t, "the stub thread could not be created") }
-	server.data = &serve
-	thread.start(server)
-	defer {
-		thread.join(server)
-		thread.destroy(server)
-		testing.expect(t, serve.served, "the delivered line's turn never made its request")
-	}
+	app_client_prompt(&app, "queued line", observer)
+	testing.expect_value(t, app_entries_count(&app, "queued line"), 1)
 
 	if close_error := journal.close(runner); close_error != nil { testing.fail_now(t, "the runner's journal did not close") }
 	runner = nil
 	testing.expect(t, app_follow_service(&app, observer), "the claim dropped")
-	testing.expect(t, !app_following(&app), "the follower is the runner now")
-	testing.expect_value(t, app.setup.store.claimed, id)
+	testing.expect(t, app_following(&app), "closing the runner does not make this process the owner")
+	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
+	testing.expect_value(t, app.setup.store.followed, id)
 
 	_, recovered, recovered_error := journal.read_latest(app.setup.store, {session = id, kinds = {.Session_Recovered}}, context.temp_allocator)
 	testing.expect(t, recovered_error == nil, "the recovery record could not be read")
-	testing.expect(t, recovered, "recovery recorded the turn the runner left open")
-	// The transcript on screen was kept, and the line shows once though a turn delivered it.
+	testing.expect(t, !recovered, "a follower does not recover the runner's turn")
 	testing.expect_value(t, app_entries_count(&app, "an answer"), 1)
 	testing.expect_value(t, app_entries_count(&app, "queued line"), 1)
 	lines, lines_error := journal.read_inbox(app.setup.store, id, 0, context.temp_allocator)
 	testing.expect(t, lines_error == nil, "the inbox could not be read")
 	if !testing.expect_value(t, len(lines), 1) { return }
-	delivered, delivered_error := journal.last_delivered_message(app.setup.store, id)
-	testing.expect(t, delivered_error == nil, "the delivered line could not be read")
-	testing.expect_value(t, delivered, lines[0].seq)
-	_, recorded, selection_error := selection_latest(app.setup.store, app.setup.alloc)
-	testing.expect(t, selection_error == nil, "the selection could not be read")
-	testing.expect(t, !recorded, "a takeover must not rewrite the default model")
+	testing.expect_value(t, string(lines[0].body), "queued line")
 }
 
 // app_entries returns every entry on screen once the window has caught up with the committed head.
@@ -1278,17 +1284,6 @@ app_entries_count :: proc(app: ^App, text: string) -> int {
 	return count
 }
 
-Stub_Serve :: struct {
-	listener: net.TCP_Socket,
-	response: string,
-	served:   bool,
-}
-
-stub_serve_thread :: proc(thread_handle: ^thread.Thread) {
-	serve := cast(^Stub_Serve)thread_handle.data
-	serve.served = stub_serve(serve.listener, serve.response)
-}
-
 // Resuming has to leave the conversation able to send, so the model the session
 // recorded is applied to the running session. The selection lives in the store,
 // so the fixture's own store is all the test needs.
@@ -1329,12 +1324,10 @@ test_new_and_resume_switch_and_replay :: proc(t: ^testing.T) {
 	second := app.setup.session.session
 	testing.expect(t, first != second, "a new session must be a different session")
 
-	// The new session has no prompt, so it has no row: the list still names only
-	// the conversation that was used.
 	snapshot_clear(&app)
 	session_refresh_rows(&app)
 	menu_open_session(&app)
-	if !testing.expect_value(t, len(app.menu.choices), 1) { return }
+	if !testing.expect_value(t, len(app.menu.choices), 2) { return }
 	menu_close(&app)
 
 	snapshot_clear(&app)
@@ -1919,81 +1912,6 @@ test_a_stopped_worker_abandons_queued_work :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(entries), 0)
 }
 
-// --- a headless turn, end to end ---------------------------------------------
-
-// COMPLETION_RESPONSE is one complete OpenAI chat-completions stream: a text
-// delta and a stop.
-COMPLETION_RESPONSE ::
-	"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n" +
-	"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n" +
-	"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
-	"data: [DONE]\n\n"
-
-// STUB_BOUND bounds the wait for a turn's request, so a turn that never connects
-// fails the test rather than hanging it.
-STUB_BOUND :: 10 * time.Second
-
-// stub_serve answers the one request a turn makes. The listener is non-blocking,
-// so the wait for that request is bounded rather than an accept this test could
-// never interrupt.
-stub_serve :: proc(listener: net.TCP_Socket, response: string) -> bool {
-	deadline := time.tick_add(time.tick_now(), STUB_BOUND)
-	for {
-		socket, _, accept_err := net.accept_tcp(listener)
-		if accept_err == nil {
-			defer net.close(socket)
-			if !stub_read_request(socket) { return false }
-			if _, send_err := net.send_tcp(socket, transmute([]byte)response); send_err != nil { return false }
-			return true
-		}
-		if accept_err != .Would_Block { return false }
-		if time.tick_since(deadline) >= 0 { return false }
-		time.sleep(2 * time.Millisecond)
-	}
-}
-
-// stub_read_request reads a whole request, headers and body. Closing a socket
-// that still holds unread data sends RST, which would turn the response into a
-// truncation the transport reports as a stream failure.
-stub_read_request :: proc(socket: net.TCP_Socket) -> bool {
-	request: [dynamic]u8
-	defer delete(request)
-	scratch: [4096]u8
-	header_end := -1
-	body_length := 0
-	for {
-		if header_end < 0 {
-			if index := strings.index(string(request[:]), "\r\n\r\n"); index >= 0 {
-				header_end = index + 4
-				body_length = stub_content_length(string(request[:index]))
-			}
-		}
-		if header_end >= 0 && len(request) >= header_end + body_length { return true }
-		read, read_err := net.recv_tcp(socket, scratch[:])
-		if read_err != nil || read <= 0 { return false }
-		append(&request, ..scratch[:read])
-	}
-}
-
-// stub_content_length finds the request body's size. A request without a
-// Content-Length has no body.
-stub_content_length :: proc(headers: string) -> int {
-	rest := headers
-	for {
-		line_end := strings.index(rest, "\r\n")
-		line := rest if line_end < 0 else rest[:line_end]
-		if colon := strings.index_byte(line, ':'); colon > 0 {
-			if strings.equal_fold(strings.trim_space(line[:colon]), "content-length") {
-				length, _ := strconv.parse_int(strings.trim_space(line[colon + 1:]), 10)
-				return length
-			}
-		}
-		if line_end < 0 { return 0 }
-		rest = rest[line_end + 2:]
-	}
-	return 0
-}
-
 // Input typed while a turn is running is queued for the next request boundary
 // instead of being dropped or starting a second turn. The front-end's own input
 // path puts it in the queue; the agent drains it where it is safe.
@@ -2123,59 +2041,36 @@ test_a_launch_records_its_run_and_the_claims_of_its_sessions :: proc(t: ^testing
 	if workspace_err != nil { testing.fail_now(t, "could not read the working directory") }
 	defer delete(workspace, context.allocator)
 
-	// The first launch starts a session, which its first prompt creates and claims.
 	first_setup: Run_Setup
 	first_setup.alloc = context.allocator
 	defer attach_setup_destroy(&first_setup)
 	if !testing.expect(t, run_session_attach_test(&first_setup, workspace, Start_Fresh{}, &err_text)) { return }
 	session := first_setup.session.session
-	first_run := first_setup.run
+	testing.expect_value(t, first_setup.store.claimed, journal.Session_Id{})
+	testing.expect_value(t, first_setup.store.followed, session)
 	directory, clone_error := strings.clone(first_setup.journal_directory, context.temp_allocator)
 	if !testing.expect_value(t, clone_error, nil) { return }
-	app_session_turn(t, &first_setup)
 	attach_setup_destroy(&first_setup)
 
-	// The second launch resumes it, which claims it when the launch takes it.
 	second_setup: Run_Setup
 	second_setup.alloc = context.allocator
 	defer attach_setup_destroy(&second_setup)
 	if !testing.expect(t, run_session_attach_test(&second_setup, workspace, Start_Resume_Latest{}, &err_text)) { return }
-	second_run := second_setup.run
+	testing.expect_value(t, second_setup.session.session, session)
+	testing.expect_value(t, second_setup.store.claimed, journal.Session_Id{})
+	testing.expect_value(t, second_setup.store.followed, session)
 	attach_setup_destroy(&second_setup)
-	testing.expect(t, first_run != second_run, "each launch is a run of its own")
 
 	reader, reader_open_error := journal.open(directory, "", journal.run_id_create(), .Read_Only, context.allocator)
 	if reader_open_error != nil {
 		testing.fail_now(t, "the journal could not be opened for reading")
 	}
 	defer _ = journal.close(reader)
-	records, _, read_error := journal.read_records(
-		reader,
-		{kinds = {.Run_Started, .Session_Claimed, .Run_Finished, .Session_Released}},
-		0,
-		0,
-		context.temp_allocator,
-	)
+	records, _, read_error := journal.read_records(reader, {kinds = {.Run_Started, .Session_Claimed, .Session_Released}}, 0, 0, context.temp_allocator)
 	if !testing.expect_value(t, read_error, nil) { return }
-
-	// Each launch opens its run, claims the session, ends its run, and the journal close releases the session.
-	expected := [?]journal.Record_Kind{.Run_Started, .Session_Claimed, .Run_Finished, .Session_Released}
-	if !testing.expect_value(t, len(records), 2 * len(expected)) { return }
-	for record, index in records {
-		testing.expect_value(t, record.kind, expected[index % len(expected)])
-		testing.expect_value(t, record.run, first_run if index < len(expected) else second_run)
-		is_run_record := record.kind == .Run_Started || record.kind == .Run_Finished
-		testing.expect_value(t, record.session, journal.Session_Id{} if is_run_record else session)
-	}
-
-	started: journal.Run_Started
-	testing.expect_value(t, journal.payload_decode(records[0].data, &started, context.temp_allocator), nil)
-	testing.expect_value(t, started.pid, int(os.get_pid()))
-	claimed: journal.Session_Claimed
-	testing.expect_value(t, journal.payload_decode(records[1].data, &claimed, context.temp_allocator), nil)
-	testing.expect(t, !claimed.resumed, "a session the launch created is not a resumed one")
-	testing.expect_value(t, journal.payload_decode(records[5].data, &claimed, context.temp_allocator), nil)
-	testing.expect(t, claimed.resumed, "a session an earlier launch left is a resumed one")
+	if !testing.expect_value(t, len(records), 1) { return }
+	testing.expect_value(t, records[0].kind, journal.Record_Kind.Session_Claimed)
+	testing.expect_value(t, records[0].session, session)
 }
 
 @(test)
@@ -2313,107 +2208,6 @@ test_resume_restores_an_installed_selection_without_a_later_turn :: proc(t: ^tes
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(session)))) { return }
 	testing.expect_value(t, app.setup.session.model_id, "target-model")
 	testing.expect_value(t, app.run.connection.API, ai.API_Kind.OpenAI_Responses)
-}
-
-// Follow_Runner is the claimant's worker thread: it waits for a line in its session's
-// inbox and runs the turn that delivers it, as the runner's own worker does.
-Follow_Runner :: struct {
-	chat:       ^agent.Chat_Session,
-	connection: ai.Provider_Connection,
-	completed:  bool,
-}
-
-follow_runner_thread :: proc(thread_handle: ^thread.Thread) {
-	runner := cast(^Follow_Runner)thread_handle.data
-	deadline := time.tick_add(time.tick_now(), STUB_BOUND)
-	for {
-		lines, read_error := journal.read_inbox(runner.chat.store, runner.chat.session, 0, context.temp_allocator)
-		waiting := read_error == nil && len(lines) > 0
-		free_all(context.temp_allocator)
-		if waiting { break }
-		if time.tick_since(deadline) >= 0 { return }
-		time.sleep(2 * time.Millisecond)
-	}
-	if agent.chat_session_accept_user(runner.chat, "") != .Accepted { return }
-	runner.completed = agent.chat_turn_drive(runner.chat, runner.connection, agent.chat_retry_policy_default(), {}, nil, nil)
-}
-
-// A headless resume of a session another process runs sends its line to the runner and
-// returns the answer of the turn that delivered it: the runner commits the turn through a
-// stub endpoint, and the follower, which runs nothing itself, is woken by the commits.
-@(test)
-test_a_headless_follower_returns_the_answer_of_the_turn_that_delivered_its_line :: proc(t: ^testing.T) {
-	if !test_isolate_process(t, #procedure) { return }
-	listener, listen_err := net.listen_tcp({address = net.IP4_Address{127, 0, 0, 1}, port = 0}, 1)
-	if !testing.expectf(t, listen_err == nil, "the stub endpoint could not listen: %v", listen_err) { return }
-	defer net.close(listener)
-	if block_err := net.set_blocking(listener, false); block_err != nil { testing.fail_now(t, "the stub endpoint could not be made non-blocking") }
-	endpoint, endpoint_err := net.bound_endpoint(listener)
-	if !testing.expectf(t, endpoint_err == nil, "the stub endpoint could not be read: %v", endpoint_err) { return }
-
-	app: App
-	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
-	app.setup.shared_sessions = true
-	app.setup.catalog = app_test_catalog(app.setup.alloc)
-	defer agent.catalog_destroy(&app.setup.catalog)
-
-	id := app_session_add(t, &app.setup, {workspace = app.setup.workspace}, 7_000)
-	runner_store, runner_store_open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, app.setup.alloc)
-	if runner_store_open_error != nil {
-		testing.fail_now(t, "the runner's journal could not open")
-	}
-	defer _ = journal.close(runner_store)
-	if _, claim_error := journal.claim(runner_store, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
-	chat, tool_error := agent.chat_session_init(runner_store, id, journal.INITIAL_BRANCH, 0, app.setup.workspace, context.allocator)
-	if tool_error.kind != .None { testing.fail_now(t, "the runner's tool registry could not be created") }
-	defer agent.chat_session_destroy(&chat)
-	chat.skill_instructions = agent.test_skill_instructions(&chat)
-	chat.provider_id = strings.clone("test-provider", chat.allocator)
-	chat.model_id = strings.clone("test-model", chat.allocator)
-	chat.capacity = agent.model_capacity(agent.Catalog_Model{context_window = 128_000})
-	runner := Follow_Runner {
-		chat = &chat,
-		connection = {
-			API = .OpenAI_Chat_Completions,
-			Endpoint = fmt.aprintf("http://127.0.0.1:%d", endpoint.port, allocator = context.allocator),
-			Credential = "test-key",
-		},
-	}
-	defer delete(runner.connection.Endpoint, context.allocator)
-
-	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(id)))) { return }
-	if !testing.expect(t, app_following(&app), "the session runs in the other journal") { return }
-
-	serve := Stub_Serve {
-		listener = listener,
-		response = COMPLETION_RESPONSE,
-	}
-	server := thread.create(stub_serve_thread, name = "nabla-stub-provider")
-	if server == nil { testing.fail_now(t, "the stub thread could not be created") }
-	server.data = &serve
-	thread.start(server)
-	runner_thread := thread.create(follow_runner_thread, name = "nabla-follow-runner")
-	if runner_thread == nil { testing.fail_now(t, "the runner thread could not be created") }
-	runner_thread.data = &runner
-	thread.start(runner_thread)
-	defer {
-		thread.join(runner_thread)
-		thread.destroy(runner_thread)
-		thread.join(server)
-		thread.destroy(server)
-		testing.expect(t, serve.served, "the runner's turn never made its request")
-		testing.expect(t, runner.completed, "the runner's turn should complete")
-	}
-
-	answer: strings.Builder
-	defer strings.builder_destroy(&answer)
-	out := Headless_Output {
-		answer = strings.to_writer(&answer),
-	}
-	testing.expect(t, run_prompt_follow(&app, "from the follower", &out), "the followed turn should complete")
-	testing.expect_value(t, strings.to_string(answer), "hello\n")
-	testing.expect(t, app_following(&app), "a follower never takes the session")
 }
 
 @(test)
@@ -2613,6 +2407,7 @@ test_a_follower_does_not_repeat_a_result_the_replay_showed :: proc(t: ^testing.T
 	completed, _, read_error := journal.read_records(app.setup.store, {session = id, kinds = {.Tool_Completed}}, 0, 0, context.temp_allocator)
 	if !testing.expect(t, read_error == nil && len(completed) == 1) { return }
 	app.setup.follow.last = completed[0].seq - 1
+	app.setup.follow_client.cursor.last = completed[0].seq - 1
 	_ = app_follow_poll(&app, run_observer(&app))
 	boxes := 0
 	for entry in app_entries(&app) {
@@ -2639,8 +2434,8 @@ test_busy_follower_input_retries_once_and_keeps_order :: proc(t: ^testing.T) {
 	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
 	defer _ = db.rollback(&runner.connection)
 	observer := run_observer(&app)
-	app_follow_submit(&app, "first pending line", observer)
-	app_follow_submit(&app, "second pending line", observer)
+	app_client_prompt(&app, "first pending line", observer)
+	app_client_prompt(&app, "second pending line", observer)
 	testing.expect_value(t, app_entries_count(&app, "first pending line"), 0)
 	testing.expect(t, app.setup.follow_input_busy)
 	deadline, present := journal.flush_deadline(app.setup.store).?
@@ -2673,16 +2468,17 @@ test_busy_takeover_retries_only_on_new_submit :: proc(t: ^testing.T) {
 	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
 	defer _ = db.rollback(&runner.connection)
 	observer := run_observer(&app)
-	app_follow_submit(&app, "retained during takeover", observer)
+	app_client_prompt(&app, "retained during takeover", observer)
 	if error := journal.release(runner); error != nil { testing.fail_now(t, "runner release failed") }
 	_ = app_follow_service(&app, observer)
-	testing.expect(t, app.setup.takeover_failed && app.setup.takeover_retryable && app_following(&app))
+	testing.expect(t, app_following(&app), "a busy release does not take the claim")
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
 	_ = app_follow_service(&app, observer)
-	testing.expect(t, app_following(&app), "release wake must not retry the failed takeover")
-	app_follow_submit(&app, "explicit retry", observer)
+	testing.expect(t, app_following(&app), "a later wake does not take the claim")
+	app_client_prompt(&app, "explicit retry", observer)
 	_ = app_follow_service(&app, observer)
-	testing.expect(t, !app_following(&app), "a new submission retries transient takeover failure")
+	testing.expect(t, app_following(&app), "a new line does not take the claim")
+	testing.expect_value(t, app.setup.store.claimed, journal.Session_Id{})
 	testing.expect_value(t, app_entries_count(&app, "retained during takeover"), 1)
 	testing.expect_value(t, app_entries_count(&app, "explicit retry"), 1)
 }
@@ -2703,12 +2499,11 @@ test_takeover_shows_input_first_committed_by_recovery :: proc(t: ^testing.T) {
 	if error := db.exec(&runner.connection, "BEGIN IMMEDIATE"); error != nil { testing.fail_now(t, "writer begin failed") }
 	defer _ = db.rollback(&runner.connection)
 	observer := run_observer(&app)
-	app_follow_submit(&app, "first committed in recovery", observer)
+	app_client_prompt(&app, "first committed in recovery", observer)
 	if error := db.rollback(&runner.connection); error != nil { testing.fail_now(t, "writer release failed") }
 	if error := journal.release(runner); error != nil { testing.fail_now(t, "runner release failed") }
-	if _, error := journal.try_claim(app.setup.store); error != nil { testing.fail_now(t, "takeover claim failed") }
-	app_takeover(&app, observer)
-	testing.expect(t, !app_following(&app))
+	testing.expect(t, app_follow_service(&app, observer), "the committed line is new")
+	testing.expect(t, app_following(&app), "showing the line does not take the claim")
 	testing.expect_value(t, app_entries_count(&app, "first committed in recovery"), 1)
 }
 
@@ -2749,9 +2544,11 @@ test_opening_a_child_session_installs_the_subagent_role :: proc(t: ^testing.T) {
 	testing.expect(t, app.run.snap.sessions[1].child)
 	testing.expect_value(t, app.run.snap.sessions[1].title, "agent-1")
 
-	// A prefix of the child's id resumes it like any session's.
 	snapshot_clear(&app)
-	session_resume(&app, app_session_id_text(child)[:8])
+	opened, message, opened_ok := session_open(&app.setup, Start_Resume_Id(app_session_id_text(child)), app.setup.workspace)
+	defer delete(message, app.setup.alloc)
+	if !testing.expect(t, opened_ok, message) { return }
+	if !testing.expect(t, session_install(&app.setup, &opened) == "") { return }
 	if !testing.expect_value(t, app.setup.session.session, child) { return }
 	session := &app.setup.session
 	testing.expect_value(t, session.role, journal.Session_Role.Subagent)

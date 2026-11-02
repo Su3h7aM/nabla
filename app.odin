@@ -322,6 +322,11 @@ Runtime :: struct {
 	pending:                  Maybe(Pending_Selection),
 	// compact_pending crosses queue and turn boundaries until the owner consumes it.
 	compact_pending:          bool,
+	// cancel_requested asks the worker to append Cancel_Turn. Only a client sets it.
+	cancel_requested:         bool,
+	// steer_boundary says the last poll saw a request finish while the turn continued,
+	// so ready steering lines can be sent. The worker is the only thread that uses it.
+	steer_boundary:           bool,
 	// pending_target is owner-thread state retained while the target model is being fit.
 	pending_target:           Maybe(Pending_Target),
 	// steer carries lines typed while a turn is running. The front-end pushes
@@ -402,6 +407,9 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 	agent.session_watch_stop(&setup.watch)
 	setup.workers_abandoned ||= agent.chat_session_workers_outstanding(&setup.session)
 	if setup.workers_abandoned { return }
+	// The follow's watch and the server waiter stop here. The server process is not killed.
+	client_follow_close(&setup.follow_client)
+	client_server_close(&setup.server)
 	// The tool registry borrowed the runtime's bindings, so the session goes first
 	// and the MCP clients second. A runtime that was never built owns nothing.
 	mcp_runtime_destroy(&setup.mcp)
@@ -555,7 +563,12 @@ tui_run :: proc(
 	app.run.resize_wake = resize_wake
 	term.set_resize_wake(resize_wake)
 
-	if !apply_startup_selection(app, flag_provider, flag_model) {
+	session_client_ensure(app, flag_provider, flag_model)
+	// A server that was already running keeps its model; the flags are not applied over it.
+	server_keeps_model := app.setup.server.state == nil && flag_provider != ""
+	shown_provider := "" if server_keeps_model else flag_provider
+	shown_model := "" if server_keeps_model else flag_model
+	if !apply_startup_selection(app, shown_provider, shown_model) {
 		fmt.eprintln("nabla:", setup_error_text(app))
 		app_abandoned = app_teardown(app)
 		return false
@@ -563,7 +576,7 @@ tui_run :: proc(
 
 	// With no model selected, the chooser is the only input: escape quits rather
 	// than returning to a prompt that cannot send anything.
-	if app.setup.model_id == "" {
+	if app.setup.model_id == "" && !server_keeps_model {
 		menu_open_model(app)
 		app.menu.required = true
 	}
@@ -672,10 +685,8 @@ tui_run :: proc(
 	}
 
 	// Teardown: refuse further work, cancel a running turn so the worker settles,
-	// then stop it and join. Join is safe only after the turn retired;
-	// cancellation guarantees that.
+	// then stop it and join. A client only detaches: the server keeps the turn.
 	stop_runtime(app)
-	if runtime_busy(app) { agent.turn_control_stop(&app.run.control) }
 	app_abandoned = app_teardown(app)
 	return !read_failed
 }

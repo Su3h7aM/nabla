@@ -7,10 +7,11 @@ import "core:sys/linux"
 // terminating null, so a longer name is cut short.
 PROCESS_NAME_BYTES :: 16
 
-// The main process and the subagent child run the same binary, so the name is
-// what tells them apart in a process monitor.
+// The main process, the TUI, and the ACP interface run the same binary, so the
+// name is what tells them apart in a process monitor.
 PROCESS_NAME_MAIN :: "nabla"
-PROCESS_NAME_AGENT :: "nabla-agent"
+PROCESS_NAME_TUI :: "nabla-tui"
+PROCESS_NAME_ACP :: "nabla-acp"
 
 // process_name_set renames the process of the calling thread, which is what `ps`
 // and a process monitor show. It runs on the process's first thread, the one whose

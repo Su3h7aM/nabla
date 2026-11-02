@@ -58,13 +58,16 @@ Run_Setup :: struct {
 	// resume sets it too and sends its line to the runner; the ACP server leaves it false
 	// and refuses a running session.
 	shared_sessions:     bool,
+	// follow_client is the follow the client polls. server is the session server this
+	// process started, or empty when one was already running. Closing either does not
+	// stop that server.
+	follow_client:       Client_Follow,
+	server:              Client_Server,
+	// commands_seen is the newest command.applied this client has shown.
+	commands_seen:       journal.Journal_Seq,
 	// follow is where the follower's reading of the journal stands. It is meaningful only
 	// while the running store follows.
 	follow:              agent.Follow,
-	// takeover_failed stops a follower from claiming again after a claim it won could not
-	// be used, so every later wake does not repeat the failure.
-	takeover_failed:     bool,
-	takeover_retryable:  bool,
 	follow_pending:      []journal.Record, // owned until initial replay
 	follow_input_busy:   bool,
 	// watch wakes the worker for changes of the shown session's lock file. watched is the
@@ -291,35 +294,7 @@ run_catalog :: proc(sources: []agent.Catalog_Provider_Source, mcp_servers: []age
 // different one.
 @(require_results)
 run_session_attach :: proc(setup: ^Run_Setup, workspace: string, start: Session_Start, stderr: io.Writer) -> bool {
-	directory, directory_error := agent.xdg_directory(.State, setup.alloc)
-	if directory_error != .None {
-		fmt.wprintln(stderr, "nabla: cannot resolve the state directory for sessions")
-		return false
-	}
-	setup.journal_directory = directory
-	locks, replaced, locks_error := agent.session_lock_directory(setup.alloc)
-	if locks_error != .None {
-		fmt.wprintln(stderr, "nabla: cannot resolve the directory for session locks")
-		return false
-	}
-	if replaced {
-		fmt.wprintf(stderr, "nabla: warning: XDG_RUNTIME_DIR is not an absolute path; session locks are kept in %s\n", locks)
-	}
-	setup.lock_directory = locks
-	setup.run = journal.run_id_create()
-
-	opened, message, ok := session_open(setup, start, workspace)
-	if !ok {
-		fmt.wprintln(stderr, "nabla:", message)
-		delete(message, setup.alloc)
-		return false
-	}
-	report_recovery(opened.recovery, opened.queued)
-	if problem := session_install(setup, &opened); problem != "" {
-		fmt.wprintln(stderr, "nabla:", problem)
-		return false
-	}
-	return true
+	return session_client_attach(setup, workspace, start, stderr)
 }
 
 // Opened_Session is a session resolved and taken in its own journal, not yet
@@ -338,9 +313,6 @@ Opened_Session :: struct {
 	// queued is how many lines the session accepted and never delivered, which go with the
 	// next prompt.
 	queued:      int,
-	// own_queued counts the queued lines this process wrote as a follower, which a takeover
-	// delivers.
-	own_queued:  int,
 	// following says store follows the session another process claimed. follow is where its
 	// reading of the journal starts.
 	following:   bool,
@@ -524,7 +496,6 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 		for record in waiting {
 			if record.kind != .User_Input { continue }
 			opened.queued += 1
-			if record.run == store.run { opened.own_queued += 1 }
 		}
 		if opened.following { opened.pending = waiting } else { journal.records_destroy(waiting, allocator) }
 	}
@@ -636,8 +607,6 @@ session_install :: proc(setup: ^Run_Setup, opened: ^Opened_Session) -> (problem:
 	journal.records_destroy(setup.follow_pending, setup.alloc)
 	setup.follow_pending = opened.pending
 	setup.follow = opened.follow
-	setup.takeover_failed = false
-	setup.takeover_retryable = false
 	setup.follow_input_busy = false
 	opened^ = {}
 	setup.session = new_session
@@ -823,10 +792,6 @@ selection_intent_clear :: proc(app: ^App) {
 // for whichever boundary comes first.
 selection_request :: proc(app: ^App, provider_id, model_id: string) {
 	if runtime_stopping(app) { return }
-	if runtime_following(app) {
-		follower_refuse(app, "changing the model")
-		return
-	}
 	provider, provider_error := strings.clone(provider_id, app.run.alloc)
 	model, model_error := strings.clone(model_id, app.run.alloc)
 	if provider_error != nil || model_error != nil {

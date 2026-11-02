@@ -31,7 +31,7 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 	session_refresh_rows(app)
 	for {
 		seen := agent.owner_wake_seen()
-		if !runtime_stopping(app) { app_compact_observe(app, observer) }
+		if app_client_service(app, observer) { refresh_status(app) }
 		work, ok := chan.try_recv(app.run.work)
 		if !ok {
 			// A stop that arrived with nothing queued leaves through the drain loop
@@ -39,53 +39,10 @@ run_worker :: proc(thread_handle: ^thread.Thread) {
 			if runtime_stopping(app) { break }
 			// The queue is closed and empty: the front-end is gone.
 			if chan.is_closed(app.run.work) { return }
-			// A session this process runs and nobody had prompted has a lock file only
-			// once its first prompt created it, so the watch follows the session here.
-			if watch_error := app_watch_sync(&app.setup); watch_error != nil {
-				snap_append(app, .Warning, fmt.tprintf("the session cannot be watched, so other processes' changes are not shown: %v", watch_error))
-			}
-			catalog_selection_sync(app)
-			if app_selection_service(app) { refresh_status(app) }
-			// A follower shows what the runner commits and claims the session when the
-			// runner's claim drops. It runs no turn, so the rest of the idle work is not its.
-			if app_following(app) {
-				changed := app_follow_service(app, observer)
-				if changed { refresh_status(app) }
-				free_all(context.temp_allocator)
-				if !changed {
-					deadline: Maybe(time.Tick)
-					if app.setup.follow_input_busy { deadline = journal.flush_deadline(app.setup.store) }
-					agent.owner_wake_wait(seen, deadline)
-				}
-				continue
-			}
-			// A background job's report, or a line another process sent, that arrived
-			// while idle starts a turn of its own.
-			if app_agent_report_turn(app, observer) {
-				refresh_status(app)
-				free_all(context.temp_allocator)
-				continue
-			}
-			// An outstanding compaction is serviced while idle, so a finished summary does
-			// not wait for the next prompt. Work senders signal the same wake.
-			// While background work runs, the worker waits on the wake instead of the queue, because
-			// their reports arrive through the wake.
-			background_pending := app.setup.session.store != nil && agent.chat_background_pending(&app.setup.session)
-			if agent.chat_background_report_failure(&app.setup.session, observer) {
-				refresh_status(app)
-				free_all(context.temp_allocator)
-				continue
-			}
-			if app_compaction_pending(app) || app.run.pending_target != nil || background_pending {
-				if app_compaction_tick(app, observer) { refresh_status(app) }
-				if app_selection_service(app) { refresh_status(app) }
-				free_all(context.temp_allocator)
-				agent.owner_wake_wait(seen, agent.chat_background_deadline(&app.setup.session, agent.chat_compact_deadline(&app.setup.session)))
-				continue
-			}
-			// Work senders, the session watch, and teardown all signal the owner wake.
 			free_all(context.temp_allocator)
-			agent.owner_wake_wait(seen, agent.chat_background_deadline(&app.setup.session, nil))
+			deadline: Maybe(time.Tick)
+			if app.setup.follow_input_busy { deadline = journal.flush_deadline(app.setup.store) }
+			agent.owner_wake_wait(seen, deadline)
 			continue
 		}
 		if runtime_stopping(app) {
@@ -234,83 +191,37 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// A stop that arrived while this item was queued abandons it: shutdown does
 	// not start new work.
 	if runtime_stopping(app) { return }
-	// Catalog metadata can arrive while the worker is idle or while a turn is in
-	// progress. Apply it before every command; request boundaries do the same for
-	// multi-request turns.
-	catalog_selection_sync(app)
-	_ = app_selection_service(app)
 	// Work that can change which sessions exist, or what they are called, marks the
 	// list the /resume menu reads as needing a rebuild.
 	rows_dirty := false
 	switch work.kind {
 	case .Prompt:
 		rows_dirty = true
-		if app.setup.session.store == nil {
+		if app.setup.follow_client.store == nil {
 			snap_append(app, .Error, "no session is open; use /new or /resume")
 			return
 		}
-		if app_following(app) {
-			app_follow_submit(app, work.text, observer)
-			break
-		}
-		// Tools are refreshed between turns, while the session is idle. Both prompt
-		// paths refresh, so an interactive turn and a headless one see the same tools.
-		if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
-		accepted := agent.chat_session_accept_user(&app.setup.session, work.text, observer)
-		switch accepted {
-		case .Accepted:
-		case .Storage_Failed:
-			snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
-			return
-		case .Busy:
-			snap_append(app, .Warning, "chat is busy; input dropped")
-			return
-		}
-		refresh_status(app)
-		run_accepted_turn(app, observer)
-	// Steering lines left queued here arrived after the turn recorded what it was sent,
-	// so they are not part of its history. Its end is still the caller's to report, and
-	// the front-end returns them to the prompt when it sees the runtime stop running.
+		app_client_prompt(app, work.text, observer)
 	case .Compact:
-		app_command_compact(app, observer)
+		_ = app_command_send(app, journal.Compact{})
 	case .Status:
 		agent.chat_notice_status(&app.setup.session, observer, time.to_unix_nanoseconds(time.now()) / i64(time.Millisecond))
 	case .Effort:
-		if app_following(app) {
-			follower_refuse(app, "changing the effort")
-			break
-		}
 		cleared := work.text == "" || work.text == "default"
 		level := "" if cleared else work.text
-		applied := agent.chat_session_set_effort(&app.setup.session, level)
-		if applied {
-			snap_append(app, .Notice, agent.chat_effort_change_note(level))
-		} else {
-			snap_append(app, .Notice, fmt.tprintf("effort %s is not allowed for this model", work.text))
-		}
-		// The effort is part of the persisted selection, so a change rewrites it.
-		if applied {
-			record_error := selection_record(app.setup.store, app.setup.provider_id, app.setup.model_id, app.setup.session.effort)
-			if record_error != nil {
-				detail := journal.error_text(record_error, context.temp_allocator)
-				snap_append(app, .Error, fmt.tprintf("the selection could not be recorded: %s", detail))
-			} else if session_record_error := agent.chat_selection_record(
-				&app.setup.session,
-				app.setup.api,
-				app.setup.provider_id,
-				app.setup.model_id,
-				app.setup.session.effort,
-			); session_record_error != nil {
-				app.setup.session.storage_failed = true
-				detail := journal.error_text(session_record_error, context.temp_allocator)
-				snap_append(app, .Error, fmt.tprintf("the session selection could not be recorded: %s", detail))
-			}
-		}
+		_ = app_command_send(app, journal.Set_Effort{level = level})
 	case .Catalog:
-	// catalog_selection_sync above consumed the published revision. This item
-	// exists only to wake an idle worker.
+		catalog_selection_sync(app)
 	case .Model:
-		_ = app_selection_service(app)
+		pending: Maybe(Pending_Selection)
+		if sync.mutex_guard(&app.run.mu) {
+			pending = app.run.pending
+			app.run.pending = nil
+		}
+		if selection, chosen := pending.?; chosen {
+			_ = app_command_send(app, journal.Select_Model{provider = selection.provider, model = selection.model})
+			pending_selection_clear(&pending, app.run.alloc)
+		}
 	case .New_Session:
 		rows_dirty = true
 		// The new session runs the same selection; only the conversation is new. The
@@ -332,43 +243,13 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 			// The new session keeps the same selection; a failure is already in the
 			// snapshot, and the session stays open without a model.
 			if provider != "" && model != "" { _ = selection_apply_direct(app, provider, model, "", true) }
+			session_client_ensure(app, provider, model)
 		}
 	case .Resume_Session:
 		rows_dirty = true
-		session_resume(app, work.text)
+		if session_resume(app, work.text) { session_client_ensure(app, "", "") }
 	}
 	if rows_dirty { session_refresh_rows(app) }
-	refresh_status(app)
-}
-
-run_accepted_turn :: proc(app: ^App, observer: agent.Chat_Observer) {
-	app.setup.session.catalog = app_catalog_ref(app)
-	// A stop the front-end asked for is for a running turn, and none runs until the flag
-	// below is set, so an older request is cleared first. Shutdown that already began
-	// stops this turn too, rather than waiting out a whole model request.
-	agent.turn_control_clear(&app.run.control)
-	set_running(app, true)
-	if runtime_stopping(app) { agent.turn_control_stop(&app.run.control) }
-	steer := app_steer_context(app)
-	// How the turn ended reaches the front-end through the observer, which reports the
-	// terminal status, so the worker has nothing of its own to do with the return.
-	_ = agent.chat_run_turn_steered(&app.setup.session, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
-}
-
-app_command_compact :: proc(app: ^App, observer: agent.Chat_Observer) {
-	if app_following(app) {
-		follower_refuse(app, "compaction")
-		return
-	}
-	if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {
-		snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
-	}
-}
-
-app_compact_observe :: proc(app: ^App, observer: agent.Chat_Observer) {
-	if runtime_stopping(app) { return }
-	if !sync.atomic_exchange(&app.run.compact_pending, false) { return }
-	app_command_compact(app, observer)
 	refresh_status(app)
 }
 
@@ -379,55 +260,14 @@ app_steer_context :: proc(app: ^App) -> agent.Steer_Context {
 }
 
 app_steer_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Observer) {
-	app_compact_observe(cast(^App)steer.apply_data, observer)
 }
 
-// app_agent_report_turn runs a turn for the oldest message a subagent sent while no turn ran,
-// and reports whether there was one.
-@(require_results)
-app_agent_report_turn :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
-	if app.setup.session.store == nil { return false }
-	accepted, had_message := agent.chat_session_accept_agent_message(&app.setup.session, observer)
-	if !had_message { return false }
-	if accepted != .Accepted {
+// app_command_compact runs compaction for a session this process owns. The ACP worker
+// calls it. The TUI sends Compact instead and does not run the summary.
+app_command_compact :: proc(app: ^App, observer: agent.Chat_Observer) {
+	if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {
 		snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
-		return false
 	}
-	run_accepted_turn(app, observer)
-	return true
-}
-
-// follower_refuse says that action is refused because only the process that runs the
-// session can take it. The front-end and the worker both call it.
-follower_refuse :: proc(app: ^App, action: string) {
-	snap_append(app, .Notice, fmt.tprintf("%s is refused: the session runs in another process", action))
-}
-
-// app_follow_submit sends a line to the process that runs the session. The line is
-// accepted when its commit returns, and the poll that follows shows it. A commit that
-// failed busy keeps the record pending, so it is committed again and never appended twice.
-app_follow_submit :: proc(app: ^App, text: string, observer: agent.Chat_Observer) {
-	setup := &app.setup
-	if setup.takeover_failed && setup.takeover_retryable {
-		setup.takeover_failed = false
-		setup.takeover_retryable = false
-	}
-	_ = app_follow_flush(app)
-	store := setup.store
-	error := journal.append_input(store, text, .Prompt)
-	if error != nil && journal.error_is_busy(error) {
-		_, error = journal.commit(store)
-	}
-	setup.follow_input_busy = journal.error_is_busy(error)
-	if error != nil {
-		if setup.follow_input_busy {
-			snap_append(app, .Warning, "the session database is busy; the line is pending and has not been sent")
-		} else {
-			snap_append(app, .Error, fmt.tprintf("the line was not sent: %s", journal.error_text(error, context.temp_allocator)))
-		}
-		return
-	}
-	_ = app_follow_poll(app, observer)
 }
 
 // app_follow_flush retries the existing batch without appending input again.
@@ -446,6 +286,7 @@ app_follow_flush :: proc(app: ^App) -> bool {
 // of its newest request for the footer. It reports whether anything moved.
 app_follow_poll :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	setup := &app.setup
+	if setup.follow_client.store != nil { return app_client_poll(app, observer) }
 	before := setup.follow
 	if error := agent.follow_poll(setup.store, setup.session.session, &setup.follow, observer); error != nil {
 		snap_append(app, .Error, fmt.tprintf("cannot read the session: %s", journal.error_text(error, context.temp_allocator)))
@@ -456,89 +297,10 @@ app_follow_poll :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	return setup.follow != before
 }
 
-// app_follow_service is the follower's idle step: it tries the claim, which succeeds only
-// once the runner's has dropped, and otherwise shows what the runner committed. A lock close
-// raises a wake, and a claim that fails costs one syscall, so every wake tries. It reports
-// whether the display or the role changed.
+// app_follow_service shows what the runner committed. It does not take the claim.
 app_follow_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	_ = app_follow_flush(app)
-	setup := &app.setup
-	if !setup.takeover_failed {
-		_, claim_error := journal.try_claim(setup.store)
-		if claim_error == nil {
-			app_takeover(app, observer)
-			return true
-		}
-		if claim_error != journal.Journal_Error.Claimed {
-			setup.takeover_failed = true
-			setup.takeover_retryable = journal.error_is_busy(claim_error)
-			snap_append(app, .Error, fmt.tprintf("cannot take over the session: %s", journal.error_text(claim_error, context.temp_allocator)))
-		}
-	}
 	return app_follow_poll(app, observer)
-}
-
-// app_takeover makes this process the runner of the session its store just claimed: it
-// shows what the old runner committed last, runs recovery, installs the session as the
-// runner through the install every open uses (the transcript on screen stays), applies the
-// selection this process runs with, and delivers the lines it wrote as a follower that no
-// turn has read. The post-settlement poll shows every committed line before delivery, which reports none.
-app_takeover :: proc(app: ^App, observer: agent.Chat_Observer) {
-	setup := &app.setup
-	_ = app_follow_poll(app, observer)
-	opened := Opened_Session {
-		store = setup.store,
-		id    = setup.session.session,
-	}
-	if message, settled := session_settle(&opened, setup.workspace, setup.alloc); !settled {
-		// The store stays with its owner; only what settling read is released here.
-		retryable := opened.settle_busy
-		opened.store = nil
-		opened_session_destroy(&opened, setup.alloc)
-		app_takeover_abort(app, message, retryable)
-		delete(message, setup.alloc)
-		return
-	}
-	_ = app_follow_poll(app, observer)
-	recovery := opened.recovery
-	own_queued := opened.own_queued
-	if problem := session_install(setup, &opened); problem != "" {
-		app_takeover_abort(app, problem)
-		return
-	}
-	snap_append(app, .Notice, "the session's process ended; this one runs it now")
-	if recovery.calls > 0 {
-		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never reported a result; their results say whether they ran", recovery.calls))
-	}
-	// The selection this process runs with is the one it applies, and it is not recorded
-	// as the user's default: the user did not choose it now.
-	if setup.provider_id != "" && setup.model_id != "" {
-		_ = selection_apply_direct(app, setup.provider_id, setup.model_id, "", false)
-	}
-	if own_queued == 0 || setup.model_id == "" { return }
-	if warning := app_tools_refresh(app); warning != "" { snap_append(app, .Warning, warning) }
-	switch agent.chat_session_accept_user(&setup.session, "", {}) {
-	case .Accepted:
-		run_accepted_turn(app, observer)
-	case .Storage_Failed:
-		snap_append(app, .Error, agent.chat_session_last_error(&setup.session))
-	case .Busy:
-	}
-}
-
-// app_takeover_abort gives the claim back when this process won it and could not use it,
-// so a session is never held by a process that cannot run it, and follows again. It stops
-// the claims from being retried, because the release raises a wake that would retry them.
-app_takeover_abort :: proc(app: ^App, reason: string, retryable := false) {
-	setup := &app.setup
-	setup.takeover_failed = true
-	setup.takeover_retryable = retryable
-	snap_append(app, .Error, fmt.tprintf("cannot take over the session: %s; this process keeps following it", reason))
-	session := setup.store.claimed
-	_ = journal.release(setup.store)
-	if follow_error := journal.follow(setup.store, session); follow_error != nil {
-		snap_append(app, .Error, fmt.tprintf("cannot follow the session again: %s", journal.error_text(follow_error, context.temp_allocator)))
-	}
 }
 
 // app_catalog_ref is the catalog subagents resolve models from, with the lock it is
@@ -551,16 +313,16 @@ app_catalog_ref :: proc(app: ^App) -> agent.Catalog_Ref {
 // unambiguous prefix names, then shows the tail of its conversation. The menu always names a whole
 // id; the prefix form exists for typing, and an ambiguous one is refused rather
 // than guessed.
-session_resume :: proc(app: ^App, reference: string) {
+session_resume :: proc(app: ^App, reference: string) -> bool {
 	if reference == "" {
 		snap_append(app, .Notice, "usage: /resume <session id or prefix>")
-		return
+		return false
 	}
 	sessions, list_error := journal.list_sessions(app.setup.store, {workspace = app.setup.workspace}, app.run.alloc)
 	if list_error != nil {
 		detail := journal.error_text(list_error, context.temp_allocator)
 		snap_append(app, .Error, fmt.tprintf("cannot list sessions: %s", detail))
-		return
+		return false
 	}
 	defer journal.session_summaries_destroy(sessions, app.run.alloc)
 
@@ -574,68 +336,25 @@ session_resume :: proc(app: ^App, reference: string) {
 	}
 	if matches == 0 {
 		snap_append(app, .Notice, fmt.tprintf("no session matches %s", reference))
-		return
+		return false
 	}
 	if matches > 1 {
 		snap_append(app, .Notice, fmt.tprintf("%s matches more than one session", reference))
-		return
+		return false
 	}
 	matched_text := string(matched[:])
-	if !session_switch(app, Start_Resume_Id(matched_text)) { return }
+	if !session_switch(app, Start_Resume_Id(matched_text)) { return false }
 	snapshot_clear(app)
 	snap_append(app, .Notice, fmt.tprintf("resumed session %s", matched_text))
 	session_opened_show(app)
+	return true
 }
 
-// session_switch replaces the running session with the one start names, settling
-// anything an earlier run left open. The session is opened in its own journal while
-// the running one stays claimed, so a refusal leaves the front-end working in the
-// session it already had.
+// session_switch replaces the running session with one this process follows. It does
+// not claim the session and does not settle what an earlier run left open.
 @(require_results)
 session_switch :: proc(app: ^App, start: Session_Start) -> bool {
-	setup := &app.setup
-	opened, message, ok := session_open(setup, start, setup.workspace)
-	if !ok {
-		snap_append(app, .Error, message)
-		delete(message, setup.alloc)
-		// A refused follow may have moved the watch to the target, and the running
-		// session still needs its own.
-		_ = app_watch_sync(setup)
-		return false
-	}
-	recovery := opened.recovery
-	if problem := session_install(setup, &opened); problem != "" {
-		snap_append(app, .Error, problem)
-		_ = app_watch_sync(setup)
-		return false
-	}
-	selection_intent_clear(app)
-	if recovery.calls > 0 {
-		snap_append(app, .Notice, fmt.tprintf("%d tool call(s) in this session never reported a result; their results say whether they ran", recovery.calls))
-	}
-	switch _ in start {
-	case Start_Fresh, nil:
-		return true
-	case Start_Resume_Latest, Start_Resume_Id:
-	}
-
-	// A conversation has to be configured before it can run: the new chat starts with no
-	// model, so the session's recorded one is applied, with the selection already in
-	// effect as the fallback. A session whose model is gone from the catalog stays open on
-	// the current selection. A follower runs nothing, so it keeps its own selection, which
-	// is the one it would run with after a takeover.
-	if !app_following(app) &&
-	   setup.resumed_provider != "" &&
-	   setup.resumed_model != "" &&
-	   selection_apply_direct(app, setup.resumed_provider, setup.resumed_model, setup.resumed_effort, true) {
-		return true
-	}
-	if setup.provider_id != "" && setup.model_id != "" {
-		// The selection already in effect is reapplied; the snapshot carries any
-		// failure.
-		_ = selection_apply_direct(app, setup.provider_id, setup.model_id, "", true)
-	}
-	return true
+	return session_client_switch(app, start)
 }
 
 // session_opened_show says that the session is followed and shows the lines the runner has not delivered, consuming follow_pending.
@@ -1020,13 +739,14 @@ clear_retry :: proc(app: ^App) {
 }
 
 observer_request_finished :: proc(user_data: rawptr) {
-	refresh_status(cast(^App)user_data)
+	app := cast(^App)user_data
+	if app.setup.follow_client.store != nil { app.run.steer_boundary = true }
+	refresh_status(app)
 }
 
 observer_assistant_begin :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
-	if app.run.snap.status.following { return }
 	snap_after_update_locked(app)
 	snap_push_locked(app, snap_entry_make(app, .Assistant, ""))
 }
@@ -1034,7 +754,6 @@ observer_assistant_begin :: proc(user_data: rawptr) {
 observer_assistant_text :: proc(user_data: rawptr, text: string) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
-	if app.run.snap.status.following { return }
 	count := len(app.run.snap.entries)
 	if count > 0 {
 		last := &app.run.snap.entries[count - 1]
@@ -1050,7 +769,6 @@ observer_assistant_text :: proc(user_data: rawptr, text: string) {
 observer_assistant_end :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
 	sync.mutex_guard(&app.run.mu)
-	if app.run.snap.status.following { return }
 	#reverse for &entry in app.run.snap.entries {
 		if entry.kind != .Assistant { continue }
 		entry.complete = true

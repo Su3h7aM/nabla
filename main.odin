@@ -197,56 +197,6 @@ headless_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text:
 	}
 }
 
-// run_prompt_follow sends prompt to the process that runs the session app follows and
-// waits for the turn that answers it. The line is committed as a `user.input` record,
-// and the turn is the one whose User node delivers that record. Its assistant messages
-// are the answer; everything else the runner commits meanwhile goes to stderr. It runs
-// no turn and never claims the session, so a runner whose claim drops leaves it waiting
-// for the next one. Only an interrupt ends the wait early, and no timeout does. False
-// means the line was not sent, the session could not be read, the run was interrupted,
-// or the turn did not complete; the observer has said why for a turn that failed.
-@(require_results)
-run_prompt_follow :: proc(app: ^App, prompt: string, out: ^Headless_Output) -> bool {
-	setup := &app.setup
-	store := setup.store
-	error := journal.append_input(store, prompt, .Prompt)
-	// The line is the last record of its commit, so the seq the commit reached is its own.
-	seq := store.last_seq
-	if error != nil && journal.error_is_busy(error) { seq, error = journal.commit(store) }
-	if error != nil {
-		fmt.eprintf("nabla: the line was not sent: %s\n", journal.error_text(error, context.temp_allocator))
-		return false
-	}
-
-	setup.follow.input = seq
-	out.follow = &setup.follow
-	observer := headless_observer(out)
-	// The handler is armed for the whole wait, as it is for a turn, so Ctrl-C wakes the
-	// owner wake instead of ending the process with a line still unanswered.
-	previous: agent.Signal_Action
-	agent.chat_signal_arm(&previous)
-	defer agent.chat_signal_disarm(&previous)
-	for {
-		// The wake is read before the poll, so a commit that lands after the poll ends the wait.
-		seen := agent.owner_wake_seen()
-		if poll_error := agent.follow_poll(store, setup.session.session, &setup.follow, observer); poll_error != nil {
-			fmt.eprintf("nabla: cannot read the session: %s\n", journal.error_text(poll_error, context.temp_allocator))
-			return false
-		}
-		if setup.follow.ended { break }
-		if agent.process_interrupted() {
-			fmt.eprintln("nabla: interrupted while waiting for the session's turn")
-			return false
-		}
-		agent.owner_wake_wait(seen, nil)
-	}
-	if out.write_failed {
-		fmt.eprintln("nabla: the answer could not be written")
-		return false
-	}
-	return setup.follow.outcome == .Completed
-}
-
 session_start_from_options :: proc(resume: bool, resume_id: string) -> Session_Start {
 	if !resume { return Start_Fresh{} }
 	if resume_id != "" { return Start_Resume_Id(resume_id) }
@@ -295,7 +245,7 @@ chat_main :: proc() -> int {
 	// streams, so it is a subcommand rather than a launch option.
 	// The subagent child is this same subcommand, so it is named for its role.
 	if len(args) > 0 && args[0] == "acp" {
-		process_name_set(PROCESS_NAME_AGENT)
+		process_name_set(PROCESS_NAME_ACP)
 		return acp_main(args[1:])
 	}
 
@@ -373,6 +323,7 @@ chat_main :: proc() -> int {
 	}
 
 	start := session_start_from_options(options.resume, options.resume_id)
+	process_name_set(PROCESS_NAME_TUI)
 	return tui_run(sources[:], mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
 }
 

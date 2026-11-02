@@ -57,18 +57,7 @@ test_compact_is_observed_during_a_turn_without_draining_work :: proc(t: ^testing
 	dispatch_command(&app, "/compact")
 	testing.expect(t, sync.atomic_load(&app.run.compact_pending))
 	testing.expect(t, len(app.run.snap.entries) == 0, "dispatch must not run a session command on the frontend")
-	steer := agent.Steer_Context {
-		apply_data = &app,
-		observe    = app_steer_observe,
-	}
-	steer.observe(&steer, run_observer(&app))
-	testing.expect(t, !sync.atomic_load(&app.run.compact_pending))
-	if testing.expect_value(t, len(app.run.snap.entries), 1) {
-		testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "compaction is not available right now")
-	}
-	steer.observe(&steer, run_observer(&app))
-	testing.expect(t, len(app.run.snap.entries) == 1, "a request is consumed once")
-	testing.expect(t, runtime_busy(&app), "observing compaction must not stop the active turn")
+	testing.expect(t, runtime_busy(&app), "asking for compaction must not stop the active turn")
 	for index in 0 ..< WORK_CAPACITY {
 		work, received := chan.try_recv(app.run.work)
 		if !testing.expect(t, received, "observation must leave ordinary work queued") { break }

@@ -5,6 +5,7 @@ package main
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:sync/chan"
 import "core:testing"
 import "core:time"
@@ -219,7 +220,8 @@ test_ctrl_c_resolves_by_prompt_state :: proc(t: ^testing.T) {
 	testing.expect(t, !sequence.quit)
 
 	interrupt(&sequence)
-	testing.expect(t, agent.turn_control_stop_requested(&sequence.run.control))
+	testing.expect(t, sync.atomic_load(&sequence.run.cancel_requested))
+	testing.expect(t, !agent.turn_control_stop_requested(&sequence.run.control))
 	testing.expect(t, !sequence.quit)
 
 	// An empty prompt with nothing running exits.
@@ -239,7 +241,8 @@ test_ctrl_c_leaves_a_follower_without_cancelling_the_runner :: proc(t: ^testing.
 	testing.expect_value(t, widgets.input_text(&app.input), "")
 	testing.expect(t, !app.quit)
 	interrupt(&app)
-	testing.expect(t, app.quit, "a follower must not wait for the other process's turn to end")
+	testing.expect(t, sync.atomic_load(&app.run.cancel_requested), "ctrl+c asks the server to cancel")
+	testing.expect(t, !app.quit, "a running turn is cancelled rather than closed")
 	testing.expect(t, !agent.turn_control_stop_requested(&app.run.control))
 }
 

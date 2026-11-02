@@ -482,22 +482,18 @@ handle_event :: proc(app: ^App, event: input.Event) {
 }
 
 cancel_or_quit :: proc(app: ^App) {
-	if runtime_busy(app) && !runtime_following(app) {
+	if runtime_busy(app) {
 		stop_turn(app)
 		return
 	}
 	app.quit = true
 }
 
-// stop_turn asks the running turn to stop. A follower has no turn to stop: the runner's
-// process owns it, so the request is refused with a notice.
+// stop_turn asks the session server to stop the running turn. The server process keeps running.
 stop_turn :: proc(app: ^App) {
-	if runtime_following(app) {
-		follower_refuse(app, "cancelling the turn")
-		return
-	}
 	app.turn_stopped = true
-	agent.turn_control_stop(&app.run.control)
+	sync.atomic_store(&app.run.cancel_requested, true)
+	agent.owner_wake_signal()
 }
 
 // interrupt resolves one Ctrl+C press in the order the prompt's state demands:
@@ -560,7 +556,7 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 			return
 		}
 		// Alt+Enter queues a follow-up while a turn runs; otherwise it is a newline.
-		if key.modifiers & {.Shift, .Alt} == {.Alt} && runtime_busy(app) && !runtime_following(app) && !app.steer.editing {
+		if key.modifiers & {.Shift, .Alt} == {.Alt} && runtime_busy(app) && !app.steer.editing {
 			submit(app, follow_up = true)
 			return
 		}
@@ -656,7 +652,7 @@ submit :: proc(app: ^App, follow_up := false) {
 		line := strings.trim_space(expanded)
 		// A follower has no turn of its own to steer: its line goes to the runner as a
 		// prompt, and the runner delivers it at its next settled point.
-		if runtime_busy(app) && !runtime_following(app) {
+		if runtime_busy(app) {
 			// A steering line is not a command: commands keep their own path, which
 			// decides what can happen while a turn is running.
 			if !follow_up { transcript_jump_bottom(app) }
@@ -699,7 +695,6 @@ dispatch_command :: proc(app: ^App, text: string) -> bool {
 	}
 	switch command.id {
 	case .Quit:
-		if runtime_busy(app) { agent.turn_control_stop(&app.run.control) }
 		app.quit = true
 	case .Help:
 		command_help(app)
