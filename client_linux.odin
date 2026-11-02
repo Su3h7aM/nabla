@@ -4,12 +4,12 @@ package main
 import "core:os"
 import "core:sys/linux"
 
-// prompt_claim_held reports whether another process holds an exclusive lock on the
+// client_claim_held reports whether another process holds an exclusive lock on the
 // session lock file at path. A missing file is not held. The probe locks only to
 // learn that and drops the lock before it returns, so the caller does not become
 // the holder.
 @(require_results)
-prompt_claim_held :: proc(path: string) -> (held: bool, error: os.Error) {
+client_claim_held :: proc(path: string) -> (held: bool, error: os.Error) {
 	if !os.exists(path) { return false, nil }
 	file, open_error := os.open(path, {.Read, .Write})
 	if open_error == .Not_Exist { return false, nil }

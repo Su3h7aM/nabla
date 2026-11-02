@@ -1,132 +1,11 @@
 package main
 
-import "base:runtime"
 import "core:fmt"
 import "core:io"
 import "core:os"
-import "core:sync"
-import "core:thread"
 
 import "nabla:agent"
 import "nabla:agent/journal"
-import "nabla:subprocess"
-
-// Prompt_Server is the session server this process started, if it started one.
-// It is process-global because the waiter blocks in the child's wait until that
-// server exits, which is after this client has returned, and the process exit
-// reclaims it. The waiter writes the exit fields, then publishes; the client
-// reads them only after published is set.
-Prompt_Server :: struct {
-	child:     subprocess.Child,
-	published: bool,
-	exited:    bool,
-	exit_code: int,
-	waited:    bool,
-}
-
-prompt_server: Prompt_Server
-
-// prompt_server_wait blocks until the session server exits, records how it ended,
-// and wakes the client. The wake is the only thing the client's wait loop sleeps on.
-prompt_server_wait :: proc(worker: ^thread.Thread) {
-	context = runtime.default_context()
-	server := cast(^Prompt_Server)worker.data
-	exited, exit_code, waited := subprocess.child_reap(&server.child)
-	server.exited = exited
-	server.exit_code = exit_code
-	server.waited = waited
-	sync.atomic_store(&server.published, true)
-	agent.owner_wake_signal()
-}
-
-// prompt_server_failed reports a session server that exited non-zero before the
-// prompt was answered. An exit status of 0 lost the claim to another server and
-// is not a failure. Nothing here is written to the journal.
-@(require_results)
-prompt_server_failed :: proc() -> bool {
-	if !sync.atomic_load(&prompt_server.published) { return false }
-	if prompt_server.exited && prompt_server.exit_code == 0 { return false }
-	if prompt_server.exited {
-		fmt.eprintf("nabla: the session server exited with status %d\n", prompt_server.exit_code)
-	} else if prompt_server.waited {
-		fmt.eprintln("nabla: the session server was killed by a signal")
-	} else {
-		fmt.eprintln("nabla: the session server's exit status is unknown")
-	}
-	return true
-}
-
-// prompt_start_server runs the session server as a child when no claim holder
-// exists. The child is its own session, with no controlling terminal, and keeps
-// running after this client exits. Its standard error is this process's.
-// False means the server did not start; the reason was printed and nothing was
-// written to the journal.
-@(require_results)
-prompt_start_server :: proc(executable, session, provider, model, config: string) -> bool {
-	arguments: [10]string
-	count := 0
-	arguments[count] = executable
-	count += 1
-	arguments[count] = "--serve"
-	count += 1
-	arguments[count] = "--session"
-	count += 1
-	arguments[count] = session
-	count += 1
-	if provider != "" {
-		arguments[count] = "--provider"
-		count += 1
-		arguments[count] = provider
-		count += 1
-		arguments[count] = "--model"
-		count += 1
-		arguments[count] = model
-		count += 1
-	}
-	if config != "" {
-		arguments[count] = "--config"
-		count += 1
-		arguments[count] = config
-		count += 1
-	}
-
-	environment, environment_error := os.environ(context.allocator)
-	if environment_error != nil {
-		fmt.eprintf("nabla: the session server could not be started: %v\n", environment_error)
-		return false
-	}
-	defer {
-		for entry in environment { delete(entry) }
-		delete(environment)
-	}
-
-	// The server's own output must not mix with the answer on standard output.
-	sink := os.open("/dev/null", {.Write}) or_else nil
-	if sink == nil {
-		fmt.eprintln("nabla: the session server could not be started: /dev/null could not be opened")
-		return false
-	}
-	defer _ = os.close(sink)
-
-	child, spawn, start_error := subprocess.start({argv = arguments[:count], environment = environment, stderr = os.stderr, stdout = sink, new_session = true})
-	if spawn != .Started {
-		fmt.eprintf("nabla: the session server could not be started: %v\n", start_error)
-		return false
-	}
-
-	prompt_server = {}
-	prompt_server.child = child
-	previous := agent.chat_signal_block_watched()
-	worker := thread.create(prompt_server_wait, name = "nabla-prompt-server")
-	agent.chat_signal_restore(previous)
-	if worker == nil {
-		fmt.eprintln("nabla: the session server could not be watched")
-		return false
-	}
-	worker.data = &prompt_server
-	thread.start(worker)
-	return true
-}
 
 // prompt_commit writes the pending batch, and retries once when another writer
 // still holds the database. The seq is the last record written.
@@ -208,25 +87,16 @@ prompt_resolve_session :: proc(store: ^journal.Journal, options: chat_cli_option
 // prompt_wait_turn follows session and waits until the turn that delivers prompt
 // ends, printing as a follower does. It does not take the claim.
 @(require_results)
-prompt_wait_turn :: proc(store: ^journal.Journal, session: journal.Session_Id, prompt: string, answer: io.Writer) -> bool {
-	cursor, follow_error := agent.follow_start(store, session)
-	if follow_error != nil {
-		fmt.eprintf("nabla: cannot read the session: %s\n", journal.error_text(follow_error, context.temp_allocator))
-		return false
-	}
-
-	error := journal.append_input(store, prompt, .Prompt)
-	seq := store.last_seq
-	if error != nil && journal.error_is_busy(error) { seq, error = journal.commit(store) }
+prompt_wait_turn :: proc(follow: ^Client_Follow, server: ^Client_Server, prompt: string, answer: io.Writer) -> bool {
+	seq, error := client_send_input(follow, prompt, .Prompt)
 	if error != nil {
 		fmt.eprintf("nabla: the line was not sent: %s\n", journal.error_text(error, context.temp_allocator))
 		return false
 	}
-	cursor.input = seq
-
+	follow.cursor.input = seq
 	out := Headless_Output {
 		answer = answer,
-		follow = &cursor,
+		follow = &follow.cursor,
 	}
 	observer := headless_observer(&out)
 	previous: agent.Signal_Action
@@ -234,23 +104,37 @@ prompt_wait_turn :: proc(store: ^journal.Journal, session: journal.Session_Id, p
 	defer agent.chat_signal_disarm(&previous)
 	for {
 		seen := agent.owner_wake_seen()
-		if poll_error := agent.follow_poll(store, session, &cursor, observer); poll_error != nil {
+		if poll_error := client_follow_poll(follow, observer); poll_error != nil {
 			fmt.eprintf("nabla: cannot read the session: %s\n", journal.error_text(poll_error, context.temp_allocator))
 			return false
 		}
-		if cursor.ended { break }
+		if follow.cursor.ended { break }
 		if agent.process_interrupted() {
 			fmt.eprintln("nabla: interrupted while waiting for the session's turn")
 			return false
 		}
-		if prompt_server_failed() { return false }
+		status, _ := client_server_status(server)
+		switch status.kind {
+		case .None, .Running:
+		case .Exited:
+			if status.exit_code != 0 {
+				fmt.eprintf("nabla: the session server exited with status %d\n", status.exit_code)
+				return false
+			}
+		case .Signalled:
+			fmt.eprintln("nabla: the session server was killed by a signal")
+			return false
+		case .Unknown:
+			fmt.eprintln("nabla: the session server's exit status is unknown")
+			return false
+		}
 		agent.owner_wake_wait(seen, nil)
 	}
 	if out.write_failed {
 		fmt.eprintln("nabla: the answer could not be written")
 		return false
 	}
-	return cursor.outcome == .Completed
+	return follow.cursor.outcome == .Completed
 }
 
 // run_prompt sends one prompt to the session server and returns the process exit
@@ -284,39 +168,41 @@ run_prompt :: proc(executable: string, options: chat_cli_options, config: string
 	session, resolved := prompt_resolve_session(store, options)
 	if !resolved { return 1 }
 
-	lock_path, path_error := agent.session_lock_path(locks, session, context.allocator)
-	if path_error != nil {
-		fmt.eprintln("nabla: the session lock path could not be stored")
-		return 1
-	}
-	defer delete(lock_path)
-	held, held_error := prompt_claim_held(lock_path)
-	if held_error != nil {
-		fmt.eprintf("nabla: cannot tell whether the session is running: %v\n", held_error)
-		return 1
-	}
-	if held {
-		if options.provider_id != "" {
-			fmt.eprintln("nabla: the running session keeps its selection")
+	server, server_error := client_ensure_server(executable, session, options.provider_id, options.model_id, config)
+	if server_error.kind != .None {
+		switch server_error.kind {
+		case .None:
+		case .Locks:
+			fmt.eprintln("nabla: cannot resolve the directory for session locks")
+		case .Path:
+			fmt.eprintln("nabla: the session lock path could not be stored")
+		case .Claim:
+			fmt.eprintf("nabla: cannot tell whether the session is running: %v\n", server_error.system)
+		case .Start:
+			fmt.eprintf("nabla: the session server could not be started: %v\n", server_error.system)
+		case .Sink:
+			fmt.eprintln("nabla: the session server could not be started: /dev/null could not be opened")
+		case .Waiter:
+			fmt.eprintln("nabla: the session server could not be watched")
+		case .Follow, .Watch:
+			fmt.eprintln("nabla: cannot follow the session")
 		}
-	} else {
-		hex: [journal.SESSION_ID_HEX_LENGTH]u8
-		session_text := journal.session_id_to_hex(session, hex[:])
-		if !prompt_start_server(executable, session_text, options.provider_id, options.model_id, config) {
-			return 1
+		return 1
+	}
+	defer client_server_close(&server)
+	if server.state == nil && options.provider_id != "" { fmt.eprintln("nabla: the running session keeps its selection") }
+	follow, follow_error := client_follow_open(store, session)
+	if follow_error.kind != .None {
+		#partial switch follow_error.kind {
+		case .Watch:
+			fmt.eprintf("nabla: cannot watch the session: %v\n", follow_error.system)
+		case .Follow:
+			fmt.eprintf("nabla: cannot read the session: %s\n", journal.error_text(follow_error.journal, context.temp_allocator))
+		case:
+			fmt.eprintln("nabla: cannot follow the session")
 		}
-	}
-
-	// The watch is armed before the first read, so a commit after that read wakes the wait.
-	watch: agent.Session_Watch
-	defer agent.session_watch_stop(&watch)
-	if follow_error := journal.follow(store, session); follow_error != nil {
-		fmt.eprintf("nabla: cannot follow the session: %s\n", journal.error_text(follow_error, context.temp_allocator))
 		return 1
 	}
-	if _, watch_error := agent.session_watch_add(&watch, lock_path); watch_error != nil {
-		fmt.eprintf("nabla: cannot watch the session: %v\n", watch_error)
-		return 1
-	}
-	return prompt_wait_turn(store, session, options.prompt, answer) ? 0 : 1
+	defer client_follow_close(&follow)
+	return prompt_wait_turn(&follow, &server, options.prompt, answer) ? 0 : 1
 }
