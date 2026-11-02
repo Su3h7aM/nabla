@@ -209,7 +209,7 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 @(private)
 RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call, parent_call, subagent, data FROM (
 	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = 'turn.started'
-		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND turn = open.turn AND kind = 'turn.completed')
+		AND (open.turn IS NULL OR open.turn NOT IN (SELECT turn FROM records WHERE session = ?1 AND kind = 'turn.completed' AND turn IS NOT NULL))
 	UNION ALL
 	SELECT 1, * FROM records AS open WHERE session = ?1 AND kind = 'request.sent'
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND request = open.request AND attempt IS open.attempt
@@ -239,5 +239,5 @@ UNANSWERED_CALLS_QUERY :: `SELECT assistant.node, assistant.branch, assistant.tu
 FROM nodes AS assistant
 JOIN records AS proposed ON proposed.session = ?1 AND proposed.node = assistant.node AND proposed.kind = 'tool.proposed'
 WHERE assistant.session = ?1 AND assistant.kind = 'assistant'
-	AND NOT EXISTS (SELECT 1 FROM nodes WHERE session = ?1 AND parent = assistant.node AND kind = 'results')
+	AND assistant.node NOT IN (SELECT parent FROM nodes WHERE session = ?1 AND kind = 'results' AND parent IS NOT NULL)
 ORDER BY assistant.node, proposed.seq`

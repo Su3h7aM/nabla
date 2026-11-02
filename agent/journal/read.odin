@@ -608,16 +608,26 @@ LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0
 INBOX_QUERY ::
 	`SELECT ` +
 	RECORD_COLUMNS +
-	` FROM records AS inbound WHERE inbound.seq > ?2 AND (
-	(inbound.session = ?1 AND inbound.kind IN ('user.input', 'background.completed'))
-	OR (inbound.session = ?1 AND inbound.kind = 'subagent.completed'
+	` FROM (
+	SELECT ` +
+	RECORD_COLUMNS +
+	` FROM records AS inbound WHERE inbound.session = ?1 AND inbound.seq > ?2
+		AND inbound.kind IN ('user.input', 'background.completed')
+	UNION ALL
+	SELECT ` +
+	RECORD_COLUMNS +
+	` FROM records AS inbound WHERE inbound.session = ?1 AND inbound.seq > ?2 AND inbound.kind = 'subagent.completed'
 		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started'
 			AND started.call IS inbound.call AND started.subagent IS inbound.subagent AND json_extract(started.data, '$.background') = 1)
 		AND NOT EXISTS (SELECT 1 FROM records AS result WHERE result.session = ?1 AND result.kind = 'tool.completed' AND result.call IS inbound.call
-			AND json_extract(result.data, '$.outcome') NOT IN ('success', 'unknown')))
-	OR (inbound.kind = 'subagent.message' AND inbound.session = inbound.subagent AND inbound.session <> ?1
-		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started' AND started.subagent = inbound.session))
-) ORDER BY inbound.seq ASC`
+			AND json_extract(result.data, '$.outcome') NOT IN ('success', 'unknown'))
+	UNION ALL
+	SELECT ` +
+	RECORD_COLUMNS +
+	` FROM records AS inbound WHERE inbound.seq > ?2 AND inbound.kind = 'subagent.message'
+		AND inbound.session <> ?1 AND inbound.session = inbound.subagent
+		AND inbound.session IN (SELECT subagent FROM records WHERE session = ?1 AND kind = 'subagent.started' AND subagent IS NOT NULL)
+) ORDER BY seq ASC`
 
 // A count the provider did not report is JSON null, which SUM and the paired
 // test both skip, so it never enters a total as zero.
