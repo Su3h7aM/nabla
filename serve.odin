@@ -449,7 +449,7 @@ serve_run_turn :: proc(app: ^App) -> bool {
 	case .Busy:
 		return true
 	}
-	observer, streaming := serve_stream_begin(&app.stream, chat.store, chat.session, chat.turn, {})
+	observer, streaming := serve_stream_begin(&app.stream, chat.store, chat.session, chat.turn)
 	steer := serve_steer_context(app)
 	if streaming { steer.observe = serve_stream_observe }
 	_ = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)

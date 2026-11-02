@@ -37,7 +37,7 @@ test_serve_stream_turn_lifecycle :: proc(test: ^testing.T) {
 	if stream.path == "" { testing.fail_now(test, "the stream has no path") }
 	if write_error := os.write_entire_file(stream.path, "stale bytes"); write_error != nil { testing.fail_now(test, "could not stage a stale file") }
 
-	observer, streaming := serve_stream_begin(&stream, store, session, 1, {})
+	observer, streaming := serve_stream_begin(&stream, store, session, 1)
 	if !testing.expect(test, streaming, "the stream should open") { return }
 	if observer.user_data == nil { testing.fail_now(test, "the observer has no token") }
 	observer.assistant_begin(observer.user_data)

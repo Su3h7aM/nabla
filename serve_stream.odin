@@ -7,7 +7,6 @@ import "core:sync"
 
 import "nabla:agent"
 import "nabla:agent/journal"
-import "nabla:ai"
 
 // Serve_Stream is the server's live stream of one session's turn. Assistant
 // frames are appended on the owner thread as the turn reports them; tool output
@@ -27,7 +26,6 @@ Serve_Stream :: struct {
 	turn:       journal.Turn_Id, // the durable turn of the open turn
 	ordinal:    u32, // the ordinal of the open message
 	pending:    [dynamic]Serve_Stream_Chunk, // queued tool output, oldest first
-	inner:      agent.Chat_Observer, // the observer the turn would report through without a stream
 }
 
 // Serve_Stream_Chunk is one queued tool output chunk. text is owned by the
@@ -83,17 +81,8 @@ serve_stream_drop :: proc(stream: ^Serve_Stream) {
 // serve_stream_begin truncates the stream file for the turn about to run and
 // returns the observer the turn reports through. streaming is false when the
 // stream is disabled or the turn's token could not be allocated; the turn then
-// runs through inner unchanged. Only the owner thread calls it.
-serve_stream_begin :: proc(
-	stream: ^Serve_Stream,
-	store: ^journal.Journal,
-	session: journal.Session_Id,
-	turn: journal.Turn_Id,
-	inner: agent.Chat_Observer,
-) -> (
-	observer: agent.Chat_Observer,
-	streaming: bool,
-) {
+// runs with no observer. Only the owner thread calls it.
+serve_stream_begin :: proc(stream: ^Serve_Stream, store: ^journal.Journal, session: journal.Session_Id, turn: journal.Turn_Id) -> (agent.Chat_Observer, bool) {
 	if sync.mutex_guard(&stream.mutex) {
 		stream.generation += 1
 		for chunk in stream.pending { delete(chunk.text, stream.allocator) }
@@ -103,32 +92,24 @@ serve_stream_begin :: proc(
 		stream.session = session
 		stream.turn = turn
 		stream.ordinal = 0
-		stream.inner = inner
 	}
-	token, token_error := new(Serve_Stream_Token, stream.allocator)
-	if token_error != nil { return inner, false }
-	token^ = {stream.generation, stream}
-	if stream.path == "" { return inner, false }
+	if stream.path == "" { return {}, false }
 	file, open_error := agent.stream_open_writer(stream.path)
-	if open_error != nil { return inner, false }
+	if open_error != nil { return {}, false }
 	stream.file = file
+	// The token is allocated only once the file is open, so a disabled or
+	// unopened turn allocates nothing it can never free.
+	token, token_error := new(Serve_Stream_Token, stream.allocator)
+	if token_error != nil { return {}, false }
+	token^ = {stream.generation, stream}
 	if sync.mutex_guard(&stream.mutex) { stream.open = true }
 	return agent.Chat_Observer {
 			user_data = token,
-			turn_finished = serve_stream_turn_finished,
 			assistant_begin = serve_stream_assistant_begin,
 			assistant_text = serve_stream_assistant_text,
 			assistant_flush = serve_stream_assistant_flush,
 			assistant_end = serve_stream_assistant_end,
-			user_text = serve_stream_user_text,
-			tool_call = serve_stream_tool_call,
-			tool_result = serve_stream_tool_result,
 			tool_output = serve_stream_tool_output,
-			message = serve_stream_message,
-			usage = serve_stream_usage,
-			request_prepared = serve_stream_request_prepared,
-			request_finished = serve_stream_request_finished,
-			retry_scheduled = serve_stream_retry_scheduled,
 		},
 		true
 }
@@ -198,34 +179,24 @@ serve_stream_assistant_begin :: proc(user_data: rawptr) {
 		}
 	}
 	serve_stream_assistant(token.stream, .Assistant_Begin, "")
-	if token.stream.inner.assistant_begin != nil { token.stream.inner.assistant_begin(token.stream.inner.user_data) }
 }
 
 serve_stream_assistant_text :: proc(user_data: rawptr, text: string) {
 	token := (^Serve_Stream_Token)(user_data)
 	serve_stream_drain(token.stream)
 	serve_stream_assistant(token.stream, .Assistant_Text, text)
-	if token.stream.inner.assistant_text != nil { token.stream.inner.assistant_text(token.stream.inner.user_data, text) }
 }
 
 serve_stream_assistant_flush :: proc(user_data: rawptr) {
 	token := (^Serve_Stream_Token)(user_data)
 	serve_stream_drain(token.stream)
 	serve_stream_assistant(token.stream, .Assistant_Flush, "")
-	if token.stream.inner.assistant_flush != nil { token.stream.inner.assistant_flush(token.stream.inner.user_data) }
 }
 
 serve_stream_assistant_end :: proc(user_data: rawptr) {
 	token := (^Serve_Stream_Token)(user_data)
 	serve_stream_drain(token.stream)
 	serve_stream_assistant(token.stream, .Assistant_End, "")
-	if token.stream.inner.assistant_end != nil { token.stream.inner.assistant_end(token.stream.inner.user_data) }
-}
-
-serve_stream_turn_finished :: proc(user_data: rawptr) {
-	token := (^Serve_Stream_Token)(user_data)
-	serve_stream_drain(token.stream)
-	if token.stream.inner.turn_finished != nil { token.stream.inner.turn_finished(token.stream.inner.user_data) }
 }
 
 // serve_stream_tool_output queues one tool output chunk for the owner thread to
@@ -245,44 +216,4 @@ serve_stream_tool_output :: proc(user_data: rawptr, call, parent_call: journal.C
 		}
 	}
 	agent.owner_wake_signal()
-}
-
-serve_stream_user_text :: proc(user_data: rawptr, text: string, origin: journal.User_Origin) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.user_text != nil { token.stream.inner.user_text(token.stream.inner.user_data, text, origin) }
-}
-
-serve_stream_tool_call :: proc(user_data: rawptr, event: agent.Chat_Tool_Event) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.tool_call != nil { token.stream.inner.tool_call(token.stream.inner.user_data, event) }
-}
-
-serve_stream_tool_result :: proc(user_data: rawptr, call, parent_call: journal.Call_Id, name, arguments: string, result: ^agent.Tool_Result) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.tool_result != nil { token.stream.inner.tool_result(token.stream.inner.user_data, call, parent_call, name, arguments, result) }
-}
-
-serve_stream_message :: proc(user_data: rawptr, kind: agent.Chat_Message_Kind, text: string) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.message != nil { token.stream.inner.message(token.stream.inner.user_data, kind, text) }
-}
-
-serve_stream_usage :: proc(user_data: rawptr, operation: u64, usage: ai.Provider_Usage_Event) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.usage != nil { token.stream.inner.usage(token.stream.inner.user_data, operation, usage) }
-}
-
-serve_stream_request_prepared :: proc(user_data: rawptr) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.request_prepared != nil { token.stream.inner.request_prepared(token.stream.inner.user_data) }
-}
-
-serve_stream_request_finished :: proc(user_data: rawptr) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.request_finished != nil { token.stream.inner.request_finished(token.stream.inner.user_data) }
-}
-
-serve_stream_retry_scheduled :: proc(user_data: rawptr, event: agent.Chat_Retry_Event) {
-	token := (^Serve_Stream_Token)(user_data)
-	if token.stream.inner.retry_scheduled != nil { token.stream.inner.retry_scheduled(token.stream.inner.user_data, event) }
 }

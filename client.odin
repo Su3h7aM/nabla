@@ -300,11 +300,14 @@ client_follow_drain :: proc(follow: ^Client_Follow, observer: agent.Chat_Observe
 	if directory_error != .None { return }
 	path, path_error := agent.stream_path(directory, follow.session, context.temp_allocator)
 	if path_error != nil { return }
-	length, exists, length_error := client_stream_length(path)
-	if length_error != nil || !exists { return }
+	reader, exists, open_error := agent.stream_reader_open(path)
+	if open_error != nil || !exists { return }
+	defer agent.stream_reader_close(&reader)
+	length, length_error := agent.stream_reader_length(&reader)
+	if length_error != nil { return }
 	if length < follow.offset { follow.offset = 0 }
 	for {
-		kind, payload, next, found, read_error := agent.stream_read(path, follow.offset)
+		kind, payload, next, found, read_error := agent.stream_reader_read(&reader, follow.offset)
 		if read_error != nil || !found {
 			delete(payload)
 			return
@@ -313,18 +316,6 @@ client_follow_drain :: proc(follow: ^Client_Follow, observer: agent.Chat_Observe
 		delete(payload)
 		follow.offset = next
 	}
-}
-
-@(private)
-client_stream_length :: proc(path: string) -> (length: i64, exists: bool, error: os.Error) {
-	file, open_error := os.open(path)
-	if open_error == os.General_Error.Not_Exist { return 0, false, nil }
-	if open_error != nil { return 0, false, open_error }
-	defer _ = os.close(file)
-	length, error = os.file_size(file)
-	if error != nil { return 0, false, error }
-	exists = true
-	return
 }
 
 @(private)

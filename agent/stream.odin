@@ -99,13 +99,44 @@ stream_append :: proc(file: ^os.File, kind: Stream_Kind, payload: []u8) -> os.Er
 	return nil
 }
 
-// stream_read returns one complete frame at offset, or found false for a missing file or partial frame. The caller deletes payload with allocator.
+// Stream_Reader reads successive frames from one open stream file. It owns its
+// file until stream_reader_close, and only its owner thread may read from it.
+// The zero value reads nothing.
+Stream_Reader :: struct {
+	file: ^os.File,
+}
+
+// stream_reader_open opens path to read frames from. A missing file is no
+// stream: ok is false and err is nil. The caller closes an opened reader.
 @(require_results)
-stream_read :: proc(path: string, offset: i64, allocator := context.allocator) -> (Stream_Kind, []u8, i64, bool, os.Error) {
+stream_reader_open :: proc(path: string) -> (reader: Stream_Reader, ok: bool, err: os.Error) {
 	file, open_error := os.open(path)
-	if open_error == os.General_Error.Not_Exist { return {}, nil, offset, false, nil }
-	if open_error != nil { return {}, nil, offset, false, open_error }
-	defer _ = os.close(file)
+	if open_error == os.General_Error.Not_Exist { return {}, false, nil }
+	if open_error != nil { return {}, false, open_error }
+	return Stream_Reader{file = file}, true, nil
+}
+
+// stream_reader_close closes the reader's file.
+stream_reader_close :: proc(reader: ^Stream_Reader) {
+	if reader.file == nil { return }
+	_ = os.close(reader.file)
+	reader.file = nil
+}
+
+// stream_reader_length returns the current length of the reader's open file, so
+// a caller whose offset is past it can start over at the beginning.
+@(require_results)
+stream_reader_length :: proc(reader: ^Stream_Reader) -> (i64, os.Error) {
+	if reader.file == nil { return 0, .Invalid_File }
+	return os.file_size(reader.file)
+}
+
+// stream_reader_read returns one complete frame at offset, or found false for a
+// reader with no file or a partial frame. The caller deletes payload with allocator.
+@(require_results)
+stream_reader_read :: proc(reader: ^Stream_Reader, offset: i64, allocator := context.allocator) -> (Stream_Kind, []u8, i64, bool, os.Error) {
+	file := reader.file
+	if file == nil { return {}, nil, offset, false, nil }
 	header: [STREAM_HEADER_SIZE]u8
 	count, read_error := os.read_at(file, header[:], offset)
 	if read_error != nil && read_error != io.Error.EOF { return {}, nil, offset, false, read_error }
@@ -117,6 +148,15 @@ stream_read :: proc(path: string, offset: i64, allocator := context.allocator) -
 	if read_error != nil && read_error != io.Error.EOF { delete(payload, allocator); return {}, nil, offset, false, read_error }
 	if count != len(payload) { delete(payload, allocator); return {}, nil, offset, false, nil }
 	return Stream_Kind(header[0]), payload, offset + STREAM_HEADER_SIZE + i64(length), true, nil
+}
+
+// stream_read returns one complete frame at offset, or found false for a missing file or partial frame. The caller deletes payload with allocator.
+@(require_results)
+stream_read :: proc(path: string, offset: i64, allocator := context.allocator) -> (Stream_Kind, []u8, i64, bool, os.Error) {
+	reader, ok, open_error := stream_reader_open(path)
+	if !ok { return {}, nil, offset, false, open_error }
+	defer stream_reader_close(&reader)
+	return stream_reader_read(&reader, offset, allocator)
 }
 
 // stream_remove removes path; a missing file is already removed.
