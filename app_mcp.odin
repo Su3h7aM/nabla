@@ -73,9 +73,9 @@ mcp_runtime_ensure :: proc(runtime: ^MCP_Runtime, servers: []agent.MCP_Server_Co
 		if runtime.server_started[index] {
 			mcp.client_destroy(client)
 		}
-		stdio, stdio_ok := agent.mcp_stdio_config(server)
-		if !stdio_ok {
-			fmt.sbprintf(warnings, "\n%s: the server environment could not be built", server.id)
+		stdio, problem := agent.mcp_stdio_config(server)
+		if problem != "" {
+			fmt.sbprintf(warnings, "\n%s: %s", server.id, problem)
 			runtime.server_started[index] = false
 			runtime.server_discovered[index] = false
 			return nil, false

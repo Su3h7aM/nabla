@@ -1,6 +1,7 @@
 package agent
 
 import c "core:c"
+import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -31,9 +32,9 @@ MCP_Tool_Config :: struct {
 
 // MCP_Stdio_Config is how to launch one server. Every string is owned.
 MCP_Stdio_Config :: struct {
-	// executable is an absolute path: a server is launched by executable and argv
-	// rather than through a shell, so a relative path would depend on a search rule
-	// the user did not write.
+	// executable is a command name, searched on PATH at each launch, or an absolute
+	// path. A relative path with a directory part is refused, because it would depend
+	// on the working directory.
 	executable:        string,
 	arguments:         []string,
 	working_directory: string,
@@ -96,7 +97,7 @@ MCP_Server_Config_From_Stdio :: proc(
 	MCP_Server_Config,
 	Config_Error,
 ) {
-	if !tool_name_valid(id) || executable == "" || !strings.has_prefix(executable, "/") || len(environment_names) != len(environment_values) {
+	if !tool_name_valid(id) || !mcp_executable_valid(executable) || len(environment_names) != len(environment_values) {
 		return {}, .Invalid
 	}
 	config := MCP_Server_Config {
@@ -296,7 +297,7 @@ mcp_server_load :: proc(state: ^lua.State, raw_idx: c.int, id: string, allocator
 	lua_field(state, idx, "executable")
 	executable, executable_error := lua_string(state, -1, allocator)
 	if executable_error != .None { return executable_error }
-	if !strings.has_prefix(executable, "/") {
+	if !mcp_executable_valid(executable) {
 		delete(executable, allocator)
 		return .Invalid
 	}
@@ -532,21 +533,39 @@ mcp_tool_configs_release :: proc(configs: [dynamic]MCP_Tool_Config, allocator: m
 	delete(configs)
 }
 
-// mcp_stdio_config is the transport view of a configured server. A normal child
-// inherits the launch environment; configured entries replace or add variables.
-// The strings are borrowed until mcp.Client clones the configuration. ok is false when
-// the environment could not be built, in which case no configuration is returned.
+// mcp_executable_valid accepts a command name or an absolute path. A relative path is
+// refused, since a server would start from whatever directory the harness runs in.
+@(private, require_results)
+mcp_executable_valid :: proc(executable: string) -> bool {
+	if executable == "" { return false }
+	return !strings.contains_rune(executable, '/') || strings.has_prefix(executable, "/")
+}
+
+// mcp_stdio_config is the transport view of a configured server, resolved for one
+// launch: a command name is looked up on PATH now, so a program installed after
+// startup is used by the next launch. A normal child inherits the launch environment;
+// configured entries replace or add variables. The strings are temp-allocated or
+// borrowed until mcp.Client clones the configuration. problem is empty when stdio is
+// usable, and otherwise says why no server can be started.
 @(require_results)
-mcp_stdio_config :: proc(config: MCP_Server_Config) -> (stdio: mcp.Stdio_Config, ok: bool) {
+mcp_stdio_config :: proc(config: MCP_Server_Config) -> (stdio: mcp.Stdio_Config, problem: string) {
+	executable := config.stdio.executable
+	if !strings.contains_rune(executable, '/') {
+		path, found := command_on_path(executable)
+		if !found {
+			return {}, fmt.tprintf("command %q is neither an executable file nor a program on PATH; nothing started", executable)
+		}
+		executable = path
+	}
 	environment, environment_error := make([dynamic]mcp.Environment_Entry, 0, context.temp_allocator)
-	if environment_error != nil { return {}, false }
+	if environment_error != nil { return {}, "the server environment could not be built" }
 	inherited, inherited_error := os.environ(context.temp_allocator)
-	if inherited_error != nil { return {}, false }
+	if inherited_error != nil { return {}, "the server environment could not be built" }
 	for pair in inherited {
 		separator := strings.index_byte(pair, '=')
 		if separator <= 0 { continue }
 		if _, append_error := append(&environment, mcp.Environment_Entry{name = pair[:separator], value = pair[separator + 1:]}); append_error != nil {
-			return {}, false
+			return {}, "the server environment could not be built"
 		}
 	}
 	for override in config.stdio.environment {
@@ -559,17 +578,17 @@ mcp_stdio_config :: proc(config: MCP_Server_Config) -> (stdio: mcp.Stdio_Config,
 		}
 		if !replaced {
 			if _, append_error := append(&environment, mcp.Environment_Entry{name = override.name, value = override.value}); append_error != nil {
-				return {}, false
+				return {}, "the server environment could not be built"
 			}
 		}
 	}
 	return mcp.Stdio_Config {
-			executable = config.stdio.executable,
+			executable = executable,
 			arguments = config.stdio.arguments,
 			working_directory = config.stdio.working_directory,
 			environment = environment[:],
 		},
-		true
+		""
 }
 @(private, require_results)
 mcp_environment_entry_clone :: proc(name, value: string, allocator: mem.Allocator) -> (result_value: MCP_Environment, error: mem.Allocator_Error) {

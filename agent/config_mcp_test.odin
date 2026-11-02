@@ -3,6 +3,7 @@ package agent
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -92,8 +93,8 @@ test_mcp_stdio_environment_inherits_and_applies_overrides :: proc(t: ^testing.T)
 	)
 	defer mcp_servers_destroy(&servers)
 	if !testing.expect_value(t, err, Config_Error.None) { return }
-	stdio, stdio_ok := mcp_stdio_config(servers[0])
-	if !testing.expect(t, stdio_ok, "the server's environment could be built") { return }
+	stdio, problem := mcp_stdio_config(servers[0])
+	if !testing.expect_value(t, problem, "") { return }
 	found_path := false
 	found_override := false
 	for entry in stdio.environment {
@@ -105,9 +106,34 @@ test_mcp_stdio_environment_inherits_and_applies_overrides :: proc(t: ^testing.T)
 }
 
 @(test)
+test_mcp_config_accepts_a_command_name_for_path_lookup :: proc(t: ^testing.T) {
+	servers, err := mcp_config_load(t, "stdio-command-name", `return { mcp = { servers = { s = { executable = "serve" } } } }`)
+	defer mcp_servers_destroy(&servers)
+	if !testing.expect_value(t, err, Config_Error.None) { return }
+	testing.expect_value(t, servers[0].stdio.executable, "serve")
+}
+
+@(test)
+test_mcp_stdio_resolves_a_command_name_on_path :: proc(t: ^testing.T) {
+	servers, err := mcp_config_load(t, "stdio-resolve", `return { mcp = { servers = { s = { executable = "sh" } } } }`)
+	defer mcp_servers_destroy(&servers)
+	if !testing.expect_value(t, err, Config_Error.None) { return }
+	stdio, problem := mcp_stdio_config(servers[0])
+	if !testing.expect_value(t, problem, "") { return }
+	testing.expect(t, strings.has_prefix(stdio.executable, "/"), "the launched program is an absolute path")
+	testing.expect(t, strings.has_suffix(stdio.executable, "/sh"), "the name is resolved to the program it names")
+
+	missing, missing_err := mcp_config_load(t, "stdio-missing", `return { mcp = { servers = { s = { executable = "nabla-no-such-command" } } } }`)
+	defer mcp_servers_destroy(&missing)
+	if !testing.expect_value(t, missing_err, Config_Error.None) { return }
+	_, missing_problem := mcp_stdio_config(missing[0])
+	testing.expect(t, strings.contains(missing_problem, "nabla-no-such-command"), "a command missing from PATH is named")
+}
+
+@(test)
 test_mcp_config_refuses_what_it_cannot_run :: proc(t: ^testing.T) {
 	cases := []string {
-		`return { mcp = { servers = { s = { executable = "serve" } } } }`,
+		`return { mcp = { servers = { s = { executable = "./serve" } } } }`,
 		`return { mcp = { servers = { ["bad server"] = { executable = "/usr/bin/x" } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = false} } } } }`,
 		`return { mcp = { servers = { s = { executable = "/usr/bin/x", tools = {a = {name = "bad name"}} } } } }`,

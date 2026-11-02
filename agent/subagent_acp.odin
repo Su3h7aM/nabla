@@ -374,21 +374,9 @@ subagent_command_path :: proc(command, directory: string) -> (string, bool) {
 			if join_error != nil { return "", false }
 			path = joined
 		}
-		return path, subagent_executable(path)
+		return path, command_is_file(path)
 	}
-	search := os.get_env("PATH", context.temp_allocator)
-	for entry in strings.split_iterator(&search, ":") {
-		if entry == "" { continue }
-		path, join_error := strings.concatenate({entry, "/", command}, context.temp_allocator)
-		if join_error != nil { return "", false }
-		if subagent_executable(path) { return path, true }
-	}
-	return "", false
-}
-
-@(private, require_results)
-subagent_executable :: proc(path: string) -> bool {
-	return os.exists(path) && !os.is_dir(path)
+	return command_on_path(command)
 }
 
 @(private)
