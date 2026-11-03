@@ -1505,6 +1505,114 @@ test_acp_prompt_end_to_end_v2 :: proc(t: ^testing.T) {
 	acp_test_prompt_roundtrip(t, .V2, "test_acp_prompt_end_to_end_v2")
 }
 
+acp_test_prompt_record :: proc(t: ^testing.T, name, prompt: string, compact: bool) {
+	if !test_isolate_process(t, name) { return }
+	state, previous, had_previous := acp_test_state_isolate(t)
+	defer acp_test_state_restore(state, previous, had_previous)
+	locks, _, locks_error := agent.session_lock_directory(context.allocator)
+	if locks_error != .None { testing.fail_now(t, "the lock directory could not be resolved") }
+	defer delete(locks, context.allocator)
+	app: App
+	directory, workspace := acp_test_app_begin(t, &app, locks)
+	defer acp_test_app_end(&app, directory, workspace)
+
+	iface: ACP_Test_Interface
+	acp_test_interface_init(t, &iface, .V2, &app.setup.catalog)
+	defer acp_test_interface_destroy(&iface)
+	server := &iface.server
+	server.initialized = true
+	session, reason := acp_session_create(server, "test-session")
+	if !testing.expectf(t, session != nil, "the session could not be created: %s", reason) { return }
+	store, store_error := journal.open(directory, locks, journal.run_id_create(), .Read_Write, context.allocator)
+	if store_error != nil { testing.fail_now(t, "the client journal could not open") }
+	session.store = store
+	session.opened = true
+	session.session_id = app.setup.session.session
+	follow, follow_error := client_follow_open(store, session.session_id)
+	if follow_error.kind != .None { testing.fail_now(t, "the session could not be followed") }
+	session.follow = follow
+	session.provider_id = strings.clone("test-provider", context.allocator) or_else ""
+	session.model_id = strings.clone("test-model", context.allocator) or_else ""
+	acp_test_fake_server(session)
+	fake := session.server.state
+	defer {
+		acp_session_drop(server, session)
+		server.sessions[0] = nil
+		free(fake, context.allocator)
+	}
+
+	params, parse_error := json.parse_string(prompt, .JSON, true, context.allocator)
+	if parse_error != nil { testing.fail_now(t, "the prompt parameters could not be parsed") }
+	defer json.destroy_value(params, context.allocator)
+	envelope := acp.Envelope {
+		kind   = .Request,
+		id     = i64(1),
+		params = params,
+	}
+	acp_request_prompt(server, &envelope)
+	if compact {
+		deadline := time.tick_add(time.tick_now(), ACP_TEST_BOUND)
+		for {
+			seen := agent.owner_wake_seen()
+			commands, command_error := journal.read_pending_commands(app.setup.store, session.session_id, context.allocator)
+			if !testing.expect_value(t, command_error, nil) { return }
+			if len(commands) > 0 {
+				defer journal.records_destroy(commands, context.allocator)
+				if !testing.expect_value(t, len(commands), 1) { return }
+				command, ok := journal.payload_as(commands[0], journal.User_Command)
+				if !testing.expect(t, ok, "the prompt did not append a user.command") { return }
+				testing.expect_value(t, command.kind, journal.COMMAND_KIND_NAMES[.Compact])
+				break
+			}
+			journal.records_destroy(commands, context.allocator)
+			if time.tick_diff(time.tick_now(), deadline) <= 0 {
+				testing.expect(t, false, "the compact command was not appended")
+				return
+			}
+			agent.owner_wake_wait(seen, time.tick_add(time.tick_now(), 100 * time.Millisecond))
+		}
+		inputs, input_error := journal.read_inbox(app.setup.store, session.session_id, 0, context.allocator)
+		if !testing.expect_value(t, input_error, nil) { return }
+		defer journal.records_destroy(inputs, context.allocator)
+		testing.expect_value(t, len(inputs), 0)
+		return
+	}
+	if !acp_test_await_inbox(t, app.setup.store, session.session_id) { return }
+	inputs, input_error := journal.read_inbox(app.setup.store, session.session_id, 0, context.allocator)
+	if !testing.expect_value(t, input_error, nil) { return }
+	defer journal.records_destroy(inputs, context.allocator)
+	if !testing.expect_value(t, len(inputs), 1) { return }
+	{
+		input, ok := journal.payload_as(inputs[0], journal.User_Input)
+		if !testing.expect(t, ok, "the prompt did not append a user.input") { return }
+		testing.expect_value(t, string(inputs[0].body), "what is this")
+		if !testing.expect_value(t, len(input.attachments), 1) { return }
+		testing.expect_value(t, input.attachments[0].media_type, "image/png")
+		digest, valid := journal.digest_from_hex(input.attachments[0].digest)
+		if !testing.expect(t, valid, "the attachment digest is invalid") { return }
+		bytes, found, artifact_error := journal.read_artifact(app.setup.store, digest, context.allocator)
+		if !testing.expect_value(t, artifact_error, nil) { return }
+		defer delete(bytes, context.allocator)
+		testing.expect(t, found, "the attachment artifact is missing")
+		testing.expect_value(t, string(bytes), "\x89PNG\r\n\x1a\n")
+	}
+}
+
+@(test)
+test_acp_prompt_records_an_image_block_as_an_attachment :: proc(t: ^testing.T) {
+	acp_test_prompt_record(
+		t,
+		#procedure,
+		`{"sessionId":"test-session","prompt":[{"type":"text","text":"what is this"},{"type":"image","mimeType":"image/jpeg","data":"iVBORw0KGgo="}]}`,
+		false,
+	)
+}
+
+@(test)
+test_acp_v2_compact_command_starts_compaction_without_user_input :: proc(t: ^testing.T) {
+	acp_test_prompt_record(t, #procedure, `{"sessionId":"test-session","prompt":[{"type":"text","text":"/compact"}]}`, true)
+}
+
 // ACP_Test_Command drives one config change through the worker while the test thread
 // applies it the way the session server does.
 ACP_Test_Command :: struct {
