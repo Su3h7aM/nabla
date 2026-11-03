@@ -81,7 +81,9 @@ tool_spawn_command :: proc(
 	// user can run is a tool the command has to be able to run.
 	environment, environment_error := os.environ(context.temp_allocator)
 	if environment_error != nil { return {}, .Failed, environment_error }
-	return subprocess.start({argv = arguments, environment = environment, directory = directory, stdin = input, stdout = stdout_write, stderr = stderr_write})
+	return subprocess.start(
+		{argv = arguments, environment = environment, directory = directory, stdin = input, stdout = stdout_write, stderr = stderr_write, parent_death = true},
+	)
 }
 
 // tool_control_fds appends the descriptors a stop wakes to fds: the call's wake,
