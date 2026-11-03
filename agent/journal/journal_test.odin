@@ -507,9 +507,13 @@ test_a_follower_appends_input_the_claimant_reads :: proc(test: ^testing.T) {
 	testing.expect_value(test, string(lines[0].body), "from the other terminal")
 	testing.expect_value(test, lines[0].turn, Turn_Id(0))
 	testing.expect_value(test, lines[0].branch, Branch_Id(0))
-	input: User_Input
-	_decode_payload(test, lines[0].data, &input)
-	testing.expect_value(test, input.origin, USER_ORIGIN_NAMES[.Steering])
+	if payload, has_payload := lines[0].payload.?; has_payload {
+		value, is_input := payload.(User_Input)
+		testing.expect(test, is_input, "user.input payload is User_Input")
+		if is_input { testing.expect_value(test, value.origin, USER_ORIGIN_NAMES[.Steering]) }
+	} else {
+		testing.expect(test, false, "user.input has a payload")
+	}
 }
 
 // A follower retries the claim on the descriptor it holds: it fails while the claimant

@@ -465,9 +465,10 @@ chat_results_unconsumed :: proc(chat: ^Chat_Session, recovered: journal.Journal_
 // an unknown origin name reads as .Steering. It allocates only in the temporary
 // allocator.
 user_input_origin :: proc(record: journal.Record) -> journal.User_Origin {
-	input: journal.User_Input
-	if journal.payload_decode(record.data, &input, context.temp_allocator) == nil {
-		if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { return named }
+	if payload, has_payload := record.payload.?; has_payload {
+		if input, is_input := payload.(journal.User_Input); is_input {
+			if named, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, input.origin); known { return named }
+		}
 	}
 	return .Steering
 }
@@ -540,8 +541,9 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 inbox_attachments :: proc(record: journal.Record) -> []journal.Attachment {
 	#partial switch record.kind {
 	case .User_Input:
-		input: journal.User_Input
-		if journal.payload_decode(record.data, &input, context.temp_allocator) == nil { return input.attachments }
+		if payload, has_payload := record.payload.?; has_payload {
+			if value, is_input := payload.(journal.User_Input); is_input { return value.attachments }
+		}
 	case .Background_Completed:
 		completed: journal.Background_Completed
 		if journal.payload_decode(record.data, &completed, context.temp_allocator) == nil { return completed.attachments }

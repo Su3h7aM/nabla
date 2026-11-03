@@ -2,6 +2,7 @@ package journal
 
 import "core:mem"
 import "core:mem/virtual"
+import "core:strings"
 
 import "nabla:db"
 
@@ -20,6 +21,23 @@ payload_push :: proc(journal: ^Journal, data: $Payload) {
 		push(journal, Payload_Pending{payload = data})
 	} else when Payload == Session_Environment {
 		copied := environment_batch(journal, data)
+		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
+	} else when Payload == User_Input {
+		copied := data
+		copied.origin = batch_text(journal, data.origin)
+		copied.attachments = batch_attachments(journal, data.attachments)
+		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
+	} else when Payload == User_Command {
+		copied := data
+		copied.kind = batch_text(journal, data.kind)
+		copied.provider = batch_text(journal, data.provider)
+		copied.model = batch_text(journal, data.model)
+		copied.level = batch_text(journal, data.level)
+		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
+	} else when Payload == Command_Applied {
+		copied := data
+		copied.outcome = batch_text(journal, data.outcome)
+		copied.reason = batch_text(journal, data.reason)
 		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
 	}
 }
@@ -42,6 +60,12 @@ payload_insert :: proc(journal: ^Journal, seq: Journal_Seq, payload: Record_Payl
 		return db.exec(&journal.connection, "INSERT INTO record_session_claimed (seq, resumed) VALUES (?, ?)", {db.Value(i64(seq)), db.Value(value.resumed)})
 	case Session_Environment:
 		return environment_insert(journal, seq, value)
+	case User_Input:
+		return user_input_insert(journal, seq, value)
+	case User_Command:
+		return user_command_insert(journal, seq, value)
+	case Command_Applied:
+		return command_applied_insert(journal, seq, value)
 	case:
 		return Journal_Error.Corrupt
 	}
@@ -62,13 +86,18 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 		return load_session_claimed(journal, record, allocator)
 	case .Session_Environment:
 		return load_session_environment(journal, record, allocator)
+	case .User_Input:
+		return load_user_input(journal, record, allocator)
+	case .User_Command:
+		return load_user_command(journal, record, allocator)
+	case .Command_Applied:
+		return load_command_applied(journal, record, allocator)
 	case .Run_Finished,
 	     .Session_Created,
 	     .Session_Titled,
 	     .Session_Released,
 	     .Branch_Created,
 	     .Branch_Selected,
-	     .User_Input,
 	     .Node_Committed,
 	     .Turn_Started,
 	     .Turn_Completed,
@@ -100,9 +129,7 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 	     .Subagent_Message,
 	     .Selection_Fit,
 	     .Selection_Applied,
-	     .Background_Completed,
-	     .User_Command,
-	     .Command_Applied:
+	     .Background_Completed:
 		return nil
 	}
 	return nil
@@ -117,6 +144,17 @@ payload_destroy :: proc(payload: Record_Payload, allocator: mem.Allocator) {
 	case Run_Started, Session_Recovered, Session_Claimed:
 	case Session_Environment:
 		environment_destroy(value, allocator)
+	case User_Input:
+		delete(value.origin, allocator)
+		attachments_destroy(value.attachments, allocator)
+	case User_Command:
+		delete(value.kind, allocator)
+		delete(value.provider, allocator)
+		delete(value.model, allocator)
+		delete(value.level, allocator)
+	case Command_Applied:
+		delete(value.outcome, allocator)
+		delete(value.reason, allocator)
 	}
 }
 
@@ -570,4 +608,239 @@ environment_server_destroy :: proc(server: Session_Environment_Server, allocator
 		delete(tool.name, allocator)
 	}
 	delete(server.tools, allocator)
+}
+
+@(private)
+batch_attachments :: proc(journal: ^Journal, source: []Attachment) -> []Attachment {
+	if len(source) == 0 || journal.failure != nil { return nil }
+	copied, error := make([]Attachment, len(source), virtual.arena_allocator(&journal.batch))
+	if error != nil {
+		latch(journal, error)
+		return nil
+	}
+	for attachment, index in source {
+		copied[index] = {
+			media_type = batch_text(journal, attachment.media_type),
+			name       = batch_text(journal, attachment.name),
+			digest     = batch_text(journal, attachment.digest),
+		}
+	}
+	return copied
+}
+
+@(private, require_results)
+enum_code :: proc(names: [$Enum]string, name: string) -> (code: i64, error: Error) {
+	value, found := enum_from_name(names, name)
+	if !found { return 0, Journal_Error.Corrupt }
+	return i64(value), nil
+}
+
+@(private, require_results)
+user_input_insert :: proc(journal: ^Journal, seq: Journal_Seq, input: User_Input) -> Error {
+	origin := enum_code(USER_ORIGIN_NAMES, input.origin) or_return
+	db.exec(&journal.connection, "INSERT INTO record_user_input (seq, origin) VALUES (?, ?)", {db.Value(i64(seq)), db.Value(origin)}) or_return
+	return attachments_insert(journal, seq, input.attachments)
+}
+
+@(private, require_results)
+user_command_insert :: proc(journal: ^Journal, seq: Journal_Seq, command: User_Command) -> Error {
+	kind := enum_code(COMMAND_KIND_NAMES, command.kind) or_return
+	return db.exec(
+		&journal.connection,
+		"INSERT INTO record_user_command (seq, kind, provider, model, level) VALUES (?, ?, ?, ?, ?)",
+		{db.Value(i64(seq)), db.Value(kind), text_or_null(command.provider), text_or_null(command.model), text_or_null(command.level)},
+	)
+}
+
+@(private, require_results)
+command_applied_insert :: proc(journal: ^Journal, seq: Journal_Seq, applied: Command_Applied) -> Error {
+	outcome := enum_code(COMMAND_OUTCOME_NAMES, applied.outcome) or_return
+	return db.exec(
+		&journal.connection,
+		"INSERT INTO record_command_applied (seq, command, outcome, reason) VALUES (?, ?, ?, ?)",
+		{db.Value(i64(seq)), db.Value(i64(applied.command)), db.Value(outcome), text_or_null(applied.reason)},
+	)
+}
+
+@(private, require_results)
+attachments_insert :: proc(journal: ^Journal, seq: Journal_Seq, attachments: []Attachment) -> Error {
+	for attachment, index in attachments {
+		digest, ok := digest_from_hex(attachment.digest)
+		if !ok { return Journal_Error.Corrupt }
+		db.exec(
+			&journal.connection,
+			"INSERT INTO record_attachment (seq, ordinal, media_type, name, digest) VALUES (?, ?, ?, ?, ?)",
+			{db.Value(i64(seq)), db.Value(i64(index)), db.Value(attachment.media_type), db.Value(attachment.name), db.Value(digest[:])},
+		) or_return
+	}
+	return nil
+}
+
+@(private, require_results)
+load_user_input :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, "SELECT origin FROM record_user_input WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
+	values, has_row := db.rows_next(&rows) or_return
+	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	row := Row {
+		values    = values,
+		allocator = allocator,
+	}
+	input := User_Input {
+		version = PAYLOAD_VERSION,
+		origin  = row_enum_name(&row, USER_ORIGIN_NAMES),
+	}
+	if row.error != nil {
+		delete(input.origin, allocator)
+		return corrupt(journal, row.error, record.session, record.seq)
+	}
+	_ = db.rows_close(&rows)
+	attachments, error := attachments_load(journal, record, allocator)
+	if error != nil {
+		delete(input.origin, allocator)
+		return error
+	}
+	input.attachments = attachments
+	record.payload = input
+	return nil
+}
+
+@(private, require_results)
+load_user_command :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, "SELECT kind, provider, model, level FROM record_user_command WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
+	values, has_row := db.rows_next(&rows) or_return
+	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	row := Row {
+		values    = values,
+		allocator = allocator,
+	}
+	command := User_Command {
+		version  = PAYLOAD_VERSION,
+		kind     = row_enum_name(&row, COMMAND_KIND_NAMES),
+		provider = row_text(&row),
+		model    = row_text(&row),
+		level    = row_text(&row),
+	}
+	if row.error != nil {
+		delete(command.kind, allocator)
+		delete(command.provider, allocator)
+		delete(command.model, allocator)
+		delete(command.level, allocator)
+		return corrupt(journal, row.error, record.session, record.seq)
+	}
+	record.payload = command
+	return nil
+}
+
+@(private, require_results)
+load_command_applied :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, "SELECT command, outcome, reason FROM record_command_applied WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
+	values, has_row := db.rows_next(&rows) or_return
+	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	row := Row {
+		values    = values,
+		allocator = allocator,
+	}
+	applied := Command_Applied {
+		version = PAYLOAD_VERSION,
+		command = Journal_Seq(row_int(&row)),
+		outcome = row_enum_name(&row, COMMAND_OUTCOME_NAMES),
+		reason  = row_text(&row),
+	}
+	if row.error != nil {
+		delete(applied.outcome, allocator)
+		delete(applied.reason, allocator)
+		return corrupt(journal, row.error, record.session, record.seq)
+	}
+	record.payload = applied
+	return nil
+}
+
+@(private)
+row_enum_name :: proc(row: ^Row, names: [$Enum]string) -> string {
+	code := row_code(row, Enum)
+	if row.error != nil { return "" }
+	copied, error := strings.clone(names[code], row.allocator)
+	if error != nil {
+		row.error = error
+		return ""
+	}
+	return copied
+}
+
+@(private)
+row_digest :: proc(row: ^Row) -> string {
+	value, ok := row_next(row)
+	if !ok { return "" }
+	if value == nil {
+		row.error = Journal_Error.Corrupt
+		return ""
+	}
+	bytes, error := db.as_bytes(value)
+	if error != nil || len(bytes) != size_of(Digest) {
+		row.error = Journal_Error.Corrupt
+		return ""
+	}
+	digest: Digest
+	copy(digest[:], bytes)
+	hex: [DIGEST_HEX_LENGTH]u8
+	copied, clone_error := strings.clone(digest_to_hex(digest, hex[:]), row.allocator)
+	if clone_error != nil {
+		row.error = clone_error
+		return ""
+	}
+	return copied
+}
+
+@(private, require_results)
+attachments_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> (attachments: []Attachment, error: Error) {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(
+		&journal.connection,
+		&rows,
+		"SELECT ordinal, media_type, name, digest FROM record_attachment WHERE seq = ? ORDER BY ordinal",
+		{db.Value(i64(record.seq))},
+	) or_return
+	listed := make([dynamic]Attachment, allocator) or_return
+	defer if error != nil { attachments_destroy(listed[:], allocator) }
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		ordinal := row_int(&row)
+		attachment := Attachment {
+			media_type = row_text(&row),
+			name       = row_text(&row),
+			digest     = row_digest(&row),
+		}
+		if row.error != nil {
+			attachments_destroy([]Attachment{attachment}, allocator)
+			return nil, corrupt(journal, row.error, record.session, record.seq)
+		}
+		if _, append_error := append(&listed, attachment); append_error != nil {
+			attachments_destroy([]Attachment{attachment}, allocator)
+			return nil, append_error
+		}
+		if ordinal != i64(len(listed) - 1) { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	}
+	return listed[:], nil
+}
+
+@(private)
+attachments_destroy :: proc(attachments: []Attachment, allocator: mem.Allocator) {
+	for attachment in attachments {
+		delete(attachment.media_type, allocator)
+		delete(attachment.name, allocator)
+		delete(attachment.digest, allocator)
+	}
+	delete(attachments, allocator)
 }

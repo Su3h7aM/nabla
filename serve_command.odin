@@ -44,8 +44,11 @@ serve_commands_apply :: proc(app: ^App, phase: Serve_Command_Phase) {
 		payload: journal.User_Command
 		command: journal.Command
 		known := false
-		if journal.payload_decode(record.data, &payload, context.temp_allocator) == nil {
-			command, known = journal.command_decode(payload)
+		if stored, has_payload := record.payload.?; has_payload {
+			if value, is_command := stored.(journal.User_Command); is_command {
+				payload = value
+				command, known = journal.command_decode(payload)
+			}
 		}
 		if !known {
 			journal.append_command_applied(chat.store, chat.session, record.seq, .Refused, "the command did not name a command this harness runs")

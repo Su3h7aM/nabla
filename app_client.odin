@@ -408,7 +408,11 @@ app_client_refusals :: proc(app: ^App) -> bool {
 	for &record in records {
 		if record.seq > app.setup.commands_seen { app.setup.commands_seen = record.seq }
 		applied: journal.Command_Applied
-		if decode_error := journal.payload_decode(record.data, &applied, context.temp_allocator); decode_error != nil { continue }
+		payload, has_payload := record.payload.?
+		if !has_payload { continue }
+		value, is_applied := payload.(journal.Command_Applied)
+		if !is_applied { continue }
+		applied = value
 		if applied.outcome == journal.COMMAND_OUTCOME_NAMES[.Refused] && applied.reason != "" {
 			snap_append(app, .Notice, applied.reason)
 			shown = true

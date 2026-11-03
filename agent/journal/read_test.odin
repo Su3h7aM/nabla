@@ -1037,3 +1037,40 @@ test_session_lifecycle_records_round_trip :: proc(test: ^testing.T) {
 		testing.expect(test, !server.tools[0].enabled, "a disabled tool stays disabled")
 	}
 }
+
+@(test)
+test_pending_commands_use_the_applied_table :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+	journal := _open_journal(test, directory)
+	defer _close_journal(test, journal)
+	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
+	_commit_ok(test, journal)
+	_expect_ok(test, release(journal))
+	_expect_ok(test, follow(journal, session))
+	_expect_ok(test, append_command(journal, Cancel_Turn{}))
+	_expect_ok(test, append_command(journal, Set_Effort{level = "low"}))
+	_expect_ok(test, release(journal))
+	_, claim_error := claim(journal, session)
+	_expect_ok(test, claim_error)
+	pending, pending_error := read_pending_commands(journal, session, context.allocator)
+	_expect_ok(test, pending_error)
+	defer records_destroy(pending, context.allocator)
+	if !testing.expect_value(test, len(pending), 2) { return }
+	append_command_applied(journal, session, pending[0].seq, .Applied, "")
+	remaining, remaining_error := read_pending_commands(journal, session, context.allocator)
+	_expect_ok(test, remaining_error)
+	defer records_destroy(remaining, context.allocator)
+	if !testing.expect_value(test, len(remaining), 1) { return }
+	testing.expect_value(test, remaining[0].seq, pending[1].seq)
+	if payload, has_payload := remaining[0].payload.?; has_payload {
+		value, is_command := payload.(User_Command)
+		testing.expect(test, is_command, "user.command payload is User_Command")
+		if is_command {
+			testing.expect_value(test, value.kind, COMMAND_KIND_NAMES[.Set_Effort])
+			testing.expect_value(test, value.level, "low")
+		}
+	} else {
+		testing.expect(test, false, "user.command has a payload")
+	}
+}

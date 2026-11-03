@@ -712,8 +712,10 @@ PENDING_COMMANDS_QUERY ::
 	`SELECT ` +
 	RECORD_COLUMNS +
 	` FROM records AS pending WHERE pending.session = ?1 AND pending.kind = ?2
-	AND NOT EXISTS (SELECT 1 FROM records AS answered WHERE answered.session = ?1 AND answered.kind = ?3
-		AND json_extract(answered.data, '$.command') = pending.seq)
+	AND NOT EXISTS (
+		SELECT 1 FROM records AS answered
+		JOIN record_command_applied AS applied ON applied.seq = answered.seq
+		WHERE answered.session = ?1 AND answered.kind = ?3 AND applied.command = pending.seq)
 ORDER BY seq ASC`
 
 @(private)

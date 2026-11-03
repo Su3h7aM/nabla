@@ -81,6 +81,9 @@ Record_Payload :: union {
 	Session_Recovered,
 	Session_Claimed,
 	Session_Environment,
+	User_Input,
+	User_Command,
+	Command_Applied,
 }
 
 // Node is one committed step of the session tree. The journal fills id, seq,

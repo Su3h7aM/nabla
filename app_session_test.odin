@@ -3871,14 +3871,16 @@ test_serve_applies_each_pending_command_once :: proc(t: ^testing.T) {
 	defer journal.records_destroy(outcomes, context.allocator)
 	if !testing.expect_value(t, len(outcomes), 3) { return }
 	for answered, index in outcomes {
-		applied: journal.Command_Applied
-		if !testing.expect_value(t, journal.payload_decode(answered.data, &applied, context.temp_allocator), nil) { return }
+		stored, has_payload := answered.payload.?
+		applied, is_applied := stored.(journal.Command_Applied)
+		if !testing.expect(t, has_payload && is_applied, "command.applied payload is Command_Applied") { return }
 		testing.expect_value(t, applied.command, commands[index].seq)
 		want := journal.COMMAND_OUTCOME_NAMES[.Applied] if index > 0 else journal.COMMAND_OUTCOME_NAMES[.Refused]
 		testing.expect_value(t, applied.outcome, want)
 	}
-	refused: journal.Command_Applied
-	testing.expect_value(t, journal.payload_decode(outcomes[0].data, &refused, context.temp_allocator), nil)
+	refused_payload, refused_present := outcomes[0].payload.?
+	refused, refused_is := refused_payload.(journal.Command_Applied)
+	testing.expect(t, refused_present && refused_is, "the refused command is Command_Applied")
 	testing.expect(t, refused.reason != "", "a refused command says why")
 	pending, pending_error := journal.read_pending_commands(client, app.setup.session.session, context.temp_allocator)
 	testing.expect(t, pending_error == nil, "the pending commands could not be read")
@@ -3927,8 +3929,9 @@ test_serve_stop_server_ends_the_turn_and_the_server :: proc(t: ^testing.T) {
 	if !testing.expect(t, answered_error == nil, "the answers could not be read") { return }
 	defer journal.records_destroy(outcomes, context.allocator)
 	if !testing.expect_value(t, len(outcomes), 1) { return }
-	applied: journal.Command_Applied
-	if !testing.expect_value(t, journal.payload_decode(outcomes[0].data, &applied, context.temp_allocator), nil) { return }
+	stored, has_payload := outcomes[0].payload.?
+	applied, is_applied := stored.(journal.Command_Applied)
+	if !testing.expect(t, has_payload && is_applied, "command.applied payload is Command_Applied") { return }
 	testing.expect_value(t, applied.outcome, journal.COMMAND_OUTCOME_NAMES[.Applied])
 	testing.expect(t, !serve_commands_pending(&app), "the stopped server has no command left to apply")
 }
