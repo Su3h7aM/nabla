@@ -199,6 +199,9 @@ chat_session_select :: proc(chat: ^Chat_Session, selection: Model_Selection, eff
 	provider_id, model_id, levels, clone_error := chat_selection_clone(selection, allocator)
 	if clone_error != nil { return false, false }
 	chat.capacity = selection.capacity
+	if percent, configured := chat.compaction_trigger_percent.?; configured {
+		chat.capacity.trigger = int(i64(chat.capacity.window) * i64(percent) / 100)
+	}
 	chat.cost = selection.cost
 	if selection.provider_id != chat.provider_id || selection.model_id != chat.model_id || selection.connection.API != chat.model_api {
 		chat.calibration = {}

@@ -24,6 +24,9 @@ Follow :: struct {
 	turn:                   journal.Turn_Id,
 	ended:                  bool,
 	outcome:                journal.Turn_Outcome,
+	// released is set when a Session_Released record is read: the server that held the
+	// session has ended, so the caller decides whether to claim the session again.
+	released:               bool,
 	// assistant_message, when set, runs as a committed assistant message is delivered.
 	// turn is that message's turn. ordinal counts the assistant nodes of the turn in
 	// delivery order, from zero. text is the committed body. Returning true means the
@@ -86,6 +89,8 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		return follow_tool_result(store, record, observer)
 	case .Turn_Started:
 		follow.working = true
+	case .Session_Released:
+		follow.released = true
 	case .Turn_Completed:
 		defer _observer_turn_finished(observer)
 		follow.working = false

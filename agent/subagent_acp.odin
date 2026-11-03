@@ -167,8 +167,9 @@ acp_program :: proc(
 	model: string
 	model, effort, problem = acp_native_model(args.provider, args.model, args.effort, parent, resume)
 	if problem != "" { return {}, "", problem }
-	arguments: []string = {"acp"}
-	if parent.nabla_config != "" { arguments = {"acp", "--config", parent.nabla_config} }
+	// --subagent makes the child's session server quit when the child's conversation ends.
+	arguments: []string = {"acp", "--subagent"}
+	if parent.nabla_config != "" { arguments = {"acp", "--config", parent.nabla_config, "--subagent"} }
 	clone_error: mem.Allocator_Error
 	program, clone_error = subagent_program_clone({arguments = arguments}, parent.nabla_executable, model, parent, allocator)
 	if clone_error != nil { return {}, "", "the native subagent's program could not be held" }
@@ -1027,6 +1028,9 @@ acp_prompt :: proc(connection: ^ACP_Connection, text: string, after := journal.J
 			delete(owned^, connection.member.allocator)
 			owned^ = ""
 		}
+		// The agent is busy from the moment the prompt is sent. The idle state left by the session
+		// open or the previous turn is stale, and waiting on it would end this turn before it ran.
+		connection.idle = false
 		if problem = acp_prompt_send(connection, text); problem != "" { return }
 		if after != 0 { acp_inbox_consumed(connection.member, after) }
 	}

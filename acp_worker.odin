@@ -372,6 +372,13 @@ acp_wait_turn :: proc(session: ^ACP_Session, input: journal.Journal_Seq) -> (out
 		seen := agent.owner_wake_seen()
 		if acp_wait_step(session) { return {}, false }
 		if session.follow.cursor.ended { return session.follow.cursor.outcome, true }
+		// The server that held the session ended while this turn waits for one. The session is
+		// claimed again: this connection starts a server, or follows the one that now holds it.
+		if session.follow.cursor.released {
+			session.follow.cursor.released = false
+			client_server_close(&session.server)
+			if _, started := acp_ensure_server(session); !started { return {}, false }
+		}
 		if acp_server_failed(session) { return {}, false }
 		acp_work_between(session)
 		agent.owner_wake_wait(seen, nil)
@@ -911,15 +918,19 @@ acp_work_compact :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, command: ACP
 		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, message))
 		return
 	}
+	// A compaction that runs during a turn reports no state: a state update names no prompt,
+	// so an idle state would end the turn the client is waiting on. Its outcome is in the journal.
+	during_turn := session.turn_waiting
 	if acp_is_v2(session.conn) {
 		message_id := acp_next_message_id(session)
 		acp_sent(session, acp_send_user_message(session, message_id, command.text))
 		acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Prompt_Accepted_Result{message_id = message_id}))
-		acp_sent(session, acp_send_state(session, "running", ""))
+		if !during_turn { acp_sent(session, acp_send_state(session, "running", "")) }
 	}
 	seq, appended := acp_append_command(session, journal.Compact{})
 	if !appended {
 		if acp_is_v2(session.conn) {
+			if during_turn { return }
 			acp_sent(
 				session,
 				acp_send_state(
@@ -937,6 +948,7 @@ acp_work_compact :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, command: ACP
 	outcome, reason, waited := acp_wait_applied(session, seq)
 	if !waited {
 		if acp_is_v2(session.conn) {
+			if during_turn { return }
 			acp_sent(
 				session,
 				acp_send_state(
@@ -953,7 +965,7 @@ acp_work_compact :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, command: ACP
 	}
 	if outcome == .Applied {
 		if acp_is_v2(session.conn) {
-			acp_sent(session, acp_send_state(session, "idle", acp.stop_reason_name(.End_Turn)))
+			if !during_turn { acp_sent(session, acp_send_state(session, "idle", acp.stop_reason_name(.End_Turn))) }
 		} else {
 			acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Prompt_Result{stop_reason = acp.stop_reason_name(.End_Turn)}))
 		}
@@ -961,7 +973,7 @@ acp_work_compact :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, command: ACP
 	}
 	if reason == "" { reason = "compaction is not available" }
 	if acp_is_v2(session.conn) {
-		acp_sent(session, acp_send_state(session, "idle", acp.stop_reason_name(.Error), acp.RPC_Error{code = acp.ERROR_INTERNAL, message = reason}))
+		if !during_turn { acp_sent(session, acp_send_state(session, "idle", acp.stop_reason_name(.Error), acp.RPC_Error{code = acp.ERROR_INTERNAL, message = reason})) }
 	} else {
 		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, reason))
 	}

@@ -64,7 +64,7 @@ SUBAGENT_LABEL :: term.Style {
 }
 AGENT_TEXT :: term.Style{}
 NOTICE_TEXT :: term.Style {
-	foreground = term.Indexed_Color(6),
+	foreground = term.Indexed_Color(8),
 }
 WARNING_TEXT :: term.Style {
 	foreground = term.Indexed_Color(3),

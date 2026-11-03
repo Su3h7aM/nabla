@@ -249,6 +249,8 @@ Chat_Session :: struct {
 	disable_project_instructions: bool,
 	subagents_max_running:        int, // zero means SUBAGENTS_MAX_RUNNING
 	compact_on_switch:            bool, // a model switch that does not fit compacts instead of being refused
+	compaction_min_percent:       Maybe(int),
+	compaction_trigger_percent:   Maybe(int),
 
 	// role_instructions are appended after everything else the instructions hold, so a
 	// subagent's requests share its orchestrator's instruction prefix. Owned.
@@ -479,6 +481,8 @@ chat_session_apply_harness :: proc(chat: ^Chat_Session, options: Harness_Options
 	chat.disable_project_instructions = options.disable_project_instructions
 	chat.subagents_max_running = options.subagents_max_running
 	chat.compact_on_switch = options.compact_on_switch
+	chat.compaction_min_percent = options.compaction_min_percent
+	chat.compaction_trigger_percent = options.compaction_trigger_percent
 	chat.acp_agents = options.acp_agents
 	if directory := search_frecency_directory(chat.allocator); directory != "" {
 		defer delete(directory, chat.allocator)

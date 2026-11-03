@@ -109,6 +109,10 @@ ACP_Server :: struct {
 	initialized:      bool,
 	// profile is the wire surface agreed with the client.
 	profile:          ACP_Wire_Profile,
+	// subagent is set when this process is a native subagent. Its session server ends with
+	// the conversation: the subagent's answer is its last state, so the server quits rather
+	// than detaching and waiting out its idle limit.
+	subagent:         bool,
 	// table_mu guards use_clock and the fields of every session that its comment names.
 	table_mu:         sync.Mutex,
 	sessions:         [ACP_MAX_SESSIONS]^ACP_Session,
@@ -117,6 +121,18 @@ ACP_Server :: struct {
 	// that did not stop. Reader only.
 	worker_stuck:     bool,
 	memory_leaked:    bool,
+}
+
+// acp_session_quit_server asks the session server this process started to stop. A server
+// that already exited has nothing to stop, and a session that never followed its journal
+// has no server.
+acp_session_quit_server :: proc(session: ^ACP_Session) {
+	if session.follow.store == nil { return }
+	status, status_error := client_server_status(&session.server)
+	if status_error.kind != .None || status.kind != .Running { return }
+	if _, ok := acp_append_command(session, journal.Stop_Server{}); !ok {
+		fmt.eprintln("nabla: the session server could not be asked to stop")
+	}
 }
 
 // --- the connection ----------------------------------------------------------
@@ -456,11 +472,12 @@ acp_session_shutdown :: proc(session: ^ACP_Session) {
 
 // acp_session_release gives back what the session holds: the follow, the server handle,
 // the journal, and the model's strings. It may run twice, once by a close on the worker
-// and once by whoever frees the session. A closed connection only detaches: the session
-// server keeps running without it.
+// and once by whoever frees the session. A closed connection only detaches, except a
+// subagent's, which also stops its session server.
 acp_session_release :: proc(session: ^ACP_Session) {
 	if session.released { return }
 	session.released = true
+	if session.conn.subagent { acp_session_quit_server(session) }
 	client_follow_close(&session.follow)
 	client_server_close(&session.server)
 	if session.store != nil {

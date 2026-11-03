@@ -1366,6 +1366,21 @@ test_agent_message_delivers_a_message_into_a_running_subagent_turn :: proc(test:
 
 }
 
+// subagent_test_wait_for_child_record polls the only child session until it records kind. The child
+// runs in its own process, so its journal is the only place its progress is visible to the test.
+subagent_test_wait_for_child_record :: proc(test: ^testing.T, chat: ^Chat_Session, kind: journal.Record_Kind) {
+	deadline := time.tick_add(time.tick_now(), AGENT_PROVIDER_BOUND)
+	for {
+		children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
+		if !testing.expect(test, children_error == nil && len(children) == 1) { return }
+		records, _, read_error := journal.read_records(chat.store, {session = children[0].id, kinds = {kind}}, 0, 0, context.temp_allocator)
+		if read_error != nil { testing.fail_now(test, "the child journal could not be read") }
+		if len(records) > 0 { return }
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { testing.fail_now(test, "the child did not record its compaction") }
+		time.sleep(time.Millisecond)
+	}
+}
+
 // While a child's request is held, agent configure with compact starts the child's compaction, and
 // the summary installs at a later request boundary of the same run: the child does not stop.
 @(test)
@@ -1414,14 +1429,19 @@ test_agent_configure_compacts_a_running_subagent_without_stopping_it :: proc(tes
 	}
 	testing.expect_value(test, subagent_test_call(test, chat, "send_2", TOOL_AGENT_NAME, `{"action":"configure","agent":"agent-1","compact":true}`), success)
 	testing.expect(test, strings.contains(subagent_test_result(test, chat), "a compaction"), subagent_test_result(test, chat))
+	// The child is still held at its boundary. Its summary finishes on its own request, and the
+	// checkpoint installs at the next boundary, which the release below reaches. Releasing before
+	// the summary is recorded would let the child end with a ready summary it never installs.
+	subagent_test_wait_for_child_record(test, chat, .Compaction_Completed)
 	sync.sema_post(&provider.release)
-	testing.expect(test, strings.contains(subagent_test_report(test, chat), "finished"), "the child finished its turn")
+	report := subagent_test_report(test, chat)
+	testing.expect(test, strings.contains(report, "finished"), report)
 
 	children, children_error := journal.list_sessions(chat.store, {parent = chat.session}, context.temp_allocator)
 	if !testing.expect(test, children_error == nil && len(children) == 1) { return }
 	for kind in ([]journal.Record_Kind{.Compaction_Completed, .Checkpoint_Installed}) {
 		records, _, read_error := journal.read_records(chat.store, {session = children[0].id, kinds = {kind}}, 0, 0, context.temp_allocator)
-		testing.expect(test, read_error == nil && len(records) == 1, "the child's journal holds the compaction")
+		testing.expectf(test, read_error == nil && len(records) == 1, "child record %v: count %d, error %v", kind, len(records), read_error)
 	}
 }
 @(test)

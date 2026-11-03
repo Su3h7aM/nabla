@@ -195,6 +195,7 @@ compact_setup_begin :: proc(test: ^testing.T, setup: ^Compact_Setup, foreground_
 	if !compact_provider_start(test, &setup.foreground, FOREGROUND_TEST_BODY, foreground_stall) { return false }
 	chat := &setup.chat.chat
 	chat_test_capacity(chat, 500_000)
+	chat.compaction_min_percent = 0
 	setup.big_prompt = strings.repeat("context ", 4000) or_else ""
 	if setup.big_prompt == "" { return false }
 	_test_accept(test, chat, setup.big_prompt)
@@ -427,6 +428,18 @@ test_the_compact_tool_records_an_intent_and_returns :: proc(test: ^testing.T) {
 // A command while the session is settled starts the work immediately: there is no
 // request boundary to wait for, and the request it freezes is the one it would
 // send next.
+@(test)
+test_the_compact_command_respects_the_minimum_context :: proc(test: ^testing.T) {
+	setup: Compact_Setup
+	if !compact_setup_begin(test, &setup) { return }
+	defer compact_setup_end(test, &setup)
+	chat := &setup.chat.chat
+	chat.compaction_min_percent = 100
+	testing.expect(test, chat_command_compact(chat, {}, {}))
+	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
+	testing.expect(test, chat.compact.below_minimum)
+}
+
 @(test)
 test_the_compact_command_starts_a_job_while_idle :: proc(test: ^testing.T) {
 	setup: Compact_Setup

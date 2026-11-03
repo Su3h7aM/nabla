@@ -32,6 +32,8 @@ Harness_Options :: struct {
 	nabla_config:                 string,
 	disable_project_instructions: bool,
 	compact_on_switch:            bool,
+	compaction_min_percent:       Maybe(int),
+	compaction_trigger_percent:   Maybe(int),
 	// idle_exit_seconds is how long the session server waits with nothing to do before
 	// it exits. Zero means unset, which is IDLE_EXIT_SECONDS_DEFAULT. A loaded value is
 	// at least one.
@@ -551,6 +553,29 @@ load_harness_options :: proc(state: ^lua.State, root_idx: c.int, allocator: mem.
 			project, ok := lua_bool(state, -1)
 			if !ok { return {}, .Invalid, config_field_detail("instructions.project", "boolean", state, -1, allocator) }
 			options.disable_project_instructions = !project
+		}
+	}
+	lua.settop(state, base)
+	lua_field(state, root_idx, "compaction")
+	if lua.type(state, -1) != .NIL {
+		if !lua_plain_table(state, -1) { return {}, .Invalid, config_field_detail("compaction", "plain table", state, -1, allocator) }
+		index := lua.absindex(state, -1)
+		lua_field(state, index, "min_percent")
+		if lua.type(state, -1) != .NIL {
+			value, ok := lua_int(state, -1)
+			if !ok ||
+			   value < 0 ||
+			   value > 100 { return {}, .Invalid, config_field_detail("compaction.min_percent", "integer from 0 to 100", state, -1, allocator) }
+			options.compaction_min_percent = value
+		}
+		lua.pop(state, 1)
+		lua_field(state, index, "trigger_percent")
+		if lua.type(state, -1) != .NIL {
+			value, ok := lua_int(state, -1)
+			if !ok ||
+			   value < 1 ||
+			   value > 100 { return {}, .Invalid, config_field_detail("compaction.trigger_percent", "integer from 1 to 100", state, -1, allocator) }
+			options.compaction_trigger_percent = value
 		}
 	}
 	lua.settop(state, base)

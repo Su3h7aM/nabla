@@ -230,6 +230,25 @@ test_lua_config_validates_disabled_models_and_reports_the_field :: proc(t: ^test
 }
 
 @(test)
+test_lua_config_loads_compaction_percentages :: proc(t: ^testing.T) {
+	directory, err := os.make_directory_temp("", "nabla-config-compaction-*", context.allocator)
+	if !testing.expect_value(t, err, nil) { return }
+	defer delete(directory, context.allocator)
+	defer testing.expect_value(t, os.remove_all(directory), nil)
+	path := fmt.aprintf("%s/config.lua", directory, allocator = context.temp_allocator)
+	body := `return { compaction = { min_percent = 20, trigger_percent = 50 } }`
+	if !testing.expect(t, os.write_entire_file(path, transmute([]u8)body) == nil) { return }
+	sources, options, servers, load_error, detail := load_lua_config(path)
+	defer catalog_sources_destroy(&sources)
+	defer mcp_servers_destroy(&servers)
+	defer web_search_config_destroy(options.web_search)
+	defer if detail != "" { delete(detail) }
+	testing.expect_value(t, load_error, Config_Error.None)
+	testing.expect_value(t, options.compaction_min_percent.? or_else -1, 20)
+	testing.expect_value(t, options.compaction_trigger_percent.? or_else -1, 50)
+}
+
+@(test)
 test_lua_config_loads_compact_on_switch :: proc(t: ^testing.T) {
 	directory, directory_error := os.make_directory_temp("", "nabla-config-compact-*", context.allocator)
 	if !testing.expect_value(t, directory_error, nil) { return }

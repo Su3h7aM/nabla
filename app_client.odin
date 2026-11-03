@@ -329,6 +329,23 @@ app_client_poll :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	if error := client_follow_poll(follow, observer); error != nil {
 		snap_append(app, .Error, fmt.tprintf("cannot read the session: %s", journal.error_text(error, context.temp_allocator)))
 	}
+	records, _, records_error := journal.read_records(
+		follow.store,
+		{session = follow.session, kinds = {.Compaction_Started, .Compaction_Completed}},
+		before.last,
+		0,
+		context.temp_allocator,
+	)
+	if records_error == nil {
+		for record in records {
+			if record.seq > follow.cursor.last { break }
+			if record.kind == .Compaction_Started {
+				snap_append(app, .Notice, "compaction: started in background")
+			} else {
+				snap_append(app, .Notice, "compaction: finished successfully")
+			}
+		}
+	}
 	app.setup.follow = follow.cursor
 	app.setup.session.last_estimate = follow.cursor.estimate
 	if follow.cursor.window > 0 { app.setup.session.capacity.window = follow.cursor.window }
@@ -378,6 +395,14 @@ client_selection_adopt :: proc(app: ^App) -> bool {
 		delete(chat_model, chat.allocator)
 		delete(effort, chat.allocator)
 		return false
+	}
+	if app.setup.model_id != "" && (app.setup.provider_id != applied.provider || app.setup.model_id != applied.model) {
+		snap_append(app, .Notice, fmt.tprintf("model: %s (%s) -> %s (%s)", app.setup.model_id, app.setup.provider_id, applied.model, applied.provider))
+	}
+	if chat.effort != applied.effort {
+		previous := chat.effort if chat.effort != "" else "default"
+		current := applied.effort if applied.effort != "" else "default"
+		snap_append(app, .Notice, fmt.tprintf("effort: %s -> %s", previous, current))
 	}
 	delete(app.setup.provider_id, app.setup.alloc)
 	app.setup.provider_id = provider
@@ -442,7 +467,7 @@ app_client_refusals :: proc(app: ^App) -> bool {
 		value, is_applied := payload.(journal.Command_Applied)
 		if !is_applied { continue }
 		applied = value
-		if applied.outcome == journal.COMMAND_OUTCOME_NAMES[.Refused] && applied.reason != "" {
+		if applied.reason != "" {
 			snap_append(app, .Notice, applied.reason)
 			shown = true
 		}
@@ -450,13 +475,11 @@ app_client_refusals :: proc(app: ^App) -> bool {
 	return shown
 }
 
-// app_client_steer sends the ready steering lines once a request boundary was seen
-// and the turn is still running. A turn that ended in the same poll keeps the lines
-// for the front-end, which sends them as the next prompt.
+// app_client_steer sends ready lines to the journal while the turn is running. The
+// session owner delivers them at its next settled boundary.
 @(require_results)
 app_client_steer :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
-	if !app.setup.follow.working || !app.run.steer_boundary { return false }
-	app.run.steer_boundary = false
+	if !app.setup.follow.working { return false }
 	taken, taken_ok := agent.steer_take_ready(&app.run.steer)
 	if !taken_ok {
 		snap_append(app, .Warning, "input queued during that turn could not be sent")

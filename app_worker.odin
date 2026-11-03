@@ -683,7 +683,6 @@ clear_retry :: proc(app: ^App) {
 
 observer_request_finished :: proc(user_data: rawptr) {
 	app := cast(^App)user_data
-	if app.setup.follow_client.store != nil { app.run.steer_boundary = true }
 	refresh_status(app)
 }
 

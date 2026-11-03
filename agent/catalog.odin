@@ -335,7 +335,7 @@ catalog_apply_cost :: proc(dst: ^Catalog_Cost, src: Catalog_Cost) {
 }
 
 @(require_results)
-catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allocator: mem.Allocator) -> Catalog_Error {
+catalog_apply_model :: proc(dst: ^Catalog_Model, src: ^Catalog_Model_Source, allocator: mem.Allocator) -> Catalog_Error {
 	if dst.api == nil && src.api != nil {
 		api, api_error := strings.clone(src.api.?, allocator)
 		if api_error != nil { return .Allocation }
@@ -374,7 +374,7 @@ catalog_apply_model :: proc(dst: ^Catalog_Model, src: Catalog_Model_Source, allo
 }
 
 @(require_results)
-catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: Catalog_Provider_Source, allocator: mem.Allocator) -> Catalog_Error {
+catalog_apply_provider :: proc(dst: ^Catalog_Provider, src: ^Catalog_Provider_Source, allocator: mem.Allocator) -> Catalog_Error {
 	if dst.base_url == nil && src.base_url != nil {
 		base_url, base_url_error := strings.clone(src.base_url.?, allocator)
 		if base_url_error != nil { return .Allocation }
@@ -412,7 +412,7 @@ catalog_apply_source :: proc(
 	user: []Catalog_Provider_Source,
 	allocator: mem.Allocator,
 ) -> Catalog_Error {
-	for provider_source in source {
+	for &provider_source in source {
 		provider_index, found := catalog_find_provider(catalog, provider_source.id)
 		if !found {
 			id, id_error := strings.clone(provider_source.id, allocator)
@@ -423,8 +423,8 @@ catalog_apply_source :: proc(
 			}
 			provider_index = len(catalog.providers) - 1
 		}
-		catalog_apply_provider(&catalog.providers[provider_index], provider_source, allocator) or_return
-		for model_source in provider_source.models {
+		catalog_apply_provider(&catalog.providers[provider_index], &provider_source, allocator) or_return
+		for &model_source in provider_source.models {
 			// An excluded model is not enriched and does not appear in the
 			// resolved list. It is a tombstone, not a selectable placeholder.
 			if catalog_has_disabled(provider_source.id, model_source.id, user) { continue }
@@ -444,7 +444,7 @@ catalog_apply_source :: proc(
 				}
 				model_index = len(catalog.models) - 1
 			}
-			catalog_apply_model(&catalog.models[model_index], model_source, allocator) or_return
+			catalog_apply_model(&catalog.models[model_index], &model_source, allocator) or_return
 		}
 	}
 	return .None

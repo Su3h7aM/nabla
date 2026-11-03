@@ -345,9 +345,6 @@ Runtime :: struct {
 	compact_pending:          bool,
 	// cancel_requested asks the worker to append Cancel_Turn. Only a client sets it.
 	cancel_requested:         bool,
-	// steer_boundary says the last poll saw a request finish while the turn continued,
-	// so ready steering lines can be sent. The worker is the only thread that uses it.
-	steer_boundary:           bool,
 	// pending_target is owner-thread state retained while the target model is being fit.
 	pending_target:           Maybe(Pending_Target),
 	// steer carries lines typed while a turn is running. The front-end pushes

@@ -28,6 +28,8 @@ CHAT_COMPACT_KEEP_MESSAGES :: 10
 // a summarization request.
 CHAT_COMPACT_MIN_REDUCTION_TOKENS :: 1024
 
+CHAT_COMPACT_MIN_PERCENT :: 10
+
 // CHAT_COMPACT_COOLDOWN is how long an exhausted summary chain rests before another
 // snapshot may start. Whoever asks, the context has not changed in the meantime, and the
 // provider has already refused the same work once.
@@ -312,6 +314,7 @@ Compact_Job :: struct {
 // Compact_Control is the owner-side view. Only the thread that drives the session
 // changes it; the worker never reads it.
 Compact_Control :: struct {
+	below_minimum:        bool,
 	state:                Compact_State,
 	job_generation:       u64,
 	completed_generation: u64,
@@ -487,6 +490,13 @@ chat_compact_start_pending :: proc(chat: ^Chat_Session, observer: Chat_Observer,
 	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
 	if prep_error != nil {
 		chat_session_record_failure(chat, "the context could not be read", prep_error)
+		return
+	}
+	if control.pending == .User_Command &&
+	   prep.estimate < int(i64(chat.capacity.window) * i64(chat.compaction_min_percent.? or_else CHAT_COMPACT_MIN_PERCENT) / 100) {
+		control.pending = .None
+		control.below_minimum = true
+		_observer_message(observer, .Notice, "compaction: minimum context threshold not reached")
 		return
 	}
 	chat_compact_consider(chat, observer, connection, &prep)
@@ -1269,6 +1279,7 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 @(require_results)
 chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> bool {
 	if chat.storage_failed { return false }
+	chat.compact.below_minimum = false
 	switch chat_compact_request(chat, .User_Command) {
 	case .Unavailable:
 		_observer_message(observer, .Error, "compaction is not available right now")
@@ -1290,7 +1301,7 @@ chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, conne
 	// cannot see from here.
 	if chat.compact.state != .Running && chat.compact.pending != .None {
 		_observer_message(observer, .Notice, "compaction is waiting for the retry cooldown")
-	} else if chat.compact.state != .Running {
+	} else if chat.compact.state != .Running && !chat.compact.below_minimum {
 		_observer_message(observer, .Notice, "nothing to compact")
 	}
 	return true

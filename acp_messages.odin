@@ -1225,6 +1225,7 @@ acp_usage :: proc() {
 	fmt.println("nabla acp [--config PATH]")
 	fmt.println("runs an Agent Client Protocol agent on stdin and stdout, for an editor or another ACP client")
 	fmt.println("default config: $XDG_CONFIG_HOME/nabla/config.lua (~/.config/nabla/config.lua)")
+	fmt.println("--subagent: the session server quits when the conversation ends, as a subagent's does")
 }
 
 // acp_run opens the front-end, serves conversations on the given streams, and releases
@@ -1241,11 +1242,13 @@ acp_run :: proc(
 	input: io.Reader,
 	output: io.Writer,
 	retained: ^bool = nil,
+	subagent := false,
 ) -> bool {
 	if retained != nil { retained^ = false }
 	server, server_error := new(ACP_Server)
 	if server_error != nil { return false }
 	server.alloc = context.allocator
+	server.subagent = subagent
 	server_cleanup_managed := false
 	defer if !server_cleanup_managed { free(server, server.alloc) }
 	server.app.run.alloc = server.alloc
@@ -1283,11 +1286,16 @@ acp_run :: proc(
 // the front-end differs.
 acp_main :: proc(args: []string) -> int {
 	config_path := ""
+	subagent := false
 	for i := 0; i < len(args); i += 1 {
 		arg := args[i]
 		if arg == "--help" || arg == "-h" {
 			acp_usage()
 			return 0
+		}
+		if arg == "--subagent" {
+			subagent = true
+			continue
 		}
 		if strings.has_prefix(arg, "--config=") {
 			config_path = arg[len("--config="):]
@@ -1343,7 +1351,15 @@ acp_main :: proc(args: []string) -> int {
 	agent.chat_interactive_arm(&signals)
 	defer agent.chat_interactive_disarm(&signals)
 
-	served := acp_run(sources[:], harness_options, mcp_servers[:], io.to_reader(os.to_stream(os.stdin)), io.to_writer(os.to_stream(os.stdout)), &retained)
+	served := acp_run(
+		sources[:],
+		harness_options,
+		mcp_servers[:],
+		io.to_reader(os.to_stream(os.stdin)),
+		io.to_writer(os.to_stream(os.stdout)),
+		&retained,
+		subagent,
+	)
 	// A signal ends the run the way a client closing the stream does, and stopping for it
 	// is not a stream failure.
 	if served || agent.process_interrupted() { return 0 }
