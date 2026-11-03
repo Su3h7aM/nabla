@@ -521,6 +521,27 @@ test_a_client_launch_follows_without_claiming :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(last.text[:]), "no turn was running")
 }
 
+// A command the server applied carries a reason too, and the client must not report it as
+// a refusal: the outcome decides that, and work that happened is not work that did not.
+@(test)
+test_a_client_shows_only_a_refused_command :: proc(t: ^testing.T) {
+	app: App
+	directory := app_session_begin(t, &app)
+	defer app_session_end(&app, directory)
+
+	store := app.setup.store
+	session := app.setup.session.session
+	journal.append_command_applied(store, session, 1, .Refused, "the request was refused")
+	journal.append_command_applied(store, session, 2, .Applied, "compaction: in progress")
+	app.setup.follow_client.store = store
+	app.setup.follow_client.session = session
+
+	testing.expect(t, app_client_refusals(&app), "the client shows the refusal")
+	if !testing.expect_value(t, len(app.run.snap.entries), 1) { return }
+	testing.expect_value(t, string(app.run.snap.entries[0].text[:]), "the request was refused")
+	testing.expect(t, !app_client_refusals(&app), "an answered command is not shown twice")
+}
+
 // A bare --resume is scoped to the directory it is run from, and the newest
 // session in that directory is the one it opens.
 @(test)

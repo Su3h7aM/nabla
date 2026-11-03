@@ -435,9 +435,10 @@ test_the_compact_command_respects_the_minimum_context :: proc(test: ^testing.T) 
 	defer compact_setup_end(test, &setup)
 	chat := &setup.chat.chat
 	chat.compaction_min_percent = 100
-	testing.expect(test, chat_command_compact(chat, {}, {}))
+	result := chat_command_compact(chat, {}, {})
+	testing.expect_value(test, result.outcome, journal.Command_Outcome.Applied)
+	testing.expect_value(test, result.reason, "compaction: minimum context threshold not reached")
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
-	testing.expect(test, chat.compact.below_minimum)
 }
 
 @(test)
@@ -455,7 +456,9 @@ test_the_compact_command_starts_a_job_while_idle :: proc(test: ^testing.T) {
 		API      = .OpenAI_Chat_Completions,
 		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
 	}
-	testing.expect(test, chat_command_compact(chat, {}, background))
+	result := chat_command_compact(chat, {}, background)
+	testing.expect_value(test, result.outcome, journal.Command_Outcome.Applied)
+	testing.expect_value(test, result.reason, "compaction: in progress")
 	testing.expect_value(test, chat.compact.state, Compact_State.Running)
 	testing.expect_value(test, chat.compact.trigger, Compact_Trigger.User_Command)
 	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
@@ -484,7 +487,7 @@ test_the_compact_command_starts_before_a_running_provider_finishes :: proc(test:
 		testing.fail_now(test, "the foreground request never started")
 	}
 	foreground_request := chat.chain.request
-	testing.expect(test, chat_command_compact(chat, {}, background))
+	testing.expect_value(test, chat_command_compact(chat, {}, background).outcome, journal.Command_Outcome.Applied)
 	testing.expect_value(test, chat.compact.state, Compact_State.Running)
 	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
 		testing.fail_now(test, "compaction waited for the foreground response")
@@ -492,7 +495,7 @@ test_the_compact_command_starts_before_a_running_provider_finishes :: proc(test:
 	testing.expect_value(test, chat.chain.request, foreground_request)
 	testing.expect(test, !job_published(&chat.chain.attempt.worker), "the foreground is still blocked")
 	compaction_request := chat.compact.job.request
-	testing.expect(test, chat_command_compact(chat, {}, background))
+	testing.expect_value(test, chat_command_compact(chat, {}, background).reason, "compaction: in progress")
 	testing.expect_value(test, chat.compact.job.request, compaction_request)
 
 	sync.sema_post(&setup.background.release)
@@ -527,7 +530,7 @@ test_compaction_intent_starts_while_a_tool_batch_is_unfinished :: proc(test: ^te
 		Endpoint = compact_provider_endpoint(&setup.background, context.temp_allocator),
 	}
 	testing.expect_value(test, chat_compact_request(chat, .Agent_Tool), Compact_Request_Result.Scheduled)
-	chat_compact_start_pending(chat, {}, background)
+	testing.expect_value(test, chat_compact_start_pending(chat, {}, background), Compact_Start_Result.Started)
 	testing.expect_value(test, chat.compact.state, Compact_State.Running)
 	if !sync.sema_wait_with_timeout(&setup.background.reached, COMPACT_TEST_BOUND) {
 		testing.fail_now(test, "compaction waited for the unfinished tool batch")

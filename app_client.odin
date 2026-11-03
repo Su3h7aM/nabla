@@ -446,7 +446,10 @@ client_selection_levels_publish :: proc(app: ^App, provider, model: string) {
 	delete(levels, app.run.alloc)
 }
 
-// app_client_refusals shows a command the server refused. The reason is the notice.
+// app_client_refusals shows a command the server refused, and what it said about it.
+//
+// The outcome decides that, not the reason: an applied command carries a reason too, and
+// reading one as a refusal would report work that happened as work that did not.
 @(require_results)
 app_client_refusals :: proc(app: ^App) -> bool {
 	store := app.setup.follow_client.store
@@ -461,16 +464,12 @@ app_client_refusals :: proc(app: ^App) -> bool {
 	shown := false
 	for &record in records {
 		if record.seq > app.setup.commands_seen { app.setup.commands_seen = record.seq }
-		applied: journal.Command_Applied
-		payload, has_payload := record.payload.?
-		if !has_payload { continue }
-		value, is_applied := payload.(journal.Command_Applied)
+		applied, is_applied := journal.payload_as(record, journal.Command_Applied)
 		if !is_applied { continue }
-		applied = value
-		if applied.reason != "" {
-			snap_append(app, .Notice, applied.reason)
-			shown = true
-		}
+		outcome, known := journal.enum_from_name(journal.COMMAND_OUTCOME_NAMES, applied.outcome)
+		if !known || outcome != .Refused { continue }
+		if applied.reason != "" { snap_append(app, .Notice, applied.reason) }
+		shown = true
 	}
 	return shown
 }

@@ -239,9 +239,8 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 // app_command_compact runs compaction for a session this process owns. The ACP worker
 // calls it. The TUI sends Compact instead and does not run the summary.
 app_command_compact :: proc(app: ^App, observer: agent.Chat_Observer) {
-	if !agent.chat_command_compact(&app.setup.session, observer, app.run.connection) && agent.chat_session_storage_failed(&app.setup.session) {
-		snap_append(app, .Error, agent.chat_session_last_error(&app.setup.session))
-	}
+	result := agent.chat_command_compact(&app.setup.session, observer, app.run.connection)
+	if result.outcome == .Refused { snap_append(app, .Error, result.reason) }
 }
 
 // app_follow_flush retries the existing batch without appending input again.

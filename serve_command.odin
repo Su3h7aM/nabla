@@ -119,22 +119,11 @@ serve_command_apply :: proc(app: ^App, command: journal.Command) -> (result: Ser
 		}
 		return .Applied, ""
 	case journal.Compact:
-		if !agent.chat_command_compact(chat, run_observer(app), app.run.connection) {
-			if chat.storage_failed { return .Refused, agent.chat_session_last_error(chat) }
-			return .Refused, "compaction is not available"
-		}
-		if chat.compact.below_minimum { return .Applied, "compaction: minimum context threshold not reached" }
-		switch chat.compact.state {
-		case .Running:
-			return .Applied, "compaction: in progress"
-		case .Ready:
-			return .Applied, "compaction: summary ready"
-		case .Backoff, .Retiring:
-			return .Applied, "compaction: pending"
-		case .Idle:
-			if chat.compact.pending != .None { return .Applied, "compaction: pending" }
-			return .Applied, "compaction: nothing to compact"
-		}
+		// The session says what the request became, so this answer is the decision itself
+		// rather than a second reading of the state that decision left behind.
+		result := agent.chat_command_compact(chat, run_observer(app), app.run.connection)
+		outcome: Serve_Command_Result = .Applied if result.outcome == .Applied else .Refused
+		return outcome, result.reason
 	}
 	return .Refused, "the command did not name a command this harness runs"
 }

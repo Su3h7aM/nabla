@@ -406,7 +406,7 @@ chat_turn_drive :: proc(
 		now := time.tick_now()
 		chat_session_observe_at(chat, now)
 		if steer != nil && steer.observe != nil { steer.observe(steer, observer) }
-		chat_compact_start_pending(chat, observer, current)
+		_ = chat_compact_start_pending(chat, observer, current)
 		// A summarizer that finished is adopted here, where its completion is read, so the job's
 		// storage and its thread are released without waiting for a request boundary. The summary
 		// itself still installs at a boundary, so it cannot change a request already in flight.

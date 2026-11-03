@@ -314,7 +314,6 @@ Compact_Job :: struct {
 // Compact_Control is the owner-side view. Only the thread that drives the session
 // changes it; the worker never reads it.
 Compact_Control :: struct {
-	below_minimum:        bool,
 	state:                Compact_State,
 	job_generation:       u64,
 	completed_generation: u64,
@@ -345,6 +344,58 @@ Compact_Request_Result :: enum {
 	Scheduled,
 	Already_Scheduled,
 	Unavailable,
+}
+
+// Compact_Start_Result is what a recorded intent became when the owner looked at it.
+// Every value but Started means no summarizer was launched.
+Compact_Start_Result :: enum {
+	// Started means a job is running or a ready candidate is installed.
+	Started,
+	// Below_Minimum means a manual request found the context under the configured
+	// minimum percentage. The intent is consumed and nothing was started.
+	Below_Minimum,
+	// Waiting_Cooldown means the last chain failed too recently to repeat the work.
+	Waiting_Cooldown,
+	// Nothing_Pending means there was no intent to start.
+	Nothing_Pending,
+	// Not_Started means the work could not begin or did not begin, with the reason
+	// already reported to the observer.
+	Not_Started,
+}
+
+// Compact_Command_Result is what one manual compaction request became, as its caller
+// answers for it. reason is "" when the outcome needs no explanation and otherwise in
+// temporary memory, like every other reason a command reports.
+Compact_Command_Result :: struct {
+	outcome: journal.Command_Outcome,
+	reason:  string,
+}
+
+// compact_start_result_text says what a start did, in words a person reads. It is the
+// reason a configured client is given for a compaction command it asked for.
+compact_start_result_text :: proc(result: Compact_Start_Result, state: Compact_State) -> string {
+	switch result {
+	case .Started:
+		switch state {
+		case .Ready:
+			return "compaction: summary ready"
+		case .Running:
+			return "compaction: in progress"
+		case .Backoff, .Retiring:
+			return "compaction: pending"
+		case .Idle:
+		}
+		return ""
+	case .Below_Minimum:
+		return "compaction: minimum context threshold not reached"
+	case .Waiting_Cooldown:
+		return "compaction: pending"
+	case .Nothing_Pending:
+		return "compaction: nothing to compact"
+	case .Not_Started:
+		return ""
+	}
+	return ""
 }
 
 @(private)
@@ -476,30 +527,33 @@ chat_compact_request :: proc(chat: ^Chat_Session, trigger: Compact_Trigger, sour
 // chat_compact_start_pending freezes committed history for a recorded intent without
 // waiting for the foreground or installing a ready summary. Streaming text and
 // unpublished tool results are not part of the projection.
-@(private)
-chat_compact_start_pending :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) {
+//
+// The result says what became of the intent, so a caller that asked for the work reads
+// the answer from the decision it made rather than from state beside it.
+@(private, require_results)
+chat_compact_start_pending :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> Compact_Start_Result {
 	control := &chat.compact
-	if chat.storage_failed || control.state != .Idle || control.pending == .None { return }
-	if control.pending != .Model_Switch && !chat_compact_retry_allowed(control, control.pending) { return }
+	if chat.storage_failed || control.state != .Idle || control.pending == .None { return .Nothing_Pending }
+	if control.pending != .Model_Switch && !chat_compact_retry_allowed(control, control.pending) { return .Waiting_Cooldown }
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil {
 		_observer_message(observer, .Warning, "the context could not be prepared")
-		return
+		return .Not_Started
 	}
 	defer virtual.arena_destroy(&arena)
 	prep, prep_error := chat_prepare(chat, connection, virtual.arena_allocator(&arena))
 	if prep_error != nil {
 		chat_session_record_failure(chat, "the context could not be read", prep_error)
-		return
+		return .Not_Started
 	}
 	if control.pending == .User_Command &&
 	   prep.estimate < int(i64(chat.capacity.window) * i64(chat.compaction_min_percent.? or_else CHAT_COMPACT_MIN_PERCENT) / 100) {
 		control.pending = .None
-		control.below_minimum = true
 		_observer_message(observer, .Notice, "compaction: minimum context threshold not reached")
-		return
+		return .Below_Minimum
 	}
 	chat_compact_consider(chat, observer, connection, &prep)
+	return .Started if control.state != .Idle else .Not_Started
 }
 
 // chat_compact_retry_allowed keeps a failed summarization from being retried at every
@@ -1101,7 +1155,7 @@ chat_compact_idle_service :: proc(chat: ^Chat_Session, observer: Chat_Observer, 
 	}
 	// An intent is consumed by the attempt to start it, so one that cannot start here is
 	// not retried at every tick: the boundary that recorded it asked once.
-	chat_compact_start_pending(chat, observer, connection)
+	_ = chat_compact_start_pending(chat, observer, connection)
 	return changed
 }
 
@@ -1276,33 +1330,37 @@ chat_compact_destroy :: proc(chat: ^Chat_Session) {
 // chat_command_compact starts the same compaction the automatic path starts, including
 // while foreground work runs. It reports that compaction is under way, not
 // that a summary exists: nothing about it blocks the caller.
+//
+// The result is what the request became. A caller that answers a user or a client reads
+// it directly, so the answer comes from the decision rather than from state read after it.
 @(require_results)
-chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> bool {
-	if chat.storage_failed { return false }
-	chat.compact.below_minimum = false
+chat_command_compact :: proc(chat: ^Chat_Session, observer: Chat_Observer, connection: ai.Provider_Connection) -> Compact_Command_Result {
+	if chat.storage_failed { return {outcome = .Refused, reason = chat.last_error} }
 	switch chat_compact_request(chat, .User_Command) {
 	case .Unavailable:
 		_observer_message(observer, .Error, "compaction is not available right now")
-		return false
+		return {outcome = .Refused, reason = "compaction is not available right now"}
 	case .Already_Scheduled:
 		// A candidate that is ready is not work under way. Saying so would leave the user
 		// waiting for a summary that already exists and installs at the next boundary.
+		reason := compact_start_result_text(.Started, chat.compact.state)
 		if chat.compact.state == .Ready {
 			_observer_message(observer, .Notice, "a summary is ready; the next request boundary installs it")
 		} else {
 			_observer_message(observer, .Notice, "compaction is already under way")
 		}
-		return true
+		return {outcome = .Applied, reason = reason}
 	case .Scheduled:
 	}
-	chat_compact_start_pending(chat, observer, connection)
-	if chat.storage_failed { return false }
-	// A job that started has already said so; the rest is the outcome the caller
-	// cannot see from here.
-	if chat.compact.state != .Running && chat.compact.pending != .None {
+	started := chat_compact_start_pending(chat, observer, connection)
+	// A job that started has already said so; the rest is the outcome the caller cannot
+	// see from here.
+	reason := compact_start_result_text(started, chat.compact.state)
+	if started == .Waiting_Cooldown {
 		_observer_message(observer, .Notice, "compaction is waiting for the retry cooldown")
-	} else if chat.compact.state != .Running && !chat.compact.below_minimum {
+	} else if started == .Nothing_Pending {
 		_observer_message(observer, .Notice, "nothing to compact")
 	}
-	return true
+	if chat.storage_failed { return {outcome = .Refused, reason = chat.last_error} }
+	return {outcome = .Applied, reason = reason}
 }
