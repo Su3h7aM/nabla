@@ -529,35 +529,35 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 
 ```sql
 records(seq INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, mono_ns INTEGER NOT NULL,
-        run BLOB NOT NULL, kind TEXT NOT NULL, session BLOB, branch INTEGER, node INTEGER,
+        run BLOB NOT NULL, kind INTEGER NOT NULL, session BLOB, branch INTEGER, node INTEGER,
         turn INTEGER, request INTEGER, attempt INTEGER, call INTEGER,
         parent_call INTEGER, subagent BLOB, provider TEXT, model TEXT,
         body BLOB, data TEXT NOT NULL) STRICT
-nodes(session BLOB, node INTEGER, parent INTEGER, branch INTEGER, kind TEXT NOT NULL, turn INTEGER,
+nodes(session BLOB, node INTEGER, parent INTEGER, branch INTEGER, kind INTEGER NOT NULL, turn INTEGER,
       covers INTEGER, seq INTEGER NOT NULL, data TEXT NOT NULL, body BLOB, PRIMARY KEY(session, node)) STRICT
 branches(session BLOB, branch INTEGER, base_node INTEGER, seq INTEGER NOT NULL,
          PRIMARY KEY(session, branch)) STRICT
 sessions(session BLOB PRIMARY KEY, created_ms INTEGER, workspace TEXT,
          parent_session BLOB, parent_call INTEGER, role INTEGER) STRICT
 artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) STRICT
--- PRAGMA user_version is 2. Version 1 and any other unknown version are refused.
+-- PRAGMA user_version is the schema this build writes. A newer version is refused.
 -- One empty STRICT table per remaining payload family is created and unused.
--- records.data and nodes.data still hold the JSON payload.
+-- records.data and nodes.data still hold the JSON payload. record_names maps kind to its dotted name.
 ```
 
 - Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is the highest `node` on that branch.
-- Indexes: `records(session, seq) WHERE session IS NOT NULL`, `records(session, call, seq) WHERE call IS NOT NULL`, `records(session, parent_call, seq) WHERE parent_call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node, seq) WHERE node IS NOT NULL`, `records(session, request, attempt) WHERE request IS NOT NULL`, `nodes(session, branch, node)`, `nodes(session, kind, node)`, `nodes(session, turn, kind) WHERE turn IS NOT NULL`. A read with a call, parent call, request, or node filter uses the index of that column and the rowid range for `seq > ?`; a read with only kinds uses `(session, kind, seq)`. A read with a node filter orders by `+seq` and tests `+kind`, because the planner would otherwise pick `(session, seq)` or `(session, kind, seq)`, which satisfy the order and scan every record of the session; the sort is over the matching rows only. A turn or subagent filter on `records` has no index and scans the session.
+- Indexes: `records(session, seq) WHERE session IS NOT NULL`, `records(session, call, seq) WHERE call IS NOT NULL`, `records(session, parent_call, seq) WHERE parent_call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node, seq) WHERE node IS NOT NULL`, `records(session, request, attempt) WHERE request IS NOT NULL`, `nodes(session, branch, node)`, `nodes(session, kind, node)`, `nodes(session, turn, kind) WHERE turn IS NOT NULL`. A read with a call, parent call, request, or node filter uses the index of that column; a read with only kinds uses `(session, kind, seq)`. The node index includes seq, so a node filter orders by seq with no extra sort. A turn or subagent filter on `records` has no index and scans the session.
 - `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
 - `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and the attachments of a `user.input` record, a `background.completed` record, a `User` node, or a `tool.completed` record are artifacts named in its `data`, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
 - WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes share the file, and SQLite serializes their write transactions, so no other journal mode is needed. Each session has one claim, held by the process that runs its turns (section 8.6).
-- The schema version is stamped in the same transaction that creates the tables. This build reads only version 2. Version 1 and any other unknown version are refused, and a newer schema is refused. There is no migration. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
+- The schema version is stamped in the same transaction that creates the tables. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 
 ### 8.3 Durability classes and write path
 
 | Class | Kinds (examples) | Rule |
 | --- | --- | --- |
-| Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `subagent.message`, `*.completed`, `checkpoint.installed`, `hook.applied` (when it changes model input), `rating.recorded`, `selection.fit`, `selection.applied`, `turn.completed` | `commit` before the dependent effect proceeds |
-| Observation | `run.started`, `run.finished`, `session.claimed`, `session.released`, `request.prepared`, `request.admitted`, `provider.observed`, `tool.started`, `retry.scheduled`, `retry.completed`, `compaction.started`, `job.abandoned`, `job.reclaimed`, `cache.observed`, `resource.observed`, `hook.failed`, `runtime.message` | buffered; written in the next barrier transaction or when the batch reaches `JOURNAL_BATCH_RECORDS`, `JOURNAL_BATCH_BYTES`, or `JOURNAL_BATCH_AGE` |
+| Barrier | `session.created`, `branch.created`, `user.input`, `request.sent`, `response.committed`, `tool.admitted`, `tool.completed`, `lua.started`, `task.started`, `subagent.started`, `subagent.message`, `*.completed`, `checkpoint.installed`, `selection.fit`, `selection.applied`, `turn.completed` | `commit` before the dependent effect proceeds |
+| Observation | `run.started`, `run.finished`, `session.claimed`, `session.released`, `request.prepared`, `request.admitted`, `tool.started`, `retry.scheduled`, `retry.completed`, `compaction.started`, `job.abandoned`, `job.reclaimed`, `runtime.message` | buffered; written in the next barrier transaction or when the batch reaches `JOURNAL_BATCH_RECORDS`, `JOURNAL_BATCH_BYTES`, or `JOURNAL_BATCH_AGE` |
 
 The owner is the only writer for its session, except that any process following it appends `user.input` and `user.command` (sections 6.4 and 8.6). A commit is one short immediate transaction; no transaction spans a network operation or a wait. Results that publish together commit together. A failed commit latches `Storage_Failed`: admission stops, cleanup continues without the journal. A crash may lose buffered observations, never barriers.
 
@@ -565,9 +565,7 @@ The journal writes `session.claimed` itself when `claim` or `create_session` tak
 
 ### 8.4 Record kinds
 
-`Record_Kind` is a closed enum with a stable-name table. Names are never changed or reused; new kinds are appended.
-
-`tool.validation_failed` and `tool.repaired` are declared and never written, and their names are never reused: `tool.admitted` carries a call's repairs and `tool.completed` carries a validation failure's outcome and detail, so a record of either would state a fact twice.
+`Record_Kind` is a closed enum. The journal stores the integer code. `RECORD_KIND_NAMES` and the `record_names` view are the dotted name of that code, for a log line and for the sqlite3 CLI. A new kind is a new code and a schema bump, because the column CHECK ends at the last code.
 
 ```text
 run.started run.finished
@@ -575,17 +573,13 @@ session.created session.titled session.recovered session.claimed session.release
 branch.created branch.selected
 user.input node.committed
 turn.started turn.completed
-request.prepared request.admitted request.sent provider.observed response.committed response.rejected request.interrupted
+request.prepared request.admitted request.sent response.committed response.rejected request.interrupted
 retry.scheduled retry.completed
-tool.proposed tool.validation_failed tool.repaired tool.admitted tool.decision tool.started tool.completed
+tool.proposed tool.admitted tool.started tool.completed
 lua.started lua.completed
 task.started task.completed
 subagent.started subagent.completed
-hook.applied hook.failed
 compaction.started compaction.completed checkpoint.installed
-config.published config.rejected catalog.published
-cache.observed resource.observed
-rating.recorded rating.cleared assessment.recorded
 runtime.message job.abandoned job.reclaimed
 selection.changed selection.fit selection.applied
 subagent.message

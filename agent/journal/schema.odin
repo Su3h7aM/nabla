@@ -2,17 +2,20 @@ package journal
 
 import "base:runtime"
 import "core:fmt"
+import "core:mem"
+import "core:strings"
 
 import "nabla:db"
 
-// SCHEMA_VERSION is the only schema this build reads or writes. A database at
-// version 1, or any other version this build does not know, is Schema_Unknown.
-// A higher version is Schema_Too_New. There is no migration.
-SCHEMA_VERSION :: 2
+// SCHEMA_VERSION is the schema this build writes and reads. A database stamped
+// with a higher version was written by newer code, and the columns this build
+// names may not be the columns it has, so this build refuses rather than guess.
+SCHEMA_VERSION :: 1
 
 // Every table is append-only and STRICT. The rowid of `records` is the global
-// seq. Kind stays text until the column becomes an integer code. `data` holds
-// the JSON payload until each family has its own table. An absent id is NULL.
+// seq. `records.kind` and `nodes.kind` are the integer codes of Record_Kind and
+// Node_Kind. `data` holds the JSON payload until a family has its own table.
+// An absent id is NULL.
 // Each element is one statement, as the backend requires. Foreign keys are
 // declared and not enforced until the connection turns them on.
 @(private)
@@ -37,7 +40,7 @@ SCHEMA := [?]string {
 		time_ms     INTEGER NOT NULL,
 		mono_ns     INTEGER NOT NULL,
 		run         BLOB NOT NULL CHECK (length(run) = 16),
-		kind        TEXT NOT NULL,
+		kind        INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 44),
 		session     BLOB CHECK (session IS NULL OR length(session) = 16),
 		branch      INTEGER CHECK (branch IS NULL OR branch > 0),
 		node        INTEGER CHECK (node IS NULL OR node > 0),
@@ -67,7 +70,7 @@ SCHEMA := [?]string {
 		node    INTEGER NOT NULL CHECK (node > 0),
 		parent  INTEGER CHECK (parent IS NULL OR parent > 0),
 		branch  INTEGER NOT NULL CHECK (branch > 0),
-		kind    TEXT NOT NULL,
+		kind    INTEGER NOT NULL CHECK (kind BETWEEN 0 AND 5),
 		turn    INTEGER CHECK (turn IS NULL OR turn > 0),
 		covers  INTEGER CHECK (covers IS NULL OR covers > 0),
 		seq     INTEGER NOT NULL REFERENCES records(seq),
@@ -416,11 +419,31 @@ schema_migrate :: proc(journal: ^Journal) -> (error: Error) {
 		tables := query_int(journal, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", nil) or_return
 		if tables != 0 { return Journal_Error.Schema_Unknown }
 		for statement in SCHEMA { db.exec(&journal.connection, statement) or_return }
+		names := record_names_sql() or_return
+		db.exec(&journal.connection, names) or_return
 		db.exec(&journal.connection, fmt.tprintf("PRAGMA user_version = %d", SCHEMA_VERSION)) or_return
-	} else if version != SCHEMA_VERSION {
-		return Journal_Error.Schema_Unknown
 	}
 	return db.commit(&journal.connection)
+}
+
+// record_names_sql is a read-only view that maps records.kind to its dotted
+// name. The VALUES list is the enum, so a renamed kind cannot leave the view
+// behind. The text is temp-allocated and lives until the caller's temp reset.
+@(private)
+record_names_sql :: proc() -> (sql: string, error: mem.Allocator_Error) {
+	builder := strings.builder_make(context.temp_allocator) or_return
+	strings.write_string(
+		&builder,
+		"CREATE VIEW record_names AS SELECT records.seq, names.name, records.* FROM records JOIN (SELECT column1 AS code, column2 AS name FROM (VALUES ",
+	)
+	separator := ""
+	for kind in Record_Kind {
+		strings.write_string(&builder, separator)
+		fmt.sbprintf(&builder, "(%d, '%s')", int(kind), RECORD_KIND_NAMES[kind])
+		separator = ", "
+	}
+	strings.write_string(&builder, ")) AS names ON names.code = records.kind")
+	return strings.to_string(builder), nil
 }
 
 @(private, require_results)

@@ -109,7 +109,7 @@ read_records :: proc(
 	query := Query{}
 	query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE seq > ?", i64(after)) or_return
 	query_filter(&query, &filter) or_return
-	query_order_by_seq(&query, &filter, "ASC") or_return
+	query_order_by_seq(&query, "ASC") or_return
 	if page > 0 { query_add(&query, " LIMIT ?", i64(page)) or_return }
 
 	records, error = query_records(journal, strings.to_string(query.sql), query.arguments[:], allocator)
@@ -132,7 +132,21 @@ read_records :: proc(
 read_inbox :: proc(journal: ^Journal, session: Session_Id, after: Journal_Seq, allocator: mem.Allocator) -> (records: []Record, error: Error) {
 	assert(journal.open)
 	session := session
-	return query_records(journal, INBOX_QUERY, {db.Value(session[:]), db.Value(i64(after))}, allocator)
+	return query_records(
+		journal,
+		INBOX_QUERY,
+		{
+			db.Value(session[:]),
+			db.Value(i64(after)),
+			i64(Record_Kind.User_Input),
+			i64(Record_Kind.Background_Completed),
+			i64(Record_Kind.Subagent_Completed),
+			i64(Record_Kind.Subagent_Started),
+			i64(Record_Kind.Tool_Completed),
+			i64(Record_Kind.Subagent_Message),
+		},
+		allocator,
+	)
 }
 
 // read_pending_commands returns the `user.command` records of session that no
@@ -143,7 +157,7 @@ read_inbox :: proc(journal: ^Journal, session: Session_Id, after: Journal_Seq, a
 read_pending_commands :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> (records: []Record, error: Error) {
 	assert(journal.open)
 	session := session
-	return query_records(journal, PENDING_COMMANDS_QUERY, {db.Value(session[:])}, allocator)
+	return query_records(journal, PENDING_COMMANDS_QUERY, {db.Value(session[:]), i64(Record_Kind.User_Command), i64(Record_Kind.Command_Applied)}, allocator)
 }
 
 // read_latest returns the matching record with the highest seq, false when none
@@ -156,7 +170,7 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 	query := Query{}
 	query_start(&query, "SELECT " + RECORD_COLUMNS + " FROM records WHERE 1 = 1") or_return
 	query_filter(&query, &filter) or_return
-	query_order_by_seq(&query, &filter, "DESC") or_return
+	query_order_by_seq(&query, "DESC") or_return
 	query_add(&query, " LIMIT 1") or_return
 
 	rows: db.Rows
@@ -223,7 +237,7 @@ read_last_node :: proc(journal: ^Journal, session: Session_Id, kind: Node_Kind, 
 	session := session
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
-	db.query(&journal.connection, &rows, NODE_LAST_QUERY, {db.Value(session[:]), NODE_KIND_NAMES[kind]}) or_return
+	db.query(&journal.connection, &rows, NODE_LAST_QUERY, {db.Value(session[:]), i64(kind)}) or_return
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return {}, false, nil }
 	row := Row {
@@ -375,7 +389,7 @@ session_head :: proc(journal: ^Journal, session: Session_Id) -> (branch: Branch_
 	session := session
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
-	row := query_first(journal, &rows, SESSION_HEAD_QUERY, {db.Value(session[:]), db.Value(i64(INITIAL_BRANCH))}) or_return
+	row := query_first(journal, &rows, SESSION_HEAD_QUERY, {db.Value(session[:]), db.Value(i64(INITIAL_BRANCH)), i64(Record_Kind.Branch_Selected)}) or_return
 	branch = Branch_Id(row_int(&row))
 	head = Node_Id(row_int(&row))
 	if row.error != nil { return 0, 0, corrupt(journal, row.error, session, 0) }
@@ -408,7 +422,7 @@ read_artifact :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocato
 last_delivered_message :: proc(journal: ^Journal, session: Session_Id) -> (seq: Journal_Seq, error: Error) {
 	assert(journal.open)
 	session := session
-	value := query_int(journal, LAST_DELIVERED_QUERY, {db.Value(session[:])}) or_return
+	value := query_int(journal, LAST_DELIVERED_QUERY, {db.Value(session[:]), i64(Node_Kind.User)}) or_return
 	return Journal_Seq(value), nil
 }
 
@@ -418,7 +432,18 @@ usage_totals :: proc(journal: ^Journal, session: Session_Id) -> (totals: Usage_T
 	session := session
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The row is already read; only releasing the set is left.
-	row := query_first(journal, &rows, USAGE_TOTALS_QUERY, {db.Value(session[:])}) or_return
+	row := query_first(
+		journal,
+		&rows,
+		USAGE_TOTALS_QUERY,
+		{
+			db.Value(session[:]),
+			i64(Record_Kind.Response_Committed),
+			i64(Record_Kind.Response_Rejected),
+			i64(Record_Kind.Request_Interrupted),
+			i64(Record_Kind.Compaction_Completed),
+		},
+	) or_return
 	totals.requests = int(row_int(&row))
 	totals.paired_requests = int(row_int(&row))
 	totals.input = row_int(&row)
@@ -452,7 +477,7 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 	assert(journal.open)
 	query := Query{}
-	query_start(&query, SESSION_LIST_QUERY) or_return
+	query_start(&query, SESSION_LIST_QUERY, i64(Record_Kind.Session_Titled)) or_return
 	session := filter.session
 	if session != {} { query_add(&query, " AND session = ?", db.Value(session[:])) or_return }
 	parent := filter.parent
@@ -507,7 +532,7 @@ list_branches :: proc(journal: ^Journal, session: Session_Id, allocator: mem.All
 	session := session
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
-	db.query(&journal.connection, &rows, BRANCH_LIST_QUERY, {db.Value(session[:])}) or_return
+	db.query(&journal.connection, &rows, BRANCH_LIST_QUERY, {i64(Node_Kind.User), db.Value(session[:])}) or_return
 
 	list := make([dynamic]Branch_Summary, allocator) or_return
 	defer if error != nil { branch_summaries_destroy(list[:], allocator) }
@@ -609,7 +634,7 @@ SELECT node, parent FROM chain ORDER BY node ASC`
 SESSION_LIST_QUERY :: `SELECT * FROM (
 	SELECT session, created_ms, workspace, role, parent_session, parent_call,
 		COALESCE((SELECT json_extract(data, '$.title') FROM records AS titled
-			WHERE titled.session = sessions.session AND titled.kind = 'session.titled' ORDER BY titled.seq DESC LIMIT 1), '') AS title,
+			WHERE titled.session = sessions.session AND titled.kind = ? ORDER BY titled.seq DESC LIMIT 1), '') AS title,
 		COALESCE((SELECT MAX(seq) FROM records WHERE records.session = sessions.session), 0) AS last_seq,
 		COALESCE((SELECT time_ms FROM records WHERE records.session = sessions.session ORDER BY seq DESC LIMIT 1), created_ms) AS updated_ms
 	FROM sessions)
@@ -618,12 +643,12 @@ WHERE 1 = 1`
 @(private)
 BRANCH_LIST_QUERY :: `SELECT branch, base_node, seq,
 	COALESCE((SELECT MAX(node) FROM nodes WHERE nodes.session = branches.session AND nodes.branch = branches.branch), 0),
-	COALESCE((SELECT CAST(body AS TEXT) FROM nodes WHERE nodes.session = branches.session AND nodes.branch = branches.branch AND nodes.kind = 'user' ORDER BY node DESC LIMIT 1), '')
+	COALESCE((SELECT CAST(body AS TEXT) FROM nodes WHERE nodes.session = branches.session AND nodes.branch = branches.branch AND nodes.kind = ? ORDER BY node DESC LIMIT 1), '')
 FROM branches WHERE session = ? ORDER BY branch`
 
 @(private)
 SESSION_HEAD_QUERY :: `WITH active AS (SELECT COALESCE(
-	(SELECT branch FROM records WHERE session = ?1 AND kind = 'branch.selected' AND branch IS NOT NULL ORDER BY seq DESC LIMIT 1),
+	(SELECT branch FROM records WHERE session = ?1 AND kind = ?3 AND branch IS NOT NULL ORDER BY seq DESC LIMIT 1),
 	?2) AS branch)
 SELECT active.branch, COALESCE(
 	(SELECT MAX(node) FROM nodes WHERE session = ?1 AND nodes.branch = active.branch),
@@ -632,7 +657,7 @@ SELECT active.branch, COALESCE(
 FROM active`
 
 @(private)
-LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0) FROM nodes WHERE session = ? AND kind = 'user'`
+LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0) FROM nodes WHERE session = ? AND kind = ?`
 
 // The inbox of session ?1 after seq ?2. A completion is reported only for a child that
 // started in the background, and not when the call that started it ended in a failure
@@ -642,8 +667,8 @@ LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0
 PENDING_COMMANDS_QUERY ::
 	`SELECT ` +
 	RECORD_COLUMNS +
-	` FROM records AS pending WHERE pending.session = ?1 AND pending.kind = 'user.command'
-	AND NOT EXISTS (SELECT 1 FROM records AS answered WHERE answered.session = ?1 AND answered.kind = 'command.applied'
+	` FROM records AS pending WHERE pending.session = ?1 AND pending.kind = ?2
+	AND NOT EXISTS (SELECT 1 FROM records AS answered WHERE answered.session = ?1 AND answered.kind = ?3
 		AND json_extract(answered.data, '$.command') = pending.seq)
 ORDER BY seq ASC`
 
@@ -655,21 +680,21 @@ INBOX_QUERY ::
 	SELECT ` +
 	RECORD_COLUMNS +
 	` FROM records AS inbound WHERE inbound.session = ?1 AND inbound.seq > ?2
-		AND inbound.kind IN ('user.input', 'background.completed')
+		AND inbound.kind IN (?3, ?4)
 	UNION ALL
 	SELECT ` +
 	RECORD_COLUMNS +
-	` FROM records AS inbound WHERE inbound.session = ?1 AND inbound.seq > ?2 AND inbound.kind = 'subagent.completed'
-		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = 'subagent.started'
+	` FROM records AS inbound WHERE inbound.session = ?1 AND inbound.seq > ?2 AND inbound.kind = ?5
+		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = ?6
 			AND started.call IS inbound.call AND started.subagent IS inbound.subagent AND json_extract(started.data, '$.background') = 1)
-		AND NOT EXISTS (SELECT 1 FROM records AS result WHERE result.session = ?1 AND result.kind = 'tool.completed' AND result.call IS inbound.call
+		AND NOT EXISTS (SELECT 1 FROM records AS result WHERE result.session = ?1 AND result.kind = ?7 AND result.call IS inbound.call
 			AND json_extract(result.data, '$.outcome') NOT IN ('success', 'unknown'))
 	UNION ALL
 	SELECT ` +
 	RECORD_COLUMNS +
-	` FROM records AS inbound WHERE inbound.seq > ?2 AND inbound.kind = 'subagent.message'
+	` FROM records AS inbound WHERE inbound.seq > ?2 AND inbound.kind = ?8
 		AND inbound.session <> ?1 AND inbound.session = inbound.subagent
-		AND inbound.session IN (SELECT subagent FROM records WHERE session = ?1 AND kind = 'subagent.started' AND subagent IS NOT NULL)
+		AND inbound.session IN (SELECT subagent FROM records WHERE session = ?1 AND kind = ?6 AND subagent IS NOT NULL)
 ) ORDER BY seq ASC`
 
 // A count the provider did not report is JSON null, which SUM and the paired
@@ -681,7 +706,7 @@ USAGE_TOTALS_QUERY :: `WITH reported AS (SELECT
 	json_extract(data, '$.cache_read_tokens') AS cache_read,
 	json_extract(data, '$.cache_write_tokens') AS cache_write,
 	json_extract(data, '$.cost') AS cost
-	FROM records WHERE session = ? AND kind IN ('response.committed', 'response.rejected', 'request.interrupted', 'compaction.completed')),
+	FROM records WHERE session = ? AND kind IN (?, ?, ?, ?)),
 paired AS (SELECT *, (input IS NOT NULL AND cache_read IS NOT NULL) AS both FROM reported)
 SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), COALESCE(SUM(cache_read), 0), COALESCE(SUM(cache_write), 0),
@@ -720,7 +745,7 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 	node.id = Node_Id(row_int(row))
 	node.parent = Node_Id(row_int(row))
 	node.branch = Branch_Id(row_int(row))
-	node.kind = row_enum(row, NODE_KIND_NAMES)
+	node.kind = row_code(row, Node_Kind)
 	node.turn = Turn_Id(row_int(row))
 	node.covers = Node_Id(row_int(row))
 	node.seq = Journal_Seq(row_int(row))
@@ -735,7 +760,7 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 	record.time_ms = row_int(row)
 	record.mono_ns = row_int(row)
 	record.run = Run_Id(row_id(row))
-	record.kind = row_enum(row, RECORD_KIND_NAMES)
+	record.kind = row_code(row, Record_Kind)
 	record.session = Session_Id(row_id(row))
 	record.branch = Branch_Id(row_int(row))
 	record.node = Node_Id(row_int(row))
@@ -826,11 +851,11 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	if filter.call != 0 { query_add(query, " AND call = ?", i64(filter.call)) or_return }
 	if filter.subagent != {} { query_add(query, " AND subagent = ?", db.Value(filter.subagent[:])) or_return }
 	if filter.kinds != {} {
-		query_add(query, " AND +kind IN (" if len(filter.nodes) > 0 else " AND kind IN (") or_return
+		query_add(query, " AND kind IN (") or_return
 		separator := ""
 		for kind in filter.kinds {
 			query_add(query, separator) or_return
-			query_add(query, "?", RECORD_KIND_NAMES[kind]) or_return
+			query_add(query, "?", i64(kind)) or_return
 			separator = ", "
 		}
 		query_add(query, ")") or_return
@@ -846,14 +871,11 @@ query_filter :: proc(query: ^Query, filter: ^Filter) -> mem.Allocator_Error {
 	return nil
 }
 
-// query_order_by_seq orders by seq. A node filter is the most selective term, but the
-// session_seq and session_kind_seq indexes also satisfy the order, so the planner scans
-// the whole session through them. The unary plus on the ORDER BY term keeps the planner
-// from choosing a session index just because it yields seq order, which leaves
-// records_session_node and a small sort.
+// query_order_by_seq orders by seq. The node index includes seq, so a node filter
+// does not need a bias to keep the planner off the session indexes.
 @(private, require_results)
-query_order_by_seq :: proc(query: ^Query, filter: ^Filter, direction: string) -> mem.Allocator_Error {
-	query_add(query, " ORDER BY +seq " if len(filter.nodes) > 0 else " ORDER BY seq ") or_return
+query_order_by_seq :: proc(query: ^Query, direction: string) -> mem.Allocator_Error {
+	query_add(query, " ORDER BY seq ") or_return
 	return query_add(query, direction)
 }
 
@@ -972,15 +994,6 @@ row_bytes :: proc(row: ^Row) -> []u8 {
 	return copied
 }
 
-@(private)
-row_enum :: proc(row: ^Row, names: [$Enum]string) -> Enum {
-	name := row_view(row)
-	if row.error != nil { return {} }
-	value, known := enum_from_name(names, name)
-	if !known { row.error = Journal_Error.Corrupt }
-	return value
-}
-
 // row_code reads an integer code of an enum whose values are 0 through max.
 // A code outside that range is corrupt. NULL reads as 0, which is a real code.
 @(private)
@@ -1004,7 +1017,7 @@ count_assistant_nodes :: proc(journal: ^Journal, session: Session_Id, turn: Turn
 	value := query_int(
 		journal,
 		"SELECT COUNT(*) FROM nodes WHERE session = ? AND turn = ? AND kind = ?",
-		{db.Value(session[:]), db.Value(i64(turn)), NODE_KIND_NAMES[.Assistant]},
+		{db.Value(session[:]), db.Value(i64(turn)), i64(Node_Kind.Assistant)},
 	) or_return
 	return u32(value), nil
 }

@@ -61,7 +61,30 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
-	db.query(&journal.connection, &rows, RECOVERY_QUERY, {db.Value(journal.claimed[:])}) or_return
+	db.query(
+		&journal.connection,
+		&rows,
+		RECOVERY_QUERY,
+		{
+			db.Value(journal.claimed[:]),
+			i64(Record_Kind.Turn_Started),
+			i64(Record_Kind.Turn_Completed),
+			i64(Record_Kind.Request_Sent),
+			i64(Record_Kind.Response_Committed),
+			i64(Record_Kind.Response_Rejected),
+			i64(Record_Kind.Request_Interrupted),
+			i64(Record_Kind.Tool_Proposed),
+			i64(Record_Kind.Tool_Admitted),
+			i64(Record_Kind.Tool_Completed),
+			i64(Record_Kind.Lua_Started),
+			i64(Record_Kind.Task_Started),
+			i64(Record_Kind.Subagent_Started),
+			i64(Record_Kind.Lua_Completed),
+			i64(Record_Kind.Task_Completed),
+			i64(Record_Kind.Subagent_Completed),
+			i64(Record_Kind.Background_Completed),
+		},
+	) or_return
 	for {
 		values, has_row := db.rows_next(&rows) or_return
 		if !has_row { break }
@@ -167,7 +190,12 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	rows: db.Rows
 	defer _ = db.rows_close(&rows) // The walk to the end released the set; an early return carries its own error.
-	db.query(&journal.connection, &rows, UNANSWERED_CALLS_QUERY, {db.Value(journal.claimed[:])}) or_return
+	db.query(
+		&journal.connection,
+		&rows,
+		UNANSWERED_CALLS_QUERY,
+		{db.Value(journal.claimed[:]), i64(Record_Kind.Tool_Proposed), i64(Node_Kind.Assistant), i64(Node_Kind.Results)},
+	) or_return
 
 	calls := make([dynamic]Call_Id, context.temp_allocator) or_return
 	assistant: Node
@@ -207,36 +235,36 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 // finds nothing.
 @(private)
 RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, call, parent_call, subagent, data FROM (
-	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = 'turn.started'
-		AND (open.turn IS NULL OR open.turn NOT IN (SELECT turn FROM records WHERE session = ?1 AND kind = 'turn.completed' AND turn IS NOT NULL))
+	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = ?2
+		AND (open.turn IS NULL OR open.turn NOT IN (SELECT turn FROM records WHERE session = ?1 AND kind = ?3 AND turn IS NOT NULL))
 	UNION ALL
-	SELECT 1, * FROM records AS open WHERE session = ?1 AND kind = 'request.sent'
+	SELECT 1, * FROM records AS open WHERE session = ?1 AND kind = ?4
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND request = open.request AND attempt IS open.attempt
-			AND kind IN ('response.committed', 'response.rejected', 'request.interrupted'))
+			AND kind IN (?5, ?6, ?7))
 	UNION ALL
-	SELECT 2, * FROM records AS open WHERE session = ?1 AND kind = 'tool.proposed'
-		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind IN ('tool.admitted', 'tool.completed'))
+	SELECT 2, * FROM records AS open WHERE session = ?1 AND kind = ?8
+		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind IN (?9, ?10))
 	UNION ALL
-	SELECT 3, * FROM records AS open WHERE session = ?1 AND kind = 'tool.admitted'
+	SELECT 3, * FROM records AS open WHERE session = ?1 AND kind = ?9
 		AND COALESCE(json_extract(open.data, '$.background'), 0) = 0
-		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = 'tool.completed')
+		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = ?10)
 	UNION ALL
-	SELECT CASE kind WHEN 'lua.started' THEN 4 WHEN 'task.started' THEN 5
+	SELECT CASE kind WHEN ?11 THEN 4 WHEN ?12 THEN 5
 		ELSE CASE WHEN COALESCE(json_extract(open.data, '$.program'), '') = ''
 			AND NOT EXISTS (SELECT 1 FROM sessions WHERE session = open.subagent) THEN 7 ELSE 6 END END, *
-		FROM records AS open WHERE session = ?1 AND kind IN ('lua.started', 'task.started', 'subagent.started')
+		FROM records AS open WHERE session = ?1 AND kind IN (?11, ?12, ?13)
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call
-			AND kind IN ('lua.completed', 'task.completed', 'subagent.completed'))
+			AND kind IN (?14, ?15, ?16))
 	UNION ALL
-	SELECT 8, * FROM records AS open WHERE session = ?1 AND kind = 'tool.admitted'
+	SELECT 8, * FROM records AS open WHERE session = ?1 AND kind = ?9
 		AND json_extract(open.data, '$.background') = 1
-		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = 'background.completed')
+		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = ?17)
 ) ORDER BY seq`
 
 @(private)
 UNANSWERED_CALLS_QUERY :: `SELECT assistant.node, assistant.branch, assistant.turn, proposed.call
 FROM nodes AS assistant
-JOIN records AS proposed ON proposed.session = ?1 AND proposed.node = assistant.node AND proposed.kind = 'tool.proposed'
-WHERE assistant.session = ?1 AND assistant.kind = 'assistant'
-	AND assistant.node NOT IN (SELECT parent FROM nodes WHERE session = ?1 AND kind = 'results' AND parent IS NOT NULL)
+JOIN records AS proposed ON proposed.session = ?1 AND proposed.node = assistant.node AND proposed.kind = ?2
+WHERE assistant.session = ?1 AND assistant.kind = ?3
+	AND assistant.node NOT IN (SELECT parent FROM nodes WHERE session = ?1 AND kind = ?4 AND parent IS NOT NULL)
 ORDER BY assistant.node, proposed.seq`

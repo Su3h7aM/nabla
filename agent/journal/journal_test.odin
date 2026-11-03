@@ -4,6 +4,7 @@ package journal
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import "core:time"
 
@@ -354,18 +355,6 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	_expect_error(test, open_error_2, .Schema_Too_New)
 	testing.expect(test, refused_2 == nil, "a refused open returns no journal")
 
-	// Version 1 is the previous schema. This build does not read it.
-	_expect_db_ok(test, sqlite.open(&connection, {path = database_path}))
-	_expect_db_ok(test, db.exec(&connection, "PRAGMA user_version = 1"))
-	_expect_db_ok(test, db.close(&connection))
-
-	refused_old, open_error_old := open(directory, directory, _test_run_id(), .Read_Write)
-	_expect_error(test, open_error_old, .Schema_Unknown)
-	testing.expect(test, refused_old == nil, "a refused open returns no journal")
-	refused_old_reader, open_error_old_reader := open(directory, directory, _test_run_id(), .Read_Only)
-	_expect_error(test, open_error_old_reader, .Schema_Unknown)
-	testing.expect(test, refused_old_reader == nil, "a refused open returns no journal")
-
 	// A database someone else wrote holds no version this package can read.
 	foreign_directory := _temp_directory(test)
 	defer _remove_directory(foreign_directory)
@@ -392,6 +381,29 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	refused_5, open_error_5 := open(empty_directory, empty_directory, _test_run_id(), .Read_Only)
 	_expect_error(test, open_error_5, .Not_Found)
 	testing.expect(test, refused_5 == nil, "a refused open returns no journal")
+}
+
+@(test)
+test_record_names_lists_every_kind :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+
+	journal := _open_journal(test, directory)
+	defer _close_journal(test, journal)
+
+	rows: db.Rows
+	defer _expect_db_ok(test, db.rows_close(&rows))
+	_expect_db_ok(test, db.query(&journal.connection, &rows, "SELECT sql FROM sqlite_master WHERE name = 'record_names'", nil))
+	values, has_row, next_error := db.rows_next(&rows)
+	_expect_db_ok(test, next_error)
+	testing.expect(test, has_row, "record_names is created with the schema")
+	if !has_row { return }
+	definition, text_error := db.as_string(values[0])
+	_expect_db_ok(test, text_error)
+	for kind in Record_Kind {
+		piece := fmt.tprintf("(%d, '%s')", int(kind), RECORD_KIND_NAMES[kind])
+		testing.expect(test, strings.contains(definition, piece), piece)
+	}
 }
 
 @(test)
