@@ -273,16 +273,35 @@ session_client_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	return true
 }
 
-// session_client_ensure starts the session server when nothing holds the claim.
+// session_client_ensure starts the session server when nothing holds the claim. A
+// running server is kept: closing its waiter on every prompt would abandon a waiter
+// thread per line while the server still holds the claim.
 session_client_ensure :: proc(app: ^App) {
 	setup := &app.setup
-	client_server_close(&setup.server)
+	if setup.session.session == {} { return }
+	if setup.server.state != nil {
+		status, _ := client_server_status(&setup.server)
+		switch status.kind {
+		case .None, .Running:
+			return
+		case .Exited, .Signalled, .Unknown:
+		}
+		client_server_close(&setup.server)
+	}
 	server, error := client_ensure_server(setup.harness_options.nabla_executable, setup.session.session, setup.harness_options.nabla_config, os.stderr)
 	if error.kind != .None {
 		snap_append(app, .Error, "the session server could not be started")
 		return
 	}
 	setup.server = server
+	// The server's idle exit drops its lock file, which drops the follow's watch on
+	// it. Watch the new file so commits the stream directory does not name still
+	// wake the worker. Adding an already watched path returns the same watch.
+	if setup.follow_client.watch != nil {
+		if path, path_error := agent.session_lock_path(setup.lock_directory, setup.session.session, context.temp_allocator); path_error == nil {
+			_, _ = agent.session_watch_add(setup.follow_client.watch, path)
+		}
+	}
 }
 
 // app_client_service is one idle step of a client: send a cancel or a compaction the
@@ -309,6 +328,9 @@ app_client_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 // app_client_prompt appends one prompt for the followed session and shows it once the
 // commit lands. A busy database keeps the record pending for the next flush.
 app_client_prompt :: proc(app: ^App, text: string, observer: agent.Chat_Observer) {
+	// The server exits after ten minutes idle, so a prompt after that must start it
+	// again on the same session before the line is committed.
+	session_client_ensure(app)
 	_, error := client_send_input(&app.setup.follow_client, text, .Prompt)
 	app.setup.follow_input_busy = error != nil && journal.error_is_busy(error)
 	if error != nil {
@@ -488,6 +510,7 @@ app_client_steer :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 		agent.steer_taken_destroy(&app.run.steer, taken)
 		return false
 	}
+	session_client_ensure(app)
 	sent := 0
 	for line in taken {
 		_, error := client_send_input(&app.setup.follow_client, line, .Steering)
@@ -526,6 +549,14 @@ app_command_send :: proc(app: ^App, command: journal.Command) -> bool {
 	if store == nil || store.followed == {} {
 		snap_append(app, .Notice, "no session is being followed")
 		return false
+	}
+	switch _ in command {
+	case journal.Cancel_Turn, journal.Stop_Server:
+	case journal.Select_Model, journal.Set_Effort, journal.Compact:
+		// A command after the server's idle exit must start it again on the same
+		// session, or the command would sit unapplied. Cancel and stop need no
+		// server: there is nothing to cancel or stop when none runs.
+		session_client_ensure(app)
 	}
 	error := journal.append_command(store, command)
 	if error != nil && journal.error_is_busy(error) { _, error = journal.commit(store) }

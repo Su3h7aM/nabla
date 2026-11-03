@@ -252,7 +252,11 @@ app_follow_flush :: proc(app: ^App) -> bool {
 	if error != nil && !setup.follow_input_busy {
 		snap_append(app, .Error, fmt.tprintf("pending input was not sent: %s", journal.error_text(error, context.temp_allocator)))
 	}
-	return error == nil
+	if error != nil { return false }
+	// A line that stayed pending while the server exited idle still needs a server
+	// to run it once the commit lands.
+	session_client_ensure(app)
+	return true
 }
 
 // app_catalog_ref is the catalog subagents resolve models from, with the lock it is

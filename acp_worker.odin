@@ -561,11 +561,7 @@ acp_ensure_server :: proc(session: ^ACP_Session) -> (message: string, ok: bool) 
 		switch status.kind {
 		case .None, .Running:
 			return "", true
-		case .Exited:
-			// A server that exited 0 lost the claim to another server, so this
-			// connection follows that one instead of starting a second one.
-			if status.exit_code == 0 { return "", true }
-		case .Signalled, .Unknown:
+		case .Exited, .Signalled, .Unknown:
 		}
 		client_server_close(&session.server)
 	}
@@ -592,6 +588,14 @@ acp_ensure_server :: proc(session: ^ACP_Session) -> (message: string, ok: bool) 
 		return "the session server could not be started", false
 	}
 	session.server = server
+	// The server's idle exit drops its lock file, which drops the follow's watch on
+	// it. Watch the new file so commits the stream directory does not name still
+	// wake the worker. Adding an already watched path returns the same watch.
+	if session.follow.watch != nil {
+		if path, path_error := agent.session_lock_path(session.conn.app.setup.lock_directory, session.session_id, context.temp_allocator); path_error == nil {
+			_, _ = agent.session_watch_add(session.follow.watch, path)
+		}
+	}
 	return "", true
 }
 
