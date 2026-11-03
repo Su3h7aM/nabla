@@ -17,21 +17,23 @@ _Track :: struct {
 }
 
 @(private)
+// The fields the solver's passes read for every child come first, so one child's
+// hot state sits in the first cache lines of its entry. The text, column, and
+// declaration fields follow the descriptor, which only the declaration and paint read.
 _Node_Input :: struct {
-	desc:              Element_Desc,
-	table_kind:        _Table_Kind,
-	columns:           []Column_Desc,
-	track_start:       int,
-	track_count:       int,
-	track_overhead:    Scalar,
-	cell_count:        int,
-	// One more than the column index of a cell; zero for a node that is not a cell.
-	track_slot:        int,
-	loc:               runtime.Source_Code_Location,
-	private_id:        Id,
 	child_start:       int,
 	child_count:       int,
+	// Children whose in_flow is set, counted as they are declared.
+	flow_child_count:  u16,
 	last_child:        Node_Handle,
+	subtree_end:       int,
+	in_flow:           bool,
+	root:              i32,
+	child_clip:        Clip_Handle,
+	table_kind:        _Table_Kind,
+	// One more than the column index of a cell; zero for a node that is not a cell.
+	track_slot:        int,
+	cell_count:        int,
 	intrinsic_size:    Vec2,
 	minimum_size:      Vec2,
 	content_size:      Vec2,
@@ -43,14 +45,14 @@ _Node_Input :: struct {
 	axis_baseline:     [Axis]Scalar,
 	correction_used:   [Axis]bool,
 	pending_overflow:  [Axis]Scalar,
-	root:              i32,
 	child_delta:       Vec2,
-	child_clip:        Clip_Handle,
-	subtree_end:       int,
-	in_flow:           bool,
-	// Children whose in_flow is set, counted as they are declared. It sits beside the
-	// bool so the struct does not grow.
-	flow_child_count:  u16,
+	desc:              Element_Desc,
+	columns:           []Column_Desc,
+	track_start:       int,
+	track_count:       int,
+	track_overhead:    Scalar,
+	loc:               runtime.Source_Code_Location,
+	private_id:        Id,
 	text:              string,
 	text_style:        Text_Style,
 	text_paint:        Paint,
