@@ -168,7 +168,7 @@ run_prompt :: proc(executable: string, options: chat_cli_options, config: string
 	session, resolved := prompt_resolve_session(store, options)
 	if !resolved { return 1 }
 
-	server, server_error := client_ensure_server(executable, session, config)
+	server, server_error := client_ensure_server(executable, session, config, os.stderr)
 	if server_error.kind != .None {
 		switch server_error.kind {
 		case .None:

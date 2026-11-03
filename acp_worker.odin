@@ -545,7 +545,7 @@ acp_ensure_server :: proc(session: ^ACP_Session) -> (message: string, ok: bool) 
 		client_server_close(&session.server)
 	}
 	options := &session.conn.app.setup.harness_options
-	server, server_error := client_ensure_server(options.nabla_executable, session.session_id, options.nabla_config)
+	server, server_error := client_ensure_server(options.nabla_executable, session.session_id, options.nabla_config, nil)
 	if server_error.kind != .None {
 		switch server_error.kind {
 		case .None:
@@ -765,6 +765,10 @@ acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Wor
 		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, message))
 		return
 	}
+	if message, ok := acp_selection_record_default(session); !ok {
+		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, message))
+		return
+	}
 	seq, appended := acp_append_input(session, work.text, .Prompt, work.attachments)
 	if !appended {
 		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the prompt could not be recorded"))
@@ -967,6 +971,24 @@ acp_work_select_model :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, kind: A
 		return
 	}
 	acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Session_Set_Config_Option_Result{config_options = options}))
+}
+
+// acp_selection_record_default gives the server the serving identity this connection tracks
+// for a session that never recorded a selection, which is the connection's default: the
+// server runs only what the journal names.
+@(require_results)
+acp_selection_record_default :: proc(session: ^ACP_Session) -> (message: string, ok: bool) {
+	_, _, _, found, _, _, _ := session_recorded_selection(session.store, session.session_id, context.temp_allocator)
+	if found { return "", true }
+	commands := [2]journal.Command{journal.Select_Model{provider = session.provider_id, model = session.model_id}, journal.Set_Effort{level = session.effort}}
+	for command in commands[:1 if session.effort == "" else 2] {
+		seq, appended := acp_append_command(session, command)
+		if !appended { return "the default model could not be recorded", false }
+		outcome, reason, waited := acp_wait_applied(session, seq)
+		if !waited { return "the default model was not answered before the session closed", false }
+		if outcome == .Refused { return fmt.tprintf("the default model was refused: %s", reason), false }
+	}
+	return "", true
 }
 
 // acp_effort_allowed reports whether level is a thinking level the named model states.

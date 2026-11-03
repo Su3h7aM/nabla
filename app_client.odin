@@ -277,7 +277,7 @@ session_client_switch :: proc(app: ^App, start: Session_Start) -> bool {
 session_client_ensure :: proc(app: ^App) {
 	setup := &app.setup
 	client_server_close(&setup.server)
-	server, error := client_ensure_server(setup.harness_options.nabla_executable, setup.session.session, setup.harness_options.nabla_config)
+	server, error := client_ensure_server(setup.harness_options.nabla_executable, setup.session.session, setup.harness_options.nabla_config, os.stderr)
 	if error.kind != .None {
 		snap_append(app, .Error, "the session server could not be started")
 		return

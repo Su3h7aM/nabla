@@ -85,7 +85,18 @@ client_lock_path :: proc(session: journal.Session_Id) -> (path: string, error: C
 	return lock_path, {}
 }
 
-client_ensure_server :: proc(executable: string, session: journal.Session_Id, config: string) -> (server: Client_Server, error: Client_Error) {
+// client_ensure_server starts the session server when no process holds the session's claim.
+// The server inherits stderr and outlives the client, so a client whose stderr is a pipe
+// someone waits to see closed passes nil, which sends it to /dev/null.
+client_ensure_server :: proc(
+	executable: string,
+	session: journal.Session_Id,
+	config: string,
+	stderr: ^os.File,
+) -> (
+	server: Client_Server,
+	error: Client_Error,
+) {
 	lock_path, path_error := client_lock_path(session)
 	if path_error.kind != .None { return {}, path_error }
 	defer delete(lock_path)
@@ -127,7 +138,9 @@ client_ensure_server :: proc(executable: string, session: journal.Session_Id, co
 	}
 	defer _ = os.close(sink)
 
-	child, spawn, start_error := subprocess.start({argv = arguments[:count], environment = environment, stderr = os.stderr, stdout = sink, new_session = true})
+	child, spawn, start_error := subprocess.start(
+		{argv = arguments[:count], environment = environment, stderr = stderr if stderr != nil else sink, stdout = sink, new_session = true},
+	)
 	if spawn != .Started {
 		return {}, Client_Error{kind = .Start, system = start_error}
 	}
