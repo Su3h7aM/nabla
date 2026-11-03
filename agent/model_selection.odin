@@ -228,6 +228,25 @@ model_selection_clone_identity :: proc(selection: ^Model_Selection, provider_id,
 	return nil
 }
 
+// catalog_model_effort_levels returns a copy of the effort levels the model states, lowest
+// first, owned by allocator; the result is nil when the model states none. It fails only when
+// the copy cannot be made. The caller holds the lock that guards catalog.
+@(require_results)
+catalog_model_effort_levels :: proc(
+	catalog: ^Catalog,
+	provider_id, model_id: string,
+	allocator: mem.Allocator,
+) -> (
+	levels: []string,
+	error: mem.Allocator_Error,
+) {
+	model_index, found := catalog_find_model(catalog, provider_id, model_id)
+	if !found { return nil, nil }
+	stated, has_levels := catalog.models[model_index].thinking.levels.?
+	if !has_levels { return nil, nil }
+	return model_selection_clone_levels(stated, allocator)
+}
+
 @(private, require_results)
 model_selection_clone_levels :: proc(levels: []string, allocator: mem.Allocator) -> (result_value: []string, error: mem.Allocator_Error) {
 	owned := make([]string, len(levels), allocator) or_return

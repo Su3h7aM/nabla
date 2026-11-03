@@ -357,6 +357,7 @@ client_selection_adopt :: proc(app: ^App) -> bool {
 		model    = record.model,
 		effort   = stored.effort,
 	}
+	client_selection_levels_publish(app, applied.provider, applied.model)
 	chat := &app.setup.session
 	if app.setup.provider_id == applied.provider &&
 	   app.setup.model_id == applied.model &&
@@ -389,6 +390,35 @@ client_selection_adopt :: proc(app: ^App) -> bool {
 	delete(chat.effort, chat.allocator)
 	chat.effort = effort
 	return true
+}
+
+// client_selection_levels_publish replaces the effort levels the /effort menu reads with the
+// levels the followed model states in the catalog this process loaded. Only the session owner
+// installs a selection and so holds its levels, so a follower takes them from the catalog. On a
+// failed copy the menu keeps the levels it had and the drop is reported.
+client_selection_levels_publish :: proc(app: ^App, provider, model: string) {
+	levels: []string
+	levels_error: mem.Allocator_Error
+	if sync.mutex_guard(&app.catalog_mu) {
+		levels, levels_error = agent.catalog_model_effort_levels(&app.setup.catalog, provider, model, app.run.alloc)
+	}
+	if levels_error != nil {
+		if sync.mutex_guard(&app.run.mu) { snap_report_dropped_locked(app) }
+		return
+	}
+	if sync.mutex_guard(&app.run.mu) {
+		status := &app.run.snap.status
+		for level in status.effort_levels { delete(level, app.run.alloc) }
+		clear(&status.effort_levels)
+		for level, index in levels {
+			if _, append_error := append(&status.effort_levels, level); append_error != nil {
+				for dropped in levels[index:] { delete(dropped, app.run.alloc) }
+				snap_report_dropped_locked(app)
+				break
+			}
+		}
+	}
+	delete(levels, app.run.alloc)
 }
 
 // app_client_refusals shows a command the server refused. The reason is the notice.
