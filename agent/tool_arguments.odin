@@ -670,24 +670,6 @@ tool_field_optional_bool :: proc(object: json.Object, name: string, path := "", 
 // The integer readers take the object's own slot, because a repaired value is written back
 // into the document so the recorded arguments say what ran. The repair is added to repairs.
 @(require_results)
-tool_field_int :: proc(
-	object: json.Object,
-	name: string,
-	minimum, maximum: int,
-	repairs: ^Tool_Repairs,
-	path := "",
-	allocator := context.allocator,
-) -> (
-	int,
-	Tool_Argument_Error,
-) {
-	object := object
-	slot, present := &object[name]
-	if !present { return 0, tool_argument_error(.Missing_Field, tool_field_path(path, name), allocator = allocator) }
-	return tool_field_int_value(slot, tool_field_path(path, name), minimum, maximum, repairs, allocator)
-}
-
-@(require_results)
 tool_field_optional_int :: proc(
 	object: json.Object,
 	name: string,

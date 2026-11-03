@@ -831,7 +831,6 @@ chat_session_recover_pending :: proc(chat: ^Chat_Session) -> bool {
 }
 
 chat_session_state :: proc(chat: ^Chat_Session) -> Chat_State { return chat.state }
-chat_session_turn_id :: proc(chat: ^Chat_Session) -> u64 { return chat.active_turn_id }
 chat_session_last_error :: proc(chat: ^Chat_Session) -> string { return chat.last_error }
 
 // chat_session_storage_failed reports whether a durable write failed and latched
