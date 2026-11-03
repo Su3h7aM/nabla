@@ -42,18 +42,18 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 		layout = {sizing = desc.sizing},
 		user = desc.user,
 	}
-	style_diagnostics := 0
-	style_values := [3]Scalar{desc.style.size, desc.style.line_height, desc.style.letter_spacing}
-	for value in style_values {
-		if !_scalar_is_finite(value) || value < 0 {
-			style_diagnostics += 1
-		}
-	}
+	// Style and runs are checked here, before the declaration, so their diagnostics share
+	// the element's batch and the pool is checked once.
+	diagnostics: _Declaration_Diagnostics
+	text_style := desc.style
+	_normalize_nonnegative(&diagnostics, &text_style.size, .Y)
+	_normalize_nonnegative(&diagnostics, &text_style.line_height, .Y)
+	_normalize_nonnegative(&diagnostics, &text_style.letter_spacing, .X)
 	runs_valid := _text_runs_valid(desc.text, desc.runs)
 	if !runs_valid {
-		style_diagnostics += 1
+		_batch_add(&diagnostics, .Invalid_Text_Runs, .X, 0)
 	}
-	node, declared := _declare_node(ctx, element_desc, false, loc, style_diagnostics)
+	node, declared := _declare_node(ctx, element_desc, false, loc, &diagnostics)
 	if !declared {
 		return
 	}
@@ -61,16 +61,11 @@ text :: proc(ctx: ^Context, #by_ptr desc: Text_Desc, loc := #caller_location) {
 	input := &state._node_inputs[node]
 	input.is_text = true
 	input.text = desc.text
-	input.text_style = desc.style
+	input.text_style = text_style
 	input.text_paint = desc.paint
 	if runs_valid {
 		input.text_runs = desc.runs
-	} else {
-		_append_diagnostic(state, .Invalid_Text_Runs, node, loc = loc)
 	}
-	_normalize_nonnegative(state, &input.text_style.size, node, .Y, loc)
-	_normalize_nonnegative(state, &input.text_style.line_height, node, .Y, loc)
-	_normalize_nonnegative(state, &input.text_style.letter_spacing, node, .X, loc)
 	// Folded here, after normalization, so every run measured from this node
 	// reuses one hash of the string instead of rehashing a substring per lookup.
 	input.text_key = _text_identity_key(state, input^)

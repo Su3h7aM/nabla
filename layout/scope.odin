@@ -75,9 +75,12 @@ frame :: proc(ctx: ^Context, viewport: Vec2, loc := #caller_location) -> bool {
 	}
 
 	_reset_frame_state(state)
+	diagnostics: _Declaration_Diagnostics
 	normalized_viewport := viewport
-	_normalize_nonnegative(state, &normalized_viewport.x, 0, .X, loc)
-	_normalize_nonnegative(state, &normalized_viewport.y, 0, .Y, loc)
+	_normalize_nonnegative(&diagnostics, &normalized_viewport.x, .X)
+	_normalize_nonnegative(&diagnostics, &normalized_viewport.y, .Y)
+	flushed := _batch_flush(state, &diagnostics, 0, loc)
+	assert(flushed, "layout: the frame's pool has no room for the viewport diagnostics")
 	state._viewport = normalized_viewport
 
 	assert(cap(state._node_inputs) >= 1)
@@ -177,7 +180,7 @@ _declare_node :: proc(
 	#by_ptr desc: Element_Desc,
 	scoped: bool,
 	loc: runtime.Source_Code_Location,
-	extra_diagnostics := 0,
+	diagnostics: ^_Declaration_Diagnostics,
 ) -> (
 	Node_Handle,
 	bool,
@@ -240,7 +243,8 @@ _declare_node :: proc(
 		}
 	}
 
-	required_diagnostics := _element_diagnostic_count(desc) + extra_diagnostics
+	normalized_desc := _normalize_element_desc(diagnostics, desc)
+	required_diagnostics := diagnostics.count
 	if duplicate_identifier {
 		required_diagnostics += 1
 	}
@@ -251,10 +255,8 @@ _declare_node :: proc(
 	}
 
 	node := Node_Handle(len(state._node_inputs))
-	normalized_desc := _normalize_element_desc(state, desc, node, loc)
-	if state._frame_error != .None {
-		return 0, false
-	}
+	flushed := _batch_flush(state, diagnostics, node, loc)
+	assert(flushed, "layout: the pool was checked for this declaration")
 	sibling_ordinal := u64(parent_input.child_count)
 	private_identifier := _auto_id(parent_input.private_id, sibling_ordinal)
 	previous_sibling := parent_input.last_child
@@ -356,7 +358,8 @@ element :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_locati
 // `element` unless a wrapper must keep the scope open across its own return.
 @(require_results)
 element_begin :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_location) -> bool {
-	_, entered := _declare_node(ctx, desc, true, loc)
+	diagnostics: _Declaration_Diagnostics
+	_, entered := _declare_node(ctx, desc, true, loc, &diagnostics)
 	return entered
 }
 
@@ -364,7 +367,8 @@ element_begin :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_
 // scope, so it is valid anywhere a node may be declared, including as a
 // one-line body.
 content :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_location) {
-	_, _ = _declare_node(ctx, desc, false, loc)
+	diagnostics: _Declaration_Diagnostics
+	_, _ = _declare_node(ctx, desc, false, loc, &diagnostics)
 }
 
 @(private)

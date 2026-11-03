@@ -63,102 +63,91 @@ _append_diagnostic :: proc(
 	pool: Pool_Id = .None,
 	loc: runtime.Source_Code_Location = {},
 ) {
-	diagnostic_amount := amount
-	if math.is_nan(diagnostic_amount) {
-		diagnostic_amount = 0
-	} else if math.is_inf(diagnostic_amount) {
-		diagnostic_amount = Scalar(math.F32_MAX)
-		if amount < 0 {
-			diagnostic_amount = -diagnostic_amount
-		}
-	}
-	diagnostic_amount = _canonical_zero(diagnostic_amount)
 	// Diagnostics are advisory, not structural: a frame that produces more of
 	// them than the pool holds still publishes, and the pool's high-water mark
 	// records that some were dropped. Only running out of a structural pool
 	// fails the frame.
-	_ = _try_append_diagnostic(state, Diagnostic{kind = kind, node = node, id = identifier, axis = axis, amount = diagnostic_amount, pool = pool, loc = loc})
+	_ = _try_append_diagnostic(
+		state,
+		Diagnostic{kind = kind, node = node, id = identifier, axis = axis, amount = _diagnostic_amount(amount), pool = pool, loc = loc},
+	)
+}
+
+// DECLARATION_DIAGNOSTIC_LIMIT bounds the diagnostics one declaration can produce: 12 from
+// its two sizes, 6 from padding, gap, and aspect, 2 from an image's intrinsic size, and 4
+// from text style and runs.
+DECLARATION_DIAGNOSTIC_LIMIT :: 20
+
+// _Declaration_Diagnostics holds a declaration's diagnostics until the pool has room for
+// them. Normalization fills it without touching frame state, so a declaration the pool
+// refuses leaves nothing behind.
+@(private)
+_Declaration_Diagnostics :: struct {
+	items: [DECLARATION_DIAGNOSTIC_LIMIT]_Pending_Diagnostic,
+	count: int,
 }
 
 @(private)
-_normalize_nonnegative :: proc(state: ^_Context_State, value: ^Scalar, node: Node_Handle, axis: Axis, loc: runtime.Source_Code_Location) {
+_Pending_Diagnostic :: struct {
+	kind:   Diagnostic_Kind,
+	axis:   Axis,
+	amount: Scalar,
+}
+
+@(private)
+_diagnostic_amount :: proc "contextless" (amount: Scalar) -> Scalar {
+	if math.is_nan(amount) {
+		return 0
+	}
+	if math.is_inf(amount) {
+		return -Scalar(math.F32_MAX) if amount < 0 else Scalar(math.F32_MAX)
+	}
+	return _canonical_zero(amount)
+}
+
+@(private)
+_batch_add :: proc(batch: ^_Declaration_Diagnostics, kind: Diagnostic_Kind, axis: Axis, amount: Scalar) {
+	assert(batch.count < len(batch.items), "layout: a declaration produced more diagnostics than its bound")
+	batch.items[batch.count] = _Pending_Diagnostic {
+		kind   = kind,
+		axis   = axis,
+		amount = _diagnostic_amount(amount),
+	}
+	batch.count += 1
+}
+
+// _batch_flush moves the batch into the pool as diagnostics of node. The caller checks
+// that the pool has room first; false means it did not.
+@(private, require_results)
+_batch_flush :: proc(state: ^_Context_State, batch: ^_Declaration_Diagnostics, node: Node_Handle, loc: runtime.Source_Code_Location) -> bool {
+	for item in batch.items[:batch.count] {
+		if !_try_append_diagnostic(state, Diagnostic{kind = item.kind, node = node, axis = item.axis, amount = item.amount, loc = loc}) {
+			return false
+		}
+	}
+	return true
+}
+
+@(private)
+_normalize_nonnegative :: proc(batch: ^_Declaration_Diagnostics, value: ^Scalar, axis: Axis) {
 	if !_scalar_is_finite(value^) || value^ < 0 {
-		_append_diagnostic(state, .Invalid_Sizing, node, axis = axis, amount = value^, loc = loc)
+		_batch_add(batch, .Invalid_Sizing, axis, value^)
 		value^ = 0
 	}
 	value^ = _canonical_zero(value^)
 }
 
 @(private)
-_axis_size_diagnostic_count :: proc "contextless" (size: Axis_Size) -> int {
-	normalized := size
-	count := 0
-	original_value := normalized.value
-	percent_out_of_range := normalized.mode == .Percent && _scalar_is_finite(original_value) && (original_value < 0 || original_value > 1)
-	values := [4]^Scalar{&normalized.value, &normalized.min, &normalized.max, &normalized.weight}
-	for value in values {
-		if !_scalar_is_finite(value^) || value^ < 0 {
-			count += 1
-			value^ = 0
-		}
-	}
-	if percent_out_of_range {
-		count += 1
-		normalized.value = math.clamp(normalized.value, 0, 1)
-	}
-	if normalized.mode == .Grow && normalized.weight == 0 {
-		normalized.weight = 1
-	}
-	if normalized.max == 0 {
-		normalized.max = math.inf_f32(1)
-	}
-	if normalized.min > normalized.max {
-		count += 1
-	}
-	return count
-}
-
-@(private)
-_element_diagnostic_count :: proc "contextless" (#by_ptr desc: Element_Desc) -> int {
-	count := _axis_size_diagnostic_count(desc.layout.sizing.width) + _axis_size_diagnostic_count(desc.layout.sizing.height)
-	values := [6]Scalar {
-		desc.layout.padding.left,
-		desc.layout.padding.right,
-		desc.layout.padding.top,
-		desc.layout.padding.bottom,
-		desc.layout.gap,
-		desc.layout.aspect,
-	}
-	for value in values {
-		if !_scalar_is_finite(value) || value < 0 {
-			count += 1
-		}
-	}
-	switch content in desc.content {
-	case Image_Content:
-		if !_scalar_is_finite(content.intrinsic_size.x) || content.intrinsic_size.x < 0 {
-			count += 1
-		}
-		if !_scalar_is_finite(content.intrinsic_size.y) || content.intrinsic_size.y < 0 {
-			count += 1
-		}
-	case Custom_Content:
-	case:
-	}
-	return count
-}
-
-@(private)
-_normalize_axis_size :: proc(state: ^_Context_State, size: ^Axis_Size, node: Node_Handle, axis: Axis, loc: runtime.Source_Code_Location) {
+_normalize_axis_size :: proc(batch: ^_Declaration_Diagnostics, size: ^Axis_Size, axis: Axis) {
 	original_value := size.value
 	percent_out_of_range := size.mode == .Percent && _scalar_is_finite(original_value) && (original_value < 0 || original_value > 1)
-	_normalize_nonnegative(state, &size.value, node, axis, loc)
-	_normalize_nonnegative(state, &size.min, node, axis, loc)
-	_normalize_nonnegative(state, &size.max, node, axis, loc)
-	_normalize_nonnegative(state, &size.weight, node, axis, loc)
+	_normalize_nonnegative(batch, &size.value, axis)
+	_normalize_nonnegative(batch, &size.min, axis)
+	_normalize_nonnegative(batch, &size.max, axis)
+	_normalize_nonnegative(batch, &size.weight, axis)
 
 	if percent_out_of_range {
-		_append_diagnostic(state, .Percent_Out_Of_Range, node, axis = axis, amount = original_value, loc = loc)
+		_batch_add(batch, .Percent_Out_Of_Range, axis, original_value)
 		size.value = math.clamp(size.value, 0, 1)
 	}
 	if size.mode == .Grow && size.weight == 0 {
@@ -168,29 +157,29 @@ _normalize_axis_size :: proc(state: ^_Context_State, size: ^Axis_Size, node: Nod
 		size.max = math.inf_f32(1)
 	}
 	if size.min > size.max {
-		_append_diagnostic(state, .Min_Exceeds_Max, node, axis = axis, amount = size.min - size.max, loc = loc)
+		_batch_add(batch, .Min_Exceeds_Max, axis, size.min - size.max)
 		size.max = size.min
 	}
 }
 
 @(private)
-_normalize_element_desc :: proc(state: ^_Context_State, #by_ptr desc: Element_Desc, node: Node_Handle, loc: runtime.Source_Code_Location) -> Element_Desc {
+_normalize_element_desc :: proc(batch: ^_Declaration_Diagnostics, #by_ptr desc: Element_Desc) -> Element_Desc {
 	result := desc
-	_normalize_axis_size(state, _axis_size(&result.layout.sizing, .X), node, .X, loc)
-	_normalize_axis_size(state, _axis_size(&result.layout.sizing, .Y), node, .Y, loc)
+	_normalize_axis_size(batch, _axis_size(&result.layout.sizing, .X), .X)
+	_normalize_axis_size(batch, _axis_size(&result.layout.sizing, .Y), .Y)
 
-	_normalize_nonnegative(state, &result.layout.padding.left, node, .X, loc)
-	_normalize_nonnegative(state, &result.layout.padding.right, node, .X, loc)
-	_normalize_nonnegative(state, &result.layout.padding.top, node, .Y, loc)
-	_normalize_nonnegative(state, &result.layout.padding.bottom, node, .Y, loc)
-	_normalize_nonnegative(state, &result.layout.gap, node, _flow_main_axis(result.layout.flow), loc)
-	_normalize_nonnegative(state, &result.layout.aspect, node, .X, loc)
+	_normalize_nonnegative(batch, &result.layout.padding.left, .X)
+	_normalize_nonnegative(batch, &result.layout.padding.right, .X)
+	_normalize_nonnegative(batch, &result.layout.padding.top, .Y)
+	_normalize_nonnegative(batch, &result.layout.padding.bottom, .Y)
+	_normalize_nonnegative(batch, &result.layout.gap, _flow_main_axis(result.layout.flow))
+	_normalize_nonnegative(batch, &result.layout.aspect, .X)
 
 	switch content in result.content {
 	case Image_Content:
 		image := content
-		_normalize_nonnegative(state, &image.intrinsic_size.x, node, .X, loc)
-		_normalize_nonnegative(state, &image.intrinsic_size.y, node, .Y, loc)
+		_normalize_nonnegative(batch, &image.intrinsic_size.x, .X)
+		_normalize_nonnegative(batch, &image.intrinsic_size.y, .Y)
 		result.content = image
 	case Custom_Content:
 	case:

@@ -15,7 +15,8 @@ table :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, columns: []Column_Desc,
 	styled := desc
 	styled.layout.flow = .Column
 	styled.layout.align = .Stretch
-	_, entered := _declare_node(ctx, styled, true, loc)
+	diagnostics: _Declaration_Diagnostics
+	_, entered := _declare_node(ctx, styled, true, loc, &diagnostics)
 	if !entered {
 		return false
 	}
@@ -55,7 +56,8 @@ _table_leave :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, columns: []Colum
 table_row :: proc(ctx: ^Context, #by_ptr desc: Element_Desc, loc := #caller_location) -> bool {
 	styled := desc
 	styled.layout.flow = .Row
-	_, entered := _declare_node(ctx, styled, true, loc)
+	diagnostics: _Declaration_Diagnostics
+	_, entered := _declare_node(ctx, styled, true, loc, &diagnostics)
 	if !entered {
 		return false
 	}
