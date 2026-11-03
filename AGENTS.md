@@ -78,7 +78,7 @@ When Nabla needs something Odin does not provide, such as a system call, a const
 
 Before committing a code change, run `mise run fmt`, `mise run check`, and the tests covering what you touched. `mise run test` is the full gate. Documentation-only changes need no run.
 
-Run tests only through `mise run test [package] [--debug-only | --release-only] [--sanitize <kind>] [--test <names>] [--log-state]`, never through `odin test` directly. The task runs each suite in its own PID namespace, so every process a test starts ends with the suite, whether it passed, failed, or timed out. After a timeout, rerun with `--log-state` to log each test state change and `--test <name,...>` to run only the named tests.
+Run tests only through `mise run test [package] [--release] [--sanitize <kind>] [--test <names>] [--log-state]`, never through `odin test` directly. Tests run in the debug configuration; `--release` runs the release configuration instead. The task runs each suite in its own PID namespace, so every process a test starts ends with the suite, whether it passed, failed, or timed out. After a timeout, rerun with `--log-state` to log each test state change and `--test <name,...>` to run only the named tests.
 
 Read, search, and edit through the dedicated tools; use the shell for builds, tests, version control, and pipelines.
 

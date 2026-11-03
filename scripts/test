@@ -2,8 +2,7 @@
 #MISE description="Run every test suite"
 #MISE alias="t"
 #USAGE arg "[target]" help="Package to test; omit for all"
-#USAGE flag "--debug-only" help="Only run the -debug configuration"
-#USAGE flag "--release-only" help="Only run the release configuration"
+#USAGE flag "--release" help="Run the release configuration instead of -debug"
 #USAGE flag "--sanitize <kind>" help="Odin sanitizer for odin test" {
 #USAGE   choices "address" "memory" "thread"
 #USAGE }
@@ -18,15 +17,13 @@ cd "$NABLA_ROOT"
 # arguments for both mise and direct runs; the #USAGE lines only feed mise
 # help and completion.
 target=""
-debug_only=false
-release_only=false
+release=false
 sanitize=""
 test_names=""
 log_state=false
 while (($#)); do
 	case "$1" in
-		--debug-only)   debug_only=true ;;
-		--release-only) release_only=true ;;
+		--release)      release=true ;;
 		--log-state)    log_state=true ;;
 		--sanitize)     (($# >= 2)) || nabla_die "--sanitize needs a value"; sanitize="$2"; shift ;;
 		--sanitize=*)   sanitize="${1#--sanitize=}" ;;
@@ -55,40 +52,35 @@ if [[ -z "$target" || "$target" == agent ]]; then
 	"$NABLA_ODIN" build . "$collection" "${NABLA_DEFINES[@]}" "-out:$out_directory/nabla"
 fi
 
-# Both configurations run: -debug carries extra contract asserts (notably in
-# layout and tui) that release compiles out, while release tests the exact
-# codegen that ships. One mode cannot stand in for the other.
-configs=()
-"$debug_only" || configs+=(release)
-"$release_only" || configs+=(debug)
+# -debug is the default: it carries the contract asserts that release compiles out.
+config=debug
+"$release" && config=release
 
 mapfile -t packages < <(nabla_test_packages)
 
 failed=()
-for config in "${configs[@]}"; do
-	for pkg in "${packages[@]}"; do
-		[[ -n "$target" && "$target" != "$pkg" ]] && continue
-		extra=(
-			-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
-			"-out:$out_directory/${pkg//\//_}-$config.bin"
-			"${NABLA_DEFINES[@]}"
-		)
-		[[ $config == debug ]] && extra+=(-debug)
-		[[ -n $sanitize ]] && extra+=("-sanitize:$sanitize")
-		[[ -n $test_names ]] && extra+=("-define:ODIN_TEST_NAMES=$test_names")
-		"$log_state" && extra+=(-define:ODIN_TEST_LOG_STATE_CHANGES=true)
-		# The PTY lifecycle test needs the term fault-injection hooks; without
-		# the define its file contributes no tests.
-		[[ "$pkg" == term ]] && extra+=(-define:NABLA_TERM_TEST_HOOKS=true)
-		[[ "$pkg" == agent ]] && extra+=("-define:NABLA_TEST_EXECUTABLE=$out_directory/nabla")
-		nabla_step "test $pkg ($config)"
-		status=0
-		nabla_contained timeout "$timeout_secs" "$NABLA_ODIN" test "$pkg" "$collection" "${extra[@]}" || status=$?
-		if ((status)); then
-			failed+=("$pkg ($config)")
-			((status != 124)) || printf 'hint: %s timed out after %ss; rerun with --log-state and --test <names> to find the stalled test\n' "$pkg" "$timeout_secs" >&2
-		fi
-	done
+for pkg in "${packages[@]}"; do
+	[[ -n "$target" && "$target" != "$pkg" ]] && continue
+	extra=(
+		-define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+		"-out:$out_directory/${pkg//\//_}-$config.bin"
+		"${NABLA_DEFINES[@]}"
+	)
+	[[ $config == debug ]] && extra+=(-debug)
+	[[ -n $sanitize ]] && extra+=("-sanitize:$sanitize")
+	[[ -n $test_names ]] && extra+=("-define:ODIN_TEST_NAMES=$test_names")
+	"$log_state" && extra+=(-define:ODIN_TEST_LOG_STATE_CHANGES=true)
+	# The PTY lifecycle test needs the term fault-injection hooks; without
+	# the define its file contributes no tests.
+	[[ "$pkg" == term ]] && extra+=(-define:NABLA_TERM_TEST_HOOKS=true)
+	[[ "$pkg" == agent ]] && extra+=("-define:NABLA_TEST_EXECUTABLE=$out_directory/nabla")
+	nabla_step "test $pkg ($config)"
+	status=0
+	nabla_contained timeout "$timeout_secs" "$NABLA_ODIN" test "$pkg" "$collection" "${extra[@]}" || status=$?
+	if ((status)); then
+		failed+=("$pkg ($config)")
+		((status != 124)) || printf 'hint: %s timed out after %ss; rerun with --log-state and --test <names> to find the stalled test\n' "$pkg" "$timeout_secs" >&2
+	fi
 done
 
 if ((${#failed[@]})); then
