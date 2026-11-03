@@ -412,8 +412,9 @@ chat_interrupted_without_answer :: proc(chat: ^Chat_Session, recovered: journal.
 	if assistant_error != nil { return false }
 	defer if assistant_found { journal.node_destroy(&assistant, context.temp_allocator) }
 	if !assistant_found || assistant.turn != completed.turn { return assistant.turn < completed.turn }
-	answer: journal.Assistant
-	if journal.payload_decode(assistant.data, &answer, context.temp_allocator) != nil { return false }
+	payload, has_payload := assistant.payload.?
+	answer, is_assistant := payload.(journal.Assistant)
+	if !has_payload || !is_assistant { return false }
 	if answer.partial { return true }
 	ids := [1]journal.Node_Id{assistant.id}
 	proposed, _, proposed_error := journal.read_records(

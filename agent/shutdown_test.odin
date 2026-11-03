@@ -87,8 +87,9 @@ test_cancel_racing_successful_completion_yields_one_status :: proc(test: ^testin
 	if !testing.expect_value(test, ancestry_error, nil) { return }
 	if !testing.expect_value(test, len(ancestry), 2) { return }
 	if !testing.expect_value(test, ancestry[1].kind, journal.Node_Kind.Assistant) { return }
-	assistant: journal.Assistant
-	if !testing.expect_value(test, journal.payload_decode(ancestry[1].data, &assistant, context.temp_allocator), nil) { return }
+	payload, has_payload := ancestry[1].payload.?
+	assistant, is_assistant := payload.(journal.Assistant)
+	if !testing.expect(test, has_payload && is_assistant, "the assistant node has a typed payload") { return }
 	testing.expect_value(test, string(ancestry[1].body), "half")
 	testing.expect(test, assistant.partial, "text from a cancelled turn is partial")
 }

@@ -125,7 +125,7 @@ test_a_follower_shows_streamed_assistant_text_once :: proc(test: ^testing.T) {
 	_ = journal.append_node(
 		store,
 		{session = session, branch = journal.INITIAL_BRANCH, kind = .Assistant, turn = 1},
-		journal.Assistant{},
+		journal.Assistant{request = 1},
 		transmute([]u8)string("World"),
 	)
 	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(test, "the assistant record did not commit") }
@@ -138,7 +138,7 @@ test_a_follower_shows_streamed_assistant_text_once :: proc(test: ^testing.T) {
 	_ = journal.append_node(
 		store,
 		{session = session, branch = journal.INITIAL_BRANCH, kind = .Assistant, turn = 1},
-		journal.Assistant{},
+		journal.Assistant{request = 1},
 		transmute([]u8)string("done"),
 	)
 	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(test, "the second assistant record did not commit") }

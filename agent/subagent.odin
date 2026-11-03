@@ -1079,8 +1079,9 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 	answer, has_answer, answer_error := journal.read_last_node(store, child_session, .Assistant, context.temp_allocator)
 	if answer_error != nil { return "", "the child's last Assistant text could not be read" }
 	if has_answer {
-		assistant: journal.Assistant
-		if journal.payload_decode(answer.data, &assistant, context.temp_allocator) != nil { return "", "the child's last Assistant text could not be decoded" }
+		payload, has_payload := answer.payload.?
+		assistant, is_assistant := payload.(journal.Assistant)
+		if !has_payload || !is_assistant { return "", "the child's last Assistant text could not be decoded" }
 		fmt.sbprintf(&block, "Assistant%s:\n%s\n", " (partial)" if assistant.partial else "", string(answer.body))
 	}
 	recipient := Subagent {

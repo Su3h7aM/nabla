@@ -101,7 +101,7 @@ test_a_partial_answer_is_never_sent :: proc(test: ^testing.T) {
 
 	_test_user(test, chat, "question", .Prompt)
 	partial := "half an ans"
-	chat_node(chat, .Assistant, journal.Assistant{partial = true}, transmute([]u8)partial)
+	chat_node(chat, .Assistant, journal.Assistant{request = 1, partial = true}, transmute([]u8)partial)
 	_test_commit(test, chat)
 	projection := _test_projection(test, chat, &arena)
 	prep: Chat_Request_Prep

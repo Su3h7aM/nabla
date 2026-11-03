@@ -69,16 +69,20 @@ Insert :: enum {
 	Session,
 	Session_Titled,
 	Artifact,
+	Node_Assistant,
+	Node_Checkpoint,
 }
 
 @(private)
 INSERT_SQL := [Insert]string {
-	.Record         = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
-	.Node           = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	.Branch         = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
-	.Session        = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
-	.Session_Titled = `INSERT INTO record_session_titled (seq, title) VALUES (?, ?)`,
-	.Artifact       = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
+	.Record          = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+	.Node            = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	.Branch          = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
+	.Session         = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
+	.Session_Titled  = `INSERT INTO record_session_titled (seq, title) VALUES (?, ?)`,
+	.Artifact        = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
+	.Node_Assistant  = `INSERT INTO node_assistant (session, node, request, partial) VALUES (?, ?, ?, ?)`,
+	.Node_Checkpoint = `INSERT INTO node_checkpoint (session, node, request) VALUES (?, ?, ?)`,
 }
 
 // append_record buffers one fact for the next commit. The header's strings and
@@ -209,6 +213,11 @@ append_node :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = 
 	row.seq = 0
 	row.data = batch_json(journal, data)
 	row.body = batch_bytes(journal, body)
+	when Payload == Assistant {
+		row.payload = data
+	} else when Payload == Checkpoint {
+		row.payload = data
+	}
 	append_record(
 		journal,
 		Record{kind = .Node_Committed, session = row.session, branch = row.branch, node = row.id, turn = row.turn},
@@ -339,6 +348,7 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 				bytes_or_null(row.body),
 			}
 			db.statement_exec(&journal.inserts[.Node], arguments[:]) or_return
+			insert_node_payload(journal, &row) or_return
 		case Branch_Row:
 			arguments := [4]db.Value{id_or_null(&row.session), db.Value(i64(row.branch)), db.Value(i64(row.base_node)), db.Value(i64(last))}
 			db.statement_exec(&journal.inserts[.Branch], arguments[:]) or_return
@@ -394,6 +404,23 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 	values, has_row := db.rows_next(&rows) or_return
 	if !has_row { return 0, Journal_Error.Corrupt }
 	return Journal_Seq(db.as_i64(values[0]) or_return), nil
+}
+
+// insert_node_payload writes the typed row of a node that has one. A kind that
+// is still JSON only has no payload, and this writes nothing for it.
+@(private, require_results)
+insert_node_payload :: proc(journal: ^Journal, row: ^Node) -> (error: Error) {
+	payload, has_payload := row.payload.?
+	if !has_payload { return nil }
+	switch value in payload {
+	case Assistant:
+		arguments := [4]db.Value{id_or_null(&row.session), db.Value(i64(row.id)), db.Value(i64(value.request)), db.Value(i64(1 if value.partial else 0))}
+		db.statement_exec(&journal.inserts[.Node_Assistant], arguments[:]) or_return
+	case Checkpoint:
+		arguments := [3]db.Value{id_or_null(&row.session), db.Value(i64(row.id)), db.Value(i64(value.request))}
+		db.statement_exec(&journal.inserts[.Node_Checkpoint], arguments[:]) or_return
+	}
+	return nil
 }
 
 // writable reports whether an append may be buffered. Writing through a

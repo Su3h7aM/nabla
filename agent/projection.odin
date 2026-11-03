@@ -341,8 +341,9 @@ projection_add_assistant :: proc(
 	admitted: map[journal.Call_Id]string,
 	arena: mem.Allocator,
 ) -> journal.Error {
-	assistant: journal.Assistant
-	journal.payload_decode(node.data, &assistant, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
+	payload, has_payload := node.payload.?
+	assistant, is_assistant := payload.(journal.Assistant)
+	if !has_payload || !is_assistant { return journal.Journal_Error.Corrupt }
 	item := Projection_Item {
 		node    = node.id,
 		turn    = node.turn,

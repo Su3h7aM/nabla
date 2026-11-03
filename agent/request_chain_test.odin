@@ -71,10 +71,11 @@ request_chain_assert :: proc(test: ^testing.T, chat: ^Chat_Session, expected_att
 		for node in ancestry {
 			if node.kind == .Assistant && string(node.body) == expected_answer {
 				answers += 1
-				payload: journal.Assistant
-				if testing.expect_value(test, journal.payload_decode(node.data, &payload, context.temp_allocator), nil) {
-					testing.expect_value(test, payload.request, request)
-					testing.expect(test, !payload.partial)
+				stored, has_payload := node.payload.?
+				assistant, is_assistant := stored.(journal.Assistant)
+				if testing.expect(test, has_payload && is_assistant, "the assistant node has a typed payload") {
+					testing.expect_value(test, assistant.request, request)
+					testing.expect(test, !assistant.partial)
 				}
 			}
 		}

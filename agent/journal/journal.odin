@@ -80,8 +80,10 @@ Record_Payload :: union {
 }
 
 // Node is one committed step of the session tree. The journal fills id, seq,
-// and data. parent is the previous node on the branch, or the fork point for a
-// branch's first node; covers is set on a Checkpoint only.
+// data, and payload. parent is the previous node on the branch, or the fork point
+// for a branch's first node; covers is set on a Checkpoint only. payload is the
+// typed row of a kind that has its own table; a kind still stored only as JSON
+// leaves it nil.
 Node :: struct {
 	session: Session_Id,
 	id:      Node_Id,
@@ -92,7 +94,15 @@ Node :: struct {
 	covers:  Node_Id,
 	seq:     Journal_Seq,
 	data:    string,
+	payload: Maybe(Node_Payload),
 	body:    []u8,
+}
+
+// Node_Payload is the typed body of a node kind that has its own table. A kind
+// that is still stored only as JSON has no variant, and its payload is nil.
+Node_Payload :: union {
+	Assistant,
+	Checkpoint,
 }
 
 // Corruption names the row a read found damaged.

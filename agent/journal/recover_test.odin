@@ -24,7 +24,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
 	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Request_Sent}, _Test_Payload{detail = "sent"})
-	assistant := append_node(writer, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant, turn = 1}, _Test_Payload{detail = "answer"})
+	assistant := append_node(writer, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant, turn = 1}, Assistant{request = 1})
 	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 1, kind = .Tool_Proposed}, _Test_Payload{detail = "first call"})
 	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Proposed}, _Test_Payload{detail = "second call"})
 	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Admitted}, _Test_Payload{detail = "admitted"})

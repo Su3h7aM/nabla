@@ -619,7 +619,11 @@ branch_summaries_destroy :: proc(summaries: []Branch_Summary, allocator := conte
 RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body, COALESCE((SELECT title FROM record_session_titled WHERE record_session_titled.seq = seq), '')"
 
 @(private)
-NODE_COLUMNS :: "session, node, parent, branch, kind, turn, covers, seq, data, body"
+NODE_COLUMNS ::
+	"session, node, parent, branch, kind, turn, covers, seq, data, body, " +
+	"(SELECT request FROM node_assistant WHERE node_assistant.session = nodes.session AND node_assistant.node = nodes.node), " +
+	"(SELECT partial FROM node_assistant WHERE node_assistant.session = nodes.session AND node_assistant.node = nodes.node), " +
+	"(SELECT request FROM node_checkpoint WHERE node_checkpoint.session = nodes.session AND node_checkpoint.node = nodes.node)"
 
 @(private)
 NODE_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND node = ?"
@@ -758,6 +762,33 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 	node.seq = Journal_Seq(row_int(row))
 	node.data = row_text(row)
 	node.body = row_bytes(row)
+	assistant_request, assistant_request_present := row_maybe_int(row)
+	assistant_partial, assistant_partial_present := row_maybe_int(row)
+	checkpoint_request, checkpoint_request_present := row_maybe_int(row)
+	if row.error != nil { return }
+	switch node.kind {
+	case .Assistant:
+		// A missing family row reads as NULL. request is never 0, so that NULL is not a stored value.
+		if !assistant_request_present || !assistant_partial_present || assistant_request <= 0 || (assistant_partial != 0 && assistant_partial != 1) {
+			row.error = Journal_Error.Corrupt
+			return
+		}
+		node.payload = Assistant {
+			version = PAYLOAD_VERSION,
+			request = Request_Id(assistant_request),
+			partial = assistant_partial == 1,
+		}
+	case .Checkpoint:
+		if !checkpoint_request_present || checkpoint_request <= 0 {
+			row.error = Journal_Error.Corrupt
+			return
+		}
+		node.payload = Checkpoint {
+			version = PAYLOAD_VERSION,
+			request = Request_Id(checkpoint_request),
+		}
+	case .User, .Results, .Context, .Notice:
+	}
 	return
 }
 
@@ -949,6 +980,21 @@ row_int :: proc(row: ^Row) -> i64 {
 	number, error := db.as_i64(value)
 	if error != nil { row.error = Journal_Error.Corrupt }
 	return number
+}
+
+// row_maybe_int reads an integer and reports whether the column was NULL.
+// NULL is absence, not zero: a stored zero stays present.
+@(private)
+row_maybe_int :: proc(row: ^Row) -> (value: i64, present: bool) {
+	raw, ok := row_next(row)
+	if !ok { return 0, false }
+	if raw == nil { return 0, false }
+	number, error := db.as_i64(raw)
+	if error != nil {
+		row.error = Journal_Error.Corrupt
+		return 0, false
+	}
+	return number, true
 }
 
 // row_f64 reads a real number; NULL is 0, the absent price.

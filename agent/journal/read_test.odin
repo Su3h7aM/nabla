@@ -197,7 +197,7 @@ test_read_ancestry_follows_a_fork_and_a_checkpoint :: proc(test: ^testing.T) {
 	checkpoint := append_node(
 		journal,
 		Node{session = session, parent = head, branch = branch, kind = .Checkpoint, turn = 1, covers = 2},
-		_Test_Payload{detail = "summary"},
+		Checkpoint{request = 1},
 		_body("summary"),
 	)
 	testing.expect_value(test, checkpoint, Node_Id(6))
@@ -219,6 +219,11 @@ test_read_ancestry_follows_a_fork_and_a_checkpoint :: proc(test: ^testing.T) {
 	testing.expect_value(test, checkpointed[0].id, checkpoint)
 	testing.expect_value(test, checkpointed[0].kind, Node_Kind.Checkpoint)
 	testing.expect_value(test, checkpointed[0].covers, Node_Id(2))
+	checkpoint_payload, has_checkpoint := checkpointed[0].payload.?
+	testing.expect(test, has_checkpoint, "a checkpoint node reads its typed row")
+	if stored, is_checkpoint := checkpoint_payload.(Checkpoint); is_checkpoint {
+		testing.expect_value(test, stored.request, Request_Id(1))
+	}
 	expected := [?]Node_Id{6, 3, 4, 5}
 	for node, index in checkpointed { testing.expect_value(test, node.id, expected[index]) }
 
@@ -545,6 +550,13 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	for node, index in ancestry {
 		testing.expect_value(test, node.kind, expected_kinds[index])
 		testing.expect_value(test, string(node.body), expected_bodies[index])
+		if node.kind != .Assistant { continue }
+		payload, has_payload := node.payload.?
+		testing.expect(test, has_payload, "an assistant node reads its typed row")
+		if assistant, is_assistant := payload.(Assistant); is_assistant {
+			testing.expect_value(test, assistant.request, Request_Id(1) if index == 1 else Request_Id(2))
+			testing.expect(test, !assistant.partial, "a finished assistant node is not partial")
+		}
 	}
 
 	// A projection over the Assistant nodes reads their facts back in order.
@@ -874,7 +886,7 @@ test_read_path_crosses_checkpoints_and_forks_and_read_nodes_keeps_order :: proc(
 	checkpoint := append_node(
 		journal,
 		Node{session = session, parent = head, branch = branch, kind = .Checkpoint, turn = 1, covers = 2},
-		_Test_Payload{detail = "summary"},
+		Checkpoint{request = 1},
 		_body("summary"),
 	)
 	// The fork's base is node 3, so its path crosses into the first branch.
