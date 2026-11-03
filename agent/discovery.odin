@@ -22,42 +22,6 @@ PROVIDER_MODELS_TIMEOUT :: 10 * time.Second
 PROVIDER_MODELS_FRESH :: 5 * time.Minute
 PROVIDER_MODELS_CACHE_PREFIX :: "provider-models"
 
-// discover_provider_models turns each configured provider's listing into one more
-// catalog source. fetch delivers one provider's listing body, owned by the caller;
-// production passes provider_models_fetch and a test supplies its own. Providers are
-// listed independently, so one that cannot be reached does not hold up the others. The
-// result is owned by the caller and released with catalog_sources_destroy, exactly like
-// the result of the other two stages. ok is false when a source record could not be
-// allocated.
-@(require_results)
-discover_provider_models :: proc(
-	providers: []Catalog_Provider_Source,
-	user_data: $T,
-	fetch: proc(user_data: T, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
-	allocator := context.allocator,
-) -> (
-	[dynamic]Catalog_Provider_Source,
-	bool,
-) {
-	result: [dynamic]Catalog_Provider_Source
-	result.allocator = allocator
-	for provider in providers {
-		// A provider with no endpoint or no credential is not asked: the request
-		// could only fail, and the other stages still describe it.
-		if (provider.base_url.? or_else "") == "" || (provider.api_key.? or_else "") == "" { continue }
-		credential, credential_ok := config_resolve_credential(provider.api_key.?, allocator)
-		if !credential_ok { continue }
-		body, fetched := fetch(user_data, provider.base_url.?, credential, allocator)
-		delete(credential, allocator)
-		if !fetched { continue }
-		if provider_models_add_body(&result, provider.id, body, allocator) == .Failed {
-			catalog_sources_destroy(&result, allocator)
-			return {}, false
-		}
-	}
-	return result, true
-}
-
 // provider_models_cached reads every usable cache entry without performing I/O
 // beyond the local filesystem. Stale entries remain valid inputs while a later
 // refresh is in flight. ok is false when a source record could not be allocated.
