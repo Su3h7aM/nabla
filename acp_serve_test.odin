@@ -1240,7 +1240,7 @@ test_acp_follower_translates_committed_records :: proc(t: ^testing.T) {
 
 	// Every committed record arrives as the session/update notification that carries
 	// it: the echoed line, the answer, the announced call and its result, and usage.
-	if !acp_test_buffer_wait(t, &iface.buffer, `"sessionUpdate":"tool_call_update"`, "the tool result") { return }
+	if !acp_test_buffer_wait(t, &iface.buffer, `"sessionUpdate":"usage_update"`, "the usage report") { return }
 	frames := acp_test_buffer_text(&iface.buffer)
 	if !testing.expect(t, strings.contains(frames, `"sessionUpdate":"user_message"`), "the line was not echoed") { return }
 	testing.expect(t, strings.contains(frames, "read the note"), "the echo lost the line")
