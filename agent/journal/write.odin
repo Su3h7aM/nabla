@@ -71,6 +71,8 @@ Insert :: enum {
 	Artifact,
 	Node_Assistant,
 	Node_Checkpoint,
+	Node_User,
+	Node_Attachment,
 }
 
 @(private)
@@ -83,6 +85,8 @@ INSERT_SQL := [Insert]string {
 	.Artifact        = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
 	.Node_Assistant  = `INSERT INTO node_assistant (session, node, request, partial) VALUES (?, ?, ?, ?)`,
 	.Node_Checkpoint = `INSERT INTO node_checkpoint (session, node, request) VALUES (?, ?, ?)`,
+	.Node_User       = `INSERT INTO node_user (session, node, origin, message) VALUES (?, ?, ?, ?)`,
+	.Node_Attachment = `INSERT INTO node_attachment (session, node, ordinal, media_type, name, digest) VALUES (?, ?, ?, ?, ?, ?)`,
 }
 
 // append_record buffers one fact for the next commit. The header's strings and
@@ -217,6 +221,8 @@ append_node :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = 
 		row.payload = data
 	} else when Payload == Checkpoint {
 		row.payload = data
+	} else when Payload == User {
+		row.payload = batch_user(journal, data)
 	}
 	append_record(
 		journal,
@@ -419,8 +425,53 @@ insert_node_payload :: proc(journal: ^Journal, row: ^Node) -> (error: Error) {
 	case Checkpoint:
 		arguments := [3]db.Value{id_or_null(&row.session), db.Value(i64(row.id)), db.Value(i64(value.request))}
 		db.statement_exec(&journal.inserts[.Node_Checkpoint], arguments[:]) or_return
+	case User:
+		origin, known := enum_from_name(USER_ORIGIN_NAMES, value.origin)
+		if !known { return Journal_Error.Corrupt }
+		arguments := [4]db.Value{id_or_null(&row.session), db.Value(i64(row.id)), db.Value(i64(origin)), int_or_null(value.message)}
+		db.statement_exec(&journal.inserts[.Node_User], arguments[:]) or_return
+		for attachment, ordinal in value.attachments {
+			digest, valid := digest_from_hex(attachment.digest)
+			if !valid { return Journal_Error.Corrupt }
+			file := [6]db.Value {
+				id_or_null(&row.session),
+				db.Value(i64(row.id)),
+				db.Value(i64(ordinal)),
+				db.Value(attachment.media_type),
+				db.Value(attachment.name),
+				db.Value(digest[:]),
+			}
+			db.statement_exec(&journal.inserts[.Node_Attachment], file[:]) or_return
+		}
 	}
 	return nil
+}
+
+// batch_user copies a user node's strings into the batch arena. The caller may
+// free its own copies after append_node returns.
+@(private)
+batch_user :: proc(journal: ^Journal, user: User) -> (stored: User) {
+	if journal.failure != nil { return }
+	stored = user
+	stored.origin = batch_text(journal, user.origin)
+	if len(user.attachments) == 0 {
+		stored.attachments = nil
+		return
+	}
+	copied, error := make([]Attachment, len(user.attachments), virtual.arena_allocator(&journal.batch))
+	if error != nil {
+		if journal.failure == nil { latch(journal, error) }
+		return
+	}
+	for attachment, index in user.attachments {
+		copied[index] = {
+			media_type = batch_text(journal, attachment.media_type),
+			name       = batch_text(journal, attachment.name),
+			digest     = batch_text(journal, attachment.digest),
+		}
+	}
+	stored.attachments = copied
+	return
 }
 
 // writable reports whether an append may be buffered. Writing through a

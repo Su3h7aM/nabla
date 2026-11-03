@@ -156,8 +156,9 @@ follow_node :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.Re
 	body := string(node.body)
 	#partial switch node.kind {
 	case .User:
-		user: journal.User
-		if journal.payload_decode(node.data, &user, context.temp_allocator) != nil { return nil }
+		payload, has_payload := node.payload.?
+		user, is_user := payload.(journal.User)
+		if !has_payload || !is_user { return nil }
 		if follow.input != 0 && user.message == follow.input { follow.turn = node.turn }
 		// A node delivering a user.input line repeats a line already shown;
 		// any other delivery is that report's first display.

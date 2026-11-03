@@ -96,7 +96,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	node_id := append_node(
 		writer,
 		Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1},
-		_Test_Payload{detail = "prompt"},
+		User{origin = USER_ORIGIN_NAMES[.Prompt]},
 		_body("hello there"),
 	)
 	testing.expect_value(test, node_id, Node_Id(1))
@@ -151,10 +151,13 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	testing.expect_value(test, string(node.body), "hello there")
 	testing.expect_value(test, node.seq, committed)
 
-	payload: _Test_Payload
-	_decode_payload(test, node.data, &payload)
-	testing.expect_value(test, payload.detail, "prompt")
-	testing.expect_value(test, payload.version, PAYLOAD_VERSION)
+	stored, has_payload := node.payload.?
+	testing.expect(test, has_payload, "a user node reads its typed row")
+	if user, is_user := stored.(User); is_user {
+		testing.expect_value(test, user.origin, USER_ORIGIN_NAMES[.Prompt])
+		testing.expect_value(test, user.message, Journal_Seq(0))
+	}
+	testing.expect(test, len(node.data) > 0, "the JSON payload is still stored")
 }
 
 @(test)

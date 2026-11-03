@@ -278,10 +278,9 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	agent_message := ""
 	for node in nodes {
 		if node.kind != .User { continue }
-		user: journal.User
-		if decode_error := journal.payload_decode(node.data, &user, context.temp_allocator); decode_error != nil {
-			testing.fail_now(test, "a user node could not be read")
-		}
+		payload, has_payload := node.payload.?
+		user, is_user := payload.(journal.User)
+		if !has_payload || !is_user { testing.fail_now(test, "a user node could not be read") }
 		if user.origin == journal.USER_ORIGIN_NAMES[.Agent] { agent_message = string(node.body) }
 	}
 	testing.expect(test, strings.contains(agent_message, "The parser has a race.") && strings.contains(agent_message, "agent-1"), agent_message)

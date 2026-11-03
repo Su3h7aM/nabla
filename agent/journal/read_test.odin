@@ -186,7 +186,7 @@ test_read_ancestry_follows_a_fork_and_a_checkpoint :: proc(test: ^testing.T) {
 		head = append_node(
 			journal,
 			Node{session = session, parent = head, branch = branch, kind = .User, turn = 1},
-			_Test_Payload{detail = "line"},
+			User{origin = USER_ORIGIN_NAMES[.Prompt]},
 			_body("line"),
 		)
 	}
@@ -206,7 +206,12 @@ test_read_ancestry_follows_a_fork_and_a_checkpoint :: proc(test: ^testing.T) {
 	// first branch.
 	fork := append_branch(journal, 3)
 	testing.expect_value(test, fork, Branch_Id(2))
-	forked := append_node(journal, Node{session = session, parent = 3, branch = fork, kind = .User, turn = 2}, _Test_Payload{detail = "fork"}, _body("fork"))
+	forked := append_node(
+		journal,
+		Node{session = session, parent = 3, branch = fork, kind = .User, turn = 2},
+		User{origin = USER_ORIGIN_NAMES[.Prompt]},
+		_body("fork"),
+	)
 	testing.expect_value(test, forked, Node_Id(7))
 	_commit_ok(test, journal)
 
@@ -265,7 +270,7 @@ test_read_ancestry_refuses_a_parent_that_is_not_there :: proc(test: ^testing.T) 
 	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
 	// A node whose parent was never committed: the tree claims a node that is
 	// not in it.
-	orphan := append_node(journal, Node{session = session, parent = 42, branch = INITIAL_BRANCH, kind = .User}, _Test_Payload{detail = "orphan"})
+	orphan := append_node(journal, Node{session = session, parent = 42, branch = INITIAL_BRANCH, kind = .User}, User{origin = USER_ORIGIN_NAMES[.Prompt]})
 	orphan_seq := _commit_ok(test, journal)
 
 	_, error := read_ancestry(journal, session, orphan, context.allocator)
@@ -879,7 +884,7 @@ test_read_path_crosses_checkpoints_and_forks_and_read_nodes_keeps_order :: proc(
 		head = append_node(
 			journal,
 			Node{session = session, parent = head, branch = branch, kind = .User, turn = 1},
-			_Test_Payload{detail = "line"},
+			User{origin = USER_ORIGIN_NAMES[.Prompt]},
 			_body("line"),
 		)
 	}
@@ -891,7 +896,12 @@ test_read_path_crosses_checkpoints_and_forks_and_read_nodes_keeps_order :: proc(
 	)
 	// The fork's base is node 3, so its path crosses into the first branch.
 	fork := append_branch(journal, 3)
-	forked := append_node(journal, Node{session = session, parent = 3, branch = fork, kind = .User, turn = 2}, _Test_Payload{detail = "fork"}, _body("fork"))
+	forked := append_node(
+		journal,
+		Node{session = session, parent = 3, branch = fork, kind = .User, turn = 2},
+		User{origin = USER_ORIGIN_NAMES[.Prompt]},
+		_body("fork"),
+	)
 	_commit_ok(test, journal)
 
 	path, path_error := read_path(journal, session, checkpoint, context.allocator)

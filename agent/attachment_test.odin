@@ -96,10 +96,9 @@ test_user_input_attachment_reaches_the_user_node_and_the_request :: proc(test: ^
 	testing.expect_value(test, node_error, nil)
 	if !testing.expect(test, found, "the input was delivered as a user node") { return }
 	testing.expect_value(test, string(node.body), "")
-	stored_user: journal.User
-	if decode_error := journal.payload_decode(node.data, &stored_user, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the user node could not be read")
-	}
+	payload, has_payload := node.payload.?
+	stored_user, is_user := payload.(journal.User)
+	if !testing.expect(test, has_payload && is_user, "the user node has a typed payload") { return }
 	testing.expect_value(test, stored_user.origin, journal.USER_ORIGIN_NAMES[.Prompt])
 	if !testing.expect_value(test, len(stored_user.attachments), 1) { return }
 	testing.expect_value(test, stored_user.attachments[0].name, "shot.png")

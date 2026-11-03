@@ -1416,8 +1416,9 @@ test_acp_prompt_records_an_image_block_as_an_attachment :: proc(t: ^testing.T) {
 	node, found, read_error := journal.read_last_node(reader, session, .User, context.temp_allocator)
 	if !testing.expect_value(t, read_error, nil) { return }
 	if !testing.expect(t, found, "the turn left no user node") { return }
-	user: journal.User
-	if !testing.expect_value(t, journal.payload_decode(node.data, &user, context.temp_allocator), nil) { return }
+	payload, has_payload := node.payload.?
+	user, is_user := payload.(journal.User)
+	if !testing.expect(t, has_payload && is_user, "the user node has a typed payload") { return }
 	if !testing.expect_value(t, len(user.attachments), 1) { return }
 	testing.expect_value(t, user.attachments[0].media_type, "image/png")
 	testing.expect_value(t, string(node.body), "what is this")

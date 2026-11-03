@@ -272,8 +272,9 @@ tool_loop_background_shell :: proc(test: ^testing.T, cancel: bool, recovery := f
 	reports := 0
 	for node in ancestry {
 		if node.kind != .User { continue }
-		user: journal.User
-		if !testing.expect_value(test, journal.payload_decode(node.data, &user, context.temp_allocator), nil) { return }
+		payload, has_payload := node.payload.?
+		user, is_user := payload.(journal.User)
+		if !testing.expect(test, has_payload && is_user, "the user node has a typed payload") { return }
 		if user.origin != journal.USER_ORIGIN_NAMES[.Job] { continue }
 		reports += 1
 		testing.expect(test, strings.contains(string(node.body), name) && strings.contains(string(node.body), "background-ok"))
@@ -343,8 +344,9 @@ test_jobs_tool_lists_and_stops_a_background_shell :: proc(test: ^testing.T) {
 	reports := 0
 	for node in ancestry {
 		if node.kind != .User { continue }
-		user: journal.User
-		if !testing.expect_value(test, journal.payload_decode(node.data, &user, context.temp_allocator), nil) { return }
+		payload, has_payload := node.payload.?
+		user, is_user := payload.(journal.User)
+		if !testing.expect(test, has_payload && is_user, "the user node has a typed payload") { return }
 		if user.origin == journal.USER_ORIGIN_NAMES[.Job] && strings.contains(string(node.body), name) { reports += 1 }
 	}
 	testing.expect_value(test, reports, 1)

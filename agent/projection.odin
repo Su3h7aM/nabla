@@ -207,8 +207,9 @@ projection_build :: proc(
 			projection.checkpoint = node.id
 			projection.covers = node.covers
 		case .User:
-			user: journal.User
-			journal.payload_decode(node.data, &user, arena, corruption_journal = store, session = node.session, seq = node.seq) or_return
+			payload, has_payload := node.payload.?
+			user, is_user := payload.(journal.User)
+			if !has_payload || !is_user { return {}, journal.Journal_Error.Corrupt }
 			origin, known := journal.enum_from_name(journal.USER_ORIGIN_NAMES, user.origin)
 			if !known { return {}, journal.Journal_Error.Corrupt }
 			attachments := projection_attachments(store, user.attachments, arena) or_return

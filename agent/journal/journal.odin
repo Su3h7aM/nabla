@@ -101,6 +101,7 @@ Node :: struct {
 // Node_Payload is the typed body of a node kind that has its own table. A kind
 // that is still stored only as JSON has no variant, and its payload is nil.
 Node_Payload :: union {
+	User,
 	Assistant,
 	Checkpoint,
 }

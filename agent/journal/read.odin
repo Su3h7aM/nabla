@@ -249,6 +249,7 @@ read_last_node :: proc(journal: ^Journal, session: Session_Id, kind: Node_Kind, 
 		return {}, false, corrupt(journal, row.error, failed_session, failed_seq)
 	}
 	node = scanned
+	release_rows_and_load_attachments(journal, &rows, &node, allocator) or_return
 	return node, true, nil
 }
 
@@ -378,6 +379,12 @@ read_nodes :: proc(journal: ^Journal, session: Session_Id, ids: []Node_Id, alloc
 	for node in list {
 		if node.id == 0 { return nil, corrupt(journal, Journal_Error.Corrupt, session, 0) }
 	}
+	if close_error := db.rows_close(&rows); close_error != nil { return nil, close_error }
+	for &node in list {
+		if attach_error := load_user_attachments(journal, &node, allocator); attach_error != nil {
+			return nil, corrupt(journal, attach_error, node.session, node.seq)
+		}
+	}
 	return list, nil
 }
 
@@ -422,7 +429,7 @@ read_artifact :: proc(journal: ^Journal, digest: Digest, allocator: mem.Allocato
 last_delivered_message :: proc(journal: ^Journal, session: Session_Id) -> (seq: Journal_Seq, error: Error) {
 	assert(journal.open)
 	session := session
-	value := query_int(journal, LAST_DELIVERED_QUERY, {db.Value(session[:]), i64(Node_Kind.User)}) or_return
+	value := query_int(journal, LAST_DELIVERED_QUERY, {db.Value(session[:])}) or_return
 	return Journal_Seq(value), nil
 }
 
@@ -584,6 +591,18 @@ records_destroy :: proc(records: []Record, allocator := context.allocator) {
 }
 
 node_destroy :: proc(node: ^Node, allocator := context.allocator) {
+	if payload, has_payload := node.payload.?; has_payload {
+		switch value in payload {
+		case Assistant, Checkpoint:
+		case User:
+			for attachment in value.attachments {
+				delete(attachment.media_type, allocator)
+				delete(attachment.name, allocator)
+				delete(attachment.digest, allocator)
+			}
+			delete(value.attachments, allocator)
+		}
+	}
 	delete(node.data, allocator)
 	delete(node.body, allocator)
 	node^ = {}
@@ -623,7 +642,9 @@ NODE_COLUMNS ::
 	"session, node, parent, branch, kind, turn, covers, seq, data, body, " +
 	"(SELECT request FROM node_assistant WHERE node_assistant.session = nodes.session AND node_assistant.node = nodes.node), " +
 	"(SELECT partial FROM node_assistant WHERE node_assistant.session = nodes.session AND node_assistant.node = nodes.node), " +
-	"(SELECT request FROM node_checkpoint WHERE node_checkpoint.session = nodes.session AND node_checkpoint.node = nodes.node)"
+	"(SELECT request FROM node_checkpoint WHERE node_checkpoint.session = nodes.session AND node_checkpoint.node = nodes.node), " +
+	"(SELECT origin FROM node_user WHERE node_user.session = nodes.session AND node_user.node = nodes.node), " +
+	"(SELECT message FROM node_user WHERE node_user.session = nodes.session AND node_user.node = nodes.node)"
 
 @(private)
 NODE_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND node = ?"
@@ -668,7 +689,7 @@ SELECT active.branch, COALESCE(
 FROM active`
 
 @(private)
-LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(json_extract(data, '$.message')), 0) FROM nodes WHERE session = ? AND kind = ?`
+LAST_DELIVERED_QUERY :: `SELECT COALESCE(MAX(message), 0) FROM node_user WHERE session = ?`
 
 // The inbox of session ?1 after seq ?2. A completion is reported only for a child that
 // started in the background, and not when the call that started it ended in a failure
@@ -746,6 +767,7 @@ read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator
 		return {}, corrupt(journal, row.error, failed_session, failed_seq)
 	}
 	node = scanned
+	release_rows_and_load_attachments(journal, &rows, &node, allocator) or_return
 	return node, nil
 }
 
@@ -765,6 +787,8 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 	assistant_request, assistant_request_present := row_maybe_int(row)
 	assistant_partial, assistant_partial_present := row_maybe_int(row)
 	checkpoint_request, checkpoint_request_present := row_maybe_int(row)
+	user_origin, user_origin_present := row_maybe_int(row)
+	user_message, user_message_present := row_maybe_int(row)
 	if row.error != nil { return }
 	switch node.kind {
 	case .Assistant:
@@ -787,9 +811,122 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 			version = PAYLOAD_VERSION,
 			request = Request_Id(checkpoint_request),
 		}
-	case .User, .Results, .Context, .Notice:
+	case .User:
+		// origin is never NULL on a stored row, so a NULL column is a missing row. message NULL is message 0.
+		if !user_origin_present || user_origin < 0 || user_origin > i64(max(User_Origin)) {
+			row.error = Journal_Error.Corrupt
+			return
+		}
+		message := Journal_Seq(0)
+		if user_message_present {
+			if user_message <= 0 {
+				row.error = Journal_Error.Corrupt
+				return
+			}
+			message = Journal_Seq(user_message)
+		}
+		node.payload = User {
+			version = PAYLOAD_VERSION,
+			origin  = USER_ORIGIN_NAMES[User_Origin(user_origin)],
+			message = message,
+		}
+	case .Results, .Context, .Notice:
 	}
 	return
+}
+
+// release_rows_and_load_attachments closes the header result set, then reads a
+// user node's files. The connection runs one result set at a time, so the header
+// query has to be finished before the attachment query starts.
+@(private, require_results)
+release_rows_and_load_attachments :: proc(journal: ^Journal, rows: ^db.Rows, node: ^Node, allocator: mem.Allocator) -> Error {
+	if close_error := db.rows_close(rows); close_error != nil {
+		node_destroy(node, allocator)
+		return close_error
+	}
+	if attach_error := load_user_attachments(journal, node, allocator); attach_error != nil {
+		session := node.session
+		seq := node.seq
+		node_destroy(node, allocator)
+		return corrupt(journal, attach_error, session, seq)
+	}
+	return nil
+}
+
+// load_user_attachments fills node.payload's files from node_attachment, in ordinal
+// order. A node of another kind is left alone. The strings are owned by allocator.
+@(private, require_results)
+load_user_attachments :: proc(journal: ^Journal, node: ^Node, allocator: mem.Allocator) -> (error: Error) {
+	if node.kind != .User { return nil }
+	payload, has_payload := node.payload.?
+	user, is_user := payload.(User)
+	if !has_payload || !is_user { return Journal_Error.Corrupt }
+	session := node.session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(
+		&journal.connection,
+		&rows,
+		"SELECT media_type, name, digest FROM node_attachment WHERE session = ? AND node = ? ORDER BY ordinal",
+		{db.Value(session[:]), db.Value(i64(node.id))},
+	) or_return
+	list := make([dynamic]Attachment, allocator) or_return
+	defer if error != nil {
+		for &attachment in list { attachment_destroy(&attachment, allocator) }
+		delete(list)
+	}
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		attachment := Attachment {
+			media_type = row_text(&row),
+			name       = row_text(&row),
+		}
+		digest_bytes := row_bytes(&row)
+		if row.error != nil {
+			attachment_destroy(&attachment, allocator)
+			delete(digest_bytes, allocator)
+			return row.error
+		}
+		if len(digest_bytes) != size_of(Digest) || attachment.media_type == "" {
+			attachment_destroy(&attachment, allocator)
+			delete(digest_bytes, allocator)
+			return Journal_Error.Corrupt
+		}
+		digest: Digest
+		copy(digest[:], digest_bytes)
+		delete(digest_bytes, allocator)
+		hex: [DIGEST_HEX_LENGTH]u8
+		cloned, clone_error := strings.clone(digest_to_hex(digest, hex[:]), allocator)
+		if clone_error != nil {
+			attachment_destroy(&attachment, allocator)
+			return clone_error
+		}
+		attachment.digest = cloned
+		if _, append_error := append(&list, attachment); append_error != nil {
+			attachment_destroy(&attachment, allocator)
+			return append_error
+		}
+	}
+	// A dynamic array's backing is sized to its capacity, so the owned slice is an exact copy.
+	exact, clone_error := slice.clone(list[:], allocator)
+	if clone_error != nil { return clone_error }
+	delete(list)
+	user.attachments = exact
+	node.payload = user
+	return nil
+}
+
+@(private)
+attachment_destroy :: proc(attachment: ^Attachment, allocator: mem.Allocator) {
+	delete(attachment.media_type, allocator)
+	delete(attachment.name, allocator)
+	delete(attachment.digest, allocator)
+	attachment^ = {}
 }
 
 @(private)

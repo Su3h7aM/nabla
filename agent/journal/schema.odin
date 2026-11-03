@@ -16,7 +16,8 @@ SCHEMA_VERSION :: 1
 // seq. `records.kind` and `nodes.kind` are the integer codes of Record_Kind and
 // Node_Kind. `data` holds the JSON payload. `session.titled` also writes
 // `record_session_titled`. Assistant and Checkpoint nodes also write
-// `node_assistant` and `node_checkpoint`. The other families still have only the JSON.
+// `node_assistant` and `node_checkpoint`. User nodes also write `node_user`
+// and `node_attachment`. The other families still have only the JSON.
 // An absent id is NULL.
 // Each element is one statement, as the backend requires. Foreign keys are
 // declared and not enforced until the connection turns them on.
