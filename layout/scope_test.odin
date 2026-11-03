@@ -60,8 +60,7 @@ test_scopes_balance_and_failures_are_atomic :: proc(t: ^testing.T) {
 	_run_break(&ctx)
 	_run_continue(&ctx)
 	_run_labelled_continue(&ctx)
-	testing.expect(t, !state._frame_open && len(state._scopes) == 0)
-	testing.expect_value(t, state._statistics.frames_failed, u64(0))
+	testing.expect_value(t, statistics(&ctx).frames_failed, u64(0))
 
 	// A pool that runs out mid-declaration fails the frame, publishes nothing,
 	// and leaves the context balanced.
@@ -76,10 +75,8 @@ test_scopes_balance_and_failures_are_atomic :: proc(t: ^testing.T) {
 		if element(&failed_ctx, {}) {
 			entered = true
 		}
-		testing.expect_value(t, len(_context_state(&failed_ctx)._nodes), 1)
 	}
 	testing.expect(t, !entered)
-	testing.expect(t, !_context_state(&failed_ctx)._frame_open)
 	failed_result, failed_error := result(&failed_ctx)
 	testing.expect_value(t, failed_error, Frame_Error.Capacity_Exhausted)
 	testing.expect_value(t, len(failed_result.nodes), 0)

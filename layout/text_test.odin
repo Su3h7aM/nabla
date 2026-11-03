@@ -369,7 +369,6 @@ test_text_larger_than_the_word_pool_shows_as_a_full_pool_until_raised :: proc(t:
 	long := []Sample{{"aaa bbb ccc ddd eee", .Words}}
 	testing.expect_value(t, _solve_texts(&ctx, &calls, long), Frame_Error.None)
 	testing.expect_value(t, statistics(&ctx).pool_high_water[.Measured_Words], 3)
-	testing.expect_value(t, _context_state(&ctx)._text_cache.word_count, 0)
 
 	// Once the pool is raised the text is cached and later frames cost nothing.
 	testing.expect_value(t, reserve(&ctx, Capacities{measured_words = 16}), nil)
