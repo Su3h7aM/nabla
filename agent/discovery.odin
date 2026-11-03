@@ -7,6 +7,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:path/filepath"
 import "core:strings"
+import "core:thread"
 import "core:time"
 
 import "nabla:http/client"
@@ -81,15 +82,21 @@ provider_models_add_body :: proc(result: ^[dynamic]Catalog_Provider_Source, id: 
 	return .Added
 }
 
-// provider_models_refresh returns the freshest source available for each
-// provider. A fresh cache avoids the network. A stale cache remains the fallback
-// when acquisition or validation fails. ok is false when a source record could not be
-// allocated.
+// Listing_Fetch_Proc requests one provider's listing and returns its body, owned by the
+// caller. user_data is what the refresh was given. It runs on a thread of its own, so it
+// and the allocator it is given must be safe for concurrent use.
+Listing_Fetch_Proc :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool)
+
+// provider_models_refresh returns the freshest source available for each provider. A
+// fresh cache avoids the network. A stale cache remains the fallback when acquisition or
+// validation fails. The listings a refresh needs are requested together, one thread per
+// provider, so the wait is the slowest provider rather than the sum of them. ok is false
+// when a source record could not be allocated.
 @(require_results)
 provider_models_refresh :: proc(
 	providers: []Catalog_Provider_Source,
-	user_data: $T,
-	fetch: proc(user_data: T, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
+	user_data: rawptr,
+	fetch: Listing_Fetch_Proc,
 	allocator := context.allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
@@ -98,76 +105,151 @@ provider_models_refresh :: proc(
 	return provider_models_refresh_at(time.now(), providers, user_data, fetch, allocator)
 }
 
+// Provider_Refresh is one provider's state across a refresh: its cache entry, read before
+// any request starts, and the listing request it needs, if any.
+@(private)
+Provider_Refresh :: struct {
+	path:          string, // owned; empty when the provider has no cache path
+	cached_models: []Catalog_Model_Source, // owned until it moves into the result
+	cache_valid:   bool,
+	fresh:         bool,
+	credential:    string, // owned; the key the request was made with
+	request:       Listing_Fetch,
+	thread:        ^thread.Thread,
+}
+
+// Listing_Fetch is one request for a provider's listing. It runs on the thread its
+// Provider_Refresh owns and is read back only after that thread is joined.
+@(private)
+Listing_Fetch :: struct {
+	fetch:     Listing_Fetch_Proc,
+	user_data: rawptr,
+	base_url:  string,
+	api_key:   string,
+	allocator: mem.Allocator,
+	body:      []u8, // owned once fetched is true
+	fetched:   bool,
+}
+
+@(private)
+listing_fetch_run :: proc(data: rawptr) {
+	request := (^Listing_Fetch)(data)
+	request.body, request.fetched = request.fetch(request.user_data, request.base_url, request.api_key, request.allocator)
+}
+
+// listing_fetch_start runs the request on a new thread. When no thread can be created the
+// request runs on this one, so the refresh never drops a provider.
+@(private)
+listing_fetch_start :: proc(request: ^Listing_Fetch) -> ^thread.Thread {
+	worker := thread.create_and_start_with_data(request, listing_fetch_run)
+	if worker == nil {
+		listing_fetch_run(request)
+	}
+	return worker
+}
+
+@(private)
+provider_refreshes_join :: proc(refreshes: []Provider_Refresh) {
+	for &refresh in refreshes {
+		if refresh.thread == nil { continue }
+		thread.join(refresh.thread)
+		thread.destroy(refresh.thread)
+		refresh.thread = nil
+	}
+}
+
+// provider_refreshes_destroy waits for every request and releases what the refresh still
+// owns. The refresh's results are moved out before this runs, so only leftovers are freed.
+@(private)
+provider_refreshes_destroy :: proc(refreshes: []Provider_Refresh, allocator: mem.Allocator) {
+	provider_refreshes_join(refreshes)
+	for refresh in refreshes {
+		delete(refresh.path, allocator)
+		catalog_model_sources_destroy(refresh.cached_models, allocator)
+		delete(refresh.credential, allocator)
+		delete(refresh.request.body, allocator)
+	}
+	delete(refreshes, allocator)
+}
+
 @(private, require_results)
 provider_models_refresh_at :: proc(
 	now: time.Time,
 	providers: []Catalog_Provider_Source,
-	user_data: $T,
-	fetch: proc(user_data: T, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
+	user_data: rawptr,
+	fetch: Listing_Fetch_Proc,
 	allocator: mem.Allocator,
 ) -> (
 	[dynamic]Catalog_Provider_Source,
 	bool,
 ) {
-	result: [dynamic]Catalog_Provider_Source
-	result.allocator = allocator
-	for provider in providers {
+	refreshes, make_error := make([]Provider_Refresh, len(providers), allocator)
+	if make_error != nil { return {}, false }
+	defer provider_refreshes_destroy(refreshes, allocator)
+
+	// Phase one reads each cache entry and starts the requests that are needed. The
+	// requests run while the rest of the phase and the later providers are prepared.
+	for provider, index in providers {
+		refresh := &refreshes[index]
 		path, path_ok := provider_models_cache_path(provider, allocator)
+		if path_ok { refresh.path = path }
 		body: []u8
 		cached := false
 		if path_ok { body, cached = fetch_cache_read(path, allocator) }
-		cached_models: []Catalog_Model_Source
-		cache_valid := false
-		if cached { cached_models, cache_valid = provider_models_list(body, allocator) }
-		fresh := path_ok && cache_valid && fetch_cache_fresh(path, now, PROVIDER_MODELS_FRESH)
-		if fresh {
-			added := provider_sources_add(&result, provider.id, cached_models, allocator)
-			delete(body, allocator)
-			delete(path, allocator)
-			if !added {
-				catalog_model_sources_destroy(cached_models, allocator)
+		if cached { refresh.cached_models, refresh.cache_valid = provider_models_list(body, allocator) }
+		delete(body, allocator)
+		refresh.fresh = path_ok && refresh.cache_valid && fetch_cache_fresh(path, now, PROVIDER_MODELS_FRESH)
+		if refresh.fresh { continue }
+		if (provider.base_url.? or_else "") == "" || (provider.api_key.? or_else "") == "" { continue }
+		credential, credential_ok := config_resolve_credential(provider.api_key.?, allocator)
+		if !credential_ok { continue }
+		refresh.credential = credential
+		refresh.request = Listing_Fetch {
+			fetch     = fetch,
+			user_data = user_data,
+			base_url  = provider.base_url.?,
+			api_key   = credential,
+			allocator = allocator,
+		}
+		refresh.thread = listing_fetch_start(&refresh.request)
+	}
+
+	// Phase two waits for every request. Phase three reads them back in provider order.
+	provider_refreshes_join(refreshes)
+	result: [dynamic]Catalog_Provider_Source
+	result.allocator = allocator
+	for provider, index in providers {
+		refresh := &refreshes[index]
+		if refresh.fresh {
+			if !provider_sources_add(&result, provider.id, refresh.cached_models, allocator) {
 				catalog_sources_destroy(&result, allocator)
 				return {}, false
 			}
+			refresh.cached_models = nil
 			continue
 		}
-		if (provider.base_url.? or_else "") != "" && (provider.api_key.? or_else "") != "" {
-			credential, credential_ok := config_resolve_credential(provider.api_key.?, allocator)
-			if credential_ok {
-				acquired, fetched := fetch(user_data, provider.base_url.?, credential, allocator)
-				delete(credential, allocator)
-				if fetched {
-					models, listed := provider_models_list(acquired, allocator)
-					if listed {
-						// Caching is best effort: the listing in hand is what answers.
-						if path_ok { _ = fetch_cache_write(path, acquired) }
-						added := provider_sources_add(&result, provider.id, models, allocator)
-						catalog_model_sources_destroy(cached_models, allocator)
-						delete(body, allocator)
-						delete(acquired, allocator)
-						if path_ok { delete(path, allocator) }
-						if !added {
-							catalog_model_sources_destroy(models, allocator)
-							catalog_sources_destroy(&result, allocator)
-							return {}, false
-						}
-						continue
-					}
-					delete(acquired, allocator)
+		if refresh.request.fetched {
+			models, listed := provider_models_list(refresh.request.body, allocator)
+			// Caching is best effort: the listing in hand is what answers.
+			if listed && refresh.path != "" { _ = fetch_cache_write(refresh.path, refresh.request.body) }
+			delete(refresh.request.body, allocator)
+			refresh.request.body = nil
+			if listed {
+				if !provider_sources_add(&result, provider.id, models, allocator) {
+					catalog_model_sources_destroy(models, allocator)
+					catalog_sources_destroy(&result, allocator)
+					return {}, false
 				}
+				continue
 			}
 		}
-		if cache_valid {
-			if !provider_sources_add(&result, provider.id, cached_models, allocator) {
-				catalog_model_sources_destroy(cached_models, allocator)
-				delete(body, allocator)
-				if path_ok { delete(path, allocator) }
+		if refresh.cache_valid {
+			if !provider_sources_add(&result, provider.id, refresh.cached_models, allocator) {
 				catalog_sources_destroy(&result, allocator)
 				return {}, false
 			}
+			refresh.cached_models = nil
 		}
-		delete(body, allocator)
-		if path_ok { delete(path, allocator) }
 	}
 	return result, true
 }
@@ -257,7 +339,8 @@ provider_models_id :: proc(entry: json.Value) -> (id: string, present: bool) {
 // the user's own endpoint, and a body that is not a listing is refused by parsing rather
 // than by a header.
 @(require_results)
-provider_models_fetch :: proc(cancel: ^bool, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
+provider_models_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
+	cancel := (^bool)(user_data)
 	url, url_error := strings.concatenate([]string{strings.trim_right(base_url, "/"), "/", PROVIDER_MODELS_SUFFIX}, allocator)
 	if url_error != nil { return nil, false }
 	defer delete(url, allocator)

@@ -17,7 +17,7 @@ import "nabla:tui/widgets"
 
 CATALOG_PIPELINE_MODELS_DEV :: `{"test-provider":{"id":"test-provider","models":{"discovered-model":{"id":"discovered-model","limit":{"context":128000,"output":4096},"tool_call":true,"reasoning":true,"reasoning_options":[{"type":"effort","values":["low","high"]}]}}}}`
 
-catalog_pipeline_provider_fetch :: proc(_: ^bool, _: string, _: string, allocator: mem.Allocator) -> ([]u8, bool) {
+catalog_pipeline_provider_fetch :: proc(_: rawptr, _: string, _: string, allocator: mem.Allocator) -> ([]u8, bool) {
 	body := `{"data":[{"id":"discovered-model"}]}`
 	bytes := make([]u8, len(body), allocator)
 	copy(bytes, body)

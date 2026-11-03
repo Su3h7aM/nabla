@@ -20,7 +20,8 @@ Discovery_Stub :: struct {
 	api_key:  string,
 }
 
-discovery_stub_fetch :: proc(stub: ^Discovery_Stub, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
+discovery_stub_fetch :: proc(user_data: rawptr, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool) {
+	stub := (^Discovery_Stub)(user_data)
 	stub.calls += 1
 	stub.base_url = base_url
 	stub.api_key = api_key

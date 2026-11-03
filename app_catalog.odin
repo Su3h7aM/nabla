@@ -94,7 +94,7 @@ catalog_refresh :: proc(app: ^App) {
 
 catalog_refresh_with :: proc(
 	app: ^App,
-	provider_fetch: proc(cancel: ^bool, base_url, api_key: string, allocator: mem.Allocator) -> ([]u8, bool),
+	provider_fetch: agent.Listing_Fetch_Proc,
 	models_dev_fetch: proc(cancel: ^bool, allocator: mem.Allocator) -> ([]u8, bool),
 ) {
 	allocator := app.run.alloc
