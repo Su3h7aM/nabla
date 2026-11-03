@@ -156,3 +156,7 @@ OTHERS_ACCESS :: os.Permissions{.Read_Group, .Write_Group, .Execute_Group, .Read
 _response_committed :: proc() -> Response_Committed {
 	return Response_Committed{api = "responses", finish = RESPONSE_FINISH_NAMES[.Stop]}
 }
+
+_tool_proposed :: proc() -> Tool_Proposed {
+	return Tool_Proposed{provider_id = "call_1", name = "read"}
+}

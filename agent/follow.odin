@@ -76,8 +76,8 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .Node_Committed:
 		return follow_node(store, follow, record, observer)
 	case .Tool_Proposed:
-		proposed: journal.Tool_Proposed
-		if journal.payload_decode(record.data, &proposed, context.temp_allocator) != nil { return nil }
+		proposed, is_proposed := journal.payload_as(record, journal.Tool_Proposed)
+		if !is_proposed { return nil }
 		_observer_tool_call(
 			observer,
 			Chat_Tool_Event{call = record.call, parent_call = record.parent_call, call_id = proposed.provider_id, name = proposed.name, arguments = body},
@@ -129,8 +129,8 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		event.failure_class = .Invalid_Request if event.reason == .Adaptive_Thinking_Refused || event.reason == .Cache_Hints_Refused else .Unknown
 		_observer_retry_scheduled(observer, event)
 	case .Runtime_Message:
-		message: journal.Runtime_Message
-		if journal.payload_decode(record.data, &message, context.temp_allocator) != nil { return nil }
+		message, is_message := journal.payload_as(record, journal.Runtime_Message)
+		if !is_message { return nil }
 		kind := Chat_Message_Kind.Warning if message.level == journal.RUNTIME_LEVEL_NAMES[.Warning] else .Error
 		_observer_message(observer, kind, message.text)
 	}
@@ -227,8 +227,8 @@ follow_delivered_input :: proc(store: ^journal.Journal, message: journal.Journal
 // `tool.proposed` record.
 @(private = "file", require_results)
 follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, observer: Chat_Observer) -> journal.Error {
-	completed: journal.Tool_Completed
-	if journal.payload_decode(record.data, &completed, context.temp_allocator) != nil { return nil }
+	completed, is_completed := journal.payload_as(record, journal.Tool_Completed)
+	if !is_completed { return nil }
 	name := "tool"
 	arguments: string
 	proposals, _ := journal.read_records(
@@ -239,8 +239,7 @@ follow_tool_result :: proc(store: ^journal.Journal, record: journal.Record, obse
 		context.temp_allocator,
 	) or_return
 	if len(proposals) > 0 {
-		proposed: journal.Tool_Proposed
-		if journal.payload_decode(proposals[0].data, &proposed, context.temp_allocator) == nil {
+		if proposed, is_proposed := journal.payload_as(proposals[0], journal.Tool_Proposed); is_proposed {
 			name = proposed.name
 			arguments = string(proposals[0].body)
 		}

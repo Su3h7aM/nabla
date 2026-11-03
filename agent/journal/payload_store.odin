@@ -326,6 +326,89 @@ payload_rows :: proc(journal: ^Journal, payload: Record_Payload) {
 		)
 	case Selection_Changed:
 		payload_row(journal, "INSERT INTO record_selection_changed (seq, effort) VALUES (?, ?)", text_or_null(value.effort))
+	case Tool_Proposed:
+		payload_row(
+			journal,
+			"INSERT INTO record_tool_proposed (seq, provider_id, item_id, name) VALUES (?, ?, ?, ?)",
+			text_or_null(value.provider_id),
+			text_or_null(value.item_id),
+			text_or_null(value.name),
+		)
+	case Tool_Admitted:
+		payload_row(journal, "INSERT INTO record_tool_admitted (seq, tool, background) VALUES (?, ?, ?)", text_or_null(value.tool), value.background)
+		for repair, index in value.repairs {
+			payload_row(journal, "INSERT INTO record_tool_repair (seq, ordinal, repair) VALUES (?, ?, ?)", int_value(index), repair)
+		}
+	case Tool_Started:
+		payload_row(journal, "INSERT INTO record_tool_started (seq, tool) VALUES (?, ?)", text_or_null(value.tool))
+	case Completion:
+		payload_row(
+			journal,
+			"INSERT INTO record_completion (seq, outcome, detail) VALUES (?, ?, ?)",
+			name_code(journal, TOOL_OUTCOME_NAMES, value.outcome),
+			text_or_null(value.detail),
+		)
+		attachment_rows(journal, value.attachments)
+	case Background_Completed:
+		payload_row(
+			journal,
+			"INSERT INTO record_completion (seq, outcome, detail, tool) VALUES (?, ?, ?, ?)",
+			name_code(journal, TOOL_OUTCOME_NAMES, value.outcome),
+			text_or_null(value.detail),
+			text_or_null(value.tool),
+		)
+		attachment_rows(journal, value.attachments)
+	case Subagent_Started:
+		payload_row(
+			journal,
+			"INSERT INTO record_subagent_started (seq, name, program, provider, model, effort, background) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			text_or_null(value.name),
+			text_or_null(value.program),
+			text_or_null(value.provider),
+			text_or_null(value.model),
+			text_or_null(value.effort),
+			value.background,
+		)
+	case Subagent_Completed:
+		payload_row(
+			journal,
+			`INSERT INTO record_subagent_completed (seq, outcome, detail, name, acp_session, acp_after, acp_model, acp_effort)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			name_code(journal, TOOL_OUTCOME_NAMES, value.outcome),
+			text_or_null(value.detail),
+			text_or_null(value.name),
+			text_or_null(value.acp_session),
+			int_or_null(value.acp_after),
+			text_or_null(value.acp_model),
+			text_or_null(value.acp_effort),
+		)
+	case Subagent_Message:
+		payload_row(journal, "INSERT INTO record_subagent_message (seq, name) VALUES (?, ?)", text_or_null(value.name))
+	case Compaction_Started:
+		payload_row(
+			journal,
+			"INSERT INTO record_compaction_started (seq, trigger, covers, head_estimate) VALUES (?, ?, ?, ?)",
+			text_or_null(value.trigger),
+			int_value(value.covers),
+			int_value(value.head_estimate),
+		)
+	case Runtime_Message:
+		payload_row(
+			journal,
+			"INSERT INTO record_runtime_message (seq, level, text) VALUES (?, ?, ?)",
+			name_code(journal, RUNTIME_LEVEL_NAMES, value.level),
+			text_or_null(value.text),
+		)
+	case Job_Abandoned:
+		payload_row(
+			journal,
+			"INSERT INTO record_job_abandoned (seq, job, waited_ms, patience_ms) VALUES (?, ?, ?, ?)",
+			name_code(journal, JOB_KIND_NAMES, value.job),
+			value.waited_ms,
+			value.patience_ms,
+		)
+	case Job_Reclaimed:
+		payload_row(journal, "INSERT INTO record_job_reclaimed (seq, job) VALUES (?, ?)", name_code(journal, JOB_KIND_NAMES, value.job))
 	case Selection_Fit:
 		payload_row(
 			journal,
@@ -435,6 +518,60 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 		return payload_load(journal, record, "SELECT purpose, outcome FROM record_retry_completed WHERE seq = ?", allocator, scan_retry_completed)
 	case .Selection_Changed:
 		return payload_load(journal, record, "SELECT effort FROM record_selection_changed WHERE seq = ?", allocator, scan_selection_changed)
+	case .Tool_Proposed:
+		return payload_load(journal, record, "SELECT provider_id, item_id, name FROM record_tool_proposed WHERE seq = ?", allocator, scan_tool_proposed)
+	case .Tool_Admitted:
+		payload_load(journal, record, "SELECT tool, background FROM record_tool_admitted WHERE seq = ?", allocator, scan_tool_admitted) or_return
+		payload := record.payload.?
+		admitted := payload.(Tool_Admitted)
+		admitted.repairs = repairs_load(journal, record, allocator) or_return
+		record.payload = admitted
+	case .Tool_Started:
+		return payload_load(journal, record, "SELECT tool FROM record_tool_started WHERE seq = ?", allocator, scan_tool_started)
+	case .Tool_Completed, .Lua_Completed, .Task_Completed:
+		payload_load(journal, record, "SELECT outcome, detail FROM record_completion WHERE seq = ?", allocator, scan_completion) or_return
+		payload := record.payload.?
+		completion := payload.(Completion)
+		completion.attachments = attachments_load(journal, record, allocator) or_return
+		record.payload = completion
+	case .Background_Completed:
+		payload_load(journal, record, "SELECT outcome, detail, tool FROM record_completion WHERE seq = ?", allocator, scan_background_completed) or_return
+		payload := record.payload.?
+		completed := payload.(Background_Completed)
+		completed.attachments = attachments_load(journal, record, allocator) or_return
+		record.payload = completed
+	case .Subagent_Started:
+		return payload_load(
+			journal,
+			record,
+			"SELECT name, program, provider, model, effort, background FROM record_subagent_started WHERE seq = ?",
+			allocator,
+			scan_subagent_started,
+		)
+	case .Subagent_Completed:
+		return payload_load(
+			journal,
+			record,
+			"SELECT outcome, detail, name, acp_session, acp_after, acp_model, acp_effort FROM record_subagent_completed WHERE seq = ?",
+			allocator,
+			scan_subagent_completed,
+		)
+	case .Subagent_Message:
+		return payload_load(journal, record, "SELECT name FROM record_subagent_message WHERE seq = ?", allocator, scan_subagent_message)
+	case .Compaction_Started:
+		return payload_load(
+			journal,
+			record,
+			"SELECT trigger, covers, head_estimate FROM record_compaction_started WHERE seq = ?",
+			allocator,
+			scan_compaction_started,
+		)
+	case .Runtime_Message:
+		return payload_load(journal, record, "SELECT level, text FROM record_runtime_message WHERE seq = ?", allocator, scan_runtime_message)
+	case .Job_Abandoned:
+		return payload_load(journal, record, "SELECT job, waited_ms, patience_ms FROM record_job_abandoned WHERE seq = ?", allocator, scan_job_abandoned)
+	case .Job_Reclaimed:
+		return payload_load(journal, record, "SELECT job FROM record_job_reclaimed WHERE seq = ?", allocator, scan_job_reclaimed)
 	case .Response_Committed, .Compaction_Completed:
 		return payload_load(
 			journal,
@@ -472,23 +609,9 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 	     .Branch_Created,
 	     .Branch_Selected,
 	     .Node_Committed,
-	     .Tool_Proposed,
-	     .Tool_Admitted,
-	     .Tool_Started,
-	     .Tool_Completed,
 	     .Lua_Started,
-	     .Lua_Completed,
 	     .Task_Started,
-	     .Task_Completed,
-	     .Subagent_Started,
-	     .Subagent_Completed,
-	     .Compaction_Started,
-	     .Checkpoint_Installed,
-	     .Runtime_Message,
-	     .Job_Abandoned,
-	     .Job_Reclaimed,
-	     .Subagent_Message,
-	     .Background_Completed:
+	     .Checkpoint_Installed:
 	}
 	return nil
 }
@@ -668,6 +791,90 @@ scan_response_rejected :: proc(row: ^Row) -> Record_Payload {
 }
 
 @(private)
+scan_tool_proposed :: proc(row: ^Row) -> Record_Payload {
+	return Tool_Proposed{version = PAYLOAD_VERSION, provider_id = row_text(row), item_id = row_text(row), name = row_text(row)}
+}
+
+@(private)
+scan_tool_admitted :: proc(row: ^Row) -> Record_Payload {
+	return Tool_Admitted{version = PAYLOAD_VERSION, tool = row_text(row), background = row_bool(row)}
+}
+
+@(private)
+scan_tool_started :: proc(row: ^Row) -> Record_Payload {
+	return Tool_Started{version = PAYLOAD_VERSION, tool = row_text(row)}
+}
+
+@(private)
+scan_completion :: proc(row: ^Row) -> Record_Payload {
+	return Completion{version = PAYLOAD_VERSION, outcome = row_enum_name(row, TOOL_OUTCOME_NAMES), detail = row_text(row)}
+}
+
+@(private)
+scan_background_completed :: proc(row: ^Row) -> Record_Payload {
+	completed := Background_Completed {
+		version = PAYLOAD_VERSION,
+		outcome = row_enum_name(row, TOOL_OUTCOME_NAMES),
+		detail  = row_text(row),
+		tool    = row_text(row),
+	}
+	if completed.tool == "" && row.error == nil { row.error = Journal_Error.Corrupt }
+	return completed
+}
+
+@(private)
+scan_subagent_started :: proc(row: ^Row) -> Record_Payload {
+	return Subagent_Started {
+		version = PAYLOAD_VERSION,
+		name = row_text(row),
+		program = row_text(row),
+		provider = row_text(row),
+		model = row_text(row),
+		effort = row_text(row),
+		background = row_bool(row),
+	}
+}
+
+@(private)
+scan_subagent_completed :: proc(row: ^Row) -> Record_Payload {
+	return Subagent_Completed {
+		version = PAYLOAD_VERSION,
+		outcome = row_enum_name(row, TOOL_OUTCOME_NAMES),
+		detail = row_text(row),
+		name = row_text(row),
+		acp_session = row_text(row),
+		acp_after = Journal_Seq(row_int(row)),
+		acp_model = row_text(row),
+		acp_effort = row_text(row),
+	}
+}
+
+@(private)
+scan_subagent_message :: proc(row: ^Row) -> Record_Payload {
+	return Subagent_Message{version = PAYLOAD_VERSION, name = row_text(row)}
+}
+
+@(private)
+scan_compaction_started :: proc(row: ^Row) -> Record_Payload {
+	return Compaction_Started{version = PAYLOAD_VERSION, trigger = row_text(row), covers = Node_Id(row_int(row)), head_estimate = int(row_int(row))}
+}
+
+@(private)
+scan_runtime_message :: proc(row: ^Row) -> Record_Payload {
+	return Runtime_Message{version = PAYLOAD_VERSION, level = row_enum_name(row, RUNTIME_LEVEL_NAMES), text = row_text(row)}
+}
+
+@(private)
+scan_job_abandoned :: proc(row: ^Row) -> Record_Payload {
+	return Job_Abandoned{version = PAYLOAD_VERSION, job = row_enum_name(row, JOB_KIND_NAMES), waited_ms = row_int(row), patience_ms = row_int(row)}
+}
+
+@(private)
+scan_job_reclaimed :: proc(row: ^Row) -> Record_Payload {
+	return Job_Reclaimed{version = PAYLOAD_VERSION, job = row_enum_name(row, JOB_KIND_NAMES)}
+}
+
+@(private)
 scan_retry_scheduled :: proc(row: ^Row) -> Record_Payload {
 	return Retry_Scheduled {
 		version = PAYLOAD_VERSION,
@@ -793,6 +1000,49 @@ payload_destroy :: proc(payload: Record_Payload, allocator: mem.Allocator) {
 	case Retry_Scheduled:
 		delete(value.purpose, allocator)
 		delete(value.reason, allocator)
+	case Tool_Proposed:
+		delete(value.provider_id, allocator)
+		delete(value.item_id, allocator)
+		delete(value.name, allocator)
+	case Tool_Admitted:
+		delete(value.tool, allocator)
+		for repair in value.repairs { delete(repair, allocator) }
+		delete(value.repairs, allocator)
+	case Tool_Started:
+		delete(value.tool, allocator)
+	case Completion:
+		delete(value.outcome, allocator)
+		delete(value.detail, allocator)
+		attachments_destroy(value.attachments, allocator)
+	case Background_Completed:
+		delete(value.outcome, allocator)
+		delete(value.detail, allocator)
+		delete(value.tool, allocator)
+		attachments_destroy(value.attachments, allocator)
+	case Subagent_Started:
+		delete(value.name, allocator)
+		delete(value.program, allocator)
+		delete(value.provider, allocator)
+		delete(value.model, allocator)
+		delete(value.effort, allocator)
+	case Subagent_Completed:
+		delete(value.outcome, allocator)
+		delete(value.detail, allocator)
+		delete(value.name, allocator)
+		delete(value.acp_session, allocator)
+		delete(value.acp_model, allocator)
+		delete(value.acp_effort, allocator)
+	case Subagent_Message:
+		delete(value.name, allocator)
+	case Compaction_Started:
+		delete(value.trigger, allocator)
+	case Runtime_Message:
+		delete(value.level, allocator)
+		delete(value.text, allocator)
+	case Job_Abandoned:
+		delete(value.job, allocator)
+	case Job_Reclaimed:
+		delete(value.job, allocator)
 	case Retry_Completed:
 		delete(value.purpose, allocator)
 		delete(value.outcome, allocator)

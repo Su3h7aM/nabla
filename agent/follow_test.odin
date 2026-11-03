@@ -191,7 +191,14 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	}
 	started := header
 	started.kind = .Turn_Started
-	journal.append_record(store, started, journal.Turn_Started{})
+	journal.append_record(
+		store,
+		started,
+		journal.Turn_Started {
+			instructions = "0000000000000000000000000000000000000000000000000000000000000000",
+			manifest = "0000000000000000000000000000000000000000000000000000000000000000",
+		},
+	)
 	user := journal.append_node(
 		store,
 		{session = session, branch = journal.INITIAL_BRANCH, kind = .User, turn = 1},
@@ -204,7 +211,13 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	journal.append_record(
 		store,
 		prepared,
-		journal.Request_Prepared{purpose = journal.REQUEST_PURPOSE_NAMES[.Response], estimate = 1234, context_window = 8000},
+		journal.Request_Prepared {
+			purpose = journal.REQUEST_PURPOSE_NAMES[.Response],
+			api = "openai_responses",
+			transport = "http",
+			estimate = 1234,
+			context_window = 8000,
+		},
 	)
 	assistant := journal.append_node(
 		store,

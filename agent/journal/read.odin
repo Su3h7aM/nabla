@@ -144,6 +144,8 @@ read_inbox :: proc(journal: ^Journal, session: Session_Id, after: Journal_Seq, a
 			i64(Record_Kind.Subagent_Started),
 			i64(Record_Kind.Tool_Completed),
 			i64(Record_Kind.Subagent_Message),
+			i64(Tool_Outcome.Unknown),
+			i64(Tool_Outcome.Success),
 		},
 		allocator,
 	)
@@ -731,10 +733,11 @@ INBOX_QUERY ::
 	SELECT ` +
 	RECORD_COLUMNS +
 	` FROM records AS inbound WHERE inbound.session = ?1 AND inbound.seq > ?2 AND inbound.kind = ?5
-		AND EXISTS (SELECT 1 FROM records AS started WHERE started.session = ?1 AND started.kind = ?6
-			AND started.call IS inbound.call AND started.subagent IS inbound.subagent AND json_extract(started.data, '$.background') = 1)
-		AND NOT EXISTS (SELECT 1 FROM records AS result WHERE result.session = ?1 AND result.kind = ?7 AND result.call IS inbound.call
-			AND json_extract(result.data, '$.outcome') NOT IN ('success', 'unknown'))
+		AND EXISTS (SELECT 1 FROM records AS started JOIN record_subagent_started AS payload ON payload.seq = started.seq
+			WHERE started.session = ?1 AND started.kind = ?6
+			AND started.call IS inbound.call AND started.subagent IS inbound.subagent AND payload.background = 1)
+		AND NOT EXISTS (SELECT 1 FROM records AS result JOIN record_completion AS done ON done.seq = result.seq
+			WHERE result.session = ?1 AND result.kind = ?7 AND result.call IS inbound.call AND done.outcome NOT IN (?9, ?10))
 	UNION ALL
 	SELECT ` +
 	RECORD_COLUMNS +

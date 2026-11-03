@@ -244,7 +244,7 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	testing.expect_value(test, to_sibling.outcome, journal.Tool_Outcome.Invalid_Arguments)
 
 	// The child's own journal carries its message to the orchestrator.
-	chat_record(chat, {kind = .Subagent_Started, subagent = member.session}, journal.Subagent_Started{background = true})
+	chat_record(chat, {kind = .Subagent_Started, subagent = member.session}, journal.Subagent_Started{name = "agent-1", background = true})
 	_test_commit(test, chat)
 	child_store, child_store_open_error := journal.open(chat.store.directory, chat.store.locks, journal.run_id_create(), .Read_Write)
 	if child_store_open_error != nil {
@@ -709,7 +709,7 @@ test_a_full_team_queues_background_subagents_in_order :: proc(test: ^testing.T) 
 		// Dispatch names each child's session and records its start before it runs, so the
 		// test does too.
 		tool_context.subagent = journal.session_id_create()
-		chat_record(chat, {kind = .Subagent_Started, subagent = tool_context.subagent}, journal.Subagent_Started{background = true})
+		chat_record(chat, {kind = .Subagent_Started, subagent = tool_context.subagent}, journal.Subagent_Started{name = "agent-1", background = true})
 		_test_commit(test, chat)
 		started := tool_agent_execute(&tool_context, Agent_Start_Args{prompt = "wait for instructions"})
 		defer tool_result_destroy(&started)
@@ -1661,7 +1661,7 @@ test_an_abandoned_subagent_is_reclaimed_after_publication :: proc(test: ^testing
 		testing.fail_now(test, "the held child could not be listed")
 	}
 	team.running += 1
-	chat_record(chat, {kind = .Subagent_Started, call = call, subagent = child}, journal.Subagent_Started{background = true})
+	chat_record(chat, {kind = .Subagent_Started, call = call, subagent = child}, journal.Subagent_Started{name = "agent-1", background = true})
 	_test_commit(test, chat)
 	if !job_launch(&member.worker) {
 		subagent_finish(member)

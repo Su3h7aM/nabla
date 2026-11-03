@@ -202,7 +202,7 @@ test_buffered_records_are_invisible_until_a_commit :: proc(test: ^testing.T) {
 
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
 	for _ in 0 ..< 3 {
-		append_record(writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "buffered"})
+		append_record(writer, Record{session = session, kind = .Runtime_Message}, Runtime_Message{level = RUNTIME_LEVEL_NAMES[.Warning], text = "buffered"})
 	}
 
 	reader := _open_journal(test, directory, .Read_Only)
@@ -232,7 +232,7 @@ test_buffered_records_are_invisible_until_a_commit :: proc(test: ^testing.T) {
 
 	// The batch record limit commits on its own, with no barrier.
 	for _ in 0 ..< JOURNAL_BATCH_RECORDS {
-		append_record(writer, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "bulk"})
+		append_record(writer, Record{session = session, kind = .Runtime_Message}, Runtime_Message{level = RUNTIME_LEVEL_NAMES[.Warning], text = "bulk"})
 	}
 	testing.expect_value(test, flush_deadline(writer) != nil, true)
 	_expect_ok(test, flush_due(writer, time.tick_now()))
@@ -325,7 +325,7 @@ test_a_failed_commit_latches_and_drops_appends :: proc(test: ^testing.T) {
 	// Nothing buffered can be written again, so the batch is dropped, every
 	// later append is dropped, and every later commit reports the latch.
 	testing.expect_value(test, len(journal.pending), 0)
-	append_record(journal, Record{session = session, kind = .Runtime_Message}, _Test_Payload{detail = "dropped"})
+	append_record(journal, Record{session = session, kind = .Runtime_Message}, Runtime_Message{level = RUNTIME_LEVEL_NAMES[.Warning], text = "dropped"})
 	testing.expect_value(test, len(journal.pending), 0)
 	_, again_error := commit(journal)
 	testing.expect(test, again_error == commit_error, "a later commit returns the latched failure")

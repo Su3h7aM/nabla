@@ -129,8 +129,7 @@ session_listing :: proc(store: ^journal.Journal, sessions: []journal.Session_Sum
 			name := ""
 			for start in starts {
 				if start.subagent != child.id { continue }
-				started: journal.Subagent_Started
-				if journal.payload_decode(start.data, &started, context.temp_allocator) == nil { name = started.name }
+				if started, is_started := journal.payload_as(start, journal.Subagent_Started); is_started { name = started.name }
 			}
 			_ = append(&listed, Listed_Session{summary = &child, name = name, child = true}) or_return
 		}
@@ -352,8 +351,8 @@ session_running_calls_show :: proc(app: ^App) {
 		done, is_done := completed[record.call]
 		if is_done && record.parent_call == 0 { continue }
 		if record.parent_call in completed { continue }
-		proposed: journal.Tool_Proposed
-		if journal.payload_decode(record.data, &proposed, context.temp_allocator) != nil { continue }
+		proposed, is_proposed := journal.payload_as(record, journal.Tool_Proposed)
+		if !is_proposed { continue }
 		arguments := string(record.body)
 		observer_tool_call(
 			app,
@@ -366,8 +365,8 @@ session_running_calls_show :: proc(app: ^App) {
 			},
 		)
 		if !is_done { continue }
-		completion: journal.Tool_Completed
-		if journal.payload_decode(done.data, &completion, context.temp_allocator) != nil { continue }
+		completion, is_completion := journal.payload_as(done, journal.Tool_Completed)
+		if !is_completion { continue }
 		outcome, _ := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
 		result := agent.Tool_Result {
 			outcome   = outcome,

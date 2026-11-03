@@ -747,10 +747,8 @@ chat_session_accept_message :: proc(
 	}
 	instructions_hex: [journal.DIGEST_HEX_LENGTH]u8
 	manifest_hex: [journal.DIGEST_HEX_LENGTH]u8
-	if chat.instructions_digest != {} {
-		started.instructions = journal.digest_to_hex(chat.instructions_digest, instructions_hex[:])
-		started.manifest = journal.digest_to_hex(chat.manifest_digest, manifest_hex[:])
-	}
+	started.instructions = journal.digest_to_hex(chat.instructions_digest, instructions_hex[:])
+	started.manifest = journal.digest_to_hex(chat.manifest_digest, manifest_hex[:])
 	chat_record(chat, {kind = .Turn_Started, provider = chat.provider_id, model = chat.model_id}, started)
 	delivered := chat_inbox_stage(chat, pending)
 	if text != "" || len(recorded) > 0 {

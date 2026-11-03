@@ -97,6 +97,18 @@ Record_Payload :: union {
 	Selection_Changed,
 	Selection_Fit,
 	Selection_Applied,
+	Tool_Proposed,
+	Tool_Admitted,
+	Tool_Started,
+	Completion,
+	Background_Completed,
+	Subagent_Started,
+	Subagent_Completed,
+	Subagent_Message,
+	Compaction_Started,
+	Runtime_Message,
+	Job_Abandoned,
+	Job_Reclaimed,
 }
 
 // Node is one committed step of the session tree. The journal fills id, seq,

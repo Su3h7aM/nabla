@@ -485,8 +485,7 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 	case .User_Input:
 		return body, user_input_origin(record)
 	case .Background_Completed:
-		completed: journal.Background_Completed
-		_ = journal.payload_decode(record.data, &completed, context.temp_allocator)
+		completed, _ := journal.payload_as(record, journal.Background_Completed)
 		state := "failed"
 		switch completed.outcome {
 		case journal.TOOL_OUTCOME_NAMES[.Success]:
@@ -499,9 +498,8 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		name := background_job_name(record.call, context.temp_allocator)
 		return fmt.tprintf("%s (%s) %s\n%s", name, completed.tool, state, body), .Job
 	case .Subagent_Completed:
-		completed: journal.Subagent_Completed
 		// A payload that cannot be read still reports that the child ended.
-		_ = journal.payload_decode(record.data, &completed, context.temp_allocator)
+		completed, _ := journal.payload_as(record, journal.Subagent_Completed)
 		name := completed.name if completed.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
 		switch completed.outcome {
 		case journal.TOOL_OUTCOME_NAMES[.Success]:
@@ -524,8 +522,7 @@ inbox_text :: proc(record: journal.Record) -> (text: string, origin: journal.Use
 		return inbox_report(fmt.tprintf("%s failed", name), cause), .Agent
 	case .Subagent_Message:
 		if record.session != record.subagent { return inbox_report("orchestrator says", body), .Agent }
-		message: journal.Subagent_Message
-		_ = journal.payload_decode(record.data, &message, context.temp_allocator)
+		message, _ := journal.payload_as(record, journal.Subagent_Message)
 		name := message.name if message.name != "" else strings.clone(journal.session_id_to_hex(record.subagent, hex[:]), context.temp_allocator)
 		return inbox_report(fmt.tprintf("%s asks", name), body), .Agent
 	}
@@ -542,8 +539,7 @@ inbox_attachments :: proc(record: journal.Record) -> []journal.Attachment {
 			if value, is_input := payload.(journal.User_Input); is_input { return value.attachments }
 		}
 	case .Background_Completed:
-		completed: journal.Background_Completed
-		if journal.payload_decode(record.data, &completed, context.temp_allocator) == nil { return completed.attachments }
+		if completed, is_completed := journal.payload_as(record, journal.Background_Completed); is_completed { return completed.attachments }
 	}
 	return nil
 }

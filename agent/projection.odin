@@ -259,8 +259,8 @@ projection_build :: proc(
 		children, _ := journal.read_records(store, {session = session, kinds = {.Tool_Proposed, .Tool_Completed}, parent_call = parent}, 0, 0, arena) or_return
 		for &record in children {
 			if record.kind == .Tool_Proposed {
-				proposal: journal.Tool_Proposed
-				journal.payload_decode(record.data, &proposal, arena, corruption_journal = store, session = session, seq = record.seq) or_return
+				proposal, is_proposal := journal.payload_as(record, journal.Tool_Proposed)
+				if !is_proposal { return {}, journal.Journal_Error.Corrupt }
 				positions[record.call] = len(nested)
 				append(
 					&nested,
@@ -285,8 +285,8 @@ projection_build :: proc(
 // strings are decoded into arena.
 @(private, require_results)
 projection_result :: proc(store: ^journal.Journal, record: ^journal.Record, arena: mem.Allocator) -> (result: Projected_Result, error: journal.Error) {
-	completion: journal.Tool_Completed
-	journal.payload_decode(record.data, &completion, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
+	completion, is_completion := journal.payload_as(record^, journal.Tool_Completed)
+	if !is_completion { return {}, journal.Journal_Error.Corrupt }
 	result = Projected_Result {
 		call        = record.call,
 		parent_call = record.parent_call,
@@ -371,8 +371,8 @@ projection_add_assistant :: proc(
 	}
 	for record in records {
 		if record.kind != .Tool_Proposed { continue }
-		proposal: journal.Tool_Proposed
-		journal.payload_decode(record.data, &proposal, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
+		proposal, is_proposal := journal.payload_as(record^, journal.Tool_Proposed)
+		if !is_proposal { return journal.Journal_Error.Corrupt }
 		item.payload = Projected_Call {
 			call        = record.call,
 			parent_call = record.parent_call,

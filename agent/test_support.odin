@@ -194,6 +194,9 @@ _test_begin_request :: proc(test: ^testing.T, chat: ^Chat_Session) -> Chat_Effec
 	if effect.kind != .Start_Request { testing.fail_now(test, "expected a request to start") }
 	chat_session_begin_request(chat)
 	chat_session_begin_operation(chat)
+	chat.request = journal.next_request(chat.store)
+	// A committed response names the API family that produced it.
+	if chat.chain.connection.API == .Invalid { chat.chain.connection.API = .OpenAI_Responses }
 	return effect
 }
 
@@ -251,6 +254,9 @@ _test_response :: proc(
 	output := "",
 	api: ai.API_Kind = .Invalid,
 ) -> journal.Node_Id {
+	// A response always answers a request, so a fixture that names none answers a new one.
+	request := request if request != 0 else journal.next_request(chat.store)
+	api := api if api != .Invalid else .OpenAI_Chat_Completions
 	node := chat_node(chat, .Assistant, journal.Assistant{request = request}, transmute([]u8)text)
 	header := journal.Record {
 		kind     = .Response_Committed,

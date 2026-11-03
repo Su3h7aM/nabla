@@ -12,6 +12,41 @@ row_flag :: proc(row: ^Row) -> (flag: bool, ok: bool) {
 	return number == 1, true
 }
 
+// row_bool reads a 0 or 1 column; anything else is Corrupt.
+@(private)
+row_bool :: proc(row: ^Row) -> bool {
+	flag, ok := row_flag(row)
+	if !ok && row.error == nil { row.error = Journal_Error.Corrupt }
+	return flag
+}
+
+@(private, require_results)
+repairs_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> (repairs: []string, error: Error) {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, "SELECT repair FROM record_tool_repair WHERE seq = ? ORDER BY ordinal", {db.Value(i64(record.seq))}) or_return
+	listed := make([dynamic]string, allocator) or_return
+	defer if error != nil {
+		for repair in listed { delete(repair, allocator) }
+		delete(listed)
+	}
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		repair := row_text(&row)
+		if row.error != nil { return nil, corrupt(journal, row.error, record.session, record.seq) }
+		if _, append_error := append(&listed, repair); append_error != nil {
+			delete(repair, allocator)
+			return nil, append_error
+		}
+	}
+	return listed[:], nil
+}
+
 
 @(private, require_results)
 environment_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> (environment: Session_Environment, error: Error) {

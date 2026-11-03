@@ -25,12 +25,12 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Request_Sent}, _request_sent())
 	assistant := append_node(writer, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant, turn = 1}, Assistant{request = 1})
-	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 1, kind = .Tool_Proposed}, _Test_Payload{detail = "first call"})
-	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Proposed}, _Test_Payload{detail = "second call"})
-	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Admitted}, _Test_Payload{detail = "admitted"})
+	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 1, kind = .Tool_Proposed}, _tool_proposed())
+	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Proposed}, _tool_proposed())
+	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 2, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell"})
 	append_record(writer, Record{session = session, turn = 1, call = 3, kind = .Lua_Started}, _Test_Payload{detail = "script"})
 	child := session_id_create()
-	append_record(writer, Record{session = session, turn = 1, call = 4, subagent = child, kind = .Subagent_Started}, Subagent_Started{})
+	append_record(writer, Record{session = session, turn = 1, call = 4, subagent = child, kind = .Subagent_Started}, Subagent_Started{name = "child"})
 	_commit_ok(test, writer)
 	_expect_ok(test, close(writer))
 
@@ -170,8 +170,8 @@ test_recovery_records_nothing_after_a_clean_turn :: proc(test: ^testing.T) {
 	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Request_Sent}, _request_sent())
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Response_Committed}, _response_committed())
-	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Proposed}, _Test_Payload{detail = "call"})
-	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Admitted}, _Test_Payload{detail = "admit"})
+	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Proposed}, _tool_proposed())
+	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell"})
 	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
 	append_record(writer, Record{session = session, turn = 1, call = 2, kind = .Lua_Started}, _Test_Payload{detail = "script"})
 	append_record(writer, Record{session = session, turn = 1, call = 2, kind = .Lua_Completed}, Call_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
@@ -262,11 +262,11 @@ test_recovery_settles_delegations_by_whether_the_child_started :: proc(test: ^te
 		{id = session_id_create(), call = 4, program = "acp", background = true}, // no Nabla session
 	}
 	for child in children {
-		append_record(writer, Record{session = parent, call = child.call, kind = .Tool_Admitted}, _Test_Payload{detail = "spawn"})
+		append_record(writer, Record{session = parent, call = child.call, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell"})
 		append_record(
 			writer,
 			Record{session = parent, call = child.call, subagent = child.id, kind = .Subagent_Started},
-			Subagent_Started{program = child.program, background = child.background},
+			Subagent_Started{name = "child", program = child.program, background = child.background},
 		)
 		append_record(writer, Record{session = parent, call = child.call, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
 	}

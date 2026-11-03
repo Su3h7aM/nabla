@@ -203,8 +203,8 @@ test_a_launch_restores_the_stored_selection :: proc(t: ^testing.T) {
 
 	journal.append_record(
 		app.setup.store,
-		{kind = .Selection_Applied, session = app.setup.session.session},
-		journal.Selection_Applied{version = 1, provider = "test-provider", model = "test-model"},
+		{kind = .Selection_Applied, session = app.setup.session.session, provider = "test-provider", model = "test-model"},
+		journal.Selection_Applied{version = 1, api = "openai_responses"},
 	)
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 
@@ -240,8 +240,8 @@ test_a_stale_selection_falls_back_rather_than_failing :: proc(t: ^testing.T) {
 	defer agent.catalog_destroy(&app.setup.catalog)
 	journal.append_record(
 		app.setup.store,
-		{kind = .Selection_Applied, session = app.setup.session.session},
-		journal.Selection_Applied{version = 1, provider = "gone", model = "gone"},
+		{kind = .Selection_Applied, session = app.setup.session.session, provider = "gone", model = "gone"},
+		journal.Selection_Applied{version = 1, api = "openai_responses"},
 	)
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
@@ -263,8 +263,8 @@ test_a_launch_with_nothing_to_resolve_continues_to_the_menu :: proc(t: ^testing.
 	defer agent.catalog_destroy(&app.setup.catalog)
 	journal.append_record(
 		app.setup.store,
-		{kind = .Selection_Applied, session = app.setup.session.session},
-		journal.Selection_Applied{version = 1, provider = "gone", model = "gone"},
+		{kind = .Selection_Applied, session = app.setup.session.session, provider = "gone", model = "gone"},
+		journal.Selection_Applied{version = 1, api = "openai_responses"},
 	)
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 
@@ -293,7 +293,7 @@ app_session_add :: proc(test: ^testing.T, setup: ^Run_Setup, options: App_Test_S
 		journal.append_record(
 			store,
 			{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = 1, provider = options.provider, model = options.model},
-			journal.Turn_Started{},
+			journal.Turn_Started{instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX},
 		)
 	}
 	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(test, "could not commit a session") }
@@ -784,7 +784,7 @@ test_a_follower_shows_the_servers_selection :: proc(t: ^testing.T) {
 	journal.append_record(
 		runner,
 		{kind = .Selection_Applied, session = id, provider = "session-provider", model = "session-model"},
-		journal.Selection_Applied{version = 1, api = "openai_responses", provider = "session-provider", model = "session-model", effort = "high"},
+		journal.Selection_Applied{version = 1, api = "openai_responses", effort = "high"},
 	)
 	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit the selection") }
 
@@ -817,7 +817,11 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 	defer _ = journal.close(runner)
 	if _, claim_error := journal.claim(runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
 	turn := journal.next_turn(runner)
-	journal.append_record(runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
+	journal.append_record(
+		runner,
+		{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn},
+		journal.Turn_Started{instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX},
+	)
 	question := journal.append_node(
 		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
@@ -2229,10 +2233,10 @@ test_mid_session_selection_commits_the_fitting_target_before_publish :: proc(t: 
 	record, found, read_error := journal.read_latest(app.setup.store, {session = app.setup.session.session, kinds = {.Selection_Applied}}, context.allocator)
 	if !testing.expect(t, read_error == nil && found, "the installed selection must be durable before publishing success") { return }
 	defer journal.record_destroy(&record, context.allocator)
-	applied: journal.Selection_Applied
-	if !testing.expect_value(t, journal.payload_decode(record.data, &applied, context.temp_allocator), nil) { return }
-	testing.expect_value(t, applied.provider, "test-provider")
-	testing.expect_value(t, applied.model, "target-model")
+	applied, is_applied := journal.payload_as(record, journal.Selection_Applied)
+	if !testing.expect(t, is_applied, "the record carries a selection") { return }
+	testing.expect_value(t, record.provider, "test-provider")
+	testing.expect_value(t, record.model, "target-model")
 	testing.expect_value(t, applied.api, agent.chat_api_name(ai.API_Kind.OpenAI_Responses))
 }
 
@@ -2318,7 +2322,11 @@ test_a_follower_shows_the_calls_running_when_it_attached :: proc(t: ^testing.T) 
 	defer _ = journal.close(runner)
 	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
 	turn := journal.next_turn(runner)
-	journal.append_record(runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, journal.Turn_Started{})
+	journal.append_record(
+		runner,
+		{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn},
+		journal.Turn_Started{instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX},
+	)
 	prompt := journal.append_node(
 		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
@@ -3976,10 +3984,15 @@ test_server_restart_restores_the_last_session_selection :: proc(t: ^testing.T) {
 	if open_error != nil { testing.fail_now(t, "could not open journal") }
 	defer _ = journal.close(store)
 	if _, claim_error := journal.claim(store, id); claim_error != nil { testing.fail_now(t, "could not claim session") }
-	for selection in ([]journal.Selection_Applied{{version = 1, api = "openai_chat_completions", provider = "test-provider", model = "model-x", effort = "low"}, {version = 1, api = "openai_chat_completions", provider = "test-provider", model = "model-y", effort = "high"}}) {
-		journal.append_record(store, {kind = .Selection_Applied, session = id, provider = selection.provider, model = selection.model}, selection)
+	for model, index in ([]string{"model-x", "model-y"}) {
+		selection := journal.Selection_Applied {
+			version = 1,
+			api     = "openai_chat_completions",
+			effort  = "low" if index == 0 else "high",
+		}
+		journal.append_record(store, {kind = .Selection_Applied, session = id, provider = "test-provider", model = model}, selection)
 	}
-	journal.append_record(store, {kind = .Selection_Changed}, journal.Selection_Changed{provider = "test-provider", model = "model-x", effort = "low"})
+	journal.append_record(store, {kind = .Selection_Changed, provider = "test-provider", model = "model-x"}, journal.Selection_Changed{effort = "low"})
 	if _, err := journal.commit(store); err != nil { testing.fail_now(t, "could not commit selections") }
 	if err := journal.release(store); err != nil { testing.fail_now(t, "could not release session") }
 	attach_setup_destroy(&setup)
@@ -4029,3 +4042,6 @@ test_server_restart_restores_the_last_session_selection :: proc(t: ^testing.T) {
 	testing.expect_value(t, reader.resumed_model, "model-y")
 	testing.expect_value(t, reader.resumed_effort, "high")
 }
+
+// TEST_DIGEST_HEX names no artifact; the journal does not check turn digests until foreign keys are on.
+TEST_DIGEST_HEX :: "0000000000000000000000000000000000000000000000000000000000000000"

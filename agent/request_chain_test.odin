@@ -54,7 +54,7 @@ request_chain_assert :: proc(test: ^testing.T, chat: ^Chat_Session, expected_att
 		payload: journal.Request_Sent
 		if testing.expect_value(test, journal.payload_decode(record.data, &payload, context.temp_allocator), nil) {
 			testing.expect_value(test, payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
-			testing.expect_value(test, payload.model_requested, chat.model_id)
+			testing.expect_value(test, record.model, chat.model_id)
 			testing.expect_value(test, payload.recovery, "initial" if index == 0 else "transient_retry")
 			testing.expect_value(test, len(payload.body_digest), journal.DIGEST_HEX_LENGTH)
 			testing.expect(test, payload.body_bytes > 0, "the frozen body was not recorded with its size")

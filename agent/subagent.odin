@@ -770,8 +770,8 @@ chat_session_role_setup :: proc(chat: ^Chat_Session, base: ^Tool_Registry) -> (p
 	start, found, read_error := journal.read_latest(chat.store, filter, context.temp_allocator)
 	if read_error != nil { return "the subagent's instruction could not be read from its parent's journal" }
 	if !found { return "the subagent's definition is not in its parent's journal" }
-	started: journal.Subagent_Started
-	if journal.payload_decode(start.data, &started, context.temp_allocator) != nil { return "the subagent definition could not be read" }
+	started, is_started := journal.payload_as(start, journal.Subagent_Started)
+	if !is_started { return "the subagent definition could not be read" }
 	name, name_error := strings.clone(started.name, chat.allocator)
 	if name_error != nil || name == "" { return "the subagent name could not be held" }
 	installed := false
@@ -836,8 +836,8 @@ subagent_outcome_status :: proc(outcome: journal.Tool_Outcome, finished: bool) -
 subagent_outcome :: proc(completions: []journal.Record, start: journal.Record) -> (outcome: journal.Tool_Outcome, finished: bool) {
 	for completion in completions {
 		if completion.call != start.call || completion.subagent != start.subagent { continue }
-		completed: journal.Subagent_Completed
-		if journal.payload_decode(completion.data, &completed, context.temp_allocator) != nil { return .Unknown, true }
+		completed, is_completed := journal.payload_as(completion, journal.Subagent_Completed)
+		if !is_completed { return .Unknown, true }
 		named, named_ok := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completed.outcome)
 		return named if named_ok else .Unknown, true
 	}
@@ -873,8 +873,8 @@ subagent_children :: proc(store: ^journal.Journal, session: journal.Session_Id) 
 	// continuation that never started leaves the child as it was.
 	known := make([dynamic]Subagent_Child, context.temp_allocator)
 	for record in starts {
-		started: journal.Subagent_Started
-		if journal.payload_decode(record.data, &started, context.temp_allocator) != nil { continue }
+		started, is_started := journal.payload_as(record, journal.Subagent_Started)
+		if !is_started { continue }
 		entry := Subagent_Child {
 			name    = started.name,
 			program = started.program,
@@ -885,8 +885,7 @@ subagent_children :: proc(store: ^journal.Journal, session: journal.Session_Id) 
 		entry.outcome, entry.finished = ended, finished
 		for completion in completions {
 			if completion.call != record.call || completion.subagent != record.subagent { continue }
-			completed: journal.Subagent_Completed
-			if journal.payload_decode(completion.data, &completed, context.temp_allocator) == nil {
+			if completed, is_completed := journal.payload_as(completion, journal.Subagent_Completed); is_completed {
 				entry.acp_model = completed.acp_model
 				entry.acp_effort = completed.acp_effort
 				entry.acp_session = completed.acp_session

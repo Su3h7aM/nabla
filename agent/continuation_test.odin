@@ -28,11 +28,18 @@ test_continuation_runs_once_after_recovery :: proc(test: ^testing.T) {
 		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt]},
 		transmute([]u8)prompt,
 	)
-	journal.append_record(store, {session = session, turn = 1, kind = .Turn_Started}, journal.Turn_Started{model = "test-model"})
+	journal.append_record(
+		store,
+		{session = session, turn = 1, kind = .Turn_Started, model = "test-model"},
+		journal.Turn_Started {
+			instructions = "0000000000000000000000000000000000000000000000000000000000000000",
+			manifest = "0000000000000000000000000000000000000000000000000000000000000000",
+		},
+	)
 	journal.append_record(
 		store,
 		{session = session, turn = 1, request = 1, kind = .Request_Sent},
-		journal.Request_Sent{purpose = journal.REQUEST_PURPOSE_NAMES[.Response], api = chat_api_name(.OpenAI_Chat_Completions)},
+		journal.Request_Sent{purpose = journal.REQUEST_PURPOSE_NAMES[.Response], api = chat_api_name(.OpenAI_Chat_Completions), recovery = "initial"},
 	)
 	assistant := journal.append_node(
 		store,

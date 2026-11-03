@@ -65,9 +65,9 @@ test_read_records_filters_by_node_in_seq_order :: proc(test: ^testing.T) {
 
 	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
 	for node in Node_Id(1) ..= Node_Id(3) {
-		append_record(journal, Record{session = session, node = node, kind = .Tool_Proposed}, _Test_Payload{detail = "call"})
-		append_record(journal, Record{session = session, node = node, kind = .Tool_Admitted}, _Test_Payload{detail = "call"})
-		append_record(journal, Record{session = session, node = node, kind = .Tool_Completed}, _Test_Payload{detail = "call"})
+		append_record(journal, Record{session = session, node = node, kind = .Tool_Proposed}, _tool_proposed())
+		append_record(journal, Record{session = session, node = node, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell"})
+		append_record(journal, Record{session = session, node = node, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
 	}
 	_commit_ok(test, journal)
 
@@ -107,7 +107,7 @@ test_read_records_filters_and_pages :: proc(test: ^testing.T) {
 	for turn in Turn_Id(1) ..= Turn_Id(2) {
 		append_record(journal, Record{session = session, turn = turn, kind = .Turn_Started}, _turn_started())
 		for call in Call_Id(1) ..= Call_Id(2) {
-			append_record(journal, Record{session = session, turn = turn, call = call, kind = .Tool_Proposed}, _Test_Payload{detail = "call"})
+			append_record(journal, Record{session = session, turn = turn, call = call, kind = .Tool_Proposed}, _tool_proposed())
 		}
 	}
 	_commit_ok(test, journal)
@@ -462,7 +462,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	append_record(
 		journal,
 		Record{session = session, turn = 1, request = 1, call = 3, parent_call = 1, kind = .Tool_Proposed},
-		Tool_Proposed{name = "grep"},
+		Tool_Proposed{provider_id = "openai", name = "grep"},
 		_body(`{"pattern": "hello"}`),
 	)
 	append_record(
@@ -767,7 +767,7 @@ test_delegation_messages_are_delivered_once :: proc(test: ^testing.T) {
 	append_record(
 		parent_journal,
 		Record{session = parent, call = call, subagent = child, kind = .Subagent_Started},
-		Subagent_Started{model = "gpt-5", effort = "low"},
+		Subagent_Started{name = "child", model = "gpt-5", effort = "low"},
 	)
 	_commit_ok(test, parent_journal)
 	testing.expect_value(

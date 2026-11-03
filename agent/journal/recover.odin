@@ -103,7 +103,7 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 		header.call = Call_Id(row_int(&row))
 		header.parent_call = Call_Id(row_int(&row))
 		header.subagent = Session_Id(row_id(&row))
-		data := row_view(&row)
+		tool := row_view(&row)
 		if row.error != nil || rule > max(Recovery_Rule) { return corrupt(journal, Journal_Error.Corrupt, journal.claimed, 0) }
 		if scope == .Live && rule == .Background_Call { continue }
 
@@ -134,14 +134,12 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 			append_record(journal, header, unknown)
 			recovery.calls += 1
 		case .Background_Call:
-			admitted: Tool_Admitted
-			payload_decode(data, &admitted, context.temp_allocator, journal, journal.claimed) or_return
 			header.kind = .Background_Completed
 			body := fmt.tprintf("error unknown: %s\n", recover_kept_detail("it may have taken effect", kept_directory, header.call))
 			append_record(
 				journal,
 				header,
-				Background_Completed{outcome = TOOL_OUTCOME_NAMES[.Unknown], detail = "it may have taken effect", tool = admitted.tool},
+				Background_Completed{outcome = TOOL_OUTCOME_NAMES[.Unknown], detail = "it may have taken effect", tool = tool},
 				transmute([]u8)body,
 			)
 			recovery.calls += 1
@@ -234,32 +232,49 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 // Each rule finds work whose closing record is missing, so a second recovery
 // finds nothing.
 @(private)
-RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, call, parent_call, subagent, data FROM (
-	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = ?2
+RECOVERY_QUERY ::
+	`SELECT rule, branch, node, turn, request, attempt, call, parent_call, subagent, tool FROM (
+	SELECT 0 AS rule, ` +
+	RECOVERY_OPEN_COLUMNS +
+	`, NULL AS tool, open.seq FROM records AS open WHERE open.session = ?1 AND open.kind = ?2
 		AND (open.turn IS NULL OR open.turn NOT IN (SELECT turn FROM records WHERE session = ?1 AND kind = ?3 AND turn IS NOT NULL))
 	UNION ALL
-	SELECT 1, * FROM records AS open WHERE session = ?1 AND kind = ?4
+	SELECT 1, ` +
+	RECOVERY_OPEN_COLUMNS +
+	`, NULL, open.seq FROM records AS open WHERE open.session = ?1 AND open.kind = ?4
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND request = open.request AND attempt IS open.attempt
 			AND kind IN (?5, ?6, ?7))
 	UNION ALL
-	SELECT 2, * FROM records AS open WHERE session = ?1 AND kind = ?8
+	SELECT 2, ` +
+	RECOVERY_OPEN_COLUMNS +
+	`, NULL, open.seq FROM records AS open WHERE open.session = ?1 AND open.kind = ?8
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind IN (?9, ?10))
 	UNION ALL
-	SELECT 3, * FROM records AS open WHERE session = ?1 AND kind = ?9
-		AND COALESCE(json_extract(open.data, '$.background'), 0) = 0
+	SELECT 3, ` +
+	RECOVERY_OPEN_COLUMNS +
+	`, NULL, open.seq FROM records AS open JOIN record_tool_admitted AS admitted ON admitted.seq = open.seq
+		WHERE open.session = ?1 AND open.kind = ?9 AND admitted.background = 0
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = ?10)
 	UNION ALL
-	SELECT CASE kind WHEN ?11 THEN 4 WHEN ?12 THEN 5
-		ELSE CASE WHEN COALESCE(json_extract(open.data, '$.program'), '') = ''
-			AND NOT EXISTS (SELECT 1 FROM sessions WHERE session = open.subagent) THEN 7 ELSE 6 END END, *
-		FROM records AS open WHERE session = ?1 AND kind IN (?11, ?12, ?13)
+	SELECT CASE open.kind WHEN ?11 THEN 4 WHEN ?12 THEN 5
+		ELSE CASE WHEN started.program IS NULL
+			AND NOT EXISTS (SELECT 1 FROM sessions WHERE session = open.subagent) THEN 7 ELSE 6 END END, ` +
+	RECOVERY_OPEN_COLUMNS +
+	`, NULL, open.seq
+		FROM records AS open LEFT JOIN record_subagent_started AS started ON started.seq = open.seq
+		WHERE open.session = ?1 AND open.kind IN (?11, ?12, ?13)
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call
 			AND kind IN (?14, ?15, ?16))
 	UNION ALL
-	SELECT 8, * FROM records AS open WHERE session = ?1 AND kind = ?9
-		AND json_extract(open.data, '$.background') = 1
+	SELECT 8, ` +
+	RECOVERY_OPEN_COLUMNS +
+	`, admitted.tool, open.seq FROM records AS open JOIN record_tool_admitted AS admitted ON admitted.seq = open.seq
+		WHERE open.session = ?1 AND open.kind = ?9 AND admitted.background = 1
 		AND NOT EXISTS (SELECT 1 FROM records WHERE session = ?1 AND call = open.call AND kind = ?17)
 ) ORDER BY seq`
+
+@(private)
+RECOVERY_OPEN_COLUMNS :: `open.branch, open.node, open.turn, open.request, open.attempt, open.call, open.parent_call, open.subagent`
 
 @(private)
 UNANSWERED_CALLS_QUERY :: `SELECT assistant.node, assistant.branch, assistant.turn, proposed.call

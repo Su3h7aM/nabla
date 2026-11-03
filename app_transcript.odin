@@ -705,8 +705,8 @@ box_toggle :: proc(app: ^App, call: journal.Call_Id) {
 		snap_append(app, .Warning, "the result of that call is not in the journal")
 		return
 	}
-	completion: journal.Tool_Completed
-	if decode_error := journal.payload_decode(records[0].data, &completion, context.temp_allocator); decode_error != nil {
+	completion, is_completion := journal.payload_as(records[0], journal.Tool_Completed)
+	if !is_completion {
 		snap_append(app, .Error, "cannot read the result: the record is damaged")
 		return
 	}
