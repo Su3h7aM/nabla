@@ -950,8 +950,7 @@ acp_test_app_end :: proc(app: ^App, directory, workspace: string) {
 	_ = session_store_close(app.setup.store)
 	app.setup.store = nil
 	for &entry in app.run.snap.entries {
-		delete(entry.stream)
-		if entry.text != nil { delete(entry.text) }
+		entry_destroy(&entry)
 	}
 	delete(app.run.snap.entries)
 	delete(app.run.snap.status.provider_id, app.run.alloc)

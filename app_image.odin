@@ -59,6 +59,8 @@ entry_destroy :: proc(entry: ^Entry) {
 	delete(entry.text)
 	delete(entry.stream)
 	delete(entry.image.pixels)
+	delete(entry.rows_index.text)
+	delete(entry.rows_index.starts)
 }
 
 // image_prepare returns the picture of the first PNG or JPEG among attachments, shrunk to IMAGE_MAX_EDGE; its pixels are empty when there is none.

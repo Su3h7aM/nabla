@@ -70,12 +70,36 @@ Entry :: struct {
 	preview_at:    int,
 	hidden_lines:  int,
 	tool_rows:     int,
+	// rows_index is the result laid out as rows: the start of each wrapped row in
+	// drawing order. The frame indexes it by row instead of splitting the result
+	// again, so drawing a window costs the rows it shows and nothing else.
+	rows_index:    Rows_Index,
 	// full is the whole text of an expanded box, borrowed from the transcript for one frame.
 	// selected marks the tool box selected by mouse or keyboard.
 	full:          string,
 	selected:      bool,
 	// image is the picture of the call's result; its id is zero when there is none.
 	image:         Entry_Image,
+}
+
+// Rows_Index is a result laid out as rows, flat and index-addressed. starts[n] is
+// where row n begins in text, and it ends where row n + 1 begins; the final entry
+// is the text's length, so the rows need no length of their own and every row is
+// one u32. laid_out names what it was laid out from, so a box knows when the rows
+// it holds describe a text or a width the entry no longer has. text and starts are
+// owned by the run's allocator; the zero value is an empty index that owns nothing.
+Rows_Index :: struct {
+	text:     string,
+	starts:   []u32,
+	laid_out: Maybe(Rows_Laid_Out),
+}
+
+// Rows_Laid_Out is what a Rows_Index was built from. A box has two texts, the part a
+// collapsed box kept and the whole result, so which one was laid out is part of it.
+Rows_Laid_Out :: struct {
+	revision: u64,
+	expanded: bool,
+	width:    int,
 }
 
 // Status carries the runtime facts the footer shows. provider_id and cwd are borrowed

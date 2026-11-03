@@ -10,6 +10,7 @@ import "core:mem"
 import "core:strings"
 import "core:sync"
 import "core:time"
+import "core:unicode/utf8"
 
 import "nabla:layout"
 import "nabla:markdown"
@@ -856,12 +857,17 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 	// The corner, the leading rule, and the space after the name leave the name
 	// this much room; the rest of the top border is rule.
 	name = text.truncate_text_at(name, max(border_inner_width - 3, 0), TOOL_LABEL_START)
-	preview = text.sanitize_text(preview, context.temp_allocator) or_else ""
+	// A box has two texts, the kept preview and the whole result, and the revision
+	// only counts changes to them. The expanded flag says which one is on screen, so
+	// it is part of what the rows were laid out from.
+	rows_ready := rows_index_fill(storage.alloc, &entry.rows_index, preview, entry.revision, expanded, content_width)
+	// A result that could not be laid out shows no rows, so its box keeps the plain
+	// rule the frame would have drawn for an empty one.
+	content_rows := rows_index_count(entry.rows_index) if rows_ready else 0
 	title := fmt.tprintf("%s %s ", outline.horizontal, name)
 	// The window is the part of the result the box shows. Its range is set
 	// here because this is where the row count and the box's width are both known:
 	// a resize or a shorter result can leave a remembered offset past the end.
-	content_rows := tool_preview_rows(preview, content_width, TOOL_CONTENT_START)
 	visible_rows := min(content_rows, TOOL_WINDOW_ROWS)
 	scrolls := expanded || entry.running
 	// The range stays on the entry because the wheel asks whether the window has
@@ -907,19 +913,19 @@ declare_tool_entry :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, entry:
 		}
 		if widgets.block(ctx, &storage.paints, box) {
 			body := storage_paint(storage, {style = TOOL_BODY})
-			remaining := preview
-			row_index := 0
-			drawn := 0
-			for len(remaining) > 0 {
-				piece, rest := tool_row_next(remaining, content_width, TOOL_CONTENT_START)
-				if row_index >= first_row && drawn < visible_rows {
-					layout.text(ctx, layout.Text_Desc{text = fmt.tprintf(" %s", piece), style = {size = 1, wrap = .None}, paint = body})
-					drawn += 1
-				}
-				row_index += 1
-				remaining = rest
-				if drawn >= visible_rows { break }
+			// The window is an index into the rows the result was laid out as, so the
+			// box draws the rows it shows and never walks the ones it hides.
+			laid_out := entry.rows_index.text
+			last := min(first_row + visible_rows, content_rows)
+			for row in first_row ..< last {
+				piece := laid_out[entry.rows_index.starts[row]:entry.rows_index.starts[row + 1]]
+				// A row ends where the next one begins, so it carries the newline that
+				// ended it. A drawn line holds no terminator.
+				if strings.has_suffix(piece, "\n") { piece = piece[:len(piece) - 1] }
+				layout.text(ctx, layout.Text_Desc{text = fmt.tprintf(" %s", piece), style = {size = 1, wrap = .None}, paint = body})
 			}
+			// A box with no result still holds one blank row, so its border has content
+			// between the two rules.
 			if content_rows == 0 {
 				layout.text(ctx, layout.Text_Desc{text = " ", style = {size = 1, wrap = .None}, paint = body})
 			}
@@ -966,10 +972,17 @@ declare_tool_image :: proc(ctx: ^layout.Context, storage: ^Frame_Storage, id: te
 // remainder. A row ends at a newline or at the content width; a grapheme wider than the
 // width still takes a row, so the split always advances. start_column is where the row
 // starts inside its drawn line.
+//
+// The newline search stops at the content width, because no row reaches past it: a result
+// written as one very long line would otherwise be rescanned to its end once per row, which
+// is quadratic in the result's size.
 tool_row_next :: proc(value: string, width, start_column: int) -> (row: string, rest: string) {
-	newline := strings.index(value, "\n")
-	logical := value
-	if newline >= 0 { logical = value[:newline] }
+	line_end := len(value)
+	// One cluster is at most utf8.UTF_MAX bytes, so a row of `width` columns ends
+	// within this many bytes of where it starts.
+	scan_end := min(len(value), max(width, 0) * utf8.UTF_MAX + 1)
+	if newline := strings.index_byte(value[:scan_end], '\n'); newline >= 0 { line_end = newline }
+	logical := value[:line_end]
 	piece := text.truncate_text_at(logical, width, start_column)
 	if piece == "" && len(logical) > 0 {
 		piece = logical[:text.next_grapheme_offset(logical, 0)]
@@ -977,22 +990,66 @@ tool_row_next :: proc(value: string, width, start_column: int) -> (row: string, 
 	switch {
 	case len(piece) < len(logical):
 		return piece, value[len(piece):]
-	case newline >= 0:
-		return piece, value[newline + 1:]
+	case line_end < len(value):
+		return piece, value[line_end + 1:]
 	}
 	return piece, ""
 }
 
-// tool_preview_rows counts the rows a tool box draws for a result: one per
-// wrapped row, so the box knows what its window is holding back.
-tool_preview_rows :: proc(preview: string, width, start_column: int) -> int {
-	rows := 0
-	remaining := preview
-	for len(remaining) > 0 {
-		_, remaining = tool_row_next(remaining, width, start_column)
-		rows += 1
+// rows_index_fill lays preview out as rows at width and stores them in index, so a
+// frame reads row n instead of splitting the result again. The rows are rebuilt
+// only when the entry's text or the width changed, which keeps a settled box the
+// same cost per frame however large its result is. One pass splits the result and
+// appends each row's span, so the count is the array's length and nothing walks
+// the result twice. Everything is allocated with allocator. A failed allocation
+// leaves index as it was and reports false, so the box draws no result this frame
+// and tries again next.
+@(require_results)
+rows_index_fill :: proc(allocator: mem.Allocator, index: ^Rows_Index, preview: string, revision: u64, expanded: bool, width: int) -> bool {
+	laid_out := Rows_Laid_Out {
+		revision = revision,
+		expanded = expanded,
+		width    = width,
 	}
-	return rows
+	if built, present := index.laid_out.?; present && built == laid_out { return true }
+	cleaned, sanitize_error := text.sanitize_text(preview, allocator)
+	if sanitize_error != nil { return false }
+	// One start per row plus the text's length, which ends the last row. An empty
+	// result is no rows at all, so it stores nothing rather than a lone end.
+	if cleaned == "" {
+		delete(index.text, allocator)
+		delete(index.starts, allocator)
+		index^ = Rows_Index {
+			laid_out = laid_out,
+		}
+		return true
+	}
+	starts := make([dynamic]u32, 0, min(len(cleaned) / 8 + 2, TOOL_WINDOW_ROWS * 4), allocator)
+	remaining := cleaned
+	for len(remaining) > 0 {
+		_, rest := tool_row_next(remaining, width, TOOL_CONTENT_START)
+		// The piece always starts where the last one ended, so its offset is the
+		// distance the remainder has advanced.
+		if _, append_error := append(&starts, u32(len(cleaned) - len(remaining))); append_error != nil {
+			delete(starts)
+			delete(cleaned, allocator)
+			return false
+		}
+		remaining = rest
+	}
+	if _, append_error := append(&starts, u32(len(cleaned))); append_error != nil {
+		delete(starts)
+		delete(cleaned, allocator)
+		return false
+	}
+	delete(index.text, allocator)
+	delete(index.starts, allocator)
+	index^ = Rows_Index {
+		text     = cleaned,
+		starts   = starts[:],
+		laid_out = laid_out,
+	}
+	return true
 }
 
 // tool_window_label names what a window is holding back. The arrows point at the
@@ -1249,4 +1306,10 @@ shorten_home :: proc(app: ^App, path: string) -> string {
 		return path
 	}
 	return fmt.tprintf("~%s", path[len(home):])
+}
+// rows_index_count is the rows index holds: one per start, less the final entry,
+// which only ends the last row. An empty result is no rows.
+rows_index_count :: proc(index: Rows_Index) -> int {
+	if len(index.starts) == 0 { return 0 }
+	return len(index.starts) - 1
 }

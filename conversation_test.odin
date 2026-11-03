@@ -661,6 +661,64 @@ tool_box_fixture :: proc(app: ^App, body: string, expanded: bool) {
 	if expanded { app.transcript.expanded[5] = strings.clone(full, app.run.alloc) }
 }
 
+// A box lays its result out as rows once, and a frame reads the rows it shows out
+// of that flat array. The spinner redraws ten times a second while a turn runs, so
+// a result written as one long line must not be rescanned to its end per row nor
+// re-laid-out per frame.
+@(test)
+test_a_tool_box_lays_its_rows_out_once :: proc(t: ^testing.T) {
+	// One line of 600 columns at a 36-column content width is more rows than the
+	// window shows, and none of them starts a new line.
+	body, _ := strings.repeat("word ", 120, context.temp_allocator)
+
+	app := new(App)
+	defer {
+		boxes_collapse_all(app)
+		delete(app.transcript.expanded)
+		snapshot_destroy(app)
+		free(app)
+	}
+	app.run.alloc = context.allocator
+	app.columns = 40
+	app.rows = 20
+	tool_box_fixture(app, body, false)
+
+	storage := frame_storage_new(context.allocator)
+	defer frame_storage_destroy(storage)
+	_, frame_error := render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	testing.expect_value(t, app.run.snap.entries[0].tool_rows, TOOL_WINDOW_ROWS)
+	testing.expect(t, conversation_row_with(storage, "more lines") > 0, "the hidden rows are counted")
+
+	// The rows are one flat array of starts the box indexes: row n begins at
+	// starts[n] and ends where the next row begins, and the last start is the
+	// result's length.
+	index := app.run.snap.entries[0].rows_index
+	rows := rows_index_count(index)
+	if !testing.expect(t, rows > TOOL_WINDOW_ROWS, "the result must not fit the window") { return }
+	testing.expect_value(t, len(index.starts), rows + 1)
+	testing.expect_value(t, index.starts[0], u32(0))
+	testing.expect_value(t, int(index.starts[rows]), len(index.text))
+	for start in 1 ..= rows {
+		testing.expect(t, index.starts[start] > index.starts[start - 1], "every row advances")
+	}
+
+	// A second frame at the same width reads the same array.
+	_, frame_error = render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	testing.expect_value(t, rows_index_count(app.run.snap.entries[0].rows_index), rows)
+	testing.expect(t, raw_data(app.run.snap.entries[0].rows_index.starts) == raw_data(index.starts), "the rows are laid out once")
+
+	// A wider box wraps the same result into fewer rows, so the array is rebuilt.
+	app.columns = 80
+	_, frame_error = render_frame(app, storage)
+	if !testing.expect_value(t, frame_error, Render_Status.None) { return }
+	built, present := app.run.snap.entries[0].rows_index.laid_out.?
+	if !testing.expect(t, present, "the rows were laid out") { return }
+	testing.expect_value(t, built.width, app.columns - 6)
+	testing.expect(t, rows_index_count(app.run.snap.entries[0].rows_index) < rows, "a wider box wraps the result into fewer rows")
+}
+
 // A collapsed box keeps the first lines of its result, and the bottom border counts the lines it hides.
 @(test)
 test_a_collapsed_tool_box_says_what_it_hides :: proc(t: ^testing.T) {

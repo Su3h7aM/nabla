@@ -73,8 +73,7 @@ app_session_end :: proc(app: ^App, directory: string) {
 	app.setup.store = nil
 	transcript_destroy(app)
 	for &entry in app.run.snap.entries {
-		delete(entry.stream)
-		if entry.text != nil { delete(entry.text) }
+		entry_destroy(&entry)
 	}
 	delete(app.run.snap.entries)
 	codemode_pending_clear_locked(app)
