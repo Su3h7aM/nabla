@@ -94,13 +94,16 @@ ACP_Session :: struct {
 // ACP_Server is the connection: the writer, the wire surface the profile names, and the
 // session table. The table's slots are written by the reader thread only.
 ACP_Server :: struct {
-	// app.setup carries the shared catalog, configuration, directories, and run id, and
-	// the connection's own default selection in provider_id and model_id. It holds no
-	// session.
+	// app.setup carries the shared catalog, configuration, directories, and run id. It
+	// holds no session and no selection of this connection.
 	app:              App,
 	alloc:            mem.Allocator,
 	base_mcp_servers: []agent.MCP_Server_Config, // borrowed from the launch config
-	default_effort:   string, // owned; the effort that goes with the default selection
+	// default_provider, default_model, and default_effort are the selection new sessions
+	// start with; they are owned by alloc.
+	default_provider: string,
+	default_model:    string,
+	default_effort:   string,
 	writer:           acp.Writer,
 	// initialized is set once initialize has been answered. Only the reader writes it.
 	initialized:      bool,
@@ -191,22 +194,24 @@ acp_default_selection :: proc(conn: ^ACP_Server, selection: Applied_Selection, f
 
 @(require_results)
 acp_default_install :: proc(conn: ^ACP_Server, provider_id, model_id, effort: string) -> bool {
-	setup := &conn.app.setup
-	target, problem := selection_target_resolve(&conn.app, provider_id, model_id, setup.alloc)
-	defer if problem != "" { delete(problem, setup.alloc) }
+	target, problem := selection_target_resolve(&conn.app, provider_id, model_id, conn.alloc)
+	defer if problem != "" { delete(problem, conn.alloc) }
 	if target.model_id == "" { return false }
-	defer agent.model_selection_destroy(&target, setup.alloc)
-	provider, provider_error := strings.clone(target.provider_id, setup.alloc)
-	model, model_error := strings.clone(target.model_id, setup.alloc)
-	kept_effort, effort_error := strings.clone(effort, setup.alloc)
+	defer agent.model_selection_destroy(&target, conn.alloc)
+	provider, provider_error := strings.clone(target.provider_id, conn.alloc)
+	model, model_error := strings.clone(target.model_id, conn.alloc)
+	kept_effort, effort_error := strings.clone(effort, conn.alloc)
 	if provider_error != nil || model_error != nil || effort_error != nil {
-		delete(provider, setup.alloc)
-		delete(model, setup.alloc)
-		delete(kept_effort, setup.alloc)
+		delete(provider, conn.alloc)
+		delete(model, conn.alloc)
+		delete(kept_effort, conn.alloc)
 		return false
 	}
-	setup.provider_id = provider
-	setup.model_id = model
+	delete(conn.default_provider, conn.alloc)
+	delete(conn.default_model, conn.alloc)
+	delete(conn.default_effort, conn.alloc)
+	conn.default_provider = provider
+	conn.default_model = model
 	conn.default_effort = kept_effort
 	return true
 }
@@ -242,7 +247,11 @@ acp_server_destroy :: proc(conn: ^ACP_Server, patience := SHUTDOWN_JOIN_PATIENCE
 	}
 	if !acp.writer_destroy(&conn.writer, patience) { return false }
 	run_setup_destroy(&conn.app.setup)
+	delete(conn.default_provider, conn.alloc)
+	delete(conn.default_model, conn.alloc)
 	delete(conn.default_effort, conn.alloc)
+	conn.default_provider = ""
+	conn.default_model = ""
 	conn.default_effort = ""
 	return true
 }

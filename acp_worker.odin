@@ -502,9 +502,9 @@ acp_open_request_selection :: proc(session: ^ACP_Session, fresh: bool) -> (messa
 // session without one still opens: the prompt is what refuses it.
 @(require_results)
 acp_install_default_selection :: proc(session: ^ACP_Session) -> (message: string, ok: bool) {
-	if session.conn.app.setup.provider_id == "" || session.conn.app.setup.model_id == "" { return "", true }
-	provider, provider_error := strings.clone(session.conn.app.setup.provider_id, session.conn.alloc)
-	model, model_error := strings.clone(session.conn.app.setup.model_id, session.conn.alloc)
+	if session.conn.default_provider == "" || session.conn.default_model == "" { return "", true }
+	provider, provider_error := strings.clone(session.conn.default_provider, session.conn.alloc)
+	model, model_error := strings.clone(session.conn.default_model, session.conn.alloc)
 	effort, effort_error := strings.clone(session.conn.default_effort, session.conn.alloc)
 	if provider_error != nil || model_error != nil || effort_error != nil {
 		delete(provider, session.conn.alloc)
