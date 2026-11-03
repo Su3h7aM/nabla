@@ -247,7 +247,7 @@ The rest of this section describes the threads of the server. The session server
 | owner | 1 per live session | `futex_wait(wake.seq)` | `Session_State`, journal writes for the session |
 | config watcher | 1 | `ppoll(inotify fd, shutdown eventfd)` | snapshot construction |
 | session watcher | 0..1 | `ppoll(inotify fd, stop eventfd)` | owner wakes for shared sessions (section 8.6) |
-| catalog refresh | 0 or 1, on demand, exits when done | network I/O | provider listing and models.dev fetch |
+| catalog refresh | 0 or 1, on demand, exits when done; its provider listing requests run on one thread each (0..configured providers), all joined before the refresh publishes | network I/O | provider listing and models.dev fetch |
 | job worker (tool call, provider attempt, compaction) | per session: 0..`TOOL_JOBS_MAX_ACTIVE` tool jobs, at most one attempt, at most one compaction | the blocking operation | its kind's record: input and output |
 | MCP server | per configured server, started lazily | (external) | its own process, started and stopped through `subprocess` |
 | subagent ACP client | 0..`subagents_max_running` | protocol exchanges | one child process; native or configured ACP |
