@@ -298,6 +298,9 @@ _declare_node :: proc(
 	parent_input = &state._node_inputs[parent]
 	parent_input.last_child = node
 	parent_input.child_count += 1
+	if in_flow {
+		parent_input.flow_child_count += 1
+	}
 	if parent != 0 {
 		state._nodes[parent].child_count = u16(parent_input.child_count)
 	}

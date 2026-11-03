@@ -48,6 +48,9 @@ _Node_Input :: struct {
 	child_clip:        Clip_Handle,
 	subtree_end:       int,
 	in_flow:           bool,
+	// Children whose in_flow is set, counted as they are declared. It sits beside the
+	// bool so the struct does not grow.
+	flow_child_count:  u16,
 	text:              string,
 	text_style:        Text_Style,
 	text_paint:        Paint,

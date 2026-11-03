@@ -16,17 +16,6 @@ _direct_children :: proc(state: ^_Context_State, parent: Node_Handle) -> []Node_
 }
 
 @(private)
-_flow_child_count :: proc(state: ^_Context_State, parent: Node_Handle) -> int {
-	count := 0
-	for child in _direct_children(state, parent) {
-		if state._node_inputs[child].in_flow {
-			count += 1
-		}
-	}
-	return count
-}
-
-@(private)
 _clamp_axis_size :: proc "contextless" (value: Scalar, style: Axis_Size) -> Scalar {
 	return _canonical_zero(math.clamp(value, style.min, style.max))
 }
@@ -530,7 +519,7 @@ _resolve_children_axis :: proc(state: ^_Context_State, parent: Node_Handle, axis
 	parent_inner := _parent_inner_size(state, parent)
 	main_axis := _flow_main_axis(_parent_flow(state, parent))
 	is_main_axis := axis == main_axis
-	normal_children := _flow_child_count(state, parent)
+	normal_children := int(parent_input.flow_child_count)
 	gap_total: f64
 	if is_main_axis && normal_children > 1 {
 		gap_total = f64(normal_children - 1) * f64(_parent_gap(state, parent))
@@ -864,7 +853,7 @@ _place_children :: proc(state: ^_Context_State, parent: Node_Handle) {
 	}
 	main_axis := _flow_main_axis(flow)
 	cross_axis := _other_axis(main_axis)
-	normal_children := _flow_child_count(state, parent)
+	normal_children := int(state._node_inputs[parent].flow_child_count)
 	content_main: f64
 	content_cross: f64
 
