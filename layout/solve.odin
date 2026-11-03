@@ -64,16 +64,27 @@ _finite_scalar :: proc(state: ^_Context_State, node: Node_Handle, axis: Axis, va
 	return _canonical_zero(Scalar(value))
 }
 
+// _finite_sum is _finite_scalar(f64(a) + f64(b)). A sum in f32 below the largest finite value
+// is the same result with no overflow to measure, so the f64 path runs only when the f32 sum
+// reaches that limit or is not a number.
+@(private)
+_finite_sum :: proc(state: ^_Context_State, node: Node_Handle, axis: Axis, a, b: Scalar) -> Scalar {
+	sum := a + b
+	if !math.is_nan(sum) && math.abs(sum) < Scalar(math.F32_MAX) {
+		return _canonical_zero(sum)
+	}
+	return _finite_scalar(state, node, axis, f64(a) + f64(b))
+}
+
 @(private)
 _deflate_node_rect :: proc(state: ^_Context_State, node: Node_Handle, rect: Rect, padding: Edges) -> Rect {
+	// Subtracting non-negative padding from a finite size cannot pass the largest finite
+	// value, so the size needs no overflow measurement.
 	return Rect {
-		position = {
-			_finite_scalar(state, node, .X, f64(rect.position.x) + f64(padding.left)),
-			_finite_scalar(state, node, .Y, f64(rect.position.y) + f64(padding.top)),
-		},
+		position = {_finite_sum(state, node, .X, rect.position.x, padding.left), _finite_sum(state, node, .Y, rect.position.y, padding.top)},
 		size = {
-			_finite_scalar(state, node, .X, math.max(f64(rect.size.x) - f64(padding.left) - f64(padding.right), 0)),
-			_finite_scalar(state, node, .Y, math.max(f64(rect.size.y) - f64(padding.top) - f64(padding.bottom), 0)),
+			_canonical_zero(math.max(rect.size.x - padding.left - padding.right, 0)),
+			_canonical_zero(math.max(rect.size.y - padding.top - padding.bottom, 0)),
 		},
 	}
 }
