@@ -127,9 +127,10 @@ serve_stream_end :: proc(stream: ^Serve_Stream) {
 	serve_stream_drop(stream)
 }
 
-// serve_stream_observe drains queued tool output on the turn driver's pump,
-// including while provider and tool jobs run. It never waits for those jobs.
-serve_stream_observe :: proc(_: ^agent.Steer_Context, observer: agent.Chat_Observer) {
+// serve_stream_observe applies the pending commands and drains queued tool output on the
+// turn driver's pump, including while provider and tool jobs run. It never waits for those jobs.
+serve_stream_observe :: proc(steer: ^agent.Steer_Context, observer: agent.Chat_Observer) {
+	serve_command_observe(steer, observer)
 	serve_stream_drain((^Serve_Stream_Token)(observer.user_data).stream)
 }
 
