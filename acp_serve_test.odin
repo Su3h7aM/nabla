@@ -1516,6 +1516,11 @@ acp_test_prompt_record :: proc(t: ^testing.T, name, prompt: string, compact: boo
 	directory, workspace := acp_test_app_begin(t, &app, locks)
 	defer acp_test_app_end(&app, directory, workspace)
 
+	// The fake server does not apply the default model selection a prompt would request.
+	app.setup.catalog = acp_test_catalog(app.setup.alloc, "http://127.0.0.1:1")
+	defer agent.catalog_destroy(&app.setup.catalog)
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", ""), "the test model could not be selected") { return }
+
 	iface: ACP_Test_Interface
 	acp_test_interface_init(t, &iface, .V2, &app.setup.catalog)
 	defer acp_test_interface_destroy(&iface)
