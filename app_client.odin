@@ -275,25 +275,21 @@ session_client_switch :: proc(app: ^App, start: Session_Start) -> bool {
 	}
 	selection_intent_clear(app)
 	if setup.resumed_provider != "" && setup.resumed_model != "" {
-		_ = selection_apply_direct(app, setup.resumed_provider, setup.resumed_model, setup.resumed_effort, false)
+		_ = selection_apply_direct(app, setup.resumed_provider, setup.resumed_model, setup.resumed_effort)
 	}
 	return true
 }
 
-// session_client_ensure starts the session server when nothing holds the claim. A
-// server that is already running is left alone, including its model.
-session_client_ensure :: proc(app: ^App, provider, model: string) {
+// session_client_ensure starts the session server when nothing holds the claim.
+session_client_ensure :: proc(app: ^App) {
 	setup := &app.setup
 	client_server_close(&setup.server)
-	server, error := client_ensure_server(setup.harness_options.nabla_executable, setup.session.session, provider, model, setup.harness_options.nabla_config)
+	server, error := client_ensure_server(setup.harness_options.nabla_executable, setup.session.session, setup.harness_options.nabla_config)
 	if error.kind != .None {
 		snap_append(app, .Error, "the session server could not be started")
 		return
 	}
 	setup.server = server
-	if server.state == nil && provider != "" {
-		snap_append(app, .Notice, "the session is already running; it keeps its model")
-	}
 }
 
 // app_client_service is one idle step of a client: send a cancel or a compaction the

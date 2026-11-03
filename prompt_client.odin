@@ -168,7 +168,7 @@ run_prompt :: proc(executable: string, options: chat_cli_options, config: string
 	session, resolved := prompt_resolve_session(store, options)
 	if !resolved { return 1 }
 
-	server, server_error := client_ensure_server(executable, session, options.provider_id, options.model_id, config)
+	server, server_error := client_ensure_server(executable, session, config)
 	if server_error.kind != .None {
 		switch server_error.kind {
 		case .None:
@@ -190,7 +190,6 @@ run_prompt :: proc(executable: string, options: chat_cli_options, config: string
 		return 1
 	}
 	defer client_server_close(&server)
-	if server.state == nil && options.provider_id != "" { fmt.eprintln("nabla: the running session keeps its selection") }
 	follow, follow_error := client_follow_open(store, session)
 	if follow_error.kind != .None {
 		#partial switch follow_error.kind {
@@ -204,5 +203,11 @@ run_prompt :: proc(executable: string, options: chat_cli_options, config: string
 		return 1
 	}
 	defer client_follow_close(&follow)
+	if options.provider_id != "" {
+		if err := journal.append_command(store, journal.Select_Model{provider = options.provider_id, model = options.model_id}); err != nil {
+			fmt.eprintf("nabla: the model selection was not sent: %s\n", journal.error_text(err, context.temp_allocator))
+			return 1
+		}
+	}
 	return prompt_wait_turn(&follow, &server, options.prompt, answer) ? 0 : 1
 }

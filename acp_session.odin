@@ -170,7 +170,7 @@ acp_connection_open :: proc(conn: ^ACP_Server, sources: []agent.Catalog_Provider
 // names none. Nothing is persisted: a model chosen for an editor conversation is not the
 // user's own last choice. An empty default is not fatal, because the prompt is what
 // refuses a session with no model.
-acp_default_selection :: proc(conn: ^ACP_Server, selection: journal.Selection_Changed, found: bool) {
+acp_default_selection :: proc(conn: ^ACP_Server, selection: journal.Selection_Applied, found: bool) {
 	if found && acp_default_install(conn, selection.provider, selection.model, selection.effort) { return }
 	candidates, candidates_ok := acp_servable_models(&conn.app, conn.alloc)
 	if !candidates_ok { return }

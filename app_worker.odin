@@ -224,30 +224,14 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 		}
 	case .New_Session:
 		rows_dirty = true
-		// The new session runs the same selection; only the conversation is new. The
-		// selection is copied first because the switch replaces it, and a session
-		// opened without one could not run a turn.
-		provider, provider_error := strings.clone(app.setup.provider_id, app.run.alloc)
-		model, model_error := strings.clone(app.setup.model_id, app.run.alloc)
-		if provider_error != nil || model_error != nil {
-			delete(provider, app.run.alloc)
-			delete(model, app.run.alloc)
-			snap_append(app, .Error, "a new session could not be started: its model could not be allocated")
-			break
-		}
-		defer delete(provider, app.run.alloc)
-		defer delete(model, app.run.alloc)
 		if session_switch(app, Start_Fresh{}) {
 			snapshot_clear(app)
 			snap_append(app, .Notice, "started a new session")
-			// The new session keeps the same selection; a failure is already in the
-			// snapshot, and the session stays open without a model.
-			if provider != "" && model != "" { _ = selection_apply_direct(app, provider, model, "", true) }
-			session_client_ensure(app, provider, model)
+			session_client_ensure(app)
 		}
 	case .Resume_Session:
 		rows_dirty = true
-		if session_resume(app, work.text) { session_client_ensure(app, "", "") }
+		if session_resume(app, work.text) { session_client_ensure(app) }
 	}
 	if rows_dirty { session_refresh_rows(app) }
 	refresh_status(app)

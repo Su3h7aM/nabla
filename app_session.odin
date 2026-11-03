@@ -38,8 +38,7 @@ Run_Setup :: struct {
 	provider_id:         string, // owned,
 	model_id:            string, // owned,
 	// resumed_provider and resumed_model are what the opened session last ran
-	// with. They are empty for a new session, and they are only a fallback for
-	// when no selection exists anywhere else.
+	// with. They are empty for a new session.
 	resumed_provider:    string, // owned,
 	resumed_model:       string, // owned,
 	resumed_effort:      string, // owned,
@@ -47,10 +46,7 @@ Run_Setup :: struct {
 	// models.dev also contributes providers, and the model menu offers only the
 	// configured ones, whose credentials the user actually set up.
 	configured:          [dynamic]string, // owned,
-	// owns_selection says whether this run's model choice is the user's. The
-	// interactive harness owns it: its choice is published to the front-end and
-	// remembered for the next launch. A headless or child run does not, because it
-	// selects a model for one job and must not change what the user starts with.
+	// owns_selection controls whether the local selection is published to the front-end.
 	owns_selection:      bool,
 	// shared_sessions says this front-end shows a session another process runs as a
 	// follower instead of refusing it, and watches the lock file of the session it shows
@@ -720,26 +716,19 @@ report_recovery :: proc(recovery: journal.Recovery, queued: int) {
 	}
 }
 
-// selection_record remembers the model the user chose, so the next launch starts with it.
-@(require_results)
-selection_record :: proc(store: ^journal.Journal, provider, model, effort: string) -> journal.Error {
-	journal.append_record(store, {kind = .Selection_Changed}, journal.Selection_Changed{provider = provider, model = model, effort = effort})
-	_, commit_error := journal.commit(store)
-	return commit_error
-}
-
 // selection_latest reads the model the user last chose, owned by allocator.
 @(require_results)
-selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: journal.Selection_Changed, found: bool, error: journal.Error) {
+selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: journal.Selection_Applied, found: bool, error: journal.Error) {
 	record: journal.Record
-	record, found = journal.read_latest(store, {kinds = {.Selection_Changed}}, allocator) or_return
+	record, found = journal.read_latest(store, {kinds = {.Selection_Applied}}, allocator) or_return
 	defer journal.record_destroy(&record, allocator)
 	if !found { return }
 	journal.payload_decode(record.data, &selection, allocator, corruption_journal = store, session = record.session, seq = record.seq) or_return
 	return selection, true, nil
 }
 
-selection_destroy :: proc(selection: ^journal.Selection_Changed, allocator: mem.Allocator) {
+selection_destroy :: proc(selection: ^journal.Selection_Applied, allocator: mem.Allocator) {
+	delete(selection.api, allocator)
 	delete(selection.provider, allocator)
 	delete(selection.model, allocator)
 	delete(selection.effort, allocator)
@@ -878,7 +867,7 @@ app_selection_service :: proc(app: ^App) -> bool {
 	}
 	switch status {
 	case .Ready:
-		installed := selection_install(app, pending.target, "", true)
+		installed := selection_install(app, pending.target, "")
 		pending_target_clear(&app.run.pending_target, app.run.alloc)
 		return installed
 	case .Pending:
@@ -919,7 +908,7 @@ selection_target_resolve :: proc(app: ^App, provider_id, model_id: string, alloc
 // selection_install installs a resolved target on the session owner. target is borrowed;
 // its owner keeps it alive through this call.
 @(require_results)
-selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: string, announce: bool) -> bool {
+selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: string) -> bool {
 	api := target.connection.API
 
 	running := &app.setup.session
@@ -997,15 +986,6 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 		delete(app.setup.model_id, app.setup.alloc)
 		app.setup.model_id = setup_model
 	}
-	// The record names the process-wide default, and only the claim holder may append
-	// it: a followed store appends nothing but its own lines.
-	if app.setup.owns_selection && announce && !app_following(app) {
-		if default_error := selection_record(app.setup.store, target.provider_id, target.model_id, running.effort); default_error != nil {
-			running.storage_failed = true
-			selection_fail(app, "the selected model was installed but its default could not be committed")
-			return false
-		}
-	}
 	if app.setup.owns_selection {
 		sync.mutex_guard(&app.run.mu)
 		selection_publish_locked(app, target.provider_id, target.model_id)
@@ -1015,7 +995,7 @@ selection_install :: proc(app: ^App, target: agent.Model_Selection, effort: stri
 }
 
 @(require_results)
-selection_apply_direct :: proc(app: ^App, provider_id, model_id, effort: string, announce: bool) -> bool {
+selection_apply_direct :: proc(app: ^App, provider_id, model_id, effort: string) -> bool {
 	target, problem := selection_target_resolve(app, provider_id, model_id, app.run.alloc)
 	defer if problem != "" { delete(problem, context.temp_allocator) }
 	if problem != "" {
@@ -1023,7 +1003,7 @@ selection_apply_direct :: proc(app: ^App, provider_id, model_id, effort: string,
 		return false
 	}
 	defer agent.model_selection_destroy(&target, app.run.alloc)
-	return selection_install(app, target, effort, announce)
+	return selection_install(app, target, effort)
 }
 
 // selection_publish_locked shows an applied selection to the front-end. The
@@ -1061,18 +1041,12 @@ selection_publish_locked :: proc(app: ^App, provider_id, model_id: string) {
 	snap_publish_locked(app)
 }
 
-// apply_startup_selection chooses the model a launch runs with: the two flags if they are
-// given, otherwise the stored selection, otherwise the model a resumed session recorded.
-// A stale selection is not fatal; it leaves the launch to the model menu. False means the
-// launch cannot continue, and the reason is in the snapshot.
-@(require_results)
-apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) -> bool {
-	if flag_provider != "" || flag_model != "" {
-		if flag_provider == "" || flag_model == "" {
-			selection_fail(app, "--provider and --model must be given together")
-			return false
-		}
-		return selection_apply_direct(app, flag_provider, flag_model, "", true)
+// apply_startup_selection restores the session's selection, or the last one used.
+// A stale selection is not fatal; the snapshot carries the reason it could not apply.
+apply_startup_selection :: proc(app: ^App) {
+	if app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
+		_ = selection_apply_direct(app, app.setup.resumed_provider, app.setup.resumed_model, app.setup.resumed_effort)
+		return
 	}
 	selection, found, load_error := selection_latest(app.setup.store, app.run.alloc)
 	defer selection_destroy(&selection, app.run.alloc)
@@ -1082,13 +1056,7 @@ apply_startup_selection :: proc(app: ^App, flag_provider, flag_model: string) ->
 		detail := journal.error_text(load_error, context.temp_allocator)
 		fmt.eprintln("nabla: the selection could not be read:", detail)
 	}
-	applied := found && selection_apply_direct(app, selection.provider, selection.model, selection.effort, true)
-	if !applied && app.setup.resumed_provider != "" && app.setup.resumed_model != "" {
-		// A fallback that also fails leaves the launch to the model menu, and the
-		// snapshot already carries why.
-		_ = selection_apply_direct(app, app.setup.resumed_provider, app.setup.resumed_model, app.setup.resumed_effort, true)
-	}
-	return true
+	if found { _ = selection_apply_direct(app, selection.provider, selection.model, selection.effort) }
 }
 
 // SETUP_ERROR_ALLOCATION is shown when the selection reason itself could not be

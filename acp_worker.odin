@@ -355,7 +355,7 @@ acp_model_selection_service :: proc(session: ^ACP_Session) -> ai.Provider_Connec
 			return session.app.run.connection
 		}
 		if acp_model_request_pending(session) { return session.app.run.connection }
-		installed := selection_install(&session.app, selection.target, "", false)
+		installed := selection_install(&session.app, selection.target, "")
 		if !installed {
 			acp_model_selection_error(session, selection, acp.ERROR_INTERNAL, "the selected model could not be installed durably")
 			return session.app.run.connection
@@ -1054,7 +1054,7 @@ acp_selection_install :: proc(session: ^ACP_Session, provider_id, model_id, effo
 	defer if problem != "" { delete(problem, context.temp_allocator) }
 	if target.model_id == "" { return false }
 	defer agent.model_selection_destroy(&target, session.app.setup.alloc)
-	return selection_install(&session.app, target, effort, false)
+	return selection_install(&session.app, target, effort)
 }
 
 // acp_select_first_model picks the first configured provider that can serve a request and

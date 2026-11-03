@@ -224,7 +224,7 @@ catalog_selection_sync :: proc(app: ^App) {
 		snap_append(app, .Warning, "the catalog change could not be applied: out of memory")
 		return
 	}
-	if selection_apply_direct(app, provider_id, model_id, "", false) {
+	if selection_apply_direct(app, provider_id, model_id, "") {
 		app.run.catalog_applied_revision = revision
 	}
 }

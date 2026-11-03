@@ -85,14 +85,7 @@ client_lock_path :: proc(session: journal.Session_Id) -> (path: string, error: C
 	return lock_path, {}
 }
 
-client_ensure_server :: proc(
-	executable: string,
-	session: journal.Session_Id,
-	provider, model, config: string,
-) -> (
-	server: Client_Server,
-	error: Client_Error,
-) {
+client_ensure_server :: proc(executable: string, session: journal.Session_Id, config: string) -> (server: Client_Server, error: Client_Error) {
 	lock_path, path_error := client_lock_path(session)
 	if path_error.kind != .None { return {}, path_error }
 	defer delete(lock_path)
@@ -101,7 +94,7 @@ client_ensure_server :: proc(
 	if held { return {}, {} }
 	hex: [journal.SESSION_ID_HEX_LENGTH]u8
 	session_text := journal.session_id_to_hex(session, hex[:])
-	arguments: [10]string
+	arguments: [6]string
 	count := 0
 	arguments[count] = executable
 	count += 1
@@ -111,16 +104,6 @@ client_ensure_server :: proc(
 	count += 1
 	arguments[count] = session_text
 	count += 1
-	if provider != "" {
-		arguments[count] = "--provider"
-		count += 1
-		arguments[count] = provider
-		count += 1
-		arguments[count] = "--model"
-		count += 1
-		arguments[count] = model
-		count += 1
-	}
 	if config != "" {
 		arguments[count] = "--config"
 		count += 1

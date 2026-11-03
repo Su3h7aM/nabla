@@ -191,8 +191,7 @@ test_a_launch_opens_only_the_session_it_asked_for :: proc(t: ^testing.T) {
 	attach_setup_destroy(&missing_setup)
 }
 
-// The stored selection is the user's own last choice, so a launch restores it,
-// and a second launch that stores another replaces it rather than adding one.
+// A launch restores the last applied selection.
 @(test)
 test_a_launch_restores_the_stored_selection :: proc(t: ^testing.T) {
 	app: App
@@ -202,19 +201,21 @@ test_a_launch_restores_the_stored_selection :: proc(t: ^testing.T) {
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
 
-	if err := selection_record(app.setup.store, "test-provider", "test-model", ""); err != nil {
-		testing.fail_now(t, "the selection could not be stored")
-	}
+	journal.append_record(
+		app.setup.store,
+		{kind = .Selection_Applied, session = app.setup.session.session},
+		journal.Selection_Applied{version = 1, provider = "test-provider", model = "test-model"},
+	)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 
-	testing.expect(t, apply_startup_selection(&app, "", ""))
+	apply_startup_selection(&app)
 	testing.expect_value(t, app.setup.session.provider_id, "test-provider")
 	testing.expect_value(t, app.setup.session.model_id, "test-model")
 }
 
-// A stored selection outranks the model a resumed session recorded, and the
-// session's model is the fallback for a launch that has no selection stored.
+// A resumed session keeps its recorded selection.
 @(test)
-test_the_stored_selection_outranks_the_session_model :: proc(t: ^testing.T) {
+test_a_launch_restores_the_resumed_session_model :: proc(t: ^testing.T) {
 	app: App
 	directory := app_session_begin(t, &app)
 	defer app_session_end(&app, directory)
@@ -224,16 +225,11 @@ test_the_stored_selection_outranks_the_session_model :: proc(t: ^testing.T) {
 	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
 	app.setup.resumed_model = strings.clone("test-model", app.setup.alloc)
 
-	testing.expect(t, apply_startup_selection(&app, "", ""))
-	testing.expect_value(t, app.setup.session.model_id, "test-model")
-
-	// Flags are the launch's own instruction and outrank both.
-	testing.expect(t, apply_startup_selection(&app, "test-provider", "test-model"))
+	apply_startup_selection(&app)
 	testing.expect_value(t, app.setup.session.model_id, "test-model")
 }
 
-// A stale selection is not fatal: the session's model is tried, and a launch
-// that can resolve nothing continues to the model menu rather than failing.
+// A stale global selection does not replace the resumed session's model.
 @(test)
 test_a_stale_selection_falls_back_rather_than_failing :: proc(t: ^testing.T) {
 	app: App
@@ -242,13 +238,16 @@ test_a_stale_selection_falls_back_rather_than_failing :: proc(t: ^testing.T) {
 
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
-	if err := selection_record(app.setup.store, "gone", "gone", ""); err != nil {
-		testing.fail_now(t, "the selection could not be stored")
-	}
+	journal.append_record(
+		app.setup.store,
+		{kind = .Selection_Applied, session = app.setup.session.session},
+		journal.Selection_Applied{version = 1, provider = "gone", model = "gone"},
+	)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
 	app.setup.resumed_model = strings.clone("test-model", app.setup.alloc)
 
-	testing.expect(t, apply_startup_selection(&app, "", ""))
+	apply_startup_selection(&app)
 	testing.expect_value(t, app.setup.session.model_id, "test-model")
 }
 
@@ -262,25 +261,17 @@ test_a_launch_with_nothing_to_resolve_continues_to_the_menu :: proc(t: ^testing.
 
 	app.setup.catalog = app_test_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
-	if err := selection_record(app.setup.store, "gone", "gone", ""); err != nil {
-		testing.fail_now(t, "the selection could not be stored")
-	}
+	journal.append_record(
+		app.setup.store,
+		{kind = .Selection_Applied, session = app.setup.session.session},
+		journal.Selection_Applied{version = 1, provider = "gone", model = "gone"},
+	)
+	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 
-	testing.expect(t, apply_startup_selection(&app, "", ""))
+	apply_startup_selection(&app)
 	testing.expect_value(t, app.setup.model_id, "")
 	// Why the stored selection did not apply is recorded for the menu to show.
 	testing.expect(t, app.run.snap.setup_error != "")
-}
-
-// One flag without the other is a launch mistake, not something to guess at.
-@(test)
-test_a_half_given_model_flag_is_refused :: proc(t: ^testing.T) {
-	app: App
-	directory := app_session_begin(t, &app)
-	defer app_session_end(&app, directory)
-
-	testing.expect(t, !apply_startup_selection(&app, "test-provider", ""))
-	testing.expect(t, !apply_startup_selection(&app, "", "test-model"))
 }
 
 // app_session_add records a session in a separate journal without disturbing the running claim.
@@ -740,7 +731,7 @@ test_a_session_another_process_runs_opens_as_a_follower :: proc(t: ^testing.T) {
 
 	// A selection applies to the follower for display and is never recorded as the user's
 	// default.
-	testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", true))
+	testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", ""))
 	_, recorded, selection_error := selection_latest(app.setup.store, app.setup.alloc)
 	testing.expect(t, selection_error == nil, "the selection could not be read")
 	testing.expect(t, !recorded, "a follower must not rewrite the default model")
@@ -2154,7 +2145,7 @@ test_catalog_refresh_enriches_the_active_selection :: proc(t: ^testing.T) {
 	stage_two, stage_two_err := agent.resolve_catalog(user, provider, {}, app.setup.alloc)
 	if !testing.expect_value(t, stage_two_err, agent.Catalog_Error.None) { return }
 	app.setup.catalog = stage_two
-	testing.expect(t, selection_apply_direct(&app, "test-provider", "discovered-model", "", true))
+	testing.expect(t, selection_apply_direct(&app, "test-provider", "discovered-model", ""))
 	testing.expect_value(t, len(app.setup.session.effort_levels), 0)
 	notices := len(app.run.snap.entries)
 
@@ -2212,7 +2203,7 @@ test_mid_session_selection_refusal_keeps_the_active_model :: proc(t: ^testing.T)
 	app.setup.catalog = app_test_switch_catalog(app.setup.alloc, 8)
 	defer agent.catalog_destroy(&app.setup.catalog)
 	app.setup.session.catalog = app_catalog_ref(&app)
-	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "")) { return }
 	previous_api := app.run.connection.API
 	app_test_selection_request(&app, "test-provider", "target-model")
 	testing.expect(t, !app_selection_service(&app))
@@ -2230,7 +2221,7 @@ test_mid_session_selection_commits_the_fitting_target_before_publish :: proc(t: 
 	app.setup.catalog = app_test_switch_catalog(app.setup.alloc, 128_000)
 	defer agent.catalog_destroy(&app.setup.catalog)
 	app.setup.session.catalog = app_catalog_ref(&app)
-	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "")) { return }
 	app_test_selection_request(&app, "test-provider", "target-model")
 	if !testing.expect(t, app_selection_service(&app), "a fitting selection should install at the safe boundary") { return }
 	testing.expect_value(t, app.setup.model_id, "target-model")
@@ -2253,12 +2244,12 @@ test_resume_restores_an_installed_selection_without_a_later_turn :: proc(t: ^tes
 	app.setup.catalog = app_test_switch_catalog(app.setup.alloc, 128_000)
 	defer agent.catalog_destroy(&app.setup.catalog)
 	app.setup.session.catalog = app_catalog_ref(&app)
-	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "")) { return }
 	app_test_selection_request(&app, "test-provider", "target-model")
 	if !testing.expect(t, app_selection_service(&app)) { return }
 	session := app.setup.session.session
 	if !testing.expect(t, session_switch(&app, Start_Fresh{})) { return }
-	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "")) { return }
 	if !testing.expect(t, session_switch(&app, Start_Resume_Id(app_session_id_text(session)))) { return }
 	testing.expect_value(t, app.setup.session.model_id, "target-model")
 	testing.expect_value(t, app.run.connection.API, ai.API_Kind.OpenAI_Responses)
@@ -3842,7 +3833,7 @@ test_serve_applies_each_pending_command_once :: proc(t: ^testing.T) {
 	app.setup.catalog = app_test_effort_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
 	app.setup.session.catalog = app_catalog_ref(&app)
-	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "")) { return }
 
 	// The client's side of the contract: a journal that follows the session the app runs.
 	client, client_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
@@ -3907,7 +3898,7 @@ test_serve_stop_server_ends_the_turn_and_the_server :: proc(t: ^testing.T) {
 	app.setup.catalog = app_test_effort_catalog(app.setup.alloc)
 	defer agent.catalog_destroy(&app.setup.catalog)
 	app.setup.session.catalog = app_catalog_ref(&app)
-	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "", false)) { return }
+	if !testing.expect(t, selection_apply_direct(&app, "test-provider", "test-model", "")) { return }
 
 	client, client_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
 	if client_error != nil { testing.fail_now(t, "the client's journal could not open") }
@@ -3963,4 +3954,75 @@ app_test_effort_catalog :: proc(allocator: mem.Allocator) -> agent.Catalog {
 	}
 	catalog, _ := agent.resolve_catalog(sources, {}, {}, allocator)
 	return catalog
+}
+@(test)
+test_server_restart_restores_the_last_session_selection :: proc(t: ^testing.T) {
+	if !test_isolate_process(t, #procedure) { return }
+	state, previous, had_previous := app_state_isolate(t)
+	defer app_state_restore(state, previous, had_previous)
+	workspace, workspace_error := os.get_working_directory(context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "could not read workspace") }
+	defer delete(workspace)
+
+	setup: Run_Setup
+	setup.alloc = context.allocator
+	defer attach_setup_destroy(&setup)
+	if !testing.expect(t, run_session_attach_test(&setup, workspace, Start_Fresh{}, nil)) { return }
+	id := setup.session.session
+	store, open_error := journal.open(setup.journal_directory, setup.lock_directory, journal.run_id_create(), .Read_Write)
+	if open_error != nil { testing.fail_now(t, "could not open journal") }
+	defer _ = journal.close(store)
+	if _, claim_error := journal.claim(store, id); claim_error != nil { testing.fail_now(t, "could not claim session") }
+	for selection in ([]journal.Selection_Applied{{version = 1, api = "openai_chat_completions", provider = "test-provider", model = "model-x", effort = "low"}, {version = 1, api = "openai_chat_completions", provider = "test-provider", model = "model-y", effort = "high"}}) {
+		journal.append_record(store, {kind = .Selection_Applied, session = id, provider = selection.provider, model = selection.model}, selection)
+	}
+	journal.append_record(store, {kind = .Selection_Changed}, journal.Selection_Changed{provider = "test-provider", model = "model-x", effort = "low"})
+	if _, err := journal.commit(store); err != nil { testing.fail_now(t, "could not commit selections") }
+	if err := journal.release(store); err != nil { testing.fail_now(t, "could not release session") }
+	attach_setup_destroy(&setup)
+
+	sources := []agent.Catalog_Provider_Source {
+		{
+			id = "test-provider",
+			base_url = "http://127.0.0.1:1",
+			api = "openai_chat_completions",
+			api_key = "test-key",
+			models = []agent.Catalog_Model_Source {
+				{
+					id = "model-x",
+					context_window = 128_000,
+					max_output_tokens = 4_096,
+					tools = true,
+					thinking = {present = true, supported = true, levels = []string{"low", "high"}},
+				},
+				{
+					id = "model-y",
+					context_window = 128_000,
+					max_output_tokens = 4_096,
+					tools = true,
+					thinking = {present = true, supported = true, levels = []string{"low", "high"}},
+				},
+			},
+		},
+	}
+	if !testing.expect_value(t, serve_run(sources, nil, {idle_exit_seconds = 1}, {session_id = app_session_id_text(id)}), 0) { return }
+
+	reader: Run_Setup
+	reader.alloc = context.allocator
+	defer attach_setup_destroy(&reader)
+	if !testing.expect(t, run_session_attach_test(&reader, workspace, Start_Resume_Id(app_session_id_text(id)), nil)) { return }
+	testing.expect_value(t, reader.resumed_provider, "test-provider")
+	testing.expect_value(t, reader.resumed_model, "model-y")
+	testing.expect_value(t, reader.resumed_effort, "high")
+	attach_setup_destroy(&reader)
+	reader.alloc = context.allocator
+	if !testing.expect(t, run_session_attach_test(&reader, workspace, Start_Fresh{}, nil)) { return }
+	new_id := reader.session.session
+	attach_setup_destroy(&reader)
+	if !testing.expect_value(t, serve_run(sources, nil, {idle_exit_seconds = 1}, {session_id = app_session_id_text(new_id)}), 0) { return }
+	reader.alloc = context.allocator
+	if !testing.expect(t, run_session_attach_test(&reader, workspace, Start_Resume_Id(app_session_id_text(new_id)), nil)) { return }
+	testing.expect_value(t, reader.resumed_provider, "test-provider")
+	testing.expect_value(t, reader.resumed_model, "model-y")
+	testing.expect_value(t, reader.resumed_effort, "high")
 }

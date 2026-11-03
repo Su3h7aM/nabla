@@ -22,15 +22,12 @@ Serve_Parse_Error :: enum {
 // to start the session server. Strings are borrowed from the argument slice.
 Serve_Options :: struct {
 	session_id:  string,
-	provider_id: string,
-	model_id:    string,
 	config_path: string,
 }
 
 // serve_main runs the session server and returns the process exit status.
 // arguments are the process arguments after the program name. An interface
-// re-executes the binary with --serve --session <id> and, when it has them,
-// --provider, --model, and --config. Those arguments are not a user command.
+// re-executes the binary with --serve --session <id> and optionally --config.
 // Exit 0 means another server already holds the session, or this one was idle.
 // A failure prints one line on stderr and returns non-zero.
 @(require_results)
@@ -41,11 +38,6 @@ serve_main :: proc(arguments: []string) -> int {
 		serve_parse_report(parse_error)
 		return 2
 	}
-	if (options.provider_id == "") != (options.model_id == "") {
-		fmt.eprintln("nabla: --provider and --model must be given together")
-		return 2
-	}
-
 	explicit_config := options.config_path
 	config_path := options.config_path
 	if config_path == "" {
@@ -100,20 +92,10 @@ serve_parse :: proc(args: []string) -> (Serve_Options, Serve_Parse_Error) {
 			options.config_path = arg[len("--config="):]
 			continue
 		}
-		if strings.has_prefix(arg, "--provider=") {
-			options.provider_id = arg[len("--provider="):]
-			continue
-		}
-		if strings.has_prefix(arg, "--model=") {
-			options.model_id = arg[len("--model="):]
-			continue
-		}
-		if arg == "--config" || arg == "--provider" || arg == "--model" {
+		if arg == "--config" {
 			if i + 1 >= len(args) { return options, .Missing_Value }
 			i += 1
-			if arg == "--config" { options.config_path = args[i] }
-			if arg == "--provider" { options.provider_id = args[i] }
-			if arg == "--model" { options.model_id = args[i] }
+			options.config_path = args[i]
 			continue
 		}
 		return options, .Unknown_Option
@@ -135,8 +117,6 @@ serve_parse_report :: proc(parse_error: Serve_Parse_Error) {
 }
 
 // serve_run claims the named session and serves it until it is idle or it fails.
-// The model flags are applied the way a headless prompt applies them, and the
-// saved selection is left as it was.
 @(require_results)
 serve_run :: proc(
 	sources: []agent.Catalog_Provider_Source,
@@ -159,13 +139,13 @@ serve_run :: proc(
 	app.compact_on_switch = harness_options.compact_on_switch
 	// The server watches the session it owns. It does not follow one it could not claim.
 	app.setup.shared_sessions = true
-	// The model this run uses belongs to the launch, not to the user.
 	app.setup.owns_selection = false
 	snapshot_transcript_own(app)
 	defer {
 		snapshot_destroy(app)
 		run_setup_destroy(&app.setup)
 		abandoned = app.setup.workers_abandoned
+		if !abandoned { catalog_run_destroy(app) }
 	}
 	defer serve_stream_destroy(&app.stream)
 
@@ -199,14 +179,7 @@ serve_run :: proc(
 		fmt.eprintln("nabla: cannot watch the session, so lines other processes send it would not arrive")
 		return 1
 	}
-	if !apply_startup_selection(app, options.provider_id, options.model_id) {
-		fmt.eprintln("nabla:", setup_error_text(app))
-		return 1
-	}
-	if app.setup.model_id == "" {
-		fmt.eprintln("nabla: no model is selected; give --provider and --model, or run the interactive harness once")
-		return 1
-	}
+	apply_startup_selection(app)
 	if app.setup.session.storage_failed {
 		return serve_storage_exit(&app.setup.session)
 	}
@@ -330,16 +303,17 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 		if chat.storage_failed {
 			return serve_storage_exit(chat)
 		}
+		step, step_ok := serve_step(app)
+		if !step_ok { return 1 }
 		serve_commands_apply(app, .Boundary)
 		if chat.storage_failed {
 			return serve_storage_exit(chat)
 		}
+		if app.stop_server { return 0 }
 		if app_compaction_pending(app) {
 			_ = app_compaction_tick(app, {})
 		}
 
-		step, step_ok := serve_step(app)
-		if !step_ok { return 1 }
 		switch step {
 		case .Environment:
 			idle_due = nil

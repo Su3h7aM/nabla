@@ -560,20 +560,13 @@ tui_run :: proc(
 	app.run.resize_wake = resize_wake
 	term.set_resize_wake(resize_wake)
 
-	session_client_ensure(app, flag_provider, flag_model)
-	// A server that was already running keeps its model; the flags are not applied over it.
-	server_keeps_model := app.setup.server.state == nil && flag_provider != ""
-	shown_provider := "" if server_keeps_model else flag_provider
-	shown_model := "" if server_keeps_model else flag_model
-	if !apply_startup_selection(app, shown_provider, shown_model) {
-		fmt.eprintln("nabla:", setup_error_text(app))
-		app_abandoned = app_teardown(app)
-		return false
-	}
+	session_client_ensure(app)
+	if flag_provider != "" { _ = app_command_send(app, journal.Select_Model{provider = flag_provider, model = flag_model}) }
+	apply_startup_selection(app)
 
 	// With no model selected, the chooser is the only input: escape quits rather
 	// than returning to a prompt that cannot send anything.
-	if app.setup.model_id == "" && !server_keeps_model {
+	if app.setup.model_id == "" && flag_provider == "" {
 		menu_open_model(app)
 		app.menu.required = true
 	}
