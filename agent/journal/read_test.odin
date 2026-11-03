@@ -555,6 +555,14 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	for node, index in ancestry {
 		testing.expect_value(test, node.kind, expected_kinds[index])
 		testing.expect_value(test, string(node.body), expected_bodies[index])
+		if node.kind == .Results {
+			payload, has_payload := node.payload.?
+			stored, is_results := payload.(Results)
+			if testing.expect(test, has_payload && is_results, "results have a typed payload") && testing.expect_value(test, len(stored.calls), 2) {
+				testing.expect_value(test, stored.calls[0], Call_Id(1))
+				testing.expect_value(test, stored.calls[1], Call_Id(2))
+			}
+		}
 		if node.kind != .Assistant { continue }
 		payload, has_payload := node.payload.?
 		testing.expect(test, has_payload, "an assistant node reads its typed row")

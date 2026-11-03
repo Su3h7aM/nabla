@@ -222,8 +222,9 @@ projection_build :: proc(
 		case .Assistant:
 			projection_add_assistant(store, &items, node, responses[node.id][:], admitted, arena) or_return
 		case .Results:
-			results: journal.Results
-			journal.payload_decode(node.data, &results, context.temp_allocator, corruption_journal = store, session = node.session, seq = node.seq) or_return
+			payload, has_payload := node.payload.?
+			results, is_results := payload.(journal.Results)
+			if !has_payload || !is_results { return {}, journal.Journal_Error.Corrupt }
 			for call in results.calls {
 				record, found := completed[call]
 				if !found {

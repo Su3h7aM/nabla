@@ -548,8 +548,10 @@ test_tool_calls_are_recorded_then_run :: proc(test: ^testing.T) {
 	found := false
 	for node in ancestry {
 		if node.kind != .Results { continue }
-		if decode_error := journal.payload_decode(node.data, &results, context.temp_allocator);
-		   decode_error != nil { testing.fail_now(test, "the results node could not be decoded") }
+		payload, has_payload := node.payload.?
+		stored, is_results := payload.(journal.Results)
+		if !has_payload || !is_results { testing.fail_now(test, "the results node has no typed payload") }
+		results = stored
 		found = true
 	}
 	if !testing.expect(test, found, "the answered batch commits a Results node") { return }

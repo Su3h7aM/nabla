@@ -104,6 +104,7 @@ Node_Payload :: union {
 	User,
 	Assistant,
 	Checkpoint,
+	Results,
 }
 
 // Corruption names the row a read found damaged.

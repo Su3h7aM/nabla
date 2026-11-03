@@ -73,20 +73,22 @@ Insert :: enum {
 	Node_Checkpoint,
 	Node_User,
 	Node_Attachment,
+	Node_Result_Call,
 }
 
 @(private)
 INSERT_SQL := [Insert]string {
-	.Record          = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
-	.Node            = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	.Branch          = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
-	.Session         = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
-	.Session_Titled  = `INSERT INTO record_session_titled (seq, title) VALUES (?, ?)`,
-	.Artifact        = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
-	.Node_Assistant  = `INSERT INTO node_assistant (session, node, request, partial) VALUES (?, ?, ?, ?)`,
-	.Node_Checkpoint = `INSERT INTO node_checkpoint (session, node, request) VALUES (?, ?, ?)`,
-	.Node_User       = `INSERT INTO node_user (session, node, origin, message) VALUES (?, ?, ?, ?)`,
-	.Node_Attachment = `INSERT INTO node_attachment (session, node, ordinal, media_type, name, digest) VALUES (?, ?, ?, ?, ?, ?)`,
+	.Record           = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+	.Node             = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	.Branch           = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
+	.Session          = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
+	.Session_Titled   = `INSERT INTO record_session_titled (seq, title) VALUES (?, ?)`,
+	.Artifact         = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
+	.Node_Assistant   = `INSERT INTO node_assistant (session, node, request, partial) VALUES (?, ?, ?, ?)`,
+	.Node_Checkpoint  = `INSERT INTO node_checkpoint (session, node, request) VALUES (?, ?, ?)`,
+	.Node_User        = `INSERT INTO node_user (session, node, origin, message) VALUES (?, ?, ?, ?)`,
+	.Node_Attachment  = `INSERT INTO node_attachment (session, node, ordinal, media_type, name, digest) VALUES (?, ?, ?, ?, ?, ?)`,
+	.Node_Result_Call = `INSERT INTO node_result_call (session, node, ordinal, call) VALUES (?, ?, ?, ?)`,
 }
 
 // append_record buffers one fact for the next commit. The header's strings and
@@ -223,6 +225,13 @@ append_node :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = 
 		row.payload = data
 	} else when Payload == User {
 		row.payload = batch_user(journal, data)
+	} else when Payload == Results {
+		calls, error := slice.clone(data.calls, virtual.arena_allocator(&journal.batch))
+		if error != nil && journal.failure == nil { latch(journal, error) }
+		row.payload = Results {
+			version = data.version,
+			calls   = calls,
+		}
 	}
 	append_record(
 		journal,
@@ -442,6 +451,11 @@ insert_node_payload :: proc(journal: ^Journal, row: ^Node) -> (error: Error) {
 				db.Value(digest[:]),
 			}
 			db.statement_exec(&journal.inserts[.Node_Attachment], file[:]) or_return
+		}
+	case Results:
+		for call, ordinal in value.calls {
+			arguments := [4]db.Value{id_or_null(&row.session), db.Value(i64(row.id)), db.Value(i64(ordinal)), db.Value(i64(call))}
+			db.statement_exec(&journal.inserts[.Node_Result_Call], arguments[:]) or_return
 		}
 	}
 	return nil

@@ -249,7 +249,7 @@ read_last_node :: proc(journal: ^Journal, session: Session_Id, kind: Node_Kind, 
 		return {}, false, corrupt(journal, row.error, failed_session, failed_seq)
 	}
 	node = scanned
-	release_rows_and_load_attachments(journal, &rows, &node, allocator) or_return
+	release_rows_and_load_children(journal, &rows, &node, allocator) or_return
 	return node, true, nil
 }
 
@@ -381,8 +381,8 @@ read_nodes :: proc(journal: ^Journal, session: Session_Id, ids: []Node_Id, alloc
 	}
 	if close_error := db.rows_close(&rows); close_error != nil { return nil, close_error }
 	for &node in list {
-		if attach_error := load_user_attachments(journal, &node, allocator); attach_error != nil {
-			return nil, corrupt(journal, attach_error, node.session, node.seq)
+		if load_error := load_node_children(journal, &node, allocator); load_error != nil {
+			return nil, corrupt(journal, load_error, node.session, node.seq)
 		}
 	}
 	return list, nil
@@ -601,6 +601,8 @@ node_destroy :: proc(node: ^Node, allocator := context.allocator) {
 				delete(attachment.digest, allocator)
 			}
 			delete(value.attachments, allocator)
+		case Results:
+			delete(value.calls, allocator)
 		}
 	}
 	delete(node.data, allocator)
@@ -767,7 +769,7 @@ read_node :: proc(journal: ^Journal, session: Session_Id, id: Node_Id, allocator
 		return {}, corrupt(journal, row.error, failed_session, failed_seq)
 	}
 	node = scanned
-	release_rows_and_load_attachments(journal, &rows, &node, allocator) or_return
+	release_rows_and_load_children(journal, &rows, &node, allocator) or_return
 	return node, nil
 }
 
@@ -830,25 +832,72 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 			origin  = USER_ORIGIN_NAMES[User_Origin(user_origin)],
 			message = message,
 		}
-	case .Results, .Context, .Notice:
+	case .Results:
+		node.payload = Results {
+			version = PAYLOAD_VERSION,
+		}
+	case .Context, .Notice:
 	}
 	return
 }
 
-// release_rows_and_load_attachments closes the header result set, then reads a
-// user node's files. The connection runs one result set at a time, so the header
-// query has to be finished before the attachment query starts.
+// The connection runs one result set at a time, so close the header query first.
 @(private, require_results)
-release_rows_and_load_attachments :: proc(journal: ^Journal, rows: ^db.Rows, node: ^Node, allocator: mem.Allocator) -> Error {
+release_rows_and_load_children :: proc(journal: ^Journal, rows: ^db.Rows, node: ^Node, allocator: mem.Allocator) -> Error {
 	if close_error := db.rows_close(rows); close_error != nil {
 		node_destroy(node, allocator)
 		return close_error
 	}
-	if attach_error := load_user_attachments(journal, node, allocator); attach_error != nil {
+	if load_error := load_node_children(journal, node, allocator); load_error != nil {
 		session := node.session
 		seq := node.seq
 		node_destroy(node, allocator)
-		return corrupt(journal, attach_error, session, seq)
+		return corrupt(journal, load_error, session, seq)
+	}
+	return nil
+}
+
+@(private, require_results)
+load_node_children :: proc(journal: ^Journal, node: ^Node, allocator: mem.Allocator) -> Error {
+	switch node.kind {
+	case .User:
+		return load_user_attachments(journal, node, allocator)
+	case .Results:
+		return load_result_calls(journal, node, allocator)
+	case .Assistant, .Checkpoint, .Context, .Notice:
+		return nil
+	}
+	return nil
+}
+
+@(private, require_results)
+load_result_calls :: proc(journal: ^Journal, node: ^Node, allocator: mem.Allocator) -> (error: Error) {
+	session := node.session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(
+		&journal.connection,
+		&rows,
+		"SELECT call FROM node_result_call WHERE session = ? AND node = ? ORDER BY ordinal",
+		{db.Value(session[:]), db.Value(i64(node.id))},
+	) or_return
+	calls := make([dynamic]Call_Id, allocator) or_return
+	defer delete(calls)
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values = values,
+		}
+		call := row_int(&row)
+		if row.error != nil { return row.error }
+		if call <= 0 { return Journal_Error.Corrupt }
+		append(&calls, Call_Id(call)) or_return
+	}
+	exact := slice.clone(calls[:], allocator) or_return
+	node.payload = Results {
+		version = PAYLOAD_VERSION,
+		calls   = exact,
 	}
 	return nil
 }
