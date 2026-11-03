@@ -163,28 +163,24 @@ _normalize_axis_size :: proc(batch: ^_Declaration_Diagnostics, size: ^Axis_Size,
 }
 
 @(private)
-_normalize_element_desc :: proc(batch: ^_Declaration_Diagnostics, #by_ptr desc: Element_Desc) -> Element_Desc {
-	result := desc
-	_normalize_axis_size(batch, _axis_size(&result.layout.sizing, .X), .X)
-	_normalize_axis_size(batch, _axis_size(&result.layout.sizing, .Y), .Y)
+_normalize_element_desc :: proc(batch: ^_Declaration_Diagnostics, desc: ^Element_Desc) {
+	_normalize_axis_size(batch, _axis_size(&desc.layout.sizing, .X), .X)
+	_normalize_axis_size(batch, _axis_size(&desc.layout.sizing, .Y), .Y)
 
-	_normalize_nonnegative(batch, &result.layout.padding.left, .X)
-	_normalize_nonnegative(batch, &result.layout.padding.right, .X)
-	_normalize_nonnegative(batch, &result.layout.padding.top, .Y)
-	_normalize_nonnegative(batch, &result.layout.padding.bottom, .Y)
-	_normalize_nonnegative(batch, &result.layout.gap, _flow_main_axis(result.layout.flow))
-	_normalize_nonnegative(batch, &result.layout.aspect, .X)
+	_normalize_nonnegative(batch, &desc.layout.padding.left, .X)
+	_normalize_nonnegative(batch, &desc.layout.padding.right, .X)
+	_normalize_nonnegative(batch, &desc.layout.padding.top, .Y)
+	_normalize_nonnegative(batch, &desc.layout.padding.bottom, .Y)
+	_normalize_nonnegative(batch, &desc.layout.gap, _flow_main_axis(desc.layout.flow))
+	_normalize_nonnegative(batch, &desc.layout.aspect, .X)
 
-	switch content in result.content {
+	switch &content in desc.content {
 	case Image_Content:
-		image := content
-		_normalize_nonnegative(batch, &image.intrinsic_size.x, .X)
-		_normalize_nonnegative(batch, &image.intrinsic_size.y, .Y)
-		result.content = image
+		_normalize_nonnegative(batch, &content.intrinsic_size.x, .X)
+		_normalize_nonnegative(batch, &content.intrinsic_size.y, .Y)
 	case Custom_Content:
 	case:
 	}
-	return result
 }
 
 @(private)

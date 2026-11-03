@@ -243,20 +243,7 @@ _declare_node :: proc(
 		}
 	}
 
-	normalized_desc := _normalize_element_desc(diagnostics, desc)
-	required_diagnostics := diagnostics.count
-	if duplicate_identifier {
-		required_diagnostics += 1
-	}
-	ordinary_diagnostic_limit := cap(state._diagnostics) - 1
-	if required_diagnostics > ordinary_diagnostic_limit - len(state._diagnostics) {
-		_latch_capacity_error(state, .Diagnostics, loc)
-		return 0, false
-	}
-
 	node := Node_Handle(len(state._node_inputs))
-	flushed := _batch_flush(state, diagnostics, node, loc)
-	assert(flushed, "layout: the pool was checked for this declaration")
 	sibling_ordinal := u64(parent_input.child_count)
 	private_identifier := _auto_id(parent_input.private_id, sibling_ordinal)
 	previous_sibling := parent_input.last_child
@@ -269,8 +256,24 @@ _declare_node :: proc(
 		root = i32(len(state._roots))
 	}
 
-	ok := _try_append(&state._node_inputs, _Node_Input{desc = normalized_desc, loc = loc, private_id = private_identifier, root = root, in_flow = in_flow})
+	// The desc is stored once and normalized in place. When the pool refuses its
+	// diagnostics, the slot is popped: nothing refers to it yet.
+	ok := _try_append(&state._node_inputs, _Node_Input{desc = desc, loc = loc, private_id = private_identifier, root = root, in_flow = in_flow})
 	assert(ok)
+	normalized_desc := &state._node_inputs[node].desc
+	_normalize_element_desc(diagnostics, normalized_desc)
+	required_diagnostics := diagnostics.count
+	if duplicate_identifier {
+		required_diagnostics += 1
+	}
+	ordinary_diagnostic_limit := cap(state._diagnostics) - 1
+	if required_diagnostics > ordinary_diagnostic_limit - len(state._diagnostics) {
+		_ = pop(&state._node_inputs)
+		_latch_capacity_error(state, .Diagnostics, loc)
+		return 0, false
+	}
+	flushed := _batch_flush(state, diagnostics, node, loc)
+	assert(flushed, "layout: the pool was checked for this declaration")
 	ok = _try_append(
 		&state._nodes,
 		Resolved_Node {
