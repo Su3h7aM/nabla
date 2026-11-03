@@ -563,6 +563,12 @@ list_branches :: proc(journal: ^Journal, session: Session_Id, allocator: mem.All
 }
 
 record_destroy :: proc(record: ^Record, allocator := context.allocator) {
+	if payload, has_payload := record.payload.?; has_payload {
+		switch value in payload {
+		case Session_Titled:
+			delete(value.title, allocator)
+		}
+	}
 	delete(record.task, allocator)
 	delete(record.hook, allocator)
 	delete(record.provider, allocator)
@@ -610,7 +616,7 @@ branch_summaries_destroy :: proc(summaries: []Branch_Summary, allocator := conte
 }
 
 @(private)
-RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body"
+RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body, COALESCE((SELECT title FROM record_session_titled WHERE record_session_titled.seq = seq), '')"
 
 @(private)
 NODE_COLUMNS :: "session, node, parent, branch, kind, turn, covers, seq, data, body"
@@ -633,7 +639,8 @@ SELECT node, parent FROM chain ORDER BY node ASC`
 @(private)
 SESSION_LIST_QUERY :: `SELECT * FROM (
 	SELECT session, created_ms, workspace, role, parent_session, parent_call,
-		COALESCE((SELECT json_extract(data, '$.title') FROM records AS titled
+		COALESCE((SELECT payload.title FROM records AS titled
+			JOIN record_session_titled AS payload ON payload.seq = titled.seq
 			WHERE titled.session = sessions.session AND titled.kind = ? ORDER BY titled.seq DESC LIMIT 1), '') AS title,
 		COALESCE((SELECT MAX(seq) FROM records WHERE records.session = sessions.session), 0) AS last_seq,
 		COALESCE((SELECT time_ms FROM records WHERE records.session = sessions.session ORDER BY seq DESC LIMIT 1), created_ms) AS updated_ms
@@ -774,6 +781,19 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 	record.model = row_text(row)
 	record.data = row_text(row)
 	record.body = row_bytes(row)
+	title := row_view(row)
+	if record.kind == .Session_Titled && row.error == nil {
+		if title == "" {
+			row.error = Journal_Error.Corrupt
+		} else if copied, clone_error := strings.clone(title, row.allocator); clone_error != nil {
+			row.error = clone_error
+		} else {
+			record.payload = Session_Titled {
+				version = PAYLOAD_VERSION,
+				title   = copied,
+			}
+		}
+	}
 	return
 }
 

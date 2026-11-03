@@ -14,7 +14,8 @@ SCHEMA_VERSION :: 1
 
 // Every table is append-only and STRICT. The rowid of `records` is the global
 // seq. `records.kind` and `nodes.kind` are the integer codes of Record_Kind and
-// Node_Kind. `data` holds the JSON payload until a family has its own table.
+// Node_Kind. `data` holds the JSON payload. `session.titled` also writes
+// `record_session_titled`; the other families still have only the JSON.
 // An absent id is NULL.
 // Each element is one statement, as the backend requires. Foreign keys are
 // declared and not enforced until the connection turns them on.

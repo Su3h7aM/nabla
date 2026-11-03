@@ -69,7 +69,14 @@ Record :: struct {
 	provider:    string,
 	model:       string,
 	data:        string,
+	payload:     Maybe(Record_Payload),
 	body:        []u8,
+}
+
+// Record_Payload is the typed body of a kind that has its own table. A kind
+// that is still stored only as JSON has no variant, and its payload is nil.
+Record_Payload :: union {
+	Session_Titled,
 }
 
 // Node is one committed step of the session tree. The journal fills id, seq,

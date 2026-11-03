@@ -6,6 +6,8 @@ import "core:math"
 import "core:mem"
 import "core:testing"
 
+import "nabla:db"
+
 @(test)
 test_response_committed_reasoning_tokens_are_presence_aware :: proc(test: ^testing.T) {
 	payload: Response_Committed
@@ -301,6 +303,29 @@ test_list_sessions_and_branches :: proc(test: ^testing.T) {
 	testing.expect_value(test, summaries[1].id, first)
 	testing.expect_value(test, summaries[1].workspace, "/tmp/one")
 	testing.expect_value(test, summaries[1].title, "the first")
+	rows: db.Rows
+	defer _expect_db_ok(test, db.rows_close(&rows))
+	_expect_db_ok(test, db.query(&journal.connection, &rows, "SELECT title FROM record_session_titled", nil))
+	values, has_title, title_next := db.rows_next(&rows)
+	_expect_db_ok(test, title_next)
+	testing.expect(test, has_title, "session.titled writes record_session_titled")
+	if has_title {
+		stored, stored_error := db.as_string(values[0])
+		_expect_db_ok(test, stored_error)
+		testing.expect_value(test, stored, "the first")
+	}
+	_expect_db_ok(test, db.rows_close(&rows))
+	titled, titled_found, titled_error := read_latest(journal, {session = first, kinds = {.Session_Titled}}, context.allocator)
+	_expect_ok(test, titled_error)
+	defer record_destroy(&titled, context.allocator)
+	testing.expect(test, titled_found, "the title record is readable")
+	if payload, has_payload := titled.payload.?; has_payload {
+		value, is_title := payload.(Session_Titled)
+		testing.expect(test, is_title, "the title record's payload is Session_Titled")
+		if is_title { testing.expect_value(test, value.title, "the first") }
+	} else {
+		testing.expect(test, false, "the title record has a payload")
+	}
 	testing.expect(test, summaries[1].last_seq > 0, "a session that holds records has activity")
 
 	// A page continues below the last seq of the previous one.

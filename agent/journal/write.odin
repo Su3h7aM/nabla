@@ -25,6 +25,7 @@ Pending :: union {
 	Node,
 	Branch_Row,
 	Session_Row,
+	Session_Titled_Row,
 	Artifact_Row,
 }
 
@@ -45,6 +46,13 @@ Session_Row :: struct {
 	role:           Session_Role,
 }
 
+// Session_Titled_Row is the record_session_titled row of the record buffered
+// just before it. title is owned by the batch arena.
+@(private)
+Session_Titled_Row :: struct {
+	title: string,
+}
+
 @(private)
 Artifact_Row :: struct {
 	digest:     Digest,
@@ -59,16 +67,18 @@ Insert :: enum {
 	Node,
 	Branch,
 	Session,
+	Session_Titled,
 	Artifact,
 }
 
 @(private)
 INSERT_SQL := [Insert]string {
-	.Record   = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
-	.Node     = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-	.Branch   = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
-	.Session  = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
-	.Artifact = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
+	.Record         = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+	.Node           = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	.Branch         = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
+	.Session        = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
+	.Session_Titled = `INSERT INTO record_session_titled (seq, title) VALUES (?, ?)`,
+	.Artifact       = `INSERT OR IGNORE INTO artifacts (digest, kind, created_ms, bytes) VALUES (?, ?, ?, ?)`,
 }
 
 // append_record buffers one fact for the next commit. The header's strings and
@@ -184,6 +194,9 @@ record_buffer :: proc(journal: ^Journal, header: Record, data: $Payload, body: [
 	record.data = batch_json(journal, data)
 	record.body = batch_bytes(journal, body)
 	push(journal, record)
+	when Payload == Session_Titled {
+		push(journal, Session_Titled_Row{title = batch_text(journal, data.title)})
+	}
 }
 
 // append_node buffers a node of the claimed session and the `node.committed`
@@ -339,6 +352,9 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 				db.Value(i64(row.role)),
 			}
 			db.statement_exec(&journal.inserts[.Session], arguments[:]) or_return
+		case Session_Titled_Row:
+			arguments := [2]db.Value{db.Value(i64(last)), db.Value(row.title)}
+			db.statement_exec(&journal.inserts[.Session_Titled], arguments[:]) or_return
 		case Artifact_Row:
 			arguments := [4]db.Value{db.Value(row.digest[:]), db.Value(row.kind), db.Value(row.created_ms), db.Value(row.bytes)}
 			db.statement_exec(&journal.inserts[.Artifact], arguments[:]) or_return
