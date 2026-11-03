@@ -17,9 +17,12 @@ Under construction. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the t
 
 ```sh
 mise run check     # type-check and vet every package
-mise run test      # in-package suites (release + -debug) and the external harnesses
+mise run test      # in-package suites in debug mode
 mise run fmt       # format owned sources (vendored code is never touched)
-mise run build     # prove every package links
+mise run build     # build the executable
+mise run build --release  # optimize with thin LTO
+mise run build --debug    # include debug information
+mise run build web        # build one library as a shared object
 ```
 
 Each task is a plain Bash script under `scripts/` and runs without mise. `mise tasks` lists

@@ -57,6 +57,13 @@ config=debug
 "$release" && config=release
 
 mapfile -t packages < <(nabla_test_packages)
+if [[ -n "$target" ]]; then
+	found=false
+	for pkg in "${packages[@]}"; do
+		if [[ "$pkg" == "$target" ]]; then found=true; break; fi
+	done
+	"$found" || nabla_die "no test suite for package: $target"
+fi
 
 failed=()
 for pkg in "${packages[@]}"; do

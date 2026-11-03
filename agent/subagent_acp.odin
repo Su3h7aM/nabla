@@ -16,6 +16,7 @@ import "core:time"
 import "nabla:acp"
 import "nabla:agent/journal"
 import "nabla:ai"
+import "nabla:subprocess"
 
 
 // An ACP subagent is another agent program, driven over the Agent Client Protocol on its
@@ -1073,10 +1074,19 @@ acp_connection_open :: proc(connection: ^ACP_Connection) -> (problem: string) {
 	if argv_error != nil { return "the agent's arguments could not be held; nothing ran" }
 	argv[0] = member.program.command
 	copy(argv[1:], member.program.arguments)
-	child, spawn_error := os.process_start(
-		{command = argv, working_dir = member.workspace, stdin = input_read, stdout = output_write, stderr = errors_write, new_group = true},
+	environment, environment_error := os.environ(context.temp_allocator)
+	if environment_error != nil { return "the agent's environment could not be held; nothing ran" }
+	started, spawn, spawn_error := subprocess.start(
+		{argv = argv, environment = environment, directory = member.workspace, stdin = input_read, stdout = output_write, stderr = errors_write},
 	)
-	if spawn_error != nil { return fmt.tprintf("%s could not be started: %v; nothing ran", member.program.command, spawn_error) }
+	if spawn != .Started { return fmt.tprintf("%s could not be started: %v; nothing ran", member.program.command, spawn_error) }
+	child, open_error := os.process_open(started.pid)
+	if open_error != nil {
+		subprocess.terminate_group(&started)
+		subprocess.child_close(&started)
+		return fmt.tprintf("%s started but its process could not be observed: %v", member.program.command, open_error)
+	}
+	subprocess.child_close(&started)
 	connection.child = child
 	connection.started = true
 	readers.process = child
@@ -1119,17 +1129,11 @@ acp_readers_wait :: proc(readers: ^ACP_Readers, process_only: bool, deadline: ti
 	}
 }
 
-// acp_child_kill_group kills the agent child together with the descendants that stayed
-// in its process group. The child must have been started with new_group, since a group
-// kill on a leader without one signals the caller's own group. Where a group kill is
-// unsupported it kills just the leader.
+// acp_child_kill_group kills the agent child and the descendants that stayed in its
+// process group. The child must have been started in its own group.
 @(private)
 acp_child_kill_group :: proc(child: os.Process) {
-	group_error := os.process_kill_group(child)
-	if group_error == nil { return }
-	if unsupported, ok := group_error.(io.Error); ok && unsupported == .Unsupported {
-		_ = os.process_kill(child)
-	}
+	if !subprocess.kill_group(child.pid) { _ = os.process_kill(child) }
 }
 
 // acp_connection_close ends stdin, lets the child exit, then kills it if necessary. A

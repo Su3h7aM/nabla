@@ -45,7 +45,7 @@ agent-45 finished a turn, its context was compacted, and `agents status` then sh
 
 # Harness feedback
 
-This report records failures observed during the Linux syscall migration in this Odin fork. Evidence comes from tool responses and agent messages in the session. It does not establish the internal cause of a provider or scheduler failure. Problems caused by the assistant are identified separately.
+This report records harness failures observed during a session. Evidence comes from tool responses and agent messages. It does not establish the internal cause of a provider or scheduler failure. Problems caused by the assistant are identified separately.
 
 ## Review agents stayed running without making progress
 
@@ -135,7 +135,7 @@ Requested improvement: expose action-specific argument schemas, or consistently 
 
 ## Subagent background jobs did not survive the agent turn
 
-Earlier in the migration, a subagent reported that validation was running in the background, but the command no longer ran after the agent ended its turn. The session adopted a workaround: subagents run long commands as foreground calls with a large timeout, while the orchestrator delegates those calls asynchronously.
+A subagent reported that validation was running in the background, but the command no longer ran after the agent ended its turn. The session adopted a workaround: subagents run long commands as foreground calls with a large timeout, while the orchestrator delegates those calls asynchronously.
 
 The exact process-lifetime mechanism was not established. The observed behaviour was that the advertised background workflow did not reliably survive the subagent turn.
 
@@ -143,7 +143,7 @@ Requested improvement: document the lifetime of background jobs in child session
 
 ## Working-directory confusion allowed edits in the wrong workspace
 
-An implementation agent was assigned the separate Jujutsu workspace `/home/su3h7am/Projects/Odin-ws2`, but its relative edits landed in `/home/su3h7am/Projects/Odin`. Another agent noticed the unexpected changes in its own working copy.
+An implementation agent was assigned a separate Jujutsu workspace, but its relative edits landed in the main workspace. Another agent noticed the unexpected changes in its own working copy.
 
 The orchestrator stopped the misplaced writer, saved its diff, restored the two affected files in the main workspace, and resumed the task with absolute paths in the assigned workspace. No permanent loss was observed.
 
@@ -153,9 +153,7 @@ Requested improvement: allow a child to have an explicit workspace root that app
 
 ## Validation reports omitted the evidence needed to investigate failures
 
-Some validation agents reported all target checks passing after running `odin check` without `-no-entry-point`. In this session, that command stopped at the entry-point diagnostic instead of performing the intended package check. Re-running with the correct flags exposed a real arm64 constant mismatch.
-
-Agents also discarded test output while counting successes. One report contained two failed runs whose failing test names could no longer be recovered. A later stress run retained every log and identified a shared-memory test race.
+Agents discarded test output while counting successes. One report contained two failed runs whose failing test names could no longer be recovered. A later stress run retained every log and identified a shared-memory test race.
 
 These were assistant and validation-script mistakes, not demonstrated tool execution bugs. The harness correctly returned the failures that were retained.
 

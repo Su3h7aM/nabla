@@ -7,7 +7,7 @@ Open work found in reviews. Each item names where the problem lives and the simp
 Each limit stays only if a protocol, API, provider, model, or the OS imposes it, and then its comment names the source.
 
 - If strict tool mode is added, apply OpenAI's strict-mode schema limits only when `strict` is sent.
-- `core:encoding/json` gains a nesting-depth limit in the Odin fork. Once it lands, delete `mcp/json_admit.odin`'s pre-scan and `MAX_MESSAGE_DEPTH`, and use the parser's limit at every peer and provider parse site.
+- When `core:encoding/json` provides a nesting-depth limit, delete `mcp/json_admit.odin`'s pre-scan and `MAX_MESSAGE_DEPTH`, and use the parser's limit at every peer and provider parse site.
 
 ## Subagents
 

@@ -109,6 +109,12 @@ Group_Signal :: enum {
 	Kill,
 }
 
+// kill_group sends SIGKILL to the process group led by pid. The caller must have
+// started the child in its own group, and must ensure pid still names that group.
+kill_group :: proc(pid: int) -> bool {
+	return pid > 0 && group_signal(pid, .Kill)
+}
+
 // start runs desc in a new process group led by the child. Every descriptor in desc must close
 // on exec, as those of os.pipe do; the child installs its own on standard input, output, and
 // error. The caller keeps ownership of the files and closes its copies of the child's ends.
@@ -199,8 +205,8 @@ cstring_vector :: proc(strs: []string, allocator: runtime.Allocator) -> (vector:
 	return vector, nil
 }
 
-// child_close releases the exit descriptor. The child must already be reaped. Closing a child
-// that has none is a no-op.
+// child_close releases the exit descriptor. The child must already be reaped, or another
+// owner must have taken responsibility for waiting for it. Closing a child that has none is a no-op.
 child_close :: proc(child: ^Child) {
 	if child.exit_open { exit_watch_close(child.exit) }
 	child.exit, child.exit_open = 0, false

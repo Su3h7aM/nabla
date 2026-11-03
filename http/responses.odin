@@ -190,7 +190,7 @@ respond_json :: proc(
 		}
 	}
 
-	if err = json.marshal_to_writer(writer.output, value, &options); err != nil {
+	if err = json.marshal_to_writer(writer.output, value, options); err != nil {
 		if close_err := headers_set_close(&response.headers); close_err != nil { response._err = close_err }
 		response_status(response, .Internal_Server_Error)
 	}

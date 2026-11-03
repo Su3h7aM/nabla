@@ -42,7 +42,7 @@ Section 3.3 of `docs/ARCHITECTURE.md` has the lifetimes and their allocators.
 
 Use JSON only where an external interface requires it: provider requests and responses, MCP, ACP, journal payloads, logs, and exports. Everything internal uses native data: typed structs, enums, tagged unions, and slices. Parse JSON once at the boundary into those types and encode only when writing back out, so JSON text and `json.Value` stay inside the boundary code. Section 3.6 of `docs/ARCHITECTURE.md` has the details.
 
-Treat your Odin knowledge as unverified. When unsure about a signature, a language rule, or an idiom, check before writing: read the standard library of the fork at `~/Projects/Odin` (`core/`, `base/`, `vendor/`) to see how Odin's own code does it, consult the official documentation, or run a small experiment against the compiler.
+Treat your Odin knowledge as unverified. When unsure about a signature, a language rule, or an idiom, check before writing: read the installed toolchain's standard library (`core/`, `base/`, `vendor/`) to see how Odin's own code does it, consult the official documentation, or run a small experiment against the compiler.
 
 Validate every refactor the same way before making it: find the `core:` or `base:` code that models the same shape and copy it. A change with no such precedent is not made. Shapes already confirmed that way:
 
@@ -72,9 +72,7 @@ Tests live in the package they validate: `<source>_test.odin` beside the source,
 
 Use **mise** for everything: it installs Odin and runs the tasks `build`, `check`, `fmt`, and `test` (`mise run <task>`). Each task is a standalone Bash script under `scripts/` that also runs directly; read it before changing it.
 
-Nabla is built against the maintainer's Odin fork at `~/Projects/Odin`, which has library features and compiler checks the official release lacks. `.mise/config.toml` sets `ODIN_ROOT` to it, so `mise run <task>` runs `$ODIN_ROOT/odin` with that tree's `core`, `base`, and `vendor`. Do not install an `odin` tool in the repository's mise configuration: its plugin exports its own `ODIN_ROOT` and silently replaces the fork. Read the standard library from the fork too.
-
-When Nabla needs something Odin does not provide, such as a system call, a constant, or a feature that only libc offers, add it to `/tmp/odin-missing-features.md` with the file and line that works around it, so it can be added to the fork.
+Nabla builds against the Odin version selected in `.mise/config.toml`. Read the standard library from that installed toolchain.
 
 Before committing a code change, run `mise run fmt`, `mise run check`, and the tests covering what you touched. `mise run test` is the full gate. Documentation-only changes need no run.
 

@@ -3,8 +3,7 @@ package web
 import "base:runtime"
 import "core:bytes"
 import "core:compress"
-import "core:compress/gzip"
-import "core:compress/zlib"
+import "core:compress/deflate"
 import "core:encoding/entity"
 import "core:fmt"
 import "core:strings"
@@ -40,10 +39,9 @@ content_decode :: proc(state: ^Exchange) -> Error {
 		defer bytes.buffer_destroy(&decoded)
 		decode_error: compress.Error
 		if is_gzip {
-			decode_error = gzip.load(state.body[:], &decoded, allocator = state.body.allocator)
+			decode_error = deflate.inflate_gzip(&decoded.buf, state.body[:], allocator = state.body.allocator)
 		} else {
-			context.allocator = state.body.allocator
-			decode_error = zlib.inflate(state.body[:], &decoded)
+			decode_error = deflate.inflate_zlib(&decoded.buf, state.body[:], allocator = state.body.allocator)
 		}
 		if decode_error != nil {
 			if _, allocation_failed := decode_error.(runtime.Allocator_Error); allocation_failed { return OUT_OF_MEMORY }

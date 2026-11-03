@@ -54,8 +54,9 @@ VMIN :: 6
 // _ioctl runs request against fd and returns its errno.
 @(require_results)
 _ioctl :: proc "contextless" (fd: linux.Fd, request: u32, arg: rawptr) -> linux.Errno {
-	_, err := linux.ioctl(fd, request, uintptr(arg))
-	return err
+	result := int(linux.ioctl(fd, request, uintptr(arg)))
+	if result < 0 { return linux.Errno(-result) }
+	return .NONE
 }
 
 @(require_results)

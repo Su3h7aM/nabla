@@ -2,7 +2,6 @@ package ai
 
 import "core:encoding/base64"
 import "core:encoding/json"
-import "core:io"
 import "core:mem"
 import "core:strings"
 
@@ -305,8 +304,7 @@ encode_write_bool :: proc(cursor: ^Encode_Cursor, body: ^strings.Builder, value:
 // library's own escaping, so the bytes are the ones a parsed value would be written as.
 @(private = "package")
 encode_write_quoted :: proc(cursor: ^Encode_Cursor, builder: ^strings.Builder, text: string) {
-	_, write_error := io.write_quoted_string(strings.to_writer(builder), text, '"', nil, true)
-	if write_error != .None { encode_fail(cursor, .Allocation) }
+	if json.marshal_to_writer(strings.to_writer(builder), text) != nil { encode_fail(cursor, .Allocation) }
 }
 
 // encode_write_text writes the JSON string a request's text goes on the wire as,

@@ -120,8 +120,8 @@ image_decode :: proc(app: ^App, data: []byte, prepared: ^Entry_Image) {
 	case:
 		return
 	}
-	prepared.pixels = decoded.pixels.buf
-	decoded.pixels.buf = nil
+	prepared.pixels = decoded.pixels
+	decoded.pixels = nil
 	prepared.width, prepared.height = decoded.width, decoded.height
 	longer := max(prepared.width, prepared.height)
 	if longer <= IMAGE_MAX_EDGE { return }
