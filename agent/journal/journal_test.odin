@@ -21,7 +21,7 @@ test_close_retains_the_journal_until_live_handles_close :: proc(test: ^testing.T
 		journal := _open_journal(test, directory)
 		defer _close_journal(test, journal)
 		if with_rows {
-			append_record(journal, {kind = .Run_Started}, Run_Started{})
+			append_record(journal, {kind = .Run_Started}, Run_Started{pid = 1})
 			_commit_ok(test, journal)
 		}
 		statement: db.Statement
@@ -92,7 +92,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
 	// A process-scope record names no session, so both session columns are
 	// absent rather than sixteen zero bytes.
-	append_record(writer, Record{kind = .Run_Started}, _Test_Payload{detail = "run"})
+	append_record(writer, Record{kind = .Run_Started}, Run_Started{pid = 1})
 	node_id := append_node(
 		writer,
 		Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1},

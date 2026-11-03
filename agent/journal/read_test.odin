@@ -945,3 +945,95 @@ test_read_path_crosses_checkpoints_and_forks_and_read_nodes_keeps_order :: proc(
 	_, absent_error := read_nodes(journal, session, absent[:], context.allocator)
 	_expect_error(test, absent_error, .Corrupt)
 }
+
+@(test)
+test_session_lifecycle_records_round_trip :: proc(test: ^testing.T) {
+	directory := _temp_directory(test)
+	defer _remove_directory(directory)
+	journal := _open_journal(test, directory)
+	defer _close_journal(test, journal)
+
+	append_record(journal, {kind = .Run_Started}, Run_Started{pid = 42})
+	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
+	append_record(journal, Record{session = session, kind = .Session_Recovered}, Session_Recovered{turns = 1, requests = 2, calls = 3, results = 4})
+	arguments := []string{"--stdio"}
+	variables := []Session_Environment_Variable{{name = "A", value = ""}}
+	tools := []Session_Environment_Tool{{remote_name = "read", name = "", enabled = false}}
+	servers := []Session_Environment_Server {
+		{
+			id = "fs",
+			executable = "server",
+			arguments = arguments,
+			working_directory = "",
+			environment = variables,
+			tools = tools,
+			discovery_timeout_ms = 1000,
+			call_timeout_ms = 2000,
+		},
+	}
+	append_record(journal, Record{session = session, kind = .Session_Environment}, Session_Environment{instructions = "be brief", servers = servers})
+	_commit_ok(test, journal)
+
+	started, started_found, started_error := read_latest(journal, {kinds = {.Run_Started}}, context.allocator)
+	_expect_ok(test, started_error)
+	defer record_destroy(&started, context.allocator)
+	testing.expect(test, started_found, "run.started is readable")
+	if payload, has_payload := started.payload.?; has_payload {
+		value, is_run := payload.(Run_Started)
+		testing.expect(test, is_run, "run.started payload is Run_Started")
+		if is_run { testing.expect_value(test, value.pid, 42) }
+	} else {
+		testing.expect(test, false, "run.started has a payload")
+	}
+
+	claimed, claimed_found, claimed_error := read_latest(journal, {session = session, kinds = {.Session_Claimed}}, context.allocator)
+	_expect_ok(test, claimed_error)
+	defer record_destroy(&claimed, context.allocator)
+	testing.expect(test, claimed_found, "session.claimed is readable")
+	if payload, has_payload := claimed.payload.?; has_payload {
+		value, is_claim := payload.(Session_Claimed)
+		testing.expect(test, is_claim, "session.claimed payload is Session_Claimed")
+		if is_claim { testing.expect(test, !value.resumed, "a created session is not resumed") }
+	} else {
+		testing.expect(test, false, "session.claimed has a payload")
+	}
+
+	recovered, recovered_found, recovered_error := read_latest(journal, {session = session, kinds = {.Session_Recovered}}, context.allocator)
+	_expect_ok(test, recovered_error)
+	defer record_destroy(&recovered, context.allocator)
+	if payload, has_payload := recovered.payload.?; has_payload {
+		value, is_recovered := payload.(Session_Recovered)
+		testing.expect(test, is_recovered && recovered_found, "session.recovered payload is Session_Recovered")
+		if is_recovered {
+			testing.expect_value(test, value.turns, 1)
+			testing.expect_value(test, value.requests, 2)
+			testing.expect_value(test, value.calls, 3)
+			testing.expect_value(test, value.results, 4)
+		}
+	} else {
+		testing.expect(test, false, "session.recovered has a payload")
+	}
+
+	environment, environment_seq, environment_found, environment_error := read_session_environment(journal, session, context.allocator)
+	_expect_ok(test, environment_error)
+	defer environment_destroy(environment, context.allocator)
+	testing.expect(test, environment_found && environment_seq > 0, "session.environment is readable")
+	testing.expect_value(test, environment.instructions, "be brief")
+	if !testing.expect_value(test, len(environment.servers), 1) { return }
+	server := environment.servers[0]
+	testing.expect_value(test, server.id, "fs")
+	testing.expect_value(test, server.executable, "server")
+	testing.expect_value(test, server.working_directory, "")
+	testing.expect_value(test, server.discovery_timeout_ms, i64(1000))
+	testing.expect_value(test, server.call_timeout_ms, i64(2000))
+	if testing.expect_value(test, len(server.arguments), 1) { testing.expect_value(test, server.arguments[0], "--stdio") }
+	if testing.expect_value(test, len(server.environment), 1) {
+		testing.expect_value(test, server.environment[0].name, "A")
+		testing.expect_value(test, server.environment[0].value, "")
+	}
+	if testing.expect_value(test, len(server.tools), 1) {
+		testing.expect_value(test, server.tools[0].remote_name, "read")
+		testing.expect_value(test, server.tools[0].name, "")
+		testing.expect(test, !server.tools[0].enabled, "a disabled tool stays disabled")
+	}
+}

@@ -77,6 +77,10 @@ Record :: struct {
 // that is still stored only as JSON has no variant, and its payload is nil.
 Record_Payload :: union {
 	Session_Titled,
+	Run_Started,
+	Session_Recovered,
+	Session_Claimed,
+	Session_Environment,
 }
 
 // Node is one committed step of the session tree. The journal fills id, seq,

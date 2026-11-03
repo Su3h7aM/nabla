@@ -189,6 +189,15 @@ read_latest :: proc(journal: ^Journal, filter: Filter, allocator: mem.Allocator)
 		record_destroy(&record, allocator)
 		return {}, false, corrupt(journal, row.error, session, seq)
 	}
+	// The family read needs the connection, which this result set still holds.
+	if close_error := db.rows_close(&rows); close_error != nil {
+		record_destroy(&record, allocator)
+		return {}, false, close_error
+	}
+	if load_error := load_record_payload(journal, &record, allocator); load_error != nil {
+		record_destroy(&record, allocator)
+		return {}, false, load_error
+	}
 	return record, true, nil
 }
 
@@ -211,8 +220,12 @@ read_session_environment :: proc(
 	if read_error != nil { return {}, 0, false, read_error }
 	if !has_record { return {}, 0, false, nil }
 	defer record_destroy(&record, allocator)
-	payload_decode(record.data, &environment, allocator, journal, record.session, record.seq) or_return
-	return environment, record.seq, true, nil
+	payload, has_payload := record.payload.?
+	if !has_payload { return {}, record.seq, false, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	value, is_environment := payload.(Session_Environment)
+	if !is_environment { return {}, record.seq, false, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	record.payload = nil
+	return value, record.seq, true, nil
 }
 @(require_results)
 scan_node_checked :: proc(row: ^Row, allocator: mem.Allocator) -> (node: Node, session: Session_Id, seq: Journal_Seq, ok: bool) {
@@ -571,10 +584,7 @@ list_branches :: proc(journal: ^Journal, session: Session_Id, allocator: mem.All
 
 record_destroy :: proc(record: ^Record, allocator := context.allocator) {
 	if payload, has_payload := record.payload.?; has_payload {
-		switch value in payload {
-		case Session_Titled:
-			delete(value.title, allocator)
-		}
+		payload_destroy(payload, allocator)
 	}
 	delete(record.task, allocator)
 	delete(record.hook, allocator)
@@ -1041,6 +1051,12 @@ query_records :: proc(journal: ^Journal, sql: string, arguments: []db.Value, all
 		if _, append_error := append(&list, record); append_error != nil {
 			record_destroy(&record, allocator)
 			return nil, append_error
+		}
+	}
+	// The header set has ended, so each family row can be read on this connection.
+	for &record in list {
+		if load_error := load_record_payload(journal, &record, allocator); load_error != nil {
+			return nil, load_error
 		}
 	}
 	return list[:], nil
