@@ -1,7 +1,6 @@
 package journal
 
 import "core:crypto/hash"
-import "core:encoding/json"
 import "core:mem"
 import "core:mem/virtual"
 import "core:slice"
@@ -79,8 +78,8 @@ Insert :: enum {
 
 @(private)
 INSERT_SQL := [Insert]string {
-	.Record           = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
-	.Node             = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	.Record           = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+	.Node             = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	.Branch           = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
 	.Session          = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
 	.Session_Titled   = `INSERT INTO record_session_titled (seq, title) VALUES (?, ?)`,
@@ -202,7 +201,6 @@ record_buffer :: proc(journal: ^Journal, header: Record, data: $Payload, body: [
 	record.mono_ns = now_mono_ns()
 	record.provider = batch_text(journal, header.provider)
 	record.model = batch_text(journal, header.model)
-	record.data = batch_json(journal, data)
 	record.body = batch_bytes(journal, body)
 	push(journal, record)
 	when Payload == Session_Titled {
@@ -219,7 +217,6 @@ append_node :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = 
 	row := node
 	row.id = journal.counters.node + 1
 	row.seq = 0
-	row.data = batch_json(journal, data)
 	row.body = batch_bytes(journal, body)
 	when Payload == Assistant {
 		row.payload = data
@@ -231,8 +228,7 @@ append_node :: proc(journal: ^Journal, node: Node, data: $Payload, body: []u8 = 
 		calls, error := slice.clone(data.calls, virtual.arena_allocator(&journal.batch))
 		if error != nil && journal.failure == nil { latch(journal, error) }
 		row.payload = Results {
-			version = data.version,
-			calls   = calls,
+			calls = calls,
 		}
 	}
 	append_record(
@@ -352,7 +348,7 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 		case Record:
 			last = insert_record(journal, &row) or_return
 		case Node:
-			arguments := [10]db.Value {
+			arguments := [9]db.Value {
 				id_or_null(&row.session),
 				db.Value(i64(row.id)),
 				int_or_null(row.parent),
@@ -361,7 +357,6 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 				int_or_null(row.turn),
 				int_or_null(row.covers),
 				db.Value(i64(last)),
-				db.Value(row.data),
 				bytes_or_null(row.body),
 			}
 			db.statement_exec(&journal.inserts[.Node], arguments[:]) or_return
@@ -396,7 +391,7 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 
 @(private, require_results)
 insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, error: Error) {
-	arguments := [17]db.Value {
+	arguments := [16]db.Value {
 		db.Value(row.time_ms),
 		db.Value(row.mono_ns),
 		db.Value(row.run[:]),
@@ -412,7 +407,6 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 		id_or_null(&row.subagent),
 		text_or_null(row.provider),
 		text_or_null(row.model),
-		db.Value(row.data),
 		bytes_or_null(row.body),
 	}
 	rows: db.Rows
@@ -427,7 +421,7 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 }
 
 // insert_node_payload writes the typed row of a node that has one. A kind that
-// is still JSON only has no payload, and this writes nothing for it.
+// has no table has no payload, and this writes nothing for it.
 @(private, require_results)
 insert_node_payload :: proc(journal: ^Journal, row: ^Node) -> (error: Error) {
 	payload, has_payload := row.payload.?
@@ -512,8 +506,8 @@ push :: proc(journal: ^Journal, item: Pending) {
 	if len(journal.pending) == 1 { journal.batch_since = time.tick_now() }
 }
 
-// batch_text, batch_bytes, and batch_json copy into the batch arena and latch an
-// allocation or encoding failure.
+// batch_text and batch_bytes copy into the batch arena and latch an allocation
+// failure.
 @(private)
 batch_text :: proc(journal: ^Journal, text: string) -> string {
 	copied, error := strings.clone(text, virtual.arena_allocator(&journal.batch))
@@ -527,15 +521,6 @@ batch_bytes :: proc(journal: ^Journal, bytes: []u8) -> []u8 {
 	copied, error := slice.clone(bytes, virtual.arena_allocator(&journal.batch))
 	if error != nil && journal.failure == nil { latch(journal, error) }
 	return copied
-}
-
-@(private)
-batch_json :: proc(journal: ^Journal, payload: $Payload) -> string {
-	versioned := payload
-	if versioned.version == 0 { versioned.version = PAYLOAD_VERSION }
-	encoded, error := json.marshal(versioned, allocator = virtual.arena_allocator(&journal.batch))
-	if error != nil && journal.failure == nil { latch(journal, error) }
-	return string(encoded)
 }
 
 @(private)

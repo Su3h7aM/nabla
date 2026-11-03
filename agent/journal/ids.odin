@@ -4,7 +4,7 @@ import "core:crypto"
 
 // The identities records correlate by. Zero means absent for every one of them
 // and is stored as SQL NULL. Branch and node ids are allocated by the journal;
-// turn, request, call, and job ids by the harness.
+// turn, request, and call ids by the harness.
 Run_Id :: distinct [16]u8
 Session_Id :: distinct [16]u8
 Branch_Id :: distinct u32
@@ -13,7 +13,6 @@ Journal_Seq :: distinct i64
 Turn_Id :: distinct u32
 Request_Id :: distinct u32
 Attempt_No :: distinct u8
-Job_Id :: distinct u64
 Call_Id :: distinct u64
 
 // Digest is the SHA-256 an artifact is stored under.

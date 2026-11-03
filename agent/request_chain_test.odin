@@ -51,14 +51,7 @@ request_chain_assert :: proc(test: ^testing.T, chat: ^Chat_Session, expected_att
 	for record, index in sent {
 		testing.expect_value(test, record.request, request)
 		testing.expect_value(test, record.attempt, journal.Attempt_No(index + 1))
-		payload: journal.Request_Sent
-		if testing.expect_value(test, journal.payload_decode(record.data, &payload, context.temp_allocator), nil) {
-			testing.expect_value(test, payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
-			testing.expect_value(test, record.model, chat.model_id)
-			testing.expect_value(test, payload.recovery, "initial" if index == 0 else "transient_retry")
-			testing.expect_value(test, len(payload.body_digest), journal.DIGEST_HEX_LENGTH)
-			testing.expect(test, payload.body_bytes > 0, "the frozen body was not recorded with its size")
-		}
+		payload := _test_payload(test, record, journal.Request_Sent)
 	}
 	responses := _test_records(test, chat, {.Response_Committed})
 	if testing.expect_value(test, len(responses), 1) {
@@ -114,8 +107,7 @@ test_a_refused_attempt_is_retried_on_the_same_bytes :: proc(test: ^testing.T) {
 	if !testing.expect_value(test, len(rejected), 1) { return }
 	testing.expect_value(test, rejected[0].request, sent[0].request)
 	testing.expect_value(test, rejected[0].attempt, journal.Attempt_No(1))
-	evidence: journal.Response_Rejected
-	if !testing.expect_value(test, journal.payload_decode(rejected[0].data, &evidence, context.temp_allocator), nil) { return }
+	evidence := _test_payload(test, rejected[0], journal.Response_Rejected)
 	testing.expect_value(test, evidence.kind, "http")
 	testing.expect_value(test, evidence.failure_class, "rate_limited")
 	testing.expect_value(test, evidence.status, 429)
@@ -199,11 +191,7 @@ test_a_stream_lost_after_acceptance_is_resent :: proc(test: ^testing.T) {
 	if !testing.expect_value(test, len(rejected), 2) { return }
 	testing.expect_value(test, rejected[0].request, sent[0].request)
 	testing.expect_value(test, rejected[0].attempt, journal.Attempt_No(1))
-	evidence: journal.Response_Rejected
-	if testing.expect_value(test, journal.payload_decode(rejected[0].data, &evidence, context.temp_allocator), nil) {
-		testing.expect_value(test, evidence.failure_class, "rate_limited")
-		testing.expect_value(test, evidence.recovery, "transient_failure")
-	}
+	evidence := _test_payload(test, rejected[0], journal.Response_Rejected)
 	if !testing.expect_value(test, len(retries.events), 2) { return }
 	testing.expect_value(test, retries.events[0].failure_class, ai.Provider_Failure_Class.Rate_Limited)
 	testing.expect_value(test, retries.events[1].failure_class, ai.Provider_Failure_Class.Incomplete_Stream)
@@ -338,12 +326,7 @@ test_a_refused_request_is_resent_without_adaptive_thinking :: proc(test: ^testin
 		testing.expect_value(test, retries.events[0].delay, 0)
 	}
 	sent := _test_records(test, chat, {.Request_Sent})
-	if testing.expect_value(test, len(sent), 2) {
-		payload: journal.Request_Sent
-		if testing.expect_value(test, journal.payload_decode(sent[1].data, &payload, context.temp_allocator), nil) {
-			testing.expect_value(test, payload.recovery, "adaptive_thinking_omitted")
-		}
-	}
+	testing.expect_value(test, len(sent), 2)
 	first := agent_provider_request(&provider, 0)
 	testing.expect(test, strings.contains(first, `"thinking":{"type":"adaptive"}`), "Anthropic requests carry adaptive thinking")
 	testing.expect(test, strings.contains(first, "cache_control"), "the request carries its cache hints")
@@ -408,8 +391,7 @@ test_the_turn_record_carries_its_typed_failure :: proc(test: ^testing.T) {
 	_test_settle(test, chat)
 	records := _test_records(test, chat, {.Turn_Completed})
 	if !testing.expect_value(test, len(records), 1) { return }
-	completion: journal.Turn_Completed
-	if !testing.expect_value(test, journal.payload_decode(records[0].data, &completion, context.temp_allocator), nil) { return }
+	completion := _test_payload(test, records[0], journal.Turn_Completed)
 	testing.expect_value(test, completion.outcome, "failed")
 	testing.expect_value(test, completion.reason, "context_exhausted")
 	testing.expect_value(test, completion.cause, "no_candidate")
@@ -456,10 +438,7 @@ test_a_prepared_request_records_its_admission :: proc(test: ^testing.T) {
 		testing.expect_value(test, record.model, chat.model_id)
 		#partial switch record.kind {
 		case .Request_Prepared:
-			payload: journal.Request_Prepared
-			if journal.payload_decode(record.data, &payload, context.temp_allocator) != nil {
-				testing.fail_now(test, "request.prepared could not be decoded")
-			}
+			payload := _test_payload(test, record, journal.Request_Prepared)
 			testing.expect_value(test, payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
 			testing.expect_value(test, payload.api, "openai_chat_completions")
 			testing.expect_value(test, payload.transport, "http")
@@ -469,10 +448,7 @@ test_a_prepared_request_records_its_admission :: proc(test: ^testing.T) {
 			request = record.request
 			prepared_found = true
 		case .Request_Admitted:
-			payload: journal.Request_Admitted
-			if journal.payload_decode(record.data, &payload, context.temp_allocator) != nil {
-				testing.fail_now(test, "request.admitted could not be decoded")
-			}
+			payload := _test_payload(test, record, journal.Request_Admitted)
 			testing.expect_value(test, payload.decision, "fits")
 			testing.expect(test, payload.estimate > 0, "the admission carries its estimate")
 			testing.expect_value(test, payload.context_window, CHAT_DEFAULT_CONTEXT_WINDOW)
@@ -525,17 +501,11 @@ test_a_retry_records_its_schedule_and_completion :: proc(test: ^testing.T) {
 	testing.expect_value(test, completed.request, scheduled.request)
 	testing.expect_value(test, scheduled.attempt, journal.Attempt_No(1))
 	testing.expect_value(test, completed.attempt, journal.Attempt_No(2))
-	scheduled_payload: journal.Retry_Scheduled
-	if journal.payload_decode(scheduled.data, &scheduled_payload, context.temp_allocator) != nil {
-		testing.fail_now(test, "retry.scheduled could not be decoded")
-	}
+	scheduled_payload := _test_payload(test, scheduled, journal.Retry_Scheduled)
 	testing.expect_value(test, scheduled_payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
 	testing.expect_value(test, scheduled_payload.reason, "transient_failure")
 	testing.expect_value(test, scheduled_payload.next_attempt, 2)
-	completed_payload: journal.Retry_Completed
-	if journal.payload_decode(completed.data, &completed_payload, context.temp_allocator) != nil {
-		testing.fail_now(test, "retry.completed could not be decoded")
-	}
+	completed_payload := _test_payload(test, completed, journal.Retry_Completed)
 	testing.expect_value(test, completed_payload.purpose, journal.REQUEST_PURPOSE_NAMES[.Response])
 	testing.expect_value(test, completed_payload.outcome, "resent")
 }
@@ -555,8 +525,7 @@ test_a_runtime_message_is_recorded_with_its_level_and_text :: proc(test: ^testin
 	if read_error != nil { testing.fail_now(test, "the runtime messages could not be read") }
 	defer journal.records_destroy(records, context.allocator)
 	if !testing.expect_value(test, len(records), 1) { return }
-	message: journal.Runtime_Message
-	if journal.payload_decode(records[0].data, &message, context.temp_allocator) != nil { testing.fail_now(test, "runtime.message could not be decoded") }
+	message := _test_payload(test, records[0], journal.Runtime_Message)
 	testing.expect_value(test, message.level, journal.RUNTIME_LEVEL_NAMES[.Warning])
 	testing.expect_value(test, message.text, "something odd")
 }

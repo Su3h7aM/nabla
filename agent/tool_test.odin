@@ -49,10 +49,7 @@ tool_test_workspace :: proc(tool_test: ^Tool_Test) -> string {
 // tool_test_result_of reads the outcome and the text out of one recorded call completion.
 @(private)
 tool_test_result_of :: proc(test: ^testing.T, record: journal.Record) -> Tool_Test_Result {
-	completed: journal.Tool_Completed
-	if decode_error := journal.payload_decode(record.data, &completed, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the recorded outcome could not be read")
-	}
+	completed := _test_payload(test, record, journal.Tool_Completed)
 	outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completed.outcome)
 	if !known { testing.fail_now(test, "the recorded outcome is not a tool outcome") }
 	return {outcome = outcome, content = string(record.body)}

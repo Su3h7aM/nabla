@@ -46,8 +46,9 @@ Counters :: struct {
 }
 
 // Record is one journal fact. The journal fills seq, time_ms, mono_ns, run, and
-// data; the caller fills kind and the correlation columns known where the fact
-// was observed.
+// payload; the caller fills kind and the correlation columns known where the fact
+// was observed. payload is the typed row of a kind that has a table, nil for a
+// kind whose header says everything.
 Record :: struct {
 	seq:         Journal_Seq,
 	time_ms:     i64,
@@ -60,21 +61,16 @@ Record :: struct {
 	turn:        Turn_Id,
 	request:     Request_Id,
 	attempt:     Attempt_No,
-	job:         Job_Id,
 	call:        Call_Id,
 	parent_call: Call_Id,
-	task:        string,
 	subagent:    Session_Id,
-	hook:        string,
 	provider:    string,
 	model:       string,
-	data:        string,
 	payload:     Maybe(Record_Payload),
 	body:        []u8,
 }
 
-// Record_Payload is the typed body of a kind that has its own table. A kind
-// that is still stored only as JSON has no variant, and its payload is nil.
+// Record_Payload is the typed body of a kind that has its own table.
 Record_Payload :: union {
 	Session_Titled,
 	Run_Started,
@@ -111,11 +107,10 @@ Record_Payload :: union {
 	Job_Reclaimed,
 }
 
-// Node is one committed step of the session tree. The journal fills id, seq,
-// data, and payload. parent is the previous node on the branch, or the fork point
-// for a branch's first node; covers is set on a Checkpoint only. payload is the
-// typed row of a kind that has its own table; a kind still stored only as JSON
-// leaves it nil.
+// Node is one committed step of the session tree. The journal fills id, seq, and
+// payload. parent is the previous node on the branch, or the fork point for a
+// branch's first node; covers is set on a Checkpoint only. payload is the typed
+// row of a kind that has its own table, nil for Context and Notice.
 Node :: struct {
 	session: Session_Id,
 	id:      Node_Id,
@@ -125,13 +120,11 @@ Node :: struct {
 	turn:    Turn_Id,
 	covers:  Node_Id,
 	seq:     Journal_Seq,
-	data:    string,
 	payload: Maybe(Node_Payload),
 	body:    []u8,
 }
 
-// Node_Payload is the typed body of a node kind that has its own table. A kind
-// that is still stored only as JSON has no variant, and its payload is nil.
+// Node_Payload is the typed body of a node kind that has its own table.
 Node_Payload :: union {
 	User,
 	Assistant,

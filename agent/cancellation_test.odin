@@ -70,8 +70,7 @@ test_cancelled_turn_retires_then_next_turn_runs :: proc(test: ^testing.T) {
 	// The turn's outcome reached the journal with the status the turn reached.
 	turns := _test_records(test, chat, {.Turn_Completed})
 	if !testing.expect_value(test, len(turns), 1) { return }
-	completion: journal.Turn_Completed
-	if !testing.expect_value(test, journal.payload_decode(turns[0].data, &completion, context.temp_allocator), nil) { return }
+	completion := _test_payload(test, turns[0], journal.Turn_Completed)
 	testing.expect_value(test, completion.outcome, journal.TURN_OUTCOME_NAMES[.Cancelled])
 
 	// A new turn starts immediately, with a fresh operation identity.

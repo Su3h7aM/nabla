@@ -52,10 +52,7 @@ test_selection_fit_projects_target_api_without_mutating_session :: proc(test: ^t
 	if !testing.expect_value(test, len(records), 1) { return }
 	testing.expect_value(test, records[0].provider, "target-provider")
 	testing.expect_value(test, records[0].model, "target-model")
-	fit: journal.Selection_Fit
-	if decode_error := journal.payload_decode(records[0].data, &fit, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the target fit record could not be decoded")
-	}
+	fit := _test_payload(test, records[0], journal.Selection_Fit)
 	testing.expect_value(test, fit.api, chat_api_name(.Anthropic_Messages))
 	testing.expect_value(test, fit.decision, journal.SELECTION_FIT_DECISION_NAMES[.Fits])
 }
@@ -84,10 +81,7 @@ test_selection_gate_refuses_oversized_default_without_compaction :: proc(test: ^
 	testing.expect_value(test, chat.compact.state, Compact_State.Idle)
 	records := _test_records(test, chat, {.Selection_Fit})
 	if !testing.expect_value(test, len(records), 1) { return }
-	fit: journal.Selection_Fit
-	if decode_error := journal.payload_decode(records[0].data, &fit, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the target fit record could not be decoded")
-	}
+	fit := _test_payload(test, records[0], journal.Selection_Fit)
 	testing.expect_value(test, fit.decision, journal.SELECTION_FIT_DECISION_NAMES[.Refused])
 }
 
@@ -188,10 +182,7 @@ test_selection_pending_keeps_foreground_tail_and_rechecks_it :: proc(test: ^test
 	testing.expect_value(test, chat.model_id, "test-model")
 	records := _test_records(test, chat, {.Selection_Fit})
 	if !testing.expect_value(test, len(records), 2) { return }
-	recheck: journal.Selection_Fit
-	if decode_error := journal.payload_decode(records[1].data, &recheck, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the post-checkpoint fit record could not be decoded")
-	}
+	recheck := _test_payload(test, records[1], journal.Selection_Fit)
 	testing.expect(test, recheck.recheck, "the installed summary must trigger a recheck")
 	testing.expect(test, recheck.estimate > transition.estimate, "the projection must include the growing foreground tail")
 	testing.expect_value(test, recheck.decision, journal.SELECTION_FIT_DECISION_NAMES[.Refused])
@@ -305,14 +296,8 @@ test_selection_compacts_again_only_after_target_estimate_decreases :: proc(test:
 	testing.expect(test, transition.estimate < first_estimate, "the transition retains measured progress")
 	records := _test_records(test, chat, {.Selection_Fit})
 	testing.expect_value(test, len(records), 3)
-	first_recheck: journal.Selection_Fit
-	if decode_error := journal.payload_decode(records[1].data, &first_recheck, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the first recheck record could not be decoded")
-	}
-	second_recheck: journal.Selection_Fit
-	if decode_error := journal.payload_decode(records[2].data, &second_recheck, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the second recheck record could not be decoded")
-	}
+	first_recheck := _test_payload(test, records[1], journal.Selection_Fit)
+	second_recheck := _test_payload(test, records[2], journal.Selection_Fit)
 	testing.expect(test, second_recheck.recheck, "the second installed checkpoint must be a recheck")
 	testing.expect(test, second_recheck.estimate < first_recheck.estimate, "each compaction round must strictly reduce the target estimate")
 	testing.expect_value(test, chat.compact.job_generation, u64(2))

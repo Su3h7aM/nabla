@@ -205,9 +205,8 @@ follow_assistant_ordinal :: proc(store: ^journal.Journal, record: journal.Record
 	) or_return
 	for earlier in records {
 		if earlier.seq >= record.seq { continue }
-		committed: journal.Node_Committed
-		if journal.payload_decode(earlier.data, &committed, context.temp_allocator) != nil { continue }
-		if committed.kind == journal.NODE_KIND_NAMES[.Assistant] { ordinal += 1 }
+		node := journal.read_node(store, earlier.session, earlier.node, context.temp_allocator) or_return
+		if node.kind == .Assistant { ordinal += 1 }
 	}
 	return ordinal, nil
 }

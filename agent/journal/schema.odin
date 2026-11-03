@@ -14,13 +14,10 @@ SCHEMA_VERSION :: 1
 
 // Every table is append-only and STRICT. The rowid of `records` is the global
 // seq. `records.kind` and `nodes.kind` are the integer codes of Record_Kind and
-// Node_Kind. `data` holds the JSON payload. `session.titled`, `run.started`,
-// `session.recovered`, `session.claimed`, and `session.environment` also write
-// their family tables, as do `user.input`, `user.command`, and `command.applied`.
-// Assistant and Checkpoint nodes also write `node_assistant` and `node_checkpoint`.
-// User nodes also write `node_user` and `node_attachment`. Results nodes also write
-// `node_result_call`. The other families still have only the JSON.
-// An absent id is NULL.
+// Node_Kind. A record kind with a payload writes it to its `record_*` family
+// tables, keyed by the record's seq, and a node kind with a payload writes
+// `node_*` tables keyed by the node. The other kinds carry everything in the
+// header. An absent id is NULL.
 // Each element is one statement, as the backend requires. Foreign keys are
 // declared and not enforced until the connection turns them on.
 @(private)
@@ -58,7 +55,6 @@ SCHEMA := [?]string {
 		provider    TEXT,
 		model       TEXT,
 		body        BLOB,
-		data        TEXT NOT NULL,
 		FOREIGN KEY (session) REFERENCES sessions(session) DEFERRABLE INITIALLY DEFERRED,
 		FOREIGN KEY (session, branch) REFERENCES branches(session, branch) DEFERRABLE INITIALLY DEFERRED,
 		FOREIGN KEY (session, node) REFERENCES nodes(session, node) DEFERRABLE INITIALLY DEFERRED
@@ -79,7 +75,6 @@ SCHEMA := [?]string {
 		turn    INTEGER CHECK (turn IS NULL OR turn > 0),
 		covers  INTEGER CHECK (covers IS NULL OR covers > 0),
 		seq     INTEGER NOT NULL REFERENCES records(seq),
-		data    TEXT NOT NULL,
 		body    BLOB,
 		PRIMARY KEY (session, node),
 		FOREIGN KEY (session, branch) REFERENCES branches(session, branch),

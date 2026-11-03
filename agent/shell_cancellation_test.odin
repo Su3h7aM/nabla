@@ -278,8 +278,7 @@ test_shell_cancel_reaps_child_and_allows_next_turn :: proc(test: ^testing.T) {
 	// journal with an outcome the harness named.
 	completions := _test_records(test, chat, {.Tool_Completed})
 	if !testing.expect_value(test, len(completions), 1) { return }
-	completion: journal.Tool_Completed
-	if !testing.expect_value(test, journal.payload_decode(completions[0].data, &completion, context.temp_allocator), nil) { return }
+	completion := _test_payload(test, completions[0], journal.Tool_Completed)
 	outcome, known := journal.enum_from_name(journal.TOOL_OUTCOME_NAMES, completion.outcome)
 	if !testing.expect(test, known, "the recorded outcome is one the harness names") { return }
 	testing.expect(test, outcome == .Cancelled || outcome == .Not_Executed, "a cancelled call is resolved, not left dangling")
@@ -445,8 +444,7 @@ test_sigint_cancels_turn_through_control_loop :: proc(test: ^testing.T) {
 	interruptions := _test_records(test, chat, {.Request_Interrupted})
 	if !testing.expect_value(test, len(interruptions), 1) { return }
 	testing.expect(test, interruptions[0].request != 0, "the interrupted send names its request")
-	interruption: journal.Request_Interrupted
-	if !testing.expect_value(test, journal.payload_decode(interruptions[0].data, &interruption, context.temp_allocator), nil) { return }
+	interruption := _test_payload(test, interruptions[0], journal.Request_Interrupted)
 	testing.expect(test, interruption.detail != "", "the cancelled send's own account must be recorded")
 
 	// The turn is over and the session is immediately reusable. The process would exit on

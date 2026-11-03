@@ -366,11 +366,9 @@ test_steering_during_response_waits_for_commit_before_recording :: proc(test: ^t
 	   !testing.expect(test, first_response.seq != 0, "the first response was durably committed") { return }
 	for record in records {
 		if record.kind != .Node_Committed || record.seq <= first_send.seq || record.seq >= first_response.seq { continue }
-		committed: journal.Node_Committed
-		if decode_error := journal.payload_decode(record.data, &committed, context.temp_allocator); decode_error != nil {
-			testing.fail_now(test, "the node commit could not be decoded")
-		}
-		testing.expect(test, committed.kind != journal.NODE_KIND_NAMES[.User], "no user node is committed between the send and its response")
+		committed, committed_error := journal.read_node(chat.store, record.session, record.node, context.temp_allocator)
+		if !testing.expect_value(test, committed_error, nil) { return }
+		testing.expect(test, committed.kind != .User, "no user node is committed between the send and its response")
 	}
 	ancestry, ancestry_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
 	if !testing.expect_value(test, ancestry_error, nil) { return }

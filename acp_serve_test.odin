@@ -2265,8 +2265,8 @@ test_acp_v2_compact_command_starts_compaction_without_user_input :: proc(t: ^tes
 			testing.expect_value(t, string(record.body), "say hello")
 		} else {
 			compactions += 1
-			started: journal.Compaction_Started
-			if !testing.expect_value(t, journal.payload_decode(record.data, &started, context.temp_allocator), nil) { return }
+			started, started_ok := journal.payload_as(record, journal.Compaction_Started)
+			if !testing.expect(t, started_ok) { return }
 			testing.expect_value(t, started.trigger, "user_command")
 		}
 	}

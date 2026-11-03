@@ -122,7 +122,6 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 		testing.expect_value(test, record.session, session)
 		testing.expect_value(test, record.subagent, Session_Id{})
 		testing.expect_value(test, record.run, _test_run_id())
-		testing.expect(test, len(record.data) > 0, "every record should carry a payload")
 	}
 
 	// The process-scope record reads back with the absent session id, so the
@@ -157,7 +156,6 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 		testing.expect_value(test, user.origin, USER_ORIGIN_NAMES[.Prompt])
 		testing.expect_value(test, user.message, Journal_Seq(0))
 	}
-	testing.expect(test, len(node.data) > 0, "the JSON payload is still stored")
 }
 
 @(test)

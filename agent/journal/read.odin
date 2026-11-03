@@ -348,7 +348,7 @@ read_path :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocat
 	return list[:], nil
 }
 
-// read_nodes returns the nodes of session named by ids, with data and body, in the
+// read_nodes returns the nodes of session named by ids, with payload and body, in the
 // order of ids. ids must be distinct, a node the session does not hold is Corrupt, and
 // their bound count is capped by SQLite's variable limit. The result is owned by
 // allocator; release it with nodes_destroy.
@@ -588,11 +588,8 @@ record_destroy :: proc(record: ^Record, allocator := context.allocator) {
 	if payload, has_payload := record.payload.?; has_payload {
 		payload_destroy(payload, allocator)
 	}
-	delete(record.task, allocator)
-	delete(record.hook, allocator)
 	delete(record.provider, allocator)
 	delete(record.model, allocator)
-	delete(record.data, allocator)
 	delete(record.body, allocator)
 	record^ = {}
 }
@@ -617,7 +614,6 @@ node_destroy :: proc(node: ^Node, allocator := context.allocator) {
 			delete(value.calls, allocator)
 		}
 	}
-	delete(node.data, allocator)
 	delete(node.body, allocator)
 	node^ = {}
 }
@@ -649,11 +645,11 @@ branch_summaries_destroy :: proc(summaries: []Branch_Summary, allocator := conte
 }
 
 @(private)
-RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body, COALESCE((SELECT title FROM record_session_titled WHERE record_session_titled.seq = seq), '')"
+RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, body, COALESCE((SELECT title FROM record_session_titled WHERE record_session_titled.seq = seq), '')"
 
 @(private)
 NODE_COLUMNS ::
-	"session, node, parent, branch, kind, turn, covers, seq, data, body, " +
+	"session, node, parent, branch, kind, turn, covers, seq, body, " +
 	"(SELECT request FROM node_assistant WHERE node_assistant.session = nodes.session AND node_assistant.node = nodes.node), " +
 	"(SELECT partial FROM node_assistant WHERE node_assistant.session = nodes.session AND node_assistant.node = nodes.node), " +
 	"(SELECT request FROM node_checkpoint WHERE node_checkpoint.session = nodes.session AND node_checkpoint.node = nodes.node), " +
@@ -804,7 +800,6 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 	node.turn = Turn_Id(row_int(row))
 	node.covers = Node_Id(row_int(row))
 	node.seq = Journal_Seq(row_int(row))
-	node.data = row_text(row)
 	node.body = row_bytes(row)
 	assistant_request, assistant_request_present := row_maybe_int(row)
 	assistant_partial, assistant_partial_present := row_maybe_int(row)
@@ -820,7 +815,6 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 			return
 		}
 		node.payload = Assistant {
-			version = PAYLOAD_VERSION,
 			request = Request_Id(assistant_request),
 			partial = assistant_partial == 1,
 		}
@@ -830,7 +824,6 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 			return
 		}
 		node.payload = Checkpoint {
-			version = PAYLOAD_VERSION,
 			request = Request_Id(checkpoint_request),
 		}
 	case .User:
@@ -848,14 +841,11 @@ scan_node :: proc(row: ^Row) -> (node: Node) {
 			message = Journal_Seq(user_message)
 		}
 		node.payload = User {
-			version = PAYLOAD_VERSION,
 			origin  = USER_ORIGIN_NAMES[User_Origin(user_origin)],
 			message = message,
 		}
 	case .Results:
-		node.payload = Results {
-			version = PAYLOAD_VERSION,
-		}
+		node.payload = Results{}
 	case .Context, .Notice:
 	}
 	return
@@ -916,8 +906,7 @@ load_result_calls :: proc(journal: ^Journal, node: ^Node, allocator: mem.Allocat
 	}
 	exact := slice.clone(calls[:], allocator) or_return
 	node.payload = Results {
-		version = PAYLOAD_VERSION,
-		calls   = exact,
+		calls = exact,
 	}
 	return nil
 }
@@ -1016,7 +1005,6 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 	record.subagent = Session_Id(row_id(row))
 	record.provider = row_text(row)
 	record.model = row_text(row)
-	record.data = row_text(row)
 	record.body = row_bytes(row)
 	title := row_view(row)
 	if record.kind == .Session_Titled && row.error == nil {
@@ -1026,8 +1014,7 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 			row.error = clone_error
 		} else {
 			record.payload = Session_Titled {
-				version = PAYLOAD_VERSION,
-				title   = copied,
+				title = copied,
 			}
 		}
 	}

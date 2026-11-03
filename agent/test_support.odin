@@ -337,6 +337,13 @@ _test_records :: proc(test: ^testing.T, chat: ^Chat_Session, kinds: bit_set[jour
 	return records
 }
 
+// _test_payload is the typed payload of a record, borrowed from it.
+_test_payload :: proc(test: ^testing.T, record: journal.Record, $Payload: typeid) -> Payload {
+	payload, matched := journal.payload_as(record, Payload)
+	if !matched { testing.fail_now(test, "the record holds no payload of the requested type") }
+	return payload
+}
+
 // _test_projection reads the projection from the chat's head into arena, which the
 // caller initializes and destroys.
 _test_projection :: proc(test: ^testing.T, chat: ^Chat_Session, arena: ^virtual.Arena) -> Projection {

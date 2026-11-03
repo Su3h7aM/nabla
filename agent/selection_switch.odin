@@ -162,7 +162,6 @@ chat_selection_check :: proc(
 			chat,
 			{kind = .Selection_Fit, provider = target.provider_id, model = target.model_id},
 			journal.Selection_Fit {
-				version = 1,
 				api = chat_api_name(target.connection.API),
 				recheck = recheck,
 				decision = journal.SELECTION_FIT_DECISION_NAMES[decision],
@@ -226,11 +225,7 @@ chat_selection_check :: proc(
 @(require_results)
 chat_selection_record :: proc(chat: ^Chat_Session, api: ai.API_Kind, provider, model, effort: string) -> journal.Error {
 	if !chat_journal_writable(chat) { return nil }
-	chat_record(
-		chat,
-		{kind = .Selection_Applied, provider = provider, model = model},
-		journal.Selection_Applied{version = 1, api = chat_api_name(api), effort = effort},
-	)
+	chat_record(chat, {kind = .Selection_Applied, provider = provider, model = model}, journal.Selection_Applied{api = chat_api_name(api), effort = effort})
 	_, commit_error := journal.commit(chat.store)
 	return commit_error
 }

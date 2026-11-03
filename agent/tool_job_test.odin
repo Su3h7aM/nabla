@@ -554,10 +554,7 @@ test_codemode_may_exceed_one_response_worth_of_calls :: proc(test: ^testing.T) {
 	parent_call := journal.Call_Id(0)
 	for record in records {
 		if record.kind != .Tool_Proposed { continue }
-		proposed: journal.Tool_Proposed
-		if decode_error := journal.payload_decode(record.data, &proposed, context.temp_allocator); decode_error != nil {
-			testing.fail_now(test, "a recorded proposal could not be read")
-		}
+		proposed := _test_payload(test, record, journal.Tool_Proposed)
 		if proposed.provider_id == "call_code" { parent_call = record.call }
 	}
 	if !testing.expect(test, parent_call != 0, "the parent call should be recorded") { return }
@@ -605,10 +602,7 @@ test_codemode_reports_what_its_script_did :: proc(test: ^testing.T) {
 	parent_call := journal.Call_Id(0)
 	for record in records {
 		if record.kind != .Tool_Proposed { continue }
-		proposed: journal.Tool_Proposed
-		if decode_error := journal.payload_decode(record.data, &proposed, context.temp_allocator); decode_error != nil {
-			testing.fail_now(test, "a recorded proposal could not be read")
-		}
+		proposed := _test_payload(test, record, journal.Tool_Proposed)
 		if proposed.provider_id == "call_code" { parent_call = record.call }
 	}
 	if !testing.expect(test, parent_call != 0, "the parent call should be recorded") { return }
@@ -846,17 +840,11 @@ test_a_call_that_ignores_its_stop_is_answered_and_abandoned :: proc(test: ^testi
 	testing.expect_value(test, records[0].kind, journal.Record_Kind.Job_Abandoned)
 	testing.expect_value(test, records[1].kind, journal.Record_Kind.Job_Reclaimed)
 	for record in records { testing.expect_value(test, record.call, deaf_call) }
-	abandoned: journal.Job_Abandoned
-	if decode_error := journal.payload_decode(records[0].data, &abandoned, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the abandonment could not be decoded")
-	}
+	abandoned := _test_payload(test, records[0], journal.Job_Abandoned)
 	testing.expect_value(test, abandoned.job, journal.JOB_KIND_NAMES[.Tool])
 	testing.expect(test, abandoned.waited_ms >= i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond), "the wait covers the whole patience")
 	testing.expect_value(test, abandoned.patience_ms, i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond))
-	reclaimed: journal.Job_Reclaimed
-	if decode_error := journal.payload_decode(records[1].data, &reclaimed, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the reclaim could not be decoded")
-	}
+	reclaimed := _test_payload(test, records[1], journal.Job_Reclaimed)
 	testing.expect_value(test, reclaimed.job, journal.JOB_KIND_NAMES[.Tool])
 }
 

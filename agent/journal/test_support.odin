@@ -5,7 +5,6 @@ package journal
 // than file-private so every suite uses one definition, and the file only
 // compiles under `odin test`.
 
-import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -13,12 +12,9 @@ import "core:testing"
 
 import "nabla:db"
 
-// _Test_Payload stands in for a payload kind whose struct this phase does not
-// declare: the write path needs a struct with a leading version field, and the
-// harness declares the rest of them when it records those facts.
+// _Test_Payload stands in for a payload that has no table.
 _Test_Payload :: struct {
-	version: int,
-	detail:  string,
+	detail: string,
 }
 
 _turn_started :: proc(journal: ^Journal) -> Turn_Started {
@@ -80,8 +76,6 @@ _describe :: proc(error: Error) -> string {
 		return fmt.tprintf("filesystem error: %s", os.error_string(value))
 	case mem.Allocator_Error:
 		return fmt.tprintf("allocator error %v", value)
-	case json.Marshal_Error:
-		return fmt.tprintf("encoding error %v", value)
 	case:
 		return "unknown error"
 	}
@@ -127,11 +121,14 @@ _commit_ok :: proc(test: ^testing.T, journal: ^Journal) -> Journal_Seq {
 	return seq
 }
 
-_decode_payload :: proc(test: ^testing.T, data: string, payload: ^$Payload) {
-	if len(data) == 0 { testing.fail_now(test, "a record has no payload to read") }
-	if error := json.unmarshal(transmute([]u8)data, payload, allocator = context.temp_allocator); error != nil {
-		testing.fail_now(test, fmt.tprintf("a payload could not be decoded: %v", error))
-	}
+// _decode_payload is the variant a Record or Node holds, borrowed from it.
+_decode_payload :: proc(test: ^testing.T, source: $Source, $Payload: typeid) -> (payload: Payload) {
+	stored, present := source.payload.?
+	if !present { testing.fail_now(test, "the source holds no payload") }
+	matched: bool
+	payload, matched = stored.(Payload)
+	if !matched { testing.fail_now(test, fmt.tprintf("the payload is not a %v", typeid_of(Payload))) }
+	return
 }
 
 // _records_of_session reads every record of one session and leaves it to the

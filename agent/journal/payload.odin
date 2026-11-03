@@ -1,42 +1,8 @@
 package journal
 
-// payload_decode is generic, so this package never instantiates its use.
-@(require) import "core:encoding/json"
-import "core:mem"
-
-// A payload is the JSON `data` of one record or node. Each begins with its
-// `version`, which an append sets to PAYLOAD_VERSION when left zero. Enums are
-// stored as the stable names of their tables; read them back with enum_from_name.
-PAYLOAD_VERSION :: 1
-
-// payload_decode reads one supported record or node payload, with strings and slices in
-// allocator. Malformed JSON or a missing or unsupported version returns .Corrupt. A failed
-// decode may leave partial allocations behind, so allocator is a temp or arena allocator.
-// Allocation failures return an allocator error without marking corruption.
-// When corruption_journal is given, a corrupt payload also records its session and seq there.
-@(require_results)
-payload_decode :: proc(
-	data: string,
-	payload: ^$Payload,
-	allocator: mem.Allocator,
-	corruption_journal: ^Journal = nil,
-	session: Session_Id = {},
-	seq: Journal_Seq = 0,
-) -> Error {
-	payload.version = 0
-	decode_error := json.unmarshal_string(data, payload, allocator = allocator)
-	if json_error, is_json := decode_error.(json.Error); is_json {
-		if json_error == .Out_Of_Memory { return mem.Allocator_Error.Out_Of_Memory }
-		if json_error == .Invalid_Allocator { return mem.Allocator_Error.Invalid_Argument }
-	}
-	if decode_error != nil || payload.version != PAYLOAD_VERSION {
-		if corruption_journal != nil {
-			return corrupt(corruption_journal, Journal_Error.Corrupt, session, seq)
-		}
-		return Journal_Error.Corrupt
-	}
-	return nil
-}
+// A payload is the typed body of one record or node, stored in the family tables
+// of its kind. Enums are stored as integer codes; the name tables below map them
+// to the stable names the structs carry, and enum_from_name reads them back.
 
 Session_Role :: enum u8 {
 	Main,
@@ -137,19 +103,17 @@ RESPONSE_FINISH_NAMES := [Response_Finish]string {
 // Completion ends a unit of work: outcome is a TOOL_OUTCOME_NAMES name for a call, Lua run, Task, or subagent. attachments are the files a tool result carries
 // beside its rendered text, in the order the model reads them.
 Completion :: struct {
-	version:     int,
 	outcome:     string,
 	detail:      string,
-	attachments: []Attachment `json:"attachments,omitempty"`,
+	attachments: []Attachment,
 }
 
 // Background_Completed carries the rendered tool result in the body; call names the background call.
 Background_Completed :: struct {
-	version:     int,
 	outcome:     string, // TOOL_OUTCOME_NAMES
 	detail:      string,
 	tool:        string,
-	attachments: []Attachment `json:"attachments,omitempty"`,
+	attachments: []Attachment,
 }
 
 Tool_Completed :: Completion
@@ -172,9 +136,8 @@ ATTACHMENT_ARTIFACT :: "attachment"
 // background completion stores them. The record is not a node, so a session accepts
 // it in any phase; a User node whose message names its seq delivers it.
 User_Input :: struct {
-	version:     int,
 	origin:      string,
-	attachments: []Attachment `json:"attachments,omitempty"`,
+	attachments: []Attachment,
 }
 
 // Command_Kind is the closed set of commands a client appends to steer a running
@@ -225,7 +188,6 @@ Stop_Server :: struct {}
 // User_Command is one command a client appended, stored flat with the fields its
 // kind uses: the payload is the boundary between the union above and JSON.
 User_Command :: struct {
-	version:  int,
 	kind:     string, // COMMAND_KIND_NAMES
 	provider: string,
 	model:    string,
@@ -287,7 +249,6 @@ COMMAND_OUTCOME_NAMES := [Command_Outcome]string {
 // Command_Applied ends one command: command is the seq of its user.command, and
 // reason says why a refused command was not applied.
 Command_Applied :: struct {
-	version: int,
 	command: Journal_Seq,
 	outcome: string, // COMMAND_OUTCOME_NAMES
 	reason:  string,
@@ -296,7 +257,6 @@ Command_Applied :: struct {
 // Turn_Completed ends a turn. reason is why its request chain stopped and cause
 // what kept the context from fitting, both "" when absent.
 Turn_Completed :: struct {
-	version: int,
 	outcome: string, // TURN_OUTCOME_NAMES
 	detail:  string,
 	reason:  string,
@@ -320,7 +280,6 @@ Attempt_Usage :: struct {
 }
 
 Request_Interrupted :: struct {
-	version: int,
 	detail:  string,
 	using _: Attempt_Usage,
 }
@@ -329,7 +288,6 @@ Request_Interrupted :: struct {
 // the provider layer classified it, the evidence it kept, and what the harness
 // decided. A retry delay the provider did not give is null.
 Response_Rejected :: struct {
-	version:             int,
 	kind:                string,
 	failure_class:       string,
 	status:              int,
@@ -347,7 +305,6 @@ Response_Rejected :: struct {
 }
 
 Session_Created :: struct {
-	version:        int,
 	workspace:      string,
 	role:           string, // SESSION_ROLE_NAMES
 	parent_session: string, // hex, "" for a main session
@@ -355,13 +312,11 @@ Session_Created :: struct {
 }
 
 Session_Titled :: struct {
-	version: int,
-	title:   string,
+	title: string,
 }
 
 // Session_Recovered counts what recover recorded.
 Session_Recovered :: struct {
-	version:  int,
 	turns:    int,
 	requests: int,
 	calls:    int,
@@ -373,9 +328,8 @@ Session_Recovered :: struct {
 // list. It mirrors MCP_Server_Config in native structs, with the timeouts in
 // milliseconds, and the server converts it once at the journal boundary.
 Session_Environment :: struct {
-	version:      int,
 	instructions: string,
-	servers:      []Session_Environment_Server `json:"servers,omitempty"`,
+	servers:      []Session_Environment_Server,
 }
 
 // Session_Environment_Server is one configured MCP server of a
@@ -383,10 +337,10 @@ Session_Environment :: struct {
 Session_Environment_Server :: struct {
 	id:                   string,
 	executable:           string,
-	arguments:            []string `json:"arguments,omitempty"`,
-	working_directory:    string `json:"working_directory,omitempty"`,
-	environment:          []Session_Environment_Variable `json:"environment,omitempty"`,
-	tools:                []Session_Environment_Tool `json:"tools,omitempty"`,
+	arguments:            []string,
+	working_directory:    string,
+	environment:          []Session_Environment_Variable,
+	tools:                []Session_Environment_Tool,
 	discovery_timeout_ms: i64,
 	call_timeout_ms:      i64,
 }
@@ -401,7 +355,7 @@ Session_Environment_Variable :: struct {
 // disable it or replace its model-visible name, never both.
 Session_Environment_Tool :: struct {
 	remote_name: string,
-	name:        string `json:"name,omitempty"`,
+	name:        string,
 	enabled:     bool,
 }
 
@@ -409,8 +363,7 @@ Session_Environment_Tool :: struct {
 // provider and model are the default; effort is the provider's own level name,
 // "" for its default.
 Selection_Changed :: struct {
-	version: int,
-	effort:  string,
+	effort: string,
 }
 
 Selection_Fit_Decision :: enum u8 {
@@ -428,7 +381,6 @@ SELECTION_FIT_DECISION_NAMES := [Selection_Fit_Decision]string {
 // Selection_Fit records a target selection's admission check. The record's provider
 // and model name the target; recheck distinguishes checks after the initial request.
 Selection_Fit :: struct {
-	version:        int,
 	api:            string,
 	recheck:        bool,
 	decision:       string, // SELECTION_FIT_DECISION_NAMES
@@ -441,13 +393,11 @@ Selection_Fit :: struct {
 // record's provider and model name. It is separate from Selection_Changed, which
 // stores the process-wide default for the next launch.
 Selection_Applied :: struct {
-	version: int,
-	api:     string,
-	effort:  string,
+	api:    string,
+	effort: string,
 }
 
 Branch_Created :: struct {
-	version:   int,
 	base_node: Node_Id,
 }
 
@@ -463,32 +413,26 @@ RUNTIME_LEVEL_NAMES := [Runtime_Level]string {
 
 // Runtime_Message is one process diagnostic. level is a RUNTIME_LEVEL_NAMES entry.
 Runtime_Message :: struct {
-	version: int,
-	level:   string,
-	text:    string,
+	level: string,
+	text:  string,
 }
 
 // Branch_Selected names the branch in the record's branch column.
-Branch_Selected :: struct {
-	version: int,
-}
+Branch_Selected :: struct {}
 
 Node_Committed :: struct {
-	version: int,
-	kind:    string, // NODE_KIND_NAMES
+	kind: string, // NODE_KIND_NAMES
 }
 
 // Turn_Started names the instruction and manifest artifacts the turn runs with
 // by hex digest. The record's model is the one the turn runs with.
 Turn_Started :: struct {
-	version:      int,
 	instructions: string,
 	manifest:     string,
 	effort:       string,
 }
 
 Request_Prepared :: struct {
-	version:        int,
 	purpose:        string, // REQUEST_PURPOSE_NAMES
 	api:            string,
 	transport:      string, // "http" or "websocket"
@@ -513,7 +457,6 @@ ADMISSION_DECISION_NAMES := [Admission_Decision]string {
 
 // Request_Admitted is whether a request fits its model's window.
 Request_Admitted :: struct {
-	version:             int,
 	decision:            string, // ADMISSION_DECISION_NAMES
 	estimate:            int,
 	context_window:      int,
@@ -524,7 +467,6 @@ Request_Admitted :: struct {
 
 // Request_Sent names the model requested in the record's model.
 Request_Sent :: struct {
-	version:     int,
 	purpose:     string, // REQUEST_PURPOSE_NAMES
 	api:         string,
 	// recovery is how the send came to be: initial, transient_retry, checkpoint_repair,
@@ -535,7 +477,6 @@ Request_Sent :: struct {
 }
 
 Retry_Scheduled :: struct {
-	version:      int,
 	purpose:      string, // REQUEST_PURPOSE_NAMES
 	reason:       string, // request_recovery_reason_name
 	next_attempt: int,
@@ -555,7 +496,6 @@ RETRY_OUTCOME_NAMES := [Retry_Outcome]string {
 // Retry_Completed ends a retry's wait: resent carries the attempt being sent,
 // cancelled the attempt that failed.
 Retry_Completed :: struct {
-	version: int,
 	purpose: string, // REQUEST_PURPOSE_NAMES
 	outcome: string, // RETRY_OUTCOME_NAMES
 }
@@ -569,7 +509,6 @@ Retry_Completed :: struct {
 // defines the child. A record written before these existed reads name as "" and an
 // empty body.
 Subagent_Started :: struct {
-	version:    int,
 	name:       string,
 	program:    string,
 	provider:   string,
@@ -583,7 +522,6 @@ Subagent_Started :: struct {
 // model knows the child by, "" when recovery wrote the record.
 // ACP fields preserve its external session, selection, and last consumed inbox sequence.
 Subagent_Completed :: struct {
-	version:     int,
 	outcome:     string, // TOOL_OUTCOME_NAMES
 	detail:      string,
 	name:        string,
@@ -598,15 +536,13 @@ Subagent_Completed :: struct {
 // parent's inbox reads replies while its ACP client sends parent messages as prompts. name is the id the parent's model
 // knows the child by.
 Subagent_Message :: struct {
-	version: int,
-	name:    string,
+	name: string,
 }
 
 // Response_Committed carries the API family that produced the response and the
 // endpoint's native output items in the body. api uses the stable API names from
 // Request_Sent.
 Response_Committed :: struct {
-	version:        int,
 	api:            string,
 	model_resolved: string,
 	finish:         string, // RESPONSE_FINISH_NAMES
@@ -615,7 +551,6 @@ Response_Committed :: struct {
 
 // Tool_Proposed carries the arguments exactly as the model sent them in the body.
 Tool_Proposed :: struct {
-	version:     int,
 	provider_id: string,
 	item_id:     string,
 	name:        string,
@@ -623,7 +558,6 @@ Tool_Proposed :: struct {
 
 // Tool_Admitted carries the arguments the tool runs with in the body.
 Tool_Admitted :: struct {
-	version:    int,
 	tool:       string,
 	repairs:    []string,
 	background: bool,
@@ -632,39 +566,31 @@ Tool_Admitted :: struct {
 // Tool_Started is the owner's dispatch of an admitted call, immediately before its
 // effect begins. A call with no such record never started.
 Tool_Started :: struct {
-	version: int,
-	tool:    string,
+	tool: string,
 }
 
 // Run_Started opens one launch of the harness. The record has no session.
 Run_Started :: struct {
-	version: int,
-	pid:     int,
+	pid: int,
 }
 
 // Run_Finished closes a launch that reached its teardown; a run without one ended
 // abruptly. The record has no session.
-Run_Finished :: struct {
-	version: int,
-}
+Run_Finished :: struct {}
 
 // Session_Claimed is the process taking the session's writer claim. resumed is false
 // for a session this launch created, and true for one an earlier run left.
 Session_Claimed :: struct {
-	version: int,
 	resumed: bool,
 }
 
 // Session_Released is written just before the journal that holds the claim closes.
-Session_Released :: struct {
-	version: int,
-}
+Session_Released :: struct {}
 
 // Compaction_Started is a summary request about to be sent. The record's request is
 // the compaction's own. trigger is a compaction trigger's name, covers the last node
 // the summary replaces, and head_estimate the token estimate of the context it covers.
 Compaction_Started :: struct {
-	version:       int,
 	trigger:       string,
 	covers:        Node_Id,
 	head_estimate: int,
@@ -690,7 +616,6 @@ JOB_KIND_NAMES := [Job_Kind]string {
 // cancelled or unknown. waited_ms is how long the stop went unanswered and patience_ms
 // the patience it was given.
 Job_Abandoned :: struct {
-	version:     int,
 	job:         string, // JOB_KIND_NAMES
 	waited_ms:   i64,
 	patience_ms: i64,
@@ -699,43 +624,36 @@ Job_Abandoned :: struct {
 // Job_Reclaimed is a retained worker finishing late, so the owner released it. What it
 // published is dropped.
 Job_Reclaimed :: struct {
-	version: int,
-	job:     string, // JOB_KIND_NAMES
+	job: string, // JOB_KIND_NAMES
 }
 
 // User carries the text in the node body and the files the user attached to it.
 User :: struct {
-	version:     int,
 	origin:      string, // USER_ORIGIN_NAMES
 	// message is the seq of the user.input, background.completed, subagent.completed, or subagent.message
 	// record this node delivers, 0 for none. The highest one is where the session's
 	// reading of its inbox resumes.
 	message:     Journal_Seq,
-	attachments: []Attachment `json:"attachments,omitempty"`,
+	attachments: []Attachment,
 }
 
 // Assistant carries the visible text in the node body. partial marks text kept
 // from a cancelled or failed response.
 Assistant :: struct {
-	version: int,
 	request: Request_Id,
 	partial: bool,
 }
 
 // Notice carries the feedback text in the node body.
-Notice :: struct {
-	version: int,
-}
+Notice :: struct {}
 
 // Checkpoint carries the summary in the node body; the node's covers names the
 // last node it replaces.
 Checkpoint :: struct {
-	version: int,
 	request: Request_Id,
 }
 
 // Results lists the root calls it answers in proposal order.
 Results :: struct {
-	version: int,
-	calls:   []Call_Id,
+	calls: []Call_Id,
 }

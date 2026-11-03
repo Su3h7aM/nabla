@@ -338,8 +338,7 @@ test_recovery_names_the_output_an_interrupted_shell_call_kept :: proc(test: ^tes
 	testing.expect_value(test, read_error, nil)
 	testing.expect_value(test, string(kept), "partial")
 	if !testing.expect_value(test, len(records), 1) { return }
-	completed: journal.Tool_Completed
-	testing.expect_value(test, journal.payload_decode(records[0].data, &completed, context.temp_allocator), nil)
+	completed := _test_payload(test, records[0], journal.Tool_Completed)
 	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Unknown])
 	testing.expect(test, strings.contains(completed.detail, fmt.tprintf("%s (7 bytes)", path)), completed.detail)
 }

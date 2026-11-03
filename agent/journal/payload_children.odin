@@ -60,7 +60,6 @@ environment_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allo
 			values    = values,
 			allocator = allocator,
 		}
-		environment.version = PAYLOAD_VERSION
 		environment.instructions = row_text(&row)
 		if row.error != nil { return environment, corrupt(journal, row.error, record.session, record.seq) }
 	}

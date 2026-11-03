@@ -37,8 +37,7 @@ context_window_test_finishes :: proc(test: ^testing.T, chat: ^Chat_Session) -> [
 	records := _test_records(test, chat, {.Response_Committed})
 	finishes := make([]string, len(records), context.temp_allocator)
 	for record, index in records {
-		committed: journal.Response_Committed
-		if !testing.expect_value(test, journal.payload_decode(record.data, &committed, context.temp_allocator), nil) { return nil }
+		committed := _test_payload(test, record, journal.Response_Committed)
 		finishes[index] = committed.finish
 	}
 	return finishes
@@ -48,8 +47,7 @@ context_window_test_purposes :: proc(test: ^testing.T, chat: ^Chat_Session) -> [
 	records := _test_records(test, chat, {.Request_Sent})
 	purposes := make([]string, len(records), context.temp_allocator)
 	for record, index in records {
-		sent: journal.Request_Sent
-		if !testing.expect_value(test, journal.payload_decode(record.data, &sent, context.temp_allocator), nil) { return nil }
+		sent := _test_payload(test, record, journal.Request_Sent)
 		purposes[index] = sent.purpose
 	}
 	return purposes

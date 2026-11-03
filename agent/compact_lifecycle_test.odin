@@ -269,10 +269,7 @@ test_a_background_compaction_keeps_the_work_that_followed_it :: proc(test: ^test
 	testing.expect_value(test, compaction[1].kind, journal.Record_Kind.Compaction_Completed)
 	testing.expect(test, compaction[0].request != 0, "the start names the compaction's request")
 	testing.expect_value(test, compaction[0].request, compaction[1].request)
-	started: journal.Compaction_Started
-	if decode_error := journal.payload_decode(compaction[0].data, &started, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the compaction start could not be decoded")
-	}
+	started := _test_payload(test, compaction[0], journal.Compaction_Started)
 	testing.expect_value(test, started.trigger, compact_trigger_name(.Agent_Tool))
 	testing.expect(test, started.covers != 0, "the start names the node the summary replaces")
 	testing.expect(test, started.head_estimate > 0, "the start carries the estimate of the context it covers")
@@ -356,9 +353,7 @@ test_a_failed_compaction_leaves_the_context_alone :: proc(test: ^testing.T) {
 	sends := _test_records(test, chat, {.Request_Sent})
 	rejections := _test_records(test, chat, {.Response_Rejected})
 	if !testing.expect_value(test, len(sends), 1) || !testing.expect_value(test, len(rejections), 1) { return }
-	sent: journal.Request_Sent
-	if decode_error := journal.payload_decode(sends[0].data, &sent, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "compaction send could not be decoded") }
+	sent := _test_payload(test, sends[0], journal.Request_Sent)
 	testing.expect_value(test, sent.purpose, journal.REQUEST_PURPOSE_NAMES[.Compaction])
 	testing.expect_value(test, len(sent.body_digest), journal.DIGEST_HEX_LENGTH)
 	testing.expect(test, sent.body_bytes > 0, "the frozen body was not recorded with its size")
@@ -419,9 +414,7 @@ test_the_compact_tool_records_an_intent_and_returns :: proc(test: ^testing.T) {
 
 	results := _test_records(test, chat, {.Tool_Completed})
 	if !testing.expect_value(test, len(results), 1) { return }
-	result: journal.Tool_Completed
-	if decode_error := journal.payload_decode(results[0].data, &result, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "tool completion could not be decoded") }
+	result := _test_payload(test, results[0], journal.Tool_Completed)
 	testing.expect_value(test, result.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
 	testing.expect(test, strings.contains(string(results[0].body), `state: scheduled`), "the result says the work was queued")
 
@@ -669,14 +662,10 @@ test_a_rejected_payload_is_repaired_from_a_ready_summary :: proc(test: ^testing.
 	testing.expect_value(test, second.request, first.request)
 	testing.expect_value(test, second.attempt, journal.Attempt_No(2))
 	testing.expect_value(test, committed[len(committed) - 1].request, answered)
-	sent: journal.Request_Sent
-	if decode_error := journal.payload_decode(second.data, &sent, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "repair send could not be decoded") }
+	sent := _test_payload(test, second, journal.Request_Sent)
 	testing.expect_value(test, sent.recovery, "checkpoint_repair")
 	testing.expect_value(test, rejections[0].request, first.request)
-	evidence: journal.Response_Rejected
-	if decode_error := journal.payload_decode(rejections[0].data, &evidence, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "rejection could not be decoded") }
+	evidence := _test_payload(test, rejections[0], journal.Response_Rejected)
 	testing.expect_value(test, evidence.failure_class, "context_overflow")
 	testing.expect_value(test, evidence.recovery, "context_exhausted")
 }
@@ -739,9 +728,7 @@ test_a_rejected_payload_waits_for_a_summary_that_is_not_ready :: proc(test: ^tes
 	sends := _test_records(test, chat, {.Request_Sent})
 	compactions := _test_records(test, chat, {.Compaction_Completed})
 	if !testing.expect_value(test, len(sends), 3) || !testing.expect_value(test, len(compactions), 1) { return }
-	second: journal.Request_Sent
-	if decode_error := journal.payload_decode(sends[2].data, &second, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "repair send could not be decoded") }
+	second := _test_payload(test, sends[2], journal.Request_Sent)
 	testing.expect_value(test, sends[2].attempt, journal.Attempt_No(2))
 	testing.expect_value(test, second.recovery, "checkpoint_repair")
 }
@@ -788,16 +775,12 @@ test_a_rejected_payload_without_a_compactable_prefix_ends_the_turn :: proc(test:
 	rejections := _test_records(test, chat, {.Response_Rejected})
 	if !testing.expect_value(test, len(sends), 1) || !testing.expect_value(test, len(rejections), 1) { return }
 	testing.expect_value(test, rejections[0].request, sends[0].request)
-	evidence: journal.Response_Rejected
-	if decode_error := journal.payload_decode(rejections[0].data, &evidence, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "rejection could not be decoded") }
+	evidence := _test_payload(test, rejections[0], journal.Response_Rejected)
 	testing.expect_value(test, evidence.failure_class, "context_overflow")
 	testing.expect_value(test, evidence.recovery, "context_exhausted")
 	turns := _test_records(test, chat, {.Turn_Completed})
 	if !testing.expect_value(test, len(turns), 1) { return }
-	completed: journal.Turn_Completed
-	if decode_error := journal.payload_decode(turns[0].data, &completed, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "turn outcome could not be decoded") }
+	completed := _test_payload(test, turns[0], journal.Turn_Completed)
 	testing.expect_value(test, completed.outcome, journal.TURN_OUTCOME_NAMES[.Failed])
 	testing.expect_value(test, completed.cause, "no_candidate")
 }
@@ -973,13 +956,9 @@ test_a_transient_summary_failure_is_retried_on_the_same_bytes :: proc(test: ^tes
 	testing.expect_value(test, sends[0].attempt, journal.Attempt_No(1))
 	testing.expect_value(test, sends[1].attempt, journal.Attempt_No(2))
 	testing.expect_value(test, committed[0].request, sends[1].request)
-	sent: journal.Request_Sent
-	if decode_error := journal.payload_decode(sends[1].data, &sent, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "retry send could not be decoded") }
+	sent := _test_payload(test, sends[1], journal.Request_Sent)
 	testing.expect_value(test, sent.recovery, "transient_retry")
-	evidence: journal.Response_Rejected
-	if decode_error := journal.payload_decode(rejections[0].data, &evidence, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "rejection could not be decoded") }
+	evidence := _test_payload(test, rejections[0], journal.Response_Rejected)
 	testing.expect_value(test, evidence.failure_class, "provider_unavailable")
 	testing.expect_value(test, evidence.recovery, "transient_failure")
 
@@ -1059,9 +1038,7 @@ test_repeated_invalid_compaction_refusals_restore_omitted_features :: proc(test:
 	sends := _test_records(test, chat, {.Request_Sent})
 	if !testing.expect_value(test, len(sends), 3) { return }
 	for send in sends {
-		sent: journal.Request_Sent
-		if decode_error := journal.payload_decode(send.data, &sent, context.temp_allocator);
-		   decode_error != nil { testing.fail_now(test, "the compaction send could not be decoded") }
+		sent := _test_payload(test, send, journal.Request_Sent)
 		testing.expect_value(test, send.attempt, journal.Attempt_No(1))
 		testing.expect_value(test, sent.recovery, "initial")
 	}
@@ -1337,10 +1314,7 @@ test_a_summary_that_ignores_its_stop_is_abandoned :: proc(test: ^testing.T) {
 	testing.expect_value(test, jobs[0].kind, journal.Record_Kind.Job_Abandoned)
 	testing.expect_value(test, jobs[1].kind, journal.Record_Kind.Job_Reclaimed)
 	for record in jobs { testing.expect_value(test, record.request, request) }
-	abandoned: journal.Job_Abandoned
-	if decode_error := journal.payload_decode(jobs[0].data, &abandoned, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the abandonment could not be decoded")
-	}
+	abandoned := _test_payload(test, jobs[0], journal.Job_Abandoned)
 	testing.expect_value(test, abandoned.job, journal.JOB_KIND_NAMES[.Compaction])
 	testing.expect_value(test, abandoned.patience_ms, i64(TOOL_JOBS_STOP_PATIENCE / time.Millisecond))
 }

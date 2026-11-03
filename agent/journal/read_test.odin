@@ -9,53 +9,6 @@ import "core:testing"
 import "nabla:db"
 
 @(test)
-test_response_committed_reasoning_tokens_are_presence_aware :: proc(test: ^testing.T) {
-	payload: Response_Committed
-	err := payload_decode(`{"version":1,"model_resolved":"model","finish":"stop","output_tokens":1}`, &payload, context.temp_allocator)
-	if !testing.expect_value(test, err, nil) { return }
-	testing.expect(test, payload.reasoning_tokens == nil, "older response records leave reasoning tokens unknown")
-
-	payload = {}
-	err = payload_decode(`{"version":1,"reasoning_tokens":0}`, &payload, context.temp_allocator)
-	if !testing.expect_value(test, err, nil) { return }
-	if value, present := payload.reasoning_tokens.?; present {
-		testing.expect_value(test, value, i64(0))
-	} else {
-		testing.fail_now(test, "a reported zero reasoning count remains present")
-	}
-}
-
-@(test)
-test_payload_decode_rejects_unsupported_and_missing_versions :: proc(test: ^testing.T) {
-	corruption_journal: Journal
-	session := session_id_create()
-	seq := Journal_Seq(37)
-	payload: Response_Committed
-	unsupported_error := payload_decode(`{"version":2}`, &payload, context.temp_allocator, &corruption_journal, session, seq)
-	if !testing.expect(test, error_is(unsupported_error, .Corrupt)) { return }
-	testing.expect_value(test, corruption_journal.corrupt.session, session)
-	testing.expect_value(test, corruption_journal.corrupt.seq, seq)
-
-	corruption_journal.corrupt = {}
-	valid_error := payload_decode(`{"version":1,"model_resolved":"model"}`, &payload, context.temp_allocator)
-	if !testing.expect_value(test, valid_error, nil) { return }
-	missing_error := payload_decode(`{"model_resolved":"model"}`, &payload, context.temp_allocator)
-	testing.expect(test, error_is(missing_error, .Corrupt))
-}
-
-@(test)
-test_payload_allocation_failure_does_not_mark_corruption :: proc(test: ^testing.T) {
-	buffer: [1]u8
-	arena: mem.Arena
-	mem.arena_init(&arena, buffer[:])
-	corruption_journal: Journal
-	payload: Response_Committed
-	error := payload_decode(`{"version":1,"model_resolved":"model"}`, &payload, mem.arena_allocator(&arena), &corruption_journal, session_id_create(), 37)
-	testing.expect_value(test, error, Error(mem.Allocator_Error.Out_Of_Memory))
-	testing.expect_value(test, corruption_journal.corrupt, Corruption{})
-}
-
-@(test)
 test_read_records_filters_by_node_in_seq_order :: proc(test: ^testing.T) {
 	directory := _temp_directory(test)
 	defer _remove_directory(directory)
@@ -644,31 +597,22 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	testing.expect_value(test, len(call_records), 3)
 
 	// The payloads carry what a projection needs to rebuild the exchange.
-	proposed: Tool_Proposed
-	_decode_payload(test, projection[0].data, &proposed)
+	proposed := _decode_payload(test, projection[0], Tool_Proposed)
 	testing.expect_value(test, proposed.name, "read")
 	testing.expect_value(test, proposed.item_id, "item_1")
-	admitted: Tool_Admitted
-	_decode_payload(test, projection[1].data, &admitted)
+	admitted := _decode_payload(test, projection[1], Tool_Admitted)
 	testing.expect_value(test, admitted.tool, "read")
 	testing.expect_value(test, len(admitted.repairs), 1)
-	completed: Tool_Completed
-	_decode_payload(test, projection[2].data, &completed)
-	committed: Response_Committed
-	_decode_payload(test, projection[6].data, &committed)
+	committed := _decode_payload(test, projection[6], Response_Committed)
 	testing.expect_value(test, committed.finish, RESPONSE_FINISH_NAMES[.Tool_Call])
 	testing.expect_value(test, committed.cache_write_tokens.?, 5)
-	answer: Assistant
-	_decode_payload(test, ancestry[1].data, &answer)
+	answer := _decode_payload(test, ancestry[1], Assistant)
 	testing.expect_value(test, answer.request, Request_Id(1))
-	summary: Assistant
-	_decode_payload(test, ancestry[4].data, &summary)
+	summary := _decode_payload(test, ancestry[4], Assistant)
 	testing.expect(test, !summary.partial, "a response that committed whole is not partial")
-	prompt: User
-	_decode_payload(test, ancestry[0].data, &prompt)
+	prompt := _decode_payload(test, ancestry[0], User)
 	testing.expect_value(test, prompt.origin, USER_ORIGIN_NAMES[.Prompt])
-	steered: User
-	_decode_payload(test, ancestry[3].data, &steered)
+	steered := _decode_payload(test, ancestry[3], User)
 	testing.expect_value(test, steered.origin, USER_ORIGIN_NAMES[.Steering])
 
 	// A count the provider never reported is not a zero in the totals, and a
@@ -942,7 +886,6 @@ test_read_path_crosses_checkpoints_and_forks_and_read_nodes_keeps_order :: proc(
 	for node, index in nodes { testing.expect_value(test, node.id, wanted[index]) }
 	testing.expect_value(test, string(nodes[0].body), "fork")
 	testing.expect_value(test, nodes[2].kind, Node_Kind.Checkpoint)
-	testing.expect(test, nodes[2].data != "", "the node carries its data")
 
 	absent := [?]Node_Id{2, 99}
 	_, absent_error := read_nodes(journal, session, absent[:], context.allocator)

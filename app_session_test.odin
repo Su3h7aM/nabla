@@ -204,7 +204,7 @@ test_a_launch_restores_the_stored_selection :: proc(t: ^testing.T) {
 	journal.append_record(
 		app.setup.store,
 		{kind = .Selection_Applied, session = app.setup.session.session, provider = "test-provider", model = "test-model"},
-		journal.Selection_Applied{version = 1, api = "openai_responses"},
+		journal.Selection_Applied{api = "openai_responses"},
 	)
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 
@@ -241,7 +241,7 @@ test_a_stale_selection_falls_back_rather_than_failing :: proc(t: ^testing.T) {
 	journal.append_record(
 		app.setup.store,
 		{kind = .Selection_Applied, session = app.setup.session.session, provider = "gone", model = "gone"},
-		journal.Selection_Applied{version = 1, api = "openai_responses"},
+		journal.Selection_Applied{api = "openai_responses"},
 	)
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 	app.setup.resumed_provider = strings.clone("test-provider", app.setup.alloc)
@@ -264,7 +264,7 @@ test_a_launch_with_nothing_to_resolve_continues_to_the_menu :: proc(t: ^testing.
 	journal.append_record(
 		app.setup.store,
 		{kind = .Selection_Applied, session = app.setup.session.session, provider = "gone", model = "gone"},
-		journal.Selection_Applied{version = 1, api = "openai_responses"},
+		journal.Selection_Applied{api = "openai_responses"},
 	)
 	if _, err := journal.commit(app.setup.store); err != nil { testing.fail_now(t, "the selection could not be stored") }
 
@@ -784,7 +784,7 @@ test_a_follower_shows_the_servers_selection :: proc(t: ^testing.T) {
 	journal.append_record(
 		runner,
 		{kind = .Selection_Applied, session = id, provider = "session-provider", model = "session-model"},
-		journal.Selection_Applied{version = 1, api = "openai_responses", effort = "high"},
+		journal.Selection_Applied{api = "openai_responses", effort = "high"},
 	)
 	if _, commit_error := journal.commit(runner); commit_error != nil { testing.fail_now(t, "the runner could not commit the selection") }
 
@@ -3978,9 +3978,8 @@ test_server_restart_restores_the_last_session_selection :: proc(t: ^testing.T) {
 	if _, claim_error := journal.claim(store, id); claim_error != nil { testing.fail_now(t, "could not claim session") }
 	for model, index in ([]string{"model-x", "model-y"}) {
 		selection := journal.Selection_Applied {
-			version = 1,
-			api     = "openai_chat_completions",
-			effort  = "low" if index == 0 else "high",
+			api    = "openai_chat_completions",
+			effort = "low" if index == 0 else "high",
 		}
 		journal.append_record(store, {kind = .Selection_Applied, session = id, provider = "test-provider", model = model}, selection)
 	}

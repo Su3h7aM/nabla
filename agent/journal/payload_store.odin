@@ -640,73 +640,49 @@ payload_load :: proc(journal: ^Journal, record: ^Record, sql: string, allocator:
 
 @(private)
 scan_run_started :: proc(row: ^Row) -> Record_Payload {
-	return Run_Started{version = PAYLOAD_VERSION, pid = int(row_int(row))}
+	return Run_Started{pid = int(row_int(row))}
 }
 
 @(private)
 scan_session_recovered :: proc(row: ^Row) -> Record_Payload {
-	return Session_Recovered {
-		version = PAYLOAD_VERSION,
-		turns = int(row_int(row)),
-		requests = int(row_int(row)),
-		calls = int(row_int(row)),
-		results = int(row_int(row)),
-	}
+	return Session_Recovered{turns = int(row_int(row)), requests = int(row_int(row)), calls = int(row_int(row)), results = int(row_int(row))}
 }
 
 @(private)
 scan_session_claimed :: proc(row: ^Row) -> Record_Payload {
 	resumed, ok := row_flag(row)
 	if !ok && row.error == nil { row.error = Journal_Error.Corrupt }
-	return Session_Claimed{version = PAYLOAD_VERSION, resumed = resumed}
+	return Session_Claimed{resumed = resumed}
 }
 
 @(private)
 scan_user_input :: proc(row: ^Row) -> Record_Payload {
-	return User_Input{version = PAYLOAD_VERSION, origin = row_enum_name(row, USER_ORIGIN_NAMES)}
+	return User_Input{origin = row_enum_name(row, USER_ORIGIN_NAMES)}
 }
 
 @(private)
 scan_user_command :: proc(row: ^Row) -> Record_Payload {
-	return User_Command {
-		version = PAYLOAD_VERSION,
-		kind = row_enum_name(row, COMMAND_KIND_NAMES),
-		provider = row_text(row),
-		model = row_text(row),
-		level = row_text(row),
-	}
+	return User_Command{kind = row_enum_name(row, COMMAND_KIND_NAMES), provider = row_text(row), model = row_text(row), level = row_text(row)}
 }
 
 @(private)
 scan_command_applied :: proc(row: ^Row) -> Record_Payload {
-	return Command_Applied {
-		version = PAYLOAD_VERSION,
-		command = Journal_Seq(row_int(row)),
-		outcome = row_enum_name(row, COMMAND_OUTCOME_NAMES),
-		reason = row_text(row),
-	}
+	return Command_Applied{command = Journal_Seq(row_int(row)), outcome = row_enum_name(row, COMMAND_OUTCOME_NAMES), reason = row_text(row)}
 }
 
 @(private)
 scan_turn_started :: proc(row: ^Row) -> Record_Payload {
-	return Turn_Started{version = PAYLOAD_VERSION, instructions = row_digest(row), manifest = row_digest(row), effort = row_text(row)}
+	return Turn_Started{instructions = row_digest(row), manifest = row_digest(row), effort = row_text(row)}
 }
 
 @(private)
 scan_turn_completed :: proc(row: ^Row) -> Record_Payload {
-	return Turn_Completed {
-		version = PAYLOAD_VERSION,
-		outcome = row_enum_name(row, TURN_OUTCOME_NAMES),
-		detail = row_text(row),
-		reason = row_text(row),
-		cause = row_text(row),
-	}
+	return Turn_Completed{outcome = row_enum_name(row, TURN_OUTCOME_NAMES), detail = row_text(row), reason = row_text(row), cause = row_text(row)}
 }
 
 @(private)
 scan_request_prepared :: proc(row: ^Row) -> Record_Payload {
 	return Request_Prepared {
-		version = PAYLOAD_VERSION,
 		purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES),
 		api = row_text(row),
 		transport = row_text(row),
@@ -721,7 +697,6 @@ scan_request_prepared :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_request_admitted :: proc(row: ^Row) -> Record_Payload {
 	return Request_Admitted {
-		version = PAYLOAD_VERSION,
 		decision = row_enum_name(row, ADMISSION_DECISION_NAMES),
 		estimate = int(row_int(row)),
 		context_window = int(row_int(row)),
@@ -734,7 +709,6 @@ scan_request_admitted :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_request_sent :: proc(row: ^Row) -> Record_Payload {
 	return Request_Sent {
-		version = PAYLOAD_VERSION,
 		purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES),
 		api = row_text(row),
 		recovery = row_text(row),
@@ -746,8 +720,7 @@ scan_request_sent :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_request_interrupted :: proc(row: ^Row) -> Record_Payload {
 	interrupted := Request_Interrupted {
-		version = PAYLOAD_VERSION,
-		detail  = row_text(row),
+		detail = row_text(row),
 	}
 	row_usage(row, &interrupted)
 	return interrupted
@@ -756,7 +729,6 @@ scan_request_interrupted :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_response_committed :: proc(row: ^Row) -> Record_Payload {
 	committed := Response_Committed {
-		version        = PAYLOAD_VERSION,
 		api            = row_text(row),
 		model_resolved = row_text(row),
 		finish         = row_enum_name(row, RESPONSE_FINISH_NAMES),
@@ -768,7 +740,6 @@ scan_response_committed :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_response_rejected :: proc(row: ^Row) -> Record_Payload {
 	rejected := Response_Rejected {
-		version             = PAYLOAD_VERSION,
 		kind                = row_text(row),
 		failure_class       = row_text(row),
 		status              = int(row_int(row)),
@@ -792,28 +763,27 @@ scan_response_rejected :: proc(row: ^Row) -> Record_Payload {
 
 @(private)
 scan_tool_proposed :: proc(row: ^Row) -> Record_Payload {
-	return Tool_Proposed{version = PAYLOAD_VERSION, provider_id = row_text(row), item_id = row_text(row), name = row_text(row)}
+	return Tool_Proposed{provider_id = row_text(row), item_id = row_text(row), name = row_text(row)}
 }
 
 @(private)
 scan_tool_admitted :: proc(row: ^Row) -> Record_Payload {
-	return Tool_Admitted{version = PAYLOAD_VERSION, tool = row_text(row), background = row_bool(row)}
+	return Tool_Admitted{tool = row_text(row), background = row_bool(row)}
 }
 
 @(private)
 scan_tool_started :: proc(row: ^Row) -> Record_Payload {
-	return Tool_Started{version = PAYLOAD_VERSION, tool = row_text(row)}
+	return Tool_Started{tool = row_text(row)}
 }
 
 @(private)
 scan_completion :: proc(row: ^Row) -> Record_Payload {
-	return Completion{version = PAYLOAD_VERSION, outcome = row_enum_name(row, TOOL_OUTCOME_NAMES), detail = row_text(row)}
+	return Completion{outcome = row_enum_name(row, TOOL_OUTCOME_NAMES), detail = row_text(row)}
 }
 
 @(private)
 scan_background_completed :: proc(row: ^Row) -> Record_Payload {
 	completed := Background_Completed {
-		version = PAYLOAD_VERSION,
 		outcome = row_enum_name(row, TOOL_OUTCOME_NAMES),
 		detail  = row_text(row),
 		tool    = row_text(row),
@@ -825,7 +795,6 @@ scan_background_completed :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_subagent_started :: proc(row: ^Row) -> Record_Payload {
 	return Subagent_Started {
-		version = PAYLOAD_VERSION,
 		name = row_text(row),
 		program = row_text(row),
 		provider = row_text(row),
@@ -838,7 +807,6 @@ scan_subagent_started :: proc(row: ^Row) -> Record_Payload {
 @(private)
 scan_subagent_completed :: proc(row: ^Row) -> Record_Payload {
 	return Subagent_Completed {
-		version = PAYLOAD_VERSION,
 		outcome = row_enum_name(row, TOOL_OUTCOME_NAMES),
 		detail = row_text(row),
 		name = row_text(row),
@@ -851,33 +819,32 @@ scan_subagent_completed :: proc(row: ^Row) -> Record_Payload {
 
 @(private)
 scan_subagent_message :: proc(row: ^Row) -> Record_Payload {
-	return Subagent_Message{version = PAYLOAD_VERSION, name = row_text(row)}
+	return Subagent_Message{name = row_text(row)}
 }
 
 @(private)
 scan_compaction_started :: proc(row: ^Row) -> Record_Payload {
-	return Compaction_Started{version = PAYLOAD_VERSION, trigger = row_text(row), covers = Node_Id(row_int(row)), head_estimate = int(row_int(row))}
+	return Compaction_Started{trigger = row_text(row), covers = Node_Id(row_int(row)), head_estimate = int(row_int(row))}
 }
 
 @(private)
 scan_runtime_message :: proc(row: ^Row) -> Record_Payload {
-	return Runtime_Message{version = PAYLOAD_VERSION, level = row_enum_name(row, RUNTIME_LEVEL_NAMES), text = row_text(row)}
+	return Runtime_Message{level = row_enum_name(row, RUNTIME_LEVEL_NAMES), text = row_text(row)}
 }
 
 @(private)
 scan_job_abandoned :: proc(row: ^Row) -> Record_Payload {
-	return Job_Abandoned{version = PAYLOAD_VERSION, job = row_enum_name(row, JOB_KIND_NAMES), waited_ms = row_int(row), patience_ms = row_int(row)}
+	return Job_Abandoned{job = row_enum_name(row, JOB_KIND_NAMES), waited_ms = row_int(row), patience_ms = row_int(row)}
 }
 
 @(private)
 scan_job_reclaimed :: proc(row: ^Row) -> Record_Payload {
-	return Job_Reclaimed{version = PAYLOAD_VERSION, job = row_enum_name(row, JOB_KIND_NAMES)}
+	return Job_Reclaimed{job = row_enum_name(row, JOB_KIND_NAMES)}
 }
 
 @(private)
 scan_retry_scheduled :: proc(row: ^Row) -> Record_Payload {
 	return Retry_Scheduled {
-		version = PAYLOAD_VERSION,
 		purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES),
 		reason = row_text(row),
 		next_attempt = int(row_int(row)),
@@ -887,19 +854,18 @@ scan_retry_scheduled :: proc(row: ^Row) -> Record_Payload {
 
 @(private)
 scan_retry_completed :: proc(row: ^Row) -> Record_Payload {
-	return Retry_Completed{version = PAYLOAD_VERSION, purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES), outcome = row_enum_name(row, RETRY_OUTCOME_NAMES)}
+	return Retry_Completed{purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES), outcome = row_enum_name(row, RETRY_OUTCOME_NAMES)}
 }
 
 @(private)
 scan_selection_changed :: proc(row: ^Row) -> Record_Payload {
-	return Selection_Changed{version = PAYLOAD_VERSION, effort = row_text(row)}
+	return Selection_Changed{effort = row_text(row)}
 }
 
 @(private)
 scan_selection_fit :: proc(row: ^Row) -> Record_Payload {
 	fit := Selection_Fit {
-		version = PAYLOAD_VERSION,
-		api     = row_text(row),
+		api = row_text(row),
 	}
 	recheck, recheck_ok := row_flag(row)
 	if !recheck_ok && row.error == nil { row.error = Journal_Error.Corrupt }
@@ -913,7 +879,7 @@ scan_selection_fit :: proc(row: ^Row) -> Record_Payload {
 
 @(private)
 scan_selection_applied :: proc(row: ^Row) -> Record_Payload {
-	return Selection_Applied{version = PAYLOAD_VERSION, api = row_text(row), effort = row_text(row)}
+	return Selection_Applied{api = row_text(row), effort = row_text(row)}
 }
 
 // row_usage reads the six Attempt_Usage columns into any payload that embeds

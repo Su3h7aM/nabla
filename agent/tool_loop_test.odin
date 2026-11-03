@@ -64,8 +64,7 @@ test_codemode_background_child_returns_a_receipt_and_delivers_its_completion :: 
 	child := admissions[1].call
 	testing.expect_value(test, admissions[1].parent_call, parent)
 	testing.expect_value(test, admissions[1].node, 0)
-	admitted: journal.Tool_Admitted
-	if !testing.expect_value(test, journal.payload_decode(admissions[1].data, &admitted, context.temp_allocator), nil) { return }
+	admitted := _test_payload(test, admissions[1], journal.Tool_Admitted)
 	testing.expect(test, admitted.background)
 	results := _test_records(test, chat, {.Tool_Completed})
 	if !testing.expect_value(test, len(results), 2) { return }
@@ -75,8 +74,7 @@ test_codemode_background_child_returns_a_receipt_and_delivers_its_completion :: 
 	testing.expect_value(test, results[1].call, parent)
 	name := background_job_name(child, context.temp_allocator)
 	testing.expect(test, strings.contains(string(results[0].body), fmt.tprintf("job: %s", name)), "the child commits its receipt")
-	completed: journal.Tool_Completed
-	if !testing.expect_value(test, journal.payload_decode(results[1].data, &completed, context.temp_allocator), nil) { return }
+	completed := _test_payload(test, results[1], journal.Tool_Completed)
 	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
 	testing.expect(test, strings.contains(string(results[1].body), name), "Lua returns the typed receipt after job.wait")
 	testing.expect(
@@ -89,8 +87,7 @@ test_codemode_background_child_returns_a_receipt_and_delivers_its_completion :: 
 	finished := _test_records(test, chat, {.Background_Completed})
 	if !testing.expect_value(test, len(finished), 1) { return }
 	testing.expect_value(test, finished[0].call, child)
-	completion: journal.Background_Completed
-	if !testing.expect_value(test, journal.payload_decode(finished[0].data, &completion, context.temp_allocator), nil) { return }
+	completion := _test_payload(test, finished[0], journal.Background_Completed)
 	testing.expect_value(test, completion.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
 	testing.expect(test, strings.contains(string(finished[0].body), "lua-background-ok"), "the detached shell survived the script and turn ending")
 	accepted, had_message := chat_session_accept_agent_message(chat, {})
@@ -214,8 +211,7 @@ tool_loop_background_shell :: proc(test: ^testing.T, cancel: bool, recovery := f
 	testing.expect_value(test, records[0].kind, journal.Record_Kind.Tool_Admitted)
 	testing.expect_value(test, records[1].kind, journal.Record_Kind.Tool_Started)
 	testing.expect_value(test, records[2].kind, journal.Record_Kind.Tool_Completed)
-	admitted: journal.Tool_Admitted
-	if !testing.expect_value(test, journal.payload_decode(records[0].data, &admitted, context.temp_allocator), nil) { return }
+	admitted := _test_payload(test, records[0], journal.Tool_Admitted)
 	testing.expect(test, admitted.background)
 	testing.expect_value(test, string(records[0].body), string(arguments))
 	call := records[0].call
@@ -257,8 +253,7 @@ tool_loop_background_shell :: proc(test: ^testing.T, cancel: bool, recovery := f
 	finished := _test_records(test, chat, {.Background_Completed})
 	if !testing.expect_value(test, len(finished), 1) { return }
 	testing.expect_value(test, finished[0].call, call)
-	payload: journal.Background_Completed
-	if !testing.expect_value(test, journal.payload_decode(finished[0].data, &payload, context.temp_allocator), nil) { return }
+	payload := _test_payload(test, finished[0], journal.Background_Completed)
 	testing.expect_value(test, payload.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
 	testing.expect_value(test, payload.tool, TOOL_SHELL_NAME)
 	testing.expect(test, strings.contains(string(finished[0].body), "background-ok"), "the command finished despite its originating turn ending")
@@ -333,8 +328,7 @@ test_jobs_tool_lists_and_stops_a_background_shell :: proc(test: ^testing.T) {
 	for background_running(chat) { _ = chat_background_wait(chat, nil) }
 	finished := _test_records(test, chat, {.Background_Completed})
 	if !testing.expect_value(test, len(finished), 1) { return }
-	payload: journal.Background_Completed
-	if !testing.expect_value(test, journal.payload_decode(finished[0].data, &payload, context.temp_allocator), nil) { return }
+	payload := _test_payload(test, finished[0], journal.Background_Completed)
 	testing.expect_value(test, payload.outcome, journal.TOOL_OUTCOME_NAMES[.Cancelled])
 	if accepted, had_message := chat_session_accept_agent_message(chat, {}); accepted == .Accepted && had_message {
 		testing.expect(test, chat_turn_drive(chat, connection, test_retry_policy(), {}, nil, nil))
@@ -522,23 +516,16 @@ test_tool_calls_are_recorded_then_run :: proc(test: ^testing.T) {
 	testing.expect_value(test, records[2].kind, journal.Record_Kind.Tool_Started)
 	testing.expect_value(test, records[3].kind, journal.Record_Kind.Tool_Completed)
 	for record in records { testing.expect_value(test, record.call, call) }
-	started: journal.Tool_Started
-	if decode_error := journal.payload_decode(records[2].data, &started, context.temp_allocator); decode_error != nil {
-		testing.fail_now(test, "the start could not be decoded")
-	}
+	started := _test_payload(test, records[2], journal.Tool_Started)
 	testing.expect_value(test, started.tool, TOOL_SHELL_NAME)
 	testing.expect_value(test, string(records[0].body), arguments)
 
-	admitted: journal.Tool_Admitted
-	if decode_error := journal.payload_decode(records[1].data, &admitted, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "the admission could not be decoded") }
+	admitted := _test_payload(test, records[1], journal.Tool_Admitted)
 	testing.expect_value(test, admitted.tool, TOOL_SHELL_NAME)
 	testing.expect_value(test, len(admitted.repairs), 0)
 	testing.expect_value(test, string(records[1].body), arguments)
 
-	completed: journal.Tool_Completed
-	if decode_error := journal.payload_decode(records[3].data, &completed, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
+	completed := _test_payload(test, records[3], journal.Tool_Completed)
 	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Success])
 	testing.expect(test, strings.contains(string(records[3].body), "tool-ok"), "the model-visible result should carry the output")
 
@@ -584,9 +571,7 @@ test_malformed_arguments_are_rejected_and_replayed :: proc(test: ^testing.T) {
 	testing.expect_value(test, records[0].kind, journal.Record_Kind.Tool_Proposed)
 	testing.expect_value(test, records[1].kind, journal.Record_Kind.Tool_Completed)
 	for record in records { testing.expect_value(test, record.call, call) }
-	completed: journal.Tool_Completed
-	if decode_error := journal.payload_decode(records[1].data, &completed, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
+	completed := _test_payload(test, records[1], journal.Tool_Completed)
 	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Invalid_Arguments])
 	testing.expect(test, strings.contains(string(records[1].body), `kind: syntax`), "the result names the defect")
 
@@ -628,9 +613,7 @@ test_a_repaired_call_is_replayed_as_what_ran :: proc(test: ^testing.T) {
 	// What was admitted names the repairs and holds the arguments the call ran with.
 	records := _test_records(test, chat, {.Tool_Admitted})
 	if !testing.expect_value(test, len(records), 1) { return }
-	admitted: journal.Tool_Admitted
-	if decode_error := journal.payload_decode(records[0].data, &admitted, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "the admission could not be decoded") }
+	admitted := _test_payload(test, records[0], journal.Tool_Admitted)
 	testing.expect(test, len(admitted.repairs) > 0, "the repair is recorded with the call")
 	testing.expect(test, strings.contains(string(records[0].body), `"timeout_ms":5000`), "the admission holds what ran")
 
@@ -759,9 +742,7 @@ test_unknown_tool_is_reported_not_run :: proc(test: ^testing.T) {
 	records := _test_records(test, chat, {.Tool_Admitted, .Tool_Completed})
 	if !testing.expect_value(test, len(records), 1) { return }
 	testing.expect_value(test, records[0].call, call)
-	completed: journal.Tool_Completed
-	if decode_error := journal.payload_decode(records[0].data, &completed, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "the result could not be decoded") }
+	completed := _test_payload(test, records[0], journal.Tool_Completed)
 	testing.expect_value(test, completed.outcome, journal.TOOL_OUTCOME_NAMES[.Unavailable])
 	testing.expect(test, strings.contains(string(records[0].body), "nope"), "the result names the tool the model asked for")
 }
@@ -1202,8 +1183,6 @@ _test_session_title :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
 	record, found, read_error := journal.read_latest(chat.store, {session = chat.session, kinds = {.Session_Titled}}, context.temp_allocator)
 	if read_error != nil { testing.fail_now(test, "the title could not be read") }
 	if !testing.expect(test, found, "the session must be named") { return "" }
-	title: journal.Session_Titled
-	if decode_error := journal.payload_decode(record.data, &title, context.temp_allocator);
-	   decode_error != nil { testing.fail_now(test, "the title could not be decoded") }
+	title := _test_payload(test, record, journal.Session_Titled)
 	return title.title
 }

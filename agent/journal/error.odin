@@ -1,6 +1,5 @@
 package journal
 
-import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -32,7 +31,6 @@ Error :: union #shared_nil {
 	db.Error,
 	os.Error,
 	mem.Allocator_Error,
-	json.Marshal_Error,
 }
 
 // error_is reports whether error is this package's own error of that kind.
@@ -72,8 +70,6 @@ error_text :: proc(error: Error, allocator := context.allocator) -> string {
 		return fmt.aprintf("filesystem error: %s", os.error_string(value), allocator = allocator)
 	case mem.Allocator_Error:
 		return fmt.aprintf("allocation failed: %v", value, allocator = allocator)
-	case json.Marshal_Error:
-		return fmt.aprintf("a record could not be encoded: %v", value, allocator = allocator)
 	}
 	return fmt.aprint("no error", allocator = allocator)
 }

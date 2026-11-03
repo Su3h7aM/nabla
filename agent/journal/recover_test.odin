@@ -69,21 +69,18 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 		#partial switch record.kind {
 		case .Turn_Completed:
 			completed_turns += 1
-			payload: Turn_Completed
-			_decode_payload(test, record.data, &payload)
+			payload := _decode_payload(test, record, Turn_Completed)
 			testing.expect_value(test, payload.outcome, TURN_OUTCOME_NAMES[.Interrupted])
 			testing.expect_value(test, record.turn, Turn_Id(1))
 			testing.expect_value(test, record.session, session)
 		case .Request_Interrupted:
 			interrupted_requests += 1
-			payload: Request_Interrupted
-			_decode_payload(test, record.data, &payload)
+			payload := _decode_payload(test, record, Request_Interrupted)
 			testing.expect(test, len(payload.detail) > 0, "an interruption names what was found")
 			testing.expect_value(test, record.request, Request_Id(1))
 		case .Tool_Completed:
 			completed_tools += 1
-			payload: Tool_Completed
-			_decode_payload(test, record.data, &payload)
+			payload := _decode_payload(test, record, Tool_Completed)
 			// The call that was never admitted did not run; the one that was
 			// admitted may have.
 			switch record.call {
@@ -98,22 +95,19 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 			testing.expect_value(test, record.turn, Turn_Id(1))
 		case .Lua_Completed:
 			completed_effects += 1
-			payload: Call_Completed
-			_decode_payload(test, record.data, &payload)
+			payload := _decode_payload(test, record, Call_Completed)
 			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Unknown])
 			testing.expect_value(test, record.call, Call_Id(3))
 		case .Subagent_Completed:
 			completed_effects += 1
-			payload: Subagent_Completed
-			_decode_payload(test, record.data, &payload)
+			payload := _decode_payload(test, record, Subagent_Completed)
 			// The child never created its session, so it did not run.
 			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Not_Executed])
 			testing.expect_value(test, record.call, Call_Id(4))
 			testing.expect_value(test, record.subagent, child)
 		case .Session_Recovered:
 			recovered_records += 1
-			payload: Session_Recovered
-			_decode_payload(test, record.data, &payload)
+			payload := _decode_payload(test, record, Session_Recovered)
 			testing.expect_value(test, payload.turns, 1)
 			testing.expect_value(test, payload.calls, 4)
 			testing.expect_value(test, payload.results, 1)
@@ -144,8 +138,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	testing.expect_value(test, results.parent, assistant)
 	testing.expect_value(test, results.branch, Branch_Id(INITIAL_BRANCH))
 	testing.expect_value(test, results.turn, Turn_Id(1))
-	payload: Results
-	_decode_payload(test, results.data, &payload)
+	payload := _decode_payload(test, results, Results)
 	testing.expect_value(test, len(payload.calls), 2)
 	testing.expect_value(test, payload.calls[0], Call_Id(1))
 	testing.expect_value(test, payload.calls[1], Call_Id(2))
@@ -289,8 +282,7 @@ test_recovery_settles_delegations_by_whether_the_child_started :: proc(test: ^te
 	defer records_destroy(records, context.allocator)
 	if !testing.expect_value(test, len(records), 4) { return }
 	for record, index in records {
-		payload: Subagent_Completed
-		_decode_payload(test, record.data, &payload)
+		payload := _decode_payload(test, record, Subagent_Completed)
 		testing.expect_value(test, payload.outcome, expected[index])
 		testing.expect_value(test, record.subagent, children[index].id)
 	}
@@ -343,8 +335,7 @@ test_recovery_settles_open_background_calls_once :: proc(test: ^testing.T) {
 	defer records_destroy(inbox, context.allocator)
 	if !testing.expect_value(test, len(inbox), 3) { return }
 	for record in inbox {
-		payload: Background_Completed
-		_decode_payload(test, record.data, &payload)
+		payload := _decode_payload(test, record, Background_Completed)
 		testing.expect_value(test, payload.tool, "shell")
 		if record.call == 44 {
 			testing.expect_value(test, payload.outcome, TOOL_OUTCOME_NAMES[.Success])

@@ -18,7 +18,7 @@ Terms: "must" is a hard rule, "default" is a named, tunable value. Every numeric
 10. Every live work item has an owner, a release point, and a cancellation path. Its limits are the external ones in section 2.1; the harness adds none.
 11. Idle means zero periodic wakeups in every thread the process owns.
 12. The model decides when its work is done. A failure the model can act on is fed back to the model and the turn continues (section 2.2). Only the model finishing, the user, or a model that cannot be reached ends a turn; an external failure never does.
-13. Native data stays typed. JSON exists only at provider, MCP, ACP, journal payload, and export boundaries.
+13. Native data stays typed. JSON exists only at provider, MCP, ACP, and export boundaries.
 14. The resolved model catalog is the only runtime source of model facts.
 15. Configuration is live. Admitted work keeps the immutable snapshot it was admitted with; new work uses the newest valid snapshot.
 16. Only a main session creates subagents. Delegation depth is one.
@@ -149,7 +149,7 @@ Write every package to the standard of Odin's own `core:` packages. Before writi
 
 - `core:encoding/json` at external boundaries only. Native tool arguments and outputs are typed structs. A Lua child's arguments are the one JSON path inside the process: they are written as JSON text because they are journaled as the proposed arguments and admitted through the same decoder as a provider call (section 17.1). Typed outputs are pushed to Lua directly.
 - Canonical JSON (sorted keys, no insignificant whitespace) for everything that enters a provider request prefix: tool schemas and harness-generated JSON. Encoded once, stored as bytes, reused verbatim.
-- Journal payloads are one level of JSON (a JSON object column, never JSON inside a JSON string). Exact external bytes (tool arguments as sent, provider replay items, rendered tool results, text) go in a `body` BLOB column. A file the model reads as an attachment (section 14.5) is an `attachment` artifact, and the payload names it by media type, file name, and hex digest.
+- Journal payloads are typed columns in per-kind tables (section 8.2), never JSON. Exact external bytes (tool arguments as sent, provider replay items, rendered tool results, text) go in a `body` BLOB column. A file the model reads as an attachment (section 14.5) is an `attachment` artifact, and the payload names it by media type, file name, and digest.
 - `core:crypto/hash` (SHA-256) for digests.
 
 ### 3.7 Source
@@ -198,7 +198,6 @@ Journal_Seq  :: distinct i64     // global commit order (SQLite rowid)
 Turn_Id      :: distinct u32     // per session
 Request_Id   :: distinct u32     // per session, one logical request
 Attempt_No   :: distinct u8      // per request
-Job_Id       :: distinct u64     // per process, monotonic, never reused
 Call_Id      :: distinct u64     // per session; provider call ids are stored separately as strings
 Snapshot_Gen :: distinct u64     // config/catalog snapshot generation
 Digest       :: distinct [32]u8  // SHA-256 of one artifact's bytes
@@ -508,7 +507,7 @@ cache_coverage :: proc(totals: Usage_Totals) -> (share: f64, measured: bool)
 list_sessions  :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.Allocator) -> ([]Session_Summary, Error)
 list_branches  :: proc(journal: ^Journal, session: Session_Id, allocator: mem.Allocator) -> ([]Branch_Summary, Error)
 recover        :: proc(journal: ^Journal, kept_directory := "") -> (Recovery, Error)   // the claimed session, one transaction
-payload_decode :: proc(data: string, payload: ^$Payload, allocator: mem.Allocator, corruption_journal: ^Journal = nil, session: Session_Id = {}, seq: Journal_Seq = 0) -> Error // Corrupt on malformed data or unsupported version
+payload_as     :: proc(record: Record, $Payload: typeid) -> (Payload, bool)           // the typed payload of a record, borrowed from it
 error_text     :: proc(error: Error, allocator := context.allocator) -> string
 ```
 
@@ -519,11 +518,11 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 - A main session is created by its first prompt, under an id chosen when the session opened, so a session nobody prompted is never recorded. Switching sessions opens the target in a second `Journal` while the running one stays claimed, and the running one is closed only once the target is claimed and recovered.
 - The latest session-scoped `selection.applied` records the most recently used model, provider, and effort for a new session.
 - The journal fills `time_ms`, `mono_ns`, and `run` on every record. The caller fills the correlation columns.
-- `data` is encoded from a typed payload struct declared in `agent/journal`, one per kind, named after it (`Tool_Completed` for `tool.completed`). Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
+- A record's payload is a typed struct declared in `agent/journal`, one per kind that has one, named after it (`Tool_Completed` for `tool.completed`), and a node's is `User`, `Assistant`, `Checkpoint`, or `Results`. Each is stored in the typed tables of section 8.2 and read back into the `Record.payload` and `Node.payload` unions. Records and nodes are copied into a batch arena at append, so the caller's memory is borrowed only for the call.
 - The journal allocates `Node_Id` and `Branch_Id` at append, and turn, request, and call ids through `next_turn`, `next_request`, and `next_call`, all from the counters loaded by `claim`, so the owner continues numbering after a restart.
 - Each node append also writes a `node.committed` record in the same transaction, and the node's `seq` is that record's seq. Branches (`branch.created`) and sessions (`session.created`) follow the same rule, so the records table is the one global order.
 - `append_record`, `append_node`, `append_branch`, and `put_artifact` return no error. An encoding or allocation failure latches in `journal.failure` and is returned by the next `commit`. A failed commit rolls back and latches its cause the same way: the session is `Storage_Failed`, every later append is dropped, and every later commit returns that cause. The exception is another writer holding the database past the busy timeout (`error_is_busy`): nothing was written, the records stay pending for the next commit, and only the turn that needed the commit ends. Appending through a read-only journal or for a session the journal did not claim is a programming error and asserts.
-- Malformed or unsupported payload data returns `.Corrupt`; allocation failure returns the allocation error without marking corruption. Other corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `journal.corrupt` for the message.
+- A kind that has a payload table and no row, or a row outside its constraints, returns `.Corrupt`; allocation failure returns the allocation error without marking corruption. Other corrupt or unreadable data returns `.Corrupt`, and the journal keeps the session and seq of the offending row in `journal.corrupt` for the message.
 
 ### 8.2 Schema
 
@@ -532,23 +531,23 @@ records(seq INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, mono_ns INTEGER NOT N
         run BLOB NOT NULL, kind INTEGER NOT NULL, session BLOB, branch INTEGER, node INTEGER,
         turn INTEGER, request INTEGER, attempt INTEGER, call INTEGER,
         parent_call INTEGER, subagent BLOB, provider TEXT, model TEXT,
-        body BLOB, data TEXT NOT NULL) STRICT
+        body BLOB) STRICT
 nodes(session BLOB, node INTEGER, parent INTEGER, branch INTEGER, kind INTEGER NOT NULL, turn INTEGER,
-      covers INTEGER, seq INTEGER NOT NULL, data TEXT NOT NULL, body BLOB, PRIMARY KEY(session, node)) STRICT
+      covers INTEGER, seq INTEGER NOT NULL, body BLOB, PRIMARY KEY(session, node)) STRICT
 branches(session BLOB, branch INTEGER, base_node INTEGER, seq INTEGER NOT NULL,
          PRIMARY KEY(session, branch)) STRICT
 sessions(session BLOB PRIMARY KEY, created_ms INTEGER, workspace TEXT,
          parent_session BLOB, parent_call INTEGER, role INTEGER) STRICT
 artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) STRICT
 -- PRAGMA user_version is the schema this build writes. A newer version is refused.
--- One empty STRICT table per remaining payload family is created and unused.
--- records.data and nodes.data still hold the JSON payload. record_names maps kind to its dotted name.
+-- Each payload family has its own STRICT table keyed by records.seq (record_*) or by (session, node) (node_*);
+-- ordered slices are child tables keyed by (parent, ordinal). record_names maps kind to its dotted name.
 ```
 
-- Every table is append-only. A session title is the latest `record_session_titled` row, not the JSON in `records.data`. Other mutable facts (active branch, selection) are still the latest record of their kind. A branch head is the highest `node` on that branch.
+- Every table is append-only. A session title is the latest `record_session_titled` row. Other mutable facts (active branch, selection) are still the latest record of their kind. A branch head is the highest `node` on that branch.
 - Indexes: `records(session, seq) WHERE session IS NOT NULL`, `records(session, call, seq) WHERE call IS NOT NULL`, `records(session, parent_call, seq) WHERE parent_call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node, seq) WHERE node IS NOT NULL`, `records(session, request, attempt) WHERE request IS NOT NULL`, `nodes(session, branch, node)`, `nodes(session, kind, node)`, `nodes(session, turn, kind) WHERE turn IS NOT NULL`. A read with a call, parent call, request, or node filter uses the index of that column; a read with only kinds uses `(session, kind, seq)`. The node index includes seq, so a node filter orders by seq with no extra sort. A turn or subagent filter on `records` has no index and scans the session.
-- `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
-- `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and the attachments of a `user.input` record, a `background.completed` record, a `User` node, or a `tool.completed` record are artifacts named in its `data`, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
+- Payloads are columns, not JSON: enums are integer codes with a CHECK, a count the provider did not report is NULL, an empty string is NULL, digests are 32-byte BLOBs, and a closed vocabulary owned by another package stays TEXT. Shared shapes share a table (`record_response` holds `response.committed` and `compaction.completed`; `record_completion` holds `tool.completed`, `lua.completed`, `task.completed`, and `background.completed`). Kinds whose header says everything have no payload table. `body` holds exact bytes. Queries join the family table; analysis needs no custom decoder.
+- `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and the attachments of a `user.input` record, a `background.completed` record, a `User` node, or a `tool.completed` record are artifacts named in its attachment rows, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
 - WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes share the file, and SQLite serializes their write transactions, so no other journal mode is needed. Each session has one claim, held by the process that runs its turns (section 8.6).
 - The schema version is stamped in the same transaction that creates the tables. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 

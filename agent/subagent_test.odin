@@ -192,9 +192,7 @@ subagent_test_call :: proc(test: ^testing.T, chat: ^Chat_Session, id, name, argu
 	chat_pending_calls_clear(chat)
 	completed, _, read_error := journal.read_records(chat.store, {session = chat.session, kinds = {.Tool_Completed}}, 0, 0, context.temp_allocator)
 	if read_error != nil || len(completed) == 0 { testing.fail_now(test, "the call's result could not be read") }
-	payload: journal.Tool_Completed
-	if journal.payload_decode(completed[len(completed) - 1].data, &payload, context.temp_allocator) !=
-	   nil { testing.fail_now(test, "a result could not be read") }
+	payload := _test_payload(test, completed[len(completed) - 1], journal.Tool_Completed)
 	return payload.outcome
 }
 
@@ -368,7 +366,7 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 	testing.expect(test, subagent_test_turn(test, chat, connection), "the turn completed")
 
 	if agent_provider_request_count(&provider) != 4 {
-		for record in _test_records(test, chat, {.Subagent_Completed, .Tool_Completed}) { testing.expectf(test, false, "%s: %s\n%s", journal.RECORD_KIND_NAMES[record.kind], record.data, string(record.body)) }
+		for record in _test_records(test, chat, {.Subagent_Completed, .Tool_Completed}) { testing.expectf(test, false, "%s: %s\n%s", journal.RECORD_KIND_NAMES[record.kind], record.payload, string(record.body)) }
 		return
 	}
 	child := agent_provider_request(&provider, 1)
@@ -397,8 +395,7 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 	answered: journal.Session_Id
 	for record in records {
 		if record.kind != .Subagent_Started { continue }
-		started: journal.Subagent_Started
-		if journal.payload_decode(record.data, &started, context.temp_allocator) != nil { testing.fail_now(test, "a start could not be read") }
+		started := _test_payload(test, record, journal.Subagent_Started)
 		testing.expect_value(test, started.name, fmt.tprintf("agent-%d", record.call))
 		testing.expect_value(test, string(record.body), "Answer with one word.")
 		completions := 0
@@ -406,8 +403,7 @@ test_a_blocking_subagent_answers_the_call_that_started_it :: proc(test: ^testing
 			if other.kind != .Subagent_Completed || other.subagent != record.subagent { continue }
 			completions += 1
 			testing.expect_value(test, other.call, record.call)
-			completion: journal.Subagent_Completed
-			if journal.payload_decode(other.data, &completion, context.temp_allocator) != nil { testing.fail_now(test, "a completion could not be read") }
+			completion := _test_payload(test, other, journal.Subagent_Completed)
 			if completion.outcome == journal.TOOL_OUTCOME_NAMES[.Success] {
 				testing.expect_value(test, string(other.body), "forty-two")
 				answered = record.subagent
@@ -659,8 +655,7 @@ test_a_failed_background_subagent_reports_cause_and_partial_text :: proc(test: ^
 	report, _ := inbox_text(records[0])
 	testing.expect(test, strings.contains(report, "agent-1 failed"), report)
 	testing.expect(test, strings.contains(report, "The parser lives in"), report)
-	completion: journal.Subagent_Completed
-	if journal.payload_decode(records[0].data, &completion, context.temp_allocator) != nil { testing.fail_now(test, "the completion could not be read") }
+	completion := _test_payload(test, records[0], journal.Subagent_Completed)
 	testing.expect_value(test, completion.outcome, journal.TOOL_OUTCOME_NAMES[.Tool_Failed])
 	testing.expect(test, completion.detail != "" && strings.contains(report, completion.detail), report)
 	testing.expect_value(test, string(records[0].body), "The parser lives in")
@@ -1281,8 +1276,7 @@ test_finished_subagent_configures_model_and_effort_independently :: proc(test: ^
 	for expected in ([]string{"first task", "first answer", "Continue this task."}) { testing.expect(test, strings.contains(request, expected), expected) }
 	turn, found, read_error := journal.read_latest(chat.store, {session = child, kinds = {.Turn_Started}}, context.temp_allocator)
 	if !testing.expect(test, read_error == nil && found) { return }
-	started: journal.Turn_Started
-	testing.expect_value(test, journal.payload_decode(turn.data, &started, context.temp_allocator), nil)
+	started := _test_payload(test, turn, journal.Turn_Started)
 	testing.expect_value(test, turn.provider, "other-provider")
 	testing.expect_value(test, turn.model, "other-model")
 	testing.expect_value(test, started.effort, "low")
