@@ -293,7 +293,7 @@ app_session_add :: proc(test: ^testing.T, setup: ^Run_Setup, options: App_Test_S
 		journal.append_record(
 			store,
 			{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = 1, provider = options.provider, model = options.model},
-			journal.Turn_Started{instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX},
+			app_test_turn_started(store),
 		)
 	}
 	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(test, "could not commit a session") }
@@ -817,11 +817,7 @@ test_a_follower_takes_the_session_over_when_the_runner_closes :: proc(t: ^testin
 	defer _ = journal.close(runner)
 	if _, claim_error := journal.claim(runner, id); claim_error != nil { testing.fail_now(t, "the runner could not claim the session") }
 	turn := journal.next_turn(runner)
-	journal.append_record(
-		runner,
-		{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn},
-		journal.Turn_Started{instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX},
-	)
+	journal.append_record(runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, app_test_turn_started(runner))
 	question := journal.append_node(
 		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
@@ -2322,11 +2318,7 @@ test_a_follower_shows_the_calls_running_when_it_attached :: proc(t: ^testing.T) 
 	defer _ = journal.close(runner)
 	if _, error := journal.claim(runner, id); error != nil { testing.fail_now(t, "runner claim failed") }
 	turn := journal.next_turn(runner)
-	journal.append_record(
-		runner,
-		{kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn},
-		journal.Turn_Started{instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX},
-	)
+	journal.append_record(runner, {kind = .Turn_Started, session = id, branch = journal.INITIAL_BRANCH, turn = turn}, app_test_turn_started(runner))
 	prompt := journal.append_node(
 		runner,
 		{session = id, branch = journal.INITIAL_BRANCH, kind = .User, turn = turn},
@@ -4043,5 +4035,9 @@ test_server_restart_restores_the_last_session_selection :: proc(t: ^testing.T) {
 	testing.expect_value(t, reader.resumed_effort, "high")
 }
 
-// TEST_DIGEST_HEX names no artifact; the journal does not check turn digests until foreign keys are on.
-TEST_DIGEST_HEX :: "0000000000000000000000000000000000000000000000000000000000000000"
+app_test_turn_started :: proc(store: ^journal.Journal) -> journal.Turn_Started {
+	_ = journal.put_artifact(store, "instructions", nil)
+	return {instructions = TEST_DIGEST_HEX, manifest = TEST_DIGEST_HEX}
+}
+
+TEST_DIGEST_HEX :: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

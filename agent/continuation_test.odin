@@ -28,14 +28,7 @@ test_continuation_runs_once_after_recovery :: proc(test: ^testing.T) {
 		journal.User{origin = journal.USER_ORIGIN_NAMES[.Prompt]},
 		transmute([]u8)prompt,
 	)
-	journal.append_record(
-		store,
-		{session = session, turn = 1, kind = .Turn_Started, model = "test-model"},
-		journal.Turn_Started {
-			instructions = "0000000000000000000000000000000000000000000000000000000000000000",
-			manifest = "0000000000000000000000000000000000000000000000000000000000000000",
-		},
-	)
+	journal.append_record(store, {session = session, turn = 1, kind = .Turn_Started, model = "test-model"}, test_turn_started(&fixture.chat))
 	journal.append_record(
 		store,
 		{session = session, turn = 1, request = 1, kind = .Request_Sent},

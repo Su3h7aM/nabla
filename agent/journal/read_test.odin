@@ -65,6 +65,7 @@ test_read_records_filters_by_node_in_seq_order :: proc(test: ^testing.T) {
 
 	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
 	for node in Node_Id(1) ..= Node_Id(3) {
+		_ = append_node(journal, Node{session = session, branch = INITIAL_BRANCH, kind = .Notice}, _Test_Payload{})
 		append_record(journal, Record{session = session, node = node, kind = .Tool_Proposed}, _tool_proposed())
 		append_record(journal, Record{session = session, node = node, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell"})
 		append_record(journal, Record{session = session, node = node, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})
@@ -105,7 +106,7 @@ test_read_records_filters_and_pages :: proc(test: ^testing.T) {
 
 	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
 	for turn in Turn_Id(1) ..= Turn_Id(2) {
-		append_record(journal, Record{session = session, turn = turn, kind = .Turn_Started}, _turn_started())
+		append_record(journal, Record{session = session, turn = turn, kind = .Turn_Started}, _turn_started(journal))
 		for call in Call_Id(1) ..= Call_Id(2) {
 			append_record(journal, Record{session = session, turn = turn, call = call, kind = .Tool_Proposed}, _tool_proposed())
 		}

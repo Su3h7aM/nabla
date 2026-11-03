@@ -22,7 +22,7 @@ test_recovery_closes_an_interrupted_turn :: proc(test: ^testing.T) {
 	// admitted, plus a Lua execution and a subagent that started.
 	writer := _open_journal(test, directory)
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
-	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started(writer))
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Request_Sent}, _request_sent())
 	assistant := append_node(writer, Node{session = session, branch = INITIAL_BRANCH, kind = .Assistant, turn = 1}, Assistant{request = 1})
 	append_record(writer, Record{session = session, turn = 1, node = assistant, call = 1, kind = .Tool_Proposed}, _tool_proposed())
@@ -167,7 +167,7 @@ test_recovery_records_nothing_after_a_clean_turn :: proc(test: ^testing.T) {
 
 	writer := _open_journal(test, directory)
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
-	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started(writer))
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Request_Sent}, _request_sent())
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Response_Committed}, _response_committed())
 	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Proposed}, _tool_proposed())
@@ -206,7 +206,7 @@ test_recovery_that_fails_after_staging_writes_nothing :: proc(test: ^testing.T) 
 
 	writer := _open_journal(test, directory)
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
-	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started(writer))
 	append_record(writer, Record{session = session, call = 42, kind = .Tool_Admitted}, Tool_Admitted{tool = "shell", background = true})
 	_commit_ok(test, writer)
 	_expect_ok(test, close(writer))

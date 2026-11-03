@@ -60,7 +60,7 @@ test_a_busy_commit_keeps_its_records_for_the_next_one :: proc(test: ^testing.T) 
 	_expect_db_ok(test, db.exec(&writer.connection, "PRAGMA busy_timeout = 0"))
 
 	_expect_db_ok(test, db.exec(&holder.connection, "BEGIN IMMEDIATE"))
-	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started(writer))
 	_, busy_error := commit(writer)
 	testing.expect(test, error_is_busy(busy_error), "the commit reports the other writer")
 	testing.expect(test, writer.failure == nil, "a busy database latches nothing")
@@ -89,7 +89,7 @@ test_committed_records_survive_a_reopen :: proc(test: ^testing.T) {
 	testing.expect(test, database_info.mode & OTHERS_ACCESS == {}, "the database should be owner-only")
 
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
-	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
+	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started(writer))
 	// A process-scope record names no session, so both session columns are
 	// absent rather than sixteen zero bytes.
 	append_record(writer, Record{kind = .Run_Started}, Run_Started{pid = 1})
@@ -266,7 +266,7 @@ test_a_session_has_one_writer_at_a_time :: proc(test: ^testing.T) {
 	// back continue where the session stopped.
 	node_id := append_node(first, Node{session = session, branch = INITIAL_BRANCH, kind = .User, turn = 1}, _Test_Payload{detail = "first writer"})
 	testing.expect_value(test, node_id, Node_Id(1))
-	append_record(first, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
+	append_record(first, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started(first))
 	branch_id := append_branch(first, node_id)
 	testing.expect_value(test, branch_id, Branch_Id(2))
 	_commit_ok(test, first)

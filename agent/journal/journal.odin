@@ -225,6 +225,7 @@ open_database :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, 
 	config := sqlite.Config {
 		path            = path,
 		busy_timeout_ms = BUSY_TIMEOUT_MS,
+		foreign_keys    = true,
 		mode            = .Read_Only if mode == .Read_Only else .Read_Write_Create,
 	}
 	sqlite.open(&journal.connection, config, allocator) or_return

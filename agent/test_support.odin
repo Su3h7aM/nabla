@@ -5,6 +5,7 @@ package agent
 // a real journal, because a session's history is the journal and a fake would
 // test the fake instead of the harness.
 
+import "core:encoding/json"
 import "core:mem"
 import "core:mem/virtual"
 import "core:os"
@@ -156,7 +157,24 @@ chat_test_reopen :: proc(test: ^testing.T, fixture, reopened: ^Chat_Test, worksp
 }
 
 test_skill_instructions :: proc(chat: ^Chat_Session) -> string {
+	manifest := Instruction_Manifest {
+		version           = INSTRUCTION_MANIFEST_VERSION,
+		workspace         = chat.workspace,
+		instruction_bytes = len(AGENT_SYSTEM_PROMPT),
+	}
+	encoded, error := json.marshal(manifest, allocator = context.temp_allocator)
+	if error != nil { return "" }
+	chat.instructions_digest = journal.put_artifact(chat.store, INSTRUCTIONS_ARTIFACT, transmute([]u8)string(AGENT_SYSTEM_PROMPT))
+	chat.manifest_digest = journal.put_artifact(chat.store, INSTRUCTION_MANIFEST_ARTIFACT, encoded)
 	return strings.clone(AGENT_SYSTEM_PROMPT, chat.allocator)
+}
+
+test_turn_started :: proc(chat: ^Chat_Session) -> journal.Turn_Started {
+	instructions, manifest: [journal.DIGEST_HEX_LENGTH]u8
+	return {
+		instructions = strings.clone(journal.digest_to_hex(chat.instructions_digest, instructions[:]), context.temp_allocator),
+		manifest = strings.clone(journal.digest_to_hex(chat.manifest_digest, manifest[:]), context.temp_allocator),
+	}
 }
 
 chat_test_end :: proc(test: ^testing.T, fixture: ^Chat_Test) {

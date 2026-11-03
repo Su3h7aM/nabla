@@ -74,6 +74,7 @@ follow_body :: proc(text: string) -> []u8 {
 
 // follow_open returns a journal following fixture's session. The caller closes it.
 follow_open :: proc(test: ^testing.T, fixture: ^Chat_Test) -> ^journal.Journal {
+	follow_commit(test, fixture.store)
 	follower, follower_open_error := journal.open(fixture.directory, fixture.directory, journal.run_id_create(), .Read_Write)
 	if follower_open_error != nil {
 		testing.fail_now(test, "the follower journal could not be opened")
@@ -191,14 +192,7 @@ test_a_follower_shows_the_records_the_runner_commits_in_order :: proc(test: ^tes
 	}
 	started := header
 	started.kind = .Turn_Started
-	journal.append_record(
-		store,
-		started,
-		journal.Turn_Started {
-			instructions = "0000000000000000000000000000000000000000000000000000000000000000",
-			manifest = "0000000000000000000000000000000000000000000000000000000000000000",
-		},
-	)
+	journal.append_record(store, started, test_turn_started(&fixture.chat))
 	user := journal.append_node(
 		store,
 		{session = session, branch = journal.INITIAL_BRANCH, kind = .User, turn = 1},
