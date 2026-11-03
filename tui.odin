@@ -516,8 +516,19 @@ declare_conversation :: proc(app: ^App, storage: ^Frame_Storage, viewport: layou
 					)
 				}
 			} else {
+				// Only the entries the view shows are declared. An entry the last frame measured
+				// off the view is a spacer of the same height, so the scroll range and the
+				// positions of the visible entries do not move.
+				view_top := offset
+				view_bottom := offset + int(viewport.y)
+				start := 0
 				for entry in order {
-					declare_entry(&storage.layout_ctx, storage, entry, width, working_elapsed(app))
+					if entry.rows > 0 && (start + entry.rows <= view_top || start >= view_bottom) {
+						layout.content(&storage.layout_ctx, {layout = {sizing = {width = layout.grow(), height = layout.fixed(layout.Scalar(entry.rows))}}})
+					} else {
+						declare_entry(&storage.layout_ctx, storage, entry, width, working_elapsed(app))
+					}
+					start += entry.rows
 				}
 			}
 		}
