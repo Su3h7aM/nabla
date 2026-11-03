@@ -84,6 +84,17 @@ Record_Payload :: union {
 	User_Input,
 	User_Command,
 	Command_Applied,
+	Turn_Started,
+	Turn_Completed,
+	Request_Prepared,
+	Request_Admitted,
+	Request_Sent,
+	Request_Interrupted,
+	Retry_Scheduled,
+	Retry_Completed,
+	Selection_Changed,
+	Selection_Fit,
+	Selection_Applied,
 }
 
 // Node is one committed step of the session tree. The journal fills id, seq,

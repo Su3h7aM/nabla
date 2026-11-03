@@ -199,12 +199,11 @@ chat_record_attempt :: proc(chat: ^Chat_Session, connection: ai.Provider_Connect
 	digest_buffer: [journal.DIGEST_HEX_LENGTH]u8
 	body_digest, body_bytes := chat_body_digest(body, digest_buffer[:])
 	sent := journal.Request_Sent {
-		purpose         = journal.REQUEST_PURPOSE_NAMES[.Response],
-		api             = chat_api_name(connection.API),
-		model_requested = chat.model_id,
-		recovery        = CHAT_RECOVERY_KIND_NAMES[attempt.recovery],
-		body_digest     = body_digest,
-		body_bytes      = body_bytes,
+		purpose     = journal.REQUEST_PURPOSE_NAMES[.Response],
+		api         = chat_api_name(connection.API),
+		recovery    = CHAT_RECOVERY_KIND_NAMES[attempt.recovery],
+		body_digest = body_digest,
+		body_bytes  = body_bytes,
 	}
 	chat_record(chat, header, sent)
 	return chat_commit(chat, "the request could not be recorded")

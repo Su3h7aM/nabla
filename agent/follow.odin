@@ -89,8 +89,7 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 	case .Turn_Completed:
 		defer _observer_turn_finished(observer)
 		follow.working = false
-		completed: journal.Turn_Completed
-		decoded := journal.payload_decode(record.data, &completed, context.temp_allocator) == nil
+		completed, decoded := journal.payload_as(record, journal.Turn_Completed)
 		outcome := journal.Turn_Outcome.Failed
 		if decoded {
 			if named, known := journal.enum_from_name(journal.TURN_OUTCOME_NAMES, completed.outcome); known { outcome = named }
@@ -117,8 +116,8 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 		follow_prepared(follow, record)
 		_observer_request_prepared(observer)
 	case .Retry_Scheduled:
-		scheduled: journal.Retry_Scheduled
-		if journal.payload_decode(record.data, &scheduled, context.temp_allocator) != nil { return nil }
+		scheduled, is_scheduled := journal.payload_as(record, journal.Retry_Scheduled)
+		if !is_scheduled { return nil }
 		event := Chat_Retry_Event {
 			request      = record.request,
 			next_attempt = scheduled.next_attempt,
@@ -142,8 +141,8 @@ follow_record :: proc(store: ^journal.Journal, follow: ^Follow, record: journal.
 // record; any other purpose is ignored.
 @(private = "file")
 follow_prepared :: proc(follow: ^Follow, record: journal.Record) {
-	prepared: journal.Request_Prepared
-	if journal.payload_decode(record.data, &prepared, context.temp_allocator) != nil { return }
+	prepared, is_prepared := journal.payload_as(record, journal.Request_Prepared)
+	if !is_prepared { return }
 	if prepared.purpose != journal.REQUEST_PURPOSE_NAMES[.Response] { return }
 	follow.estimate = prepared.estimate
 	follow.window = prepared.context_window

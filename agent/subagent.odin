@@ -976,11 +976,11 @@ subagent_resume_plan :: proc(chat: ^Chat_Session, team: ^Agent_Team, update: ^Ag
 	if latest_found {
 		#partial switch latest.kind {
 		case .Turn_Started:
-			turn: journal.Turn_Started
-			if journal.payload_decode(latest.data, &turn, context.temp_allocator) == nil { continued.effort = turn.effort }
+			if turn, is_turn := journal.payload_as(latest, journal.Turn_Started); is_turn { continued.effort = turn.effort }
 		case .Selection_Applied:
-			selection: journal.Selection_Applied
-			if journal.payload_decode(latest.data, &selection, context.temp_allocator) == nil { continued.effort = selection.effort }
+			if selection, is_selection := journal.payload_as(latest, journal.Selection_Applied); is_selection {
+				continued.effort = selection.effort
+			}
 		}
 		continued.provider_id, continued.model_id = latest.provider, latest.model
 	}
@@ -1036,8 +1036,8 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 	turn, has_turn, turn_error := journal.read_latest(store, {session = child_session, kinds = {.Turn_Started}}, context.temp_allocator)
 	if turn_error != nil { return "", "the child's last turn could not be read" }
 	if has_turn {
-		started: journal.Turn_Started
-		if journal.payload_decode(turn.data, &started, context.temp_allocator) != nil { return "", "the child's last selection could not be decoded" }
+		started, is_started := journal.payload_as(turn, journal.Turn_Started)
+		if !is_started { return "", "the child's last selection could not be decoded" }
 		fmt.sbprintf(&block, "provider: %s\nmodel: %s\neffort: %s\n", turn.provider, turn.model, started.effort)
 	}
 	latest, has_latest, latest_error := journal.read_latest(store, {session = child_session}, context.temp_allocator)
@@ -1049,8 +1049,8 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 	completed, has_completed, completed_error := journal.read_latest(store, {session = child_session, kinds = {.Turn_Completed}}, context.temp_allocator)
 	if completed_error != nil { return "", "the child's last turn outcome could not be read" }
 	if has_completed && (!has_turn || completed.turn == turn.turn) {
-		outcome: journal.Turn_Completed
-		if journal.payload_decode(completed.data, &outcome, context.temp_allocator) != nil { return "", "the child's last turn outcome could not be decoded" }
+		outcome, is_outcome := journal.payload_as(completed, journal.Turn_Completed)
+		if !is_outcome { return "", "the child's last turn outcome could not be decoded" }
 		fmt.sbprintf(&block, "last turn: %s\n", outcome.outcome)
 		if outcome.detail != "" {
 			fmt.sbprintf(&block, "last failure: %s\n", outcome.detail)

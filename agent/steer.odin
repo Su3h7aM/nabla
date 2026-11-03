@@ -383,8 +383,7 @@ chat_response_since_recovery :: proc(chat: ^Chat_Session, recovered: journal.Jou
 	if sent_error != nil { return false }
 	defer journal.records_destroy(sent, context.temp_allocator)
 	for record in sent {
-		purpose: journal.Request_Sent
-		if journal.payload_decode(record.data, &purpose, context.temp_allocator) != nil { continue }
+		purpose := journal.payload_as(record, journal.Request_Sent) or_continue
 		if name, known := journal.enum_from_name(journal.REQUEST_PURPOSE_NAMES, purpose.purpose); known && name == .Response { return true }
 	}
 	return false
@@ -400,8 +399,7 @@ chat_interrupted_without_answer :: proc(chat: ^Chat_Session, recovered: journal.
 	completed, completed_found, completed_error := journal.read_latest(chat.store, {session = chat.session, kinds = {.Turn_Completed}}, context.temp_allocator)
 	if completed_error != nil || !completed_found { return false }
 	defer journal.record_destroy(&completed, context.temp_allocator)
-	ended: journal.Turn_Completed
-	if journal.payload_decode(completed.data, &ended, context.temp_allocator) != nil { return false }
+	ended := journal.payload_as(completed, journal.Turn_Completed) or_return
 	outcome, known := journal.enum_from_name(journal.TURN_OUTCOME_NAMES, ended.outcome)
 	if !known || outcome != .Interrupted || completed.seq > recovered { return false }
 	started, started_found, started_error := journal.read_latest(chat.store, {session = chat.session, kinds = {.Turn_Started}}, context.temp_allocator)
@@ -440,8 +438,7 @@ chat_results_unconsumed :: proc(chat: ^Chat_Session, recovered: journal.Journal_
 	defer journal.records_destroy(requests, context.temp_allocator)
 	answered: journal.Journal_Seq = 0
 	for record in requests {
-		purpose: journal.Request_Sent
-		if journal.payload_decode(record.data, &purpose, context.temp_allocator) != nil { continue }
+		purpose := journal.payload_as(record, journal.Request_Sent) or_continue
 		if name, known := journal.enum_from_name(journal.REQUEST_PURPOSE_NAMES, purpose.purpose); known && name == .Response {
 			answered = max(answered, record.seq)
 		}

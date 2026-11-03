@@ -21,6 +21,18 @@ _Test_Payload :: struct {
 	detail:  string,
 }
 
+// _turn_started is a turn.started payload whose digests name no artifact, which
+// the journal does not check until foreign keys are on.
+_turn_started :: proc() -> Turn_Started {
+	return Turn_Started{instructions = _TEST_DIGEST_HEX, manifest = _TEST_DIGEST_HEX}
+}
+
+_request_sent :: proc() -> Request_Sent {
+	return Request_Sent{purpose = REQUEST_PURPOSE_NAMES[.Response], api = "responses", recovery = "initial"}
+}
+
+_TEST_DIGEST_HEX :: "0000000000000000000000000000000000000000000000000000000000000000"
+
 // _test_run_id is one process run for a whole suite. Every record a test writes
 // names it.
 _test_run_id :: proc() -> Run_Id {

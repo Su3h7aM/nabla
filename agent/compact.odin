@@ -556,7 +556,6 @@ chat_compact_begin_attempt :: proc(chat: ^Chat_Session, job: ^Compact_Job) -> bo
 		journal.Request_Sent {
 			purpose = journal.REQUEST_PURPOSE_NAMES[.Compaction],
 			api = chat_api_name(job.snapshot.api),
-			model_requested = chat.model_id,
 			recovery = CHAT_RECOVERY_KIND_NAMES[job.attempts > 1 ? .Transient_Retry : .Initial],
 			body_digest = body_digest,
 			body_bytes = body_bytes,

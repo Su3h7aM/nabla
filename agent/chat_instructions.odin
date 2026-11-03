@@ -63,15 +63,8 @@ chat_restore_instructions :: proc(chat: ^Chat_Session) -> (applied: bool, error:
 	}
 	record, found := journal.read_latest(chat.store, filter, context.temp_allocator) or_return
 	if !found { return false, nil }
-	started: journal.Turn_Started
-	journal.payload_decode(
-		record.data,
-		&started,
-		context.temp_allocator,
-		corruption_journal = chat.store,
-		session = record.session,
-		seq = record.seq,
-	) or_return
+	started, is_started := journal.payload_as(record, journal.Turn_Started)
+	if !is_started { return false, journal.Journal_Error.Corrupt }
 	if started.instructions == "" { return false, nil }
 	instructions_digest, instructions_valid := journal.digest_from_hex(started.instructions)
 	manifest_digest, manifest_valid := journal.digest_from_hex(started.manifest)

@@ -405,13 +405,12 @@ Session_Environment_Tool :: struct {
 	enabled:     bool,
 }
 
-// Selection_Changed has no session for the process-wide default. effort is the
-// provider's own level name, "" for its default.
+// Selection_Changed has no session for the process-wide default. The record's
+// provider and model are the default; effort is the provider's own level name,
+// "" for its default.
 Selection_Changed :: struct {
-	version:  int,
-	provider: string,
-	model:    string,
-	effort:   string,
+	version: int,
+	effort:  string,
 }
 
 Selection_Fit_Decision :: enum u8 {
@@ -438,14 +437,13 @@ Selection_Fit :: struct {
 	reason:         string,
 }
 
-// Selection_Applied records the session's installed serving identity. It is separate
-// from Selection_Changed, which stores the process-wide default for the next launch.
+// Selection_Applied records the session's installed serving identity, which the
+// record's provider and model name. It is separate from Selection_Changed, which
+// stores the process-wide default for the next launch.
 Selection_Applied :: struct {
-	version:  int,
-	api:      string,
-	provider: string,
-	model:    string,
-	effort:   string,
+	version: int,
+	api:     string,
+	effort:  string,
 }
 
 Branch_Created :: struct {
@@ -481,12 +479,11 @@ Node_Committed :: struct {
 }
 
 // Turn_Started names the instruction and manifest artifacts the turn runs with
-// by hex digest.
+// by hex digest. The record's model is the one the turn runs with.
 Turn_Started :: struct {
 	version:      int,
 	instructions: string,
 	manifest:     string,
-	model:        string,
 	effort:       string,
 }
 
@@ -525,16 +522,16 @@ Request_Admitted :: struct {
 	conversation_tokens: int,
 }
 
+// Request_Sent names the model requested in the record's model.
 Request_Sent :: struct {
-	version:         int,
-	purpose:         string, // REQUEST_PURPOSE_NAMES
-	api:             string,
-	model_requested: string,
+	version:     int,
+	purpose:     string, // REQUEST_PURPOSE_NAMES
+	api:         string,
 	// recovery is how the send came to be: initial, transient_retry, checkpoint_repair,
 	// adaptive_thinking_omitted, or cache_hints_omitted.
-	recovery:        string,
-	body_digest:     string, // hex SHA-256 of the frozen body, "" when the body was not encoded
-	body_bytes:      int,
+	recovery:    string,
+	body_digest: string, // hex SHA-256 of the frozen body, "" when the body was not encoded
+	body_bytes:  int,
 }
 
 Retry_Scheduled :: struct {

@@ -743,7 +743,6 @@ chat_session_accept_message :: proc(
 		}
 	}
 	started := journal.Turn_Started {
-		model  = chat.model_id,
 		effort = chat.effort,
 	}
 	instructions_hex: [journal.DIGEST_HEX_LENGTH]u8

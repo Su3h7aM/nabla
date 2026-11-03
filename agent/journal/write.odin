@@ -26,7 +26,7 @@ Pending :: union {
 	Branch_Row,
 	Session_Row,
 	Session_Titled_Row,
-	Payload_Pending,
+	Payload_Row,
 	Artifact_Row,
 }
 
@@ -382,8 +382,9 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 		case Session_Titled_Row:
 			arguments := [2]db.Value{db.Value(i64(last)), db.Value(row.title)}
 			db.statement_exec(&journal.inserts[.Session_Titled], arguments[:]) or_return
-		case Payload_Pending:
-			payload_insert(journal, last, row.payload) or_return
+		case Payload_Row:
+			row.arguments[0] = db.Value(i64(last))
+			db.exec(&journal.connection, row.sql, row.arguments) or_return
 		case Artifact_Row:
 			arguments := [4]db.Value{db.Value(row.digest[:]), db.Value(row.kind), db.Value(row.created_ms), db.Value(row.bytes)}
 			db.statement_exec(&journal.inserts[.Artifact], arguments[:]) or_return

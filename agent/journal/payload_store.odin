@@ -1,97 +1,412 @@
 package journal
 
+import "base:intrinsics"
 import "core:mem"
 import "core:mem/virtual"
-import "core:strings"
 
 import "nabla:db"
 
-// Payload_Pending is the typed family row of the record buffered just before it.
-// Its strings and slices are owned by the batch arena.
+// Payload_Row is one family-table insert buffered after the record it belongs to.
+// arguments[0] is that record's seq, set at commit. Its text and bytes are owned
+// by the batch arena.
 @(private)
-Payload_Pending :: struct {
-	payload: Record_Payload,
+Payload_Row :: struct {
+	sql:       string,
+	arguments: []db.Value,
 }
 
-// payload_push buffers the family row for a payload that has a table. Kinds that
-// are still JSON-only push nothing. Strings are copied into the batch arena.
+// payload_push buffers the family rows of a payload that has a table. A payload
+// that is still JSON-only buffers nothing.
 @(private)
 payload_push :: proc(journal: ^Journal, data: $Payload) {
-	when Payload == Run_Started || Payload == Session_Recovered || Payload == Session_Claimed {
-		push(journal, Payload_Pending{payload = data})
-	} else when Payload == Session_Environment {
-		copied := environment_batch(journal, data)
-		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
-	} else when Payload == User_Input {
-		copied := data
-		copied.origin = batch_text(journal, data.origin)
-		copied.attachments = batch_attachments(journal, data.attachments)
-		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
-	} else when Payload == User_Command {
-		copied := data
-		copied.kind = batch_text(journal, data.kind)
-		copied.provider = batch_text(journal, data.provider)
-		copied.model = batch_text(journal, data.model)
-		copied.level = batch_text(journal, data.level)
-		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
-	} else when Payload == Command_Applied {
-		copied := data
-		copied.outcome = batch_text(journal, data.outcome)
-		copied.reason = batch_text(journal, data.reason)
-		if journal.failure == nil { push(journal, Payload_Pending{payload = copied}) }
+	when intrinsics.type_is_variant_of(Record_Payload, Payload) {
+		payload_rows(journal, data)
 	}
 }
 
-// payload_insert writes the family row of seq. The header row is already inserted.
-@(private, require_results)
-payload_insert :: proc(journal: ^Journal, seq: Journal_Seq, payload: Record_Payload) -> Error {
+// payload_row buffers one insert whose first column is the record's seq and whose
+// other columns are values. It copies text and bytes into the batch arena.
+@(private)
+payload_row :: proc(journal: ^Journal, sql: string, values: ..db.Value) {
+	if journal.failure != nil { return }
+	arguments, error := make([]db.Value, len(values) + 1, virtual.arena_allocator(&journal.batch))
+	if error != nil {
+		latch(journal, error)
+		return
+	}
+	for value, index in values {
+		arguments[index + 1] = value
+		#partial switch member in value {
+		case string:
+			arguments[index + 1] = batch_text(journal, member)
+		case []u8:
+			arguments[index + 1] = batch_bytes(journal, member)
+		}
+	}
+	push(journal, Payload_Row{sql = sql, arguments = arguments})
+}
+
+@(private)
+int_value :: proc(value: $Integer) -> db.Value {
+	return db.Value(i64(value))
+}
+
+@(private)
+maybe_int :: proc(value: Maybe(i64)) -> db.Value {
+	if number, present := value.?; present { return db.Value(number) }
+	return nil
+}
+
+@(private)
+maybe_real :: proc(value: Maybe(f64)) -> db.Value {
+	if number, present := value.?; present { return db.Value(number) }
+	return nil
+}
+
+// name_code is the stored code of a name in an enum's name table. An unknown name
+// latches the journal as Corrupt: the writer built a payload no table can hold.
+@(private)
+name_code :: proc(journal: ^Journal, names: [$Enum]string, name: string) -> db.Value {
+	code, found := enum_from_name(names, name)
+	if !found && journal.failure == nil { latch(journal, Journal_Error.Corrupt) }
+	return db.Value(i64(code))
+}
+
+// digest_value is the 32 bytes of a hexadecimal digest, NULL for "". The bytes are
+// owned by the batch arena.
+@(private)
+digest_value :: proc(journal: ^Journal, hex: string) -> db.Value {
+	if hex == "" { return nil }
+	digest, ok := digest_from_hex(hex)
+	if !ok {
+		if journal.failure == nil { latch(journal, Journal_Error.Corrupt) }
+		return nil
+	}
+	return db.Value(batch_bytes(journal, digest[:]))
+}
+
+@(private)
+usage_values :: proc(usage: Attempt_Usage) -> [6]db.Value {
+	return {
+		maybe_int(usage.input_tokens),
+		maybe_int(usage.output_tokens),
+		maybe_int(usage.reasoning_tokens),
+		maybe_int(usage.cache_read_tokens),
+		maybe_int(usage.cache_write_tokens),
+		maybe_real(usage.cost),
+	}
+}
+
+@(private)
+attachment_rows :: proc(journal: ^Journal, attachments: []Attachment) {
+	for attachment, index in attachments {
+		payload_row(
+			journal,
+			"INSERT INTO record_attachment (seq, ordinal, media_type, name, digest) VALUES (?, ?, ?, ?, ?)",
+			int_value(index),
+			attachment.media_type,
+			attachment.name,
+			digest_value(journal, attachment.digest),
+		)
+	}
+}
+
+@(private)
+payload_rows :: proc(journal: ^Journal, payload: Record_Payload) {
 	switch value in payload {
 	case Session_Titled:
-		return Journal_Error.Corrupt
+	// record_session_titled has its own pending row.
 	case Run_Started:
-		return db.exec(&journal.connection, "INSERT INTO record_run_started (seq, pid) VALUES (?, ?)", {db.Value(i64(seq)), db.Value(i64(value.pid))})
+		payload_row(journal, "INSERT INTO record_run_started (seq, pid) VALUES (?, ?)", int_value(value.pid))
 	case Session_Recovered:
-		return db.exec(
-			&journal.connection,
+		payload_row(
+			journal,
 			"INSERT INTO record_session_recovered (seq, turns, requests, calls, results) VALUES (?, ?, ?, ?, ?)",
-			{db.Value(i64(seq)), db.Value(i64(value.turns)), db.Value(i64(value.requests)), db.Value(i64(value.calls)), db.Value(i64(value.results))},
+			int_value(value.turns),
+			int_value(value.requests),
+			int_value(value.calls),
+			int_value(value.results),
 		)
 	case Session_Claimed:
-		return db.exec(&journal.connection, "INSERT INTO record_session_claimed (seq, resumed) VALUES (?, ?)", {db.Value(i64(seq)), db.Value(value.resumed)})
+		payload_row(journal, "INSERT INTO record_session_claimed (seq, resumed) VALUES (?, ?)", value.resumed)
 	case Session_Environment:
-		return environment_insert(journal, seq, value)
+		payload_row(journal, "INSERT INTO record_environment (seq, instructions) VALUES (?, ?)", text_or_null(value.instructions))
+		for server, index in value.servers {
+			payload_row(
+				journal,
+				`INSERT INTO record_environment_server (seq, ordinal, id, executable, working_directory, discovery_timeout_ms, call_timeout_ms)
+				VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				int_value(index),
+				server.id,
+				server.executable,
+				text_or_null(server.working_directory),
+				server.discovery_timeout_ms,
+				server.call_timeout_ms,
+			)
+			for argument, argument_index in server.arguments {
+				payload_row(
+					journal,
+					"INSERT INTO record_environment_argument (seq, server_ordinal, ordinal, argument) VALUES (?, ?, ?, ?)",
+					int_value(index),
+					int_value(argument_index),
+					argument,
+				)
+			}
+			for variable, variable_index in server.environment {
+				payload_row(
+					journal,
+					"INSERT INTO record_environment_variable (seq, server_ordinal, ordinal, name, value) VALUES (?, ?, ?, ?, ?)",
+					int_value(index),
+					int_value(variable_index),
+					variable.name,
+					text_or_null(variable.value),
+				)
+			}
+			for tool, tool_index in server.tools {
+				payload_row(
+					journal,
+					"INSERT INTO record_environment_tool (seq, server_ordinal, ordinal, remote_name, name, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+					int_value(index),
+					int_value(tool_index),
+					tool.remote_name,
+					text_or_null(tool.name),
+					tool.enabled,
+				)
+			}
+		}
 	case User_Input:
-		return user_input_insert(journal, seq, value)
+		payload_row(journal, "INSERT INTO record_user_input (seq, origin) VALUES (?, ?)", name_code(journal, USER_ORIGIN_NAMES, value.origin))
+		attachment_rows(journal, value.attachments)
 	case User_Command:
-		return user_command_insert(journal, seq, value)
+		payload_row(
+			journal,
+			"INSERT INTO record_user_command (seq, kind, provider, model, level) VALUES (?, ?, ?, ?, ?)",
+			name_code(journal, COMMAND_KIND_NAMES, value.kind),
+			text_or_null(value.provider),
+			text_or_null(value.model),
+			text_or_null(value.level),
+		)
 	case Command_Applied:
-		return command_applied_insert(journal, seq, value)
-	case:
-		return Journal_Error.Corrupt
+		payload_row(
+			journal,
+			"INSERT INTO record_command_applied (seq, command, outcome, reason) VALUES (?, ?, ?, ?)",
+			int_value(value.command),
+			name_code(journal, COMMAND_OUTCOME_NAMES, value.outcome),
+			text_or_null(value.reason),
+		)
+	case Turn_Started:
+		payload_row(
+			journal,
+			"INSERT INTO record_turn_started (seq, instructions, manifest, effort) VALUES (?, ?, ?, ?)",
+			digest_value(journal, value.instructions),
+			digest_value(journal, value.manifest),
+			text_or_null(value.effort),
+		)
+	case Turn_Completed:
+		payload_row(
+			journal,
+			"INSERT INTO record_turn_completed (seq, outcome, detail, reason, cause) VALUES (?, ?, ?, ?, ?)",
+			name_code(journal, TURN_OUTCOME_NAMES, value.outcome),
+			text_or_null(value.detail),
+			text_or_null(value.reason),
+			text_or_null(value.cause),
+		)
+	case Request_Prepared:
+		payload_row(
+			journal,
+			`INSERT INTO record_request_prepared (seq, purpose, api, transport, estimate, context_window, messages, tools, replay_refused)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			name_code(journal, REQUEST_PURPOSE_NAMES, value.purpose),
+			text_or_null(value.api),
+			text_or_null(value.transport),
+			int_value(value.estimate),
+			int_value(value.context_window),
+			int_value(value.messages),
+			int_value(value.tools),
+			int_value(value.replay_refused),
+		)
+	case Request_Admitted:
+		payload_row(
+			journal,
+			`INSERT INTO record_request_admitted
+			(seq, decision, estimate, context_window, instructions_tokens, tools_tokens, conversation_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			name_code(journal, ADMISSION_DECISION_NAMES, value.decision),
+			int_value(value.estimate),
+			int_value(value.context_window),
+			int_value(value.instructions_tokens),
+			int_value(value.tools_tokens),
+			int_value(value.conversation_tokens),
+		)
+	case Request_Sent:
+		payload_row(
+			journal,
+			"INSERT INTO record_request_sent (seq, purpose, api, recovery, body_digest, body_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+			name_code(journal, REQUEST_PURPOSE_NAMES, value.purpose),
+			text_or_null(value.api),
+			text_or_null(value.recovery),
+			digest_value(journal, value.body_digest),
+			int_value(value.body_bytes),
+		)
+	case Request_Interrupted:
+		usage := usage_values(
+			{
+				input_tokens = value.input_tokens,
+				output_tokens = value.output_tokens,
+				reasoning_tokens = value.reasoning_tokens,
+				cache_read_tokens = value.cache_read_tokens,
+				cache_write_tokens = value.cache_write_tokens,
+				cost = value.cost,
+			},
+		)
+		payload_row(
+			journal,
+			`INSERT INTO record_request_interrupted
+			(seq, detail, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			text_or_null(value.detail),
+			usage[0],
+			usage[1],
+			usage[2],
+			usage[3],
+			usage[4],
+			usage[5],
+		)
+	case Retry_Scheduled:
+		payload_row(
+			journal,
+			"INSERT INTO record_retry_scheduled (seq, purpose, reason, next_attempt, delay_ms) VALUES (?, ?, ?, ?, ?)",
+			name_code(journal, REQUEST_PURPOSE_NAMES, value.purpose),
+			text_or_null(value.reason),
+			int_value(value.next_attempt),
+			value.delay_ms,
+		)
+	case Retry_Completed:
+		payload_row(
+			journal,
+			"INSERT INTO record_retry_completed (seq, purpose, outcome) VALUES (?, ?, ?)",
+			name_code(journal, REQUEST_PURPOSE_NAMES, value.purpose),
+			name_code(journal, RETRY_OUTCOME_NAMES, value.outcome),
+		)
+	case Selection_Changed:
+		payload_row(journal, "INSERT INTO record_selection_changed (seq, effort) VALUES (?, ?)", text_or_null(value.effort))
+	case Selection_Fit:
+		payload_row(
+			journal,
+			"INSERT INTO record_selection_fit (seq, api, recheck, decision, estimate, context_window, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			text_or_null(value.api),
+			value.recheck,
+			name_code(journal, SELECTION_FIT_DECISION_NAMES, value.decision),
+			int_value(value.estimate),
+			int_value(value.context_window),
+			text_or_null(value.reason),
+		)
+	case Selection_Applied:
+		payload_row(journal, "INSERT INTO record_selection_applied (seq, api, effort) VALUES (?, ?, ?)", text_or_null(value.api), text_or_null(value.effort))
 	}
 }
 
-// load_record_payload fills record.payload from its family table. A kind that has
-// a table and no row is Corrupt. A kind that is still JSON-only is left nil.
-// Strings and slices are owned by allocator.
+// payload_as returns the payload of record when it is a Payload, false when the
+// record has no typed payload or another kind. The result borrows record.
+payload_as :: proc(record: Record, $Payload: typeid) -> (payload: Payload, ok: bool) {
+	stored := record.payload.? or_return
+	return stored.(Payload)
+}
+
+// load_record_payload fills record.payload from its family tables. A kind that has
+// a table and no row is Corrupt. A kind with no table, or still JSON-only, is left
+// nil. Strings and slices are owned by allocator. It runs after the header's result
+// set has ended, because each family read needs the connection.
 @(private, require_results)
 load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
 	if record.payload != nil { return nil }
 	switch record.kind {
 	case .Run_Started:
-		return load_run_started(journal, record, allocator)
+		return payload_load(journal, record, "SELECT pid FROM record_run_started WHERE seq = ?", allocator, scan_run_started)
 	case .Session_Recovered:
-		return load_session_recovered(journal, record, allocator)
+		return payload_load(
+			journal,
+			record,
+			"SELECT turns, requests, calls, results FROM record_session_recovered WHERE seq = ?",
+			allocator,
+			scan_session_recovered,
+		)
 	case .Session_Claimed:
-		return load_session_claimed(journal, record, allocator)
+		return payload_load(journal, record, "SELECT resumed FROM record_session_claimed WHERE seq = ?", allocator, scan_session_claimed)
 	case .Session_Environment:
-		return load_session_environment(journal, record, allocator)
+		environment, error := environment_load(journal, record, allocator)
+		if error != nil {
+			environment_destroy(environment, allocator)
+			return error
+		}
+		record.payload = environment
 	case .User_Input:
-		return load_user_input(journal, record, allocator)
+		payload_load(journal, record, "SELECT origin FROM record_user_input WHERE seq = ?", allocator, scan_user_input) or_return
+		payload := record.payload.?
+		input := payload.(User_Input)
+		input.attachments = attachments_load(journal, record, allocator) or_return
+		record.payload = input
 	case .User_Command:
-		return load_user_command(journal, record, allocator)
+		return payload_load(journal, record, "SELECT kind, provider, model, level FROM record_user_command WHERE seq = ?", allocator, scan_user_command)
 	case .Command_Applied:
-		return load_command_applied(journal, record, allocator)
+		return payload_load(journal, record, "SELECT command, outcome, reason FROM record_command_applied WHERE seq = ?", allocator, scan_command_applied)
+	case .Turn_Started:
+		return payload_load(journal, record, "SELECT instructions, manifest, effort FROM record_turn_started WHERE seq = ?", allocator, scan_turn_started)
+	case .Turn_Completed:
+		return payload_load(journal, record, "SELECT outcome, detail, reason, cause FROM record_turn_completed WHERE seq = ?", allocator, scan_turn_completed)
+	case .Request_Prepared:
+		return payload_load(
+			journal,
+			record,
+			"SELECT purpose, api, transport, estimate, context_window, messages, tools, replay_refused FROM record_request_prepared WHERE seq = ?",
+			allocator,
+			scan_request_prepared,
+		)
+	case .Request_Admitted:
+		return payload_load(
+			journal,
+			record,
+			"SELECT decision, estimate, context_window, instructions_tokens, tools_tokens, conversation_tokens FROM record_request_admitted WHERE seq = ?",
+			allocator,
+			scan_request_admitted,
+		)
+	case .Request_Sent:
+		return payload_load(
+			journal,
+			record,
+			"SELECT purpose, api, recovery, body_digest, body_bytes FROM record_request_sent WHERE seq = ?",
+			allocator,
+			scan_request_sent,
+		)
+	case .Request_Interrupted:
+		return payload_load(
+			journal,
+			record,
+			`SELECT detail, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost
+			FROM record_request_interrupted WHERE seq = ?`,
+			allocator,
+			scan_request_interrupted,
+		)
+	case .Retry_Scheduled:
+		return payload_load(
+			journal,
+			record,
+			"SELECT purpose, reason, next_attempt, delay_ms FROM record_retry_scheduled WHERE seq = ?",
+			allocator,
+			scan_retry_scheduled,
+		)
+	case .Retry_Completed:
+		return payload_load(journal, record, "SELECT purpose, outcome FROM record_retry_completed WHERE seq = ?", allocator, scan_retry_completed)
+	case .Selection_Changed:
+		return payload_load(journal, record, "SELECT effort FROM record_selection_changed WHERE seq = ?", allocator, scan_selection_changed)
+	case .Selection_Fit:
+		return payload_load(
+			journal,
+			record,
+			"SELECT api, recheck, decision, estimate, context_window, reason FROM record_selection_fit WHERE seq = ?",
+			allocator,
+			scan_selection_fit,
+		)
+	case .Selection_Applied:
+		return payload_load(journal, record, "SELECT api, effort FROM record_selection_applied WHERE seq = ?", allocator, scan_selection_applied)
 	case .Run_Finished,
 	     .Session_Created,
 	     .Session_Titled,
@@ -99,16 +414,8 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 	     .Branch_Created,
 	     .Branch_Selected,
 	     .Node_Committed,
-	     .Turn_Started,
-	     .Turn_Completed,
-	     .Request_Prepared,
-	     .Request_Admitted,
-	     .Request_Sent,
 	     .Response_Committed,
 	     .Response_Rejected,
-	     .Request_Interrupted,
-	     .Retry_Scheduled,
-	     .Retry_Completed,
 	     .Tool_Proposed,
 	     .Tool_Admitted,
 	     .Tool_Started,
@@ -125,14 +432,221 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 	     .Runtime_Message,
 	     .Job_Abandoned,
 	     .Job_Reclaimed,
-	     .Selection_Changed,
 	     .Subagent_Message,
-	     .Selection_Fit,
-	     .Selection_Applied,
 	     .Background_Completed:
-		return nil
 	}
 	return nil
+}
+
+// payload_load reads the one family row of record with sql, which selects the
+// columns scan reads in order. A missing row is Corrupt.
+@(private, require_results)
+payload_load :: proc(journal: ^Journal, record: ^Record, sql: string, allocator: mem.Allocator, scan: proc(row: ^Row) -> Record_Payload) -> Error {
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, sql, {db.Value(i64(record.seq))}) or_return
+	values, has_row := db.rows_next(&rows) or_return
+	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
+	row := Row {
+		values    = values,
+		allocator = allocator,
+	}
+	payload := scan(&row)
+	if row.error != nil {
+		payload_destroy(payload, allocator)
+		return corrupt(journal, row.error, record.session, record.seq)
+	}
+	record.payload = payload
+	return nil
+}
+
+@(private)
+scan_run_started :: proc(row: ^Row) -> Record_Payload {
+	return Run_Started{version = PAYLOAD_VERSION, pid = int(row_int(row))}
+}
+
+@(private)
+scan_session_recovered :: proc(row: ^Row) -> Record_Payload {
+	return Session_Recovered {
+		version = PAYLOAD_VERSION,
+		turns = int(row_int(row)),
+		requests = int(row_int(row)),
+		calls = int(row_int(row)),
+		results = int(row_int(row)),
+	}
+}
+
+@(private)
+scan_session_claimed :: proc(row: ^Row) -> Record_Payload {
+	resumed, ok := row_flag(row)
+	if !ok && row.error == nil { row.error = Journal_Error.Corrupt }
+	return Session_Claimed{version = PAYLOAD_VERSION, resumed = resumed}
+}
+
+@(private)
+scan_user_input :: proc(row: ^Row) -> Record_Payload {
+	return User_Input{version = PAYLOAD_VERSION, origin = row_enum_name(row, USER_ORIGIN_NAMES)}
+}
+
+@(private)
+scan_user_command :: proc(row: ^Row) -> Record_Payload {
+	return User_Command {
+		version = PAYLOAD_VERSION,
+		kind = row_enum_name(row, COMMAND_KIND_NAMES),
+		provider = row_text(row),
+		model = row_text(row),
+		level = row_text(row),
+	}
+}
+
+@(private)
+scan_command_applied :: proc(row: ^Row) -> Record_Payload {
+	return Command_Applied {
+		version = PAYLOAD_VERSION,
+		command = Journal_Seq(row_int(row)),
+		outcome = row_enum_name(row, COMMAND_OUTCOME_NAMES),
+		reason = row_text(row),
+	}
+}
+
+@(private)
+scan_turn_started :: proc(row: ^Row) -> Record_Payload {
+	return Turn_Started{version = PAYLOAD_VERSION, instructions = row_digest(row), manifest = row_digest(row), effort = row_text(row)}
+}
+
+@(private)
+scan_turn_completed :: proc(row: ^Row) -> Record_Payload {
+	return Turn_Completed {
+		version = PAYLOAD_VERSION,
+		outcome = row_enum_name(row, TURN_OUTCOME_NAMES),
+		detail = row_text(row),
+		reason = row_text(row),
+		cause = row_text(row),
+	}
+}
+
+@(private)
+scan_request_prepared :: proc(row: ^Row) -> Record_Payload {
+	return Request_Prepared {
+		version = PAYLOAD_VERSION,
+		purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES),
+		api = row_text(row),
+		transport = row_text(row),
+		estimate = int(row_int(row)),
+		context_window = int(row_int(row)),
+		messages = int(row_int(row)),
+		tools = int(row_int(row)),
+		replay_refused = int(row_int(row)),
+	}
+}
+
+@(private)
+scan_request_admitted :: proc(row: ^Row) -> Record_Payload {
+	return Request_Admitted {
+		version = PAYLOAD_VERSION,
+		decision = row_enum_name(row, ADMISSION_DECISION_NAMES),
+		estimate = int(row_int(row)),
+		context_window = int(row_int(row)),
+		instructions_tokens = int(row_int(row)),
+		tools_tokens = int(row_int(row)),
+		conversation_tokens = int(row_int(row)),
+	}
+}
+
+@(private)
+scan_request_sent :: proc(row: ^Row) -> Record_Payload {
+	return Request_Sent {
+		version = PAYLOAD_VERSION,
+		purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES),
+		api = row_text(row),
+		recovery = row_text(row),
+		body_digest = row_digest(row),
+		body_bytes = int(row_int(row)),
+	}
+}
+
+@(private)
+scan_request_interrupted :: proc(row: ^Row) -> Record_Payload {
+	interrupted := Request_Interrupted {
+		version = PAYLOAD_VERSION,
+		detail  = row_text(row),
+	}
+	usage := row_usage(row)
+	interrupted.input_tokens = usage.input_tokens
+	interrupted.output_tokens = usage.output_tokens
+	interrupted.reasoning_tokens = usage.reasoning_tokens
+	interrupted.cache_read_tokens = usage.cache_read_tokens
+	interrupted.cache_write_tokens = usage.cache_write_tokens
+	interrupted.cost = usage.cost
+	return interrupted
+}
+
+@(private)
+scan_retry_scheduled :: proc(row: ^Row) -> Record_Payload {
+	return Retry_Scheduled {
+		version = PAYLOAD_VERSION,
+		purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES),
+		reason = row_text(row),
+		next_attempt = int(row_int(row)),
+		delay_ms = row_int(row),
+	}
+}
+
+@(private)
+scan_retry_completed :: proc(row: ^Row) -> Record_Payload {
+	return Retry_Completed{version = PAYLOAD_VERSION, purpose = row_enum_name(row, REQUEST_PURPOSE_NAMES), outcome = row_enum_name(row, RETRY_OUTCOME_NAMES)}
+}
+
+@(private)
+scan_selection_changed :: proc(row: ^Row) -> Record_Payload {
+	return Selection_Changed{version = PAYLOAD_VERSION, effort = row_text(row)}
+}
+
+@(private)
+scan_selection_fit :: proc(row: ^Row) -> Record_Payload {
+	fit := Selection_Fit {
+		version = PAYLOAD_VERSION,
+		api     = row_text(row),
+	}
+	recheck, recheck_ok := row_flag(row)
+	if !recheck_ok && row.error == nil { row.error = Journal_Error.Corrupt }
+	fit.recheck = recheck
+	fit.decision = row_enum_name(row, SELECTION_FIT_DECISION_NAMES)
+	fit.estimate = int(row_int(row))
+	fit.context_window = int(row_int(row))
+	fit.reason = row_text(row)
+	return fit
+}
+
+@(private)
+scan_selection_applied :: proc(row: ^Row) -> Record_Payload {
+	return Selection_Applied{version = PAYLOAD_VERSION, api = row_text(row), effort = row_text(row)}
+}
+
+// row_usage reads the six Attempt_Usage columns; NULL stays absent.
+@(private)
+row_usage :: proc(row: ^Row) -> (usage: Attempt_Usage) {
+	usage.input_tokens = row_optional_int(row)
+	usage.output_tokens = row_optional_int(row)
+	usage.reasoning_tokens = row_optional_int(row)
+	usage.cache_read_tokens = row_optional_int(row)
+	usage.cache_write_tokens = row_optional_int(row)
+	value, ok := row_next(row)
+	if !ok || value == nil { return }
+	number, error := db.as_f64(value)
+	if error != nil {
+		row.error = Journal_Error.Corrupt
+		return
+	}
+	usage.cost = number
+	return
+}
+
+@(private)
+row_optional_int :: proc(row: ^Row) -> Maybe(i64) {
+	number, present := row_maybe_int(row)
+	if !present { return nil }
+	return number
 }
 
 // payload_destroy releases the strings and slices load_record_payload allocated.
@@ -155,692 +669,42 @@ payload_destroy :: proc(payload: Record_Payload, allocator: mem.Allocator) {
 	case Command_Applied:
 		delete(value.outcome, allocator)
 		delete(value.reason, allocator)
+	case Turn_Started:
+		delete(value.instructions, allocator)
+		delete(value.manifest, allocator)
+		delete(value.effort, allocator)
+	case Turn_Completed:
+		delete(value.outcome, allocator)
+		delete(value.detail, allocator)
+		delete(value.reason, allocator)
+		delete(value.cause, allocator)
+	case Request_Prepared:
+		delete(value.purpose, allocator)
+		delete(value.api, allocator)
+		delete(value.transport, allocator)
+	case Request_Admitted:
+		delete(value.decision, allocator)
+	case Request_Sent:
+		delete(value.purpose, allocator)
+		delete(value.api, allocator)
+		delete(value.recovery, allocator)
+		delete(value.body_digest, allocator)
+	case Request_Interrupted:
+		delete(value.detail, allocator)
+	case Retry_Scheduled:
+		delete(value.purpose, allocator)
+		delete(value.reason, allocator)
+	case Retry_Completed:
+		delete(value.purpose, allocator)
+		delete(value.outcome, allocator)
+	case Selection_Changed:
+		delete(value.effort, allocator)
+	case Selection_Fit:
+		delete(value.api, allocator)
+		delete(value.decision, allocator)
+		delete(value.reason, allocator)
+	case Selection_Applied:
+		delete(value.api, allocator)
+		delete(value.effort, allocator)
 	}
-}
-
-@(private, require_results)
-load_run_started :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(&journal.connection, &rows, "SELECT pid FROM record_run_started WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
-	values, has_row := db.rows_next(&rows) or_return
-	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	row := Row {
-		values    = values,
-		allocator = allocator,
-	}
-	pid := row_int(&row)
-	if row.error != nil { return corrupt(journal, row.error, record.session, record.seq) }
-	record.payload = Run_Started {
-		version = PAYLOAD_VERSION,
-		pid     = int(pid),
-	}
-	return nil
-}
-
-@(private, require_results)
-load_session_recovered :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(
-		&journal.connection,
-		&rows,
-		"SELECT turns, requests, calls, results FROM record_session_recovered WHERE seq = ?",
-		{db.Value(i64(record.seq))},
-	) or_return
-	values, has_row := db.rows_next(&rows) or_return
-	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	row := Row {
-		values    = values,
-		allocator = allocator,
-	}
-	recovered := Session_Recovered {
-		version  = PAYLOAD_VERSION,
-		turns    = int(row_int(&row)),
-		requests = int(row_int(&row)),
-		calls    = int(row_int(&row)),
-		results  = int(row_int(&row)),
-	}
-	if row.error != nil { return corrupt(journal, row.error, record.session, record.seq) }
-	record.payload = recovered
-	return nil
-}
-
-@(private, require_results)
-load_session_claimed :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(&journal.connection, &rows, "SELECT resumed FROM record_session_claimed WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
-	values, has_row := db.rows_next(&rows) or_return
-	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	row := Row {
-		values    = values,
-		allocator = allocator,
-	}
-	resumed, ok := row_flag(&row)
-	if row.error != nil { return corrupt(journal, row.error, record.session, record.seq) }
-	if !ok { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	record.payload = Session_Claimed {
-		version = PAYLOAD_VERSION,
-		resumed = resumed,
-	}
-	return nil
-}
-
-@(private, require_results)
-load_session_environment :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	environment, error := environment_load(journal, record, allocator)
-	if error != nil {
-		environment_destroy(environment, allocator)
-		return error
-	}
-	record.payload = environment
-	return nil
-}
-
-// row_flag reads a 0 or 1. Any other integer is not a flag, and ok is false.
-@(private)
-row_flag :: proc(row: ^Row) -> (flag: bool, ok: bool) {
-	number := row_int(row)
-	if row.error != nil || (number != 0 && number != 1) { return false, false }
-	return number == 1, true
-}
-
-@(private)
-environment_batch :: proc(journal: ^Journal, source: Session_Environment) -> (copied: Session_Environment) {
-	allocator := virtual.arena_allocator(&journal.batch)
-	copied.version = source.version
-	copied.instructions = batch_text(journal, source.instructions)
-	if len(source.servers) == 0 || journal.failure != nil { return }
-	servers, error := make([]Session_Environment_Server, len(source.servers), allocator)
-	if error != nil {
-		latch(journal, error)
-		return {}
-	}
-	for server, index in source.servers {
-		servers[index] = {
-			id                   = batch_text(journal, server.id),
-			executable           = batch_text(journal, server.executable),
-			arguments            = batch_string_list(journal, server.arguments),
-			working_directory    = batch_text(journal, server.working_directory),
-			environment          = batch_variables(journal, server.environment),
-			tools                = batch_environment_tools(journal, server.tools),
-			discovery_timeout_ms = server.discovery_timeout_ms,
-			call_timeout_ms      = server.call_timeout_ms,
-		}
-	}
-	copied.servers = servers
-	return
-}
-
-@(private)
-batch_string_list :: proc(journal: ^Journal, source: []string) -> []string {
-	if len(source) == 0 || journal.failure != nil { return nil }
-	copied, error := make([]string, len(source), virtual.arena_allocator(&journal.batch))
-	if error != nil {
-		latch(journal, error)
-		return nil
-	}
-	for text, index in source { copied[index] = batch_text(journal, text) }
-	return copied
-}
-
-@(private)
-batch_variables :: proc(journal: ^Journal, source: []Session_Environment_Variable) -> []Session_Environment_Variable {
-	if len(source) == 0 || journal.failure != nil { return nil }
-	copied, error := make([]Session_Environment_Variable, len(source), virtual.arena_allocator(&journal.batch))
-	if error != nil {
-		latch(journal, error)
-		return nil
-	}
-	for variable, index in source {
-		copied[index] = {
-			name  = batch_text(journal, variable.name),
-			value = batch_text(journal, variable.value),
-		}
-	}
-	return copied
-}
-
-@(private)
-batch_environment_tools :: proc(journal: ^Journal, source: []Session_Environment_Tool) -> []Session_Environment_Tool {
-	if len(source) == 0 || journal.failure != nil { return nil }
-	copied, error := make([]Session_Environment_Tool, len(source), virtual.arena_allocator(&journal.batch))
-	if error != nil {
-		latch(journal, error)
-		return nil
-	}
-	for tool, index in source {
-		copied[index] = {
-			remote_name = batch_text(journal, tool.remote_name),
-			name        = batch_text(journal, tool.name),
-			enabled     = tool.enabled,
-		}
-	}
-	return copied
-}
-
-@(private, require_results)
-environment_insert :: proc(journal: ^Journal, seq: Journal_Seq, environment: Session_Environment) -> Error {
-	db.exec(
-		&journal.connection,
-		"INSERT INTO record_environment (seq, instructions) VALUES (?, ?)",
-		{db.Value(i64(seq)), text_or_null(environment.instructions)},
-	) or_return
-	for server, index in environment.servers {
-		db.exec(
-			&journal.connection,
-			`INSERT INTO record_environment_server
-				(seq, ordinal, id, executable, working_directory, discovery_timeout_ms, call_timeout_ms)
-				VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			{
-				db.Value(i64(seq)),
-				db.Value(i64(index)),
-				db.Value(server.id),
-				db.Value(server.executable),
-				text_or_null(server.working_directory),
-				db.Value(server.discovery_timeout_ms),
-				db.Value(server.call_timeout_ms),
-			},
-		) or_return
-		for argument, argument_index in server.arguments {
-			db.exec(
-				&journal.connection,
-				"INSERT INTO record_environment_argument (seq, server_ordinal, ordinal, argument) VALUES (?, ?, ?, ?)",
-				{db.Value(i64(seq)), db.Value(i64(index)), db.Value(i64(argument_index)), db.Value(argument)},
-			) or_return
-		}
-		for variable, variable_index in server.environment {
-			db.exec(
-				&journal.connection,
-				"INSERT INTO record_environment_variable (seq, server_ordinal, ordinal, name, value) VALUES (?, ?, ?, ?, ?)",
-				{db.Value(i64(seq)), db.Value(i64(index)), db.Value(i64(variable_index)), db.Value(variable.name), text_or_null(variable.value)},
-			) or_return
-		}
-		for tool, tool_index in server.tools {
-			db.exec(
-				&journal.connection,
-				`INSERT INTO record_environment_tool
-					(seq, server_ordinal, ordinal, remote_name, name, enabled) VALUES (?, ?, ?, ?, ?, ?)`,
-				{
-					db.Value(i64(seq)),
-					db.Value(i64(index)),
-					db.Value(i64(tool_index)),
-					db.Value(tool.remote_name),
-					text_or_null(tool.name),
-					db.Value(tool.enabled),
-				},
-			) or_return
-		}
-	}
-	return nil
-}
-
-@(private, require_results)
-environment_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> (environment: Session_Environment, error: Error) {
-	{
-		rows: db.Rows
-		defer _ = db.rows_close(&rows)
-		db.query(&journal.connection, &rows, "SELECT instructions FROM record_environment WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { return {}, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		environment.version = PAYLOAD_VERSION
-		environment.instructions = row_text(&row)
-		if row.error != nil { return environment, corrupt(journal, row.error, record.session, record.seq) }
-	}
-	environment.servers = environment_servers_load(journal, record, allocator) or_return
-	return environment, nil
-}
-
-@(private, require_results)
-environment_servers_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> (servers: []Session_Environment_Server, error: Error) {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(
-		&journal.connection,
-		&rows,
-		`SELECT ordinal, id, executable, working_directory, discovery_timeout_ms, call_timeout_ms
-			FROM record_environment_server WHERE seq = ? ORDER BY ordinal`,
-		{db.Value(i64(record.seq))},
-	) or_return
-	listed := make([dynamic]Session_Environment_Server, allocator) or_return
-	defer if error != nil {
-		for &server in listed { environment_server_destroy(server, allocator) }
-		delete(listed[:], allocator)
-	}
-	for {
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { break }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		ordinal := row_int(&row)
-		server := Session_Environment_Server {
-			id                   = row_text(&row),
-			executable           = row_text(&row),
-			working_directory    = row_text(&row),
-			discovery_timeout_ms = row_int(&row),
-			call_timeout_ms      = row_int(&row),
-		}
-		if row.error != nil { return nil, corrupt(journal, row.error, record.session, record.seq) }
-		if _, append_error := append(&listed, server); append_error != nil {
-			environment_server_destroy(server, allocator)
-			return nil, append_error
-		}
-		if ordinal != i64(len(listed) - 1) { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	}
-	_ = db.rows_close(&rows)
-	for &server, index in listed {
-		server.arguments = environment_arguments_load(journal, record, index, allocator) or_return
-		server.environment = environment_variables_load(journal, record, index, allocator) or_return
-		server.tools = environment_tools_load(journal, record, index, allocator) or_return
-	}
-	return listed[:], nil
-}
-
-@(private, require_results)
-environment_arguments_load :: proc(journal: ^Journal, record: ^Record, server: int, allocator: mem.Allocator) -> (arguments: []string, error: Error) {
-	return environment_text_list_load(
-		journal,
-		record,
-		server,
-		allocator,
-		"SELECT ordinal, argument FROM record_environment_argument WHERE seq = ? AND server_ordinal = ? ORDER BY ordinal",
-	)
-}
-
-@(private, require_results)
-environment_text_list_load :: proc(journal: ^Journal, record: ^Record, server: int, allocator: mem.Allocator, sql: string) -> (texts: []string, error: Error) {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(&journal.connection, &rows, sql, {db.Value(i64(record.seq)), db.Value(i64(server))}) or_return
-	listed := make([dynamic]string, allocator) or_return
-	defer if error != nil {
-		for text in listed { delete(text, allocator) }
-		delete(listed[:], allocator)
-	}
-	for {
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { break }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		ordinal := row_int(&row)
-		text := row_text(&row)
-		if row.error != nil { return nil, corrupt(journal, row.error, record.session, record.seq) }
-		if _, append_error := append(&listed, text); append_error != nil {
-			delete(text, allocator)
-			return nil, append_error
-		}
-		if ordinal != i64(len(listed) - 1) { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	}
-	return listed[:], nil
-}
-
-@(private, require_results)
-environment_variables_load :: proc(
-	journal: ^Journal,
-	record: ^Record,
-	server: int,
-	allocator: mem.Allocator,
-) -> (
-	variables: []Session_Environment_Variable,
-	error: Error,
-) {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(
-		&journal.connection,
-		&rows,
-		"SELECT ordinal, name, value FROM record_environment_variable WHERE seq = ? AND server_ordinal = ? ORDER BY ordinal",
-		{db.Value(i64(record.seq)), db.Value(i64(server))},
-	) or_return
-	listed := make([dynamic]Session_Environment_Variable, allocator) or_return
-	defer if error != nil {
-		for variable in listed {
-			delete(variable.name, allocator)
-			delete(variable.value, allocator)
-		}
-		delete(listed[:], allocator)
-	}
-	for {
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { break }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		ordinal := row_int(&row)
-		variable := Session_Environment_Variable {
-			name  = row_text(&row),
-			value = row_text(&row),
-		}
-		if row.error != nil { return nil, corrupt(journal, row.error, record.session, record.seq) }
-		if _, append_error := append(&listed, variable); append_error != nil {
-			delete(variable.name, allocator)
-			delete(variable.value, allocator)
-			return nil, append_error
-		}
-		if ordinal != i64(len(listed) - 1) { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	}
-	return listed[:], nil
-}
-
-@(private, require_results)
-environment_tools_load :: proc(
-	journal: ^Journal,
-	record: ^Record,
-	server: int,
-	allocator: mem.Allocator,
-) -> (
-	tools: []Session_Environment_Tool,
-	error: Error,
-) {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(
-		&journal.connection,
-		&rows,
-		"SELECT ordinal, remote_name, name, enabled FROM record_environment_tool WHERE seq = ? AND server_ordinal = ? ORDER BY ordinal",
-		{db.Value(i64(record.seq)), db.Value(i64(server))},
-	) or_return
-	listed := make([dynamic]Session_Environment_Tool, allocator) or_return
-	defer if error != nil {
-		for tool in listed {
-			delete(tool.remote_name, allocator)
-			delete(tool.name, allocator)
-		}
-		delete(listed[:], allocator)
-	}
-	for {
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { break }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		ordinal := row_int(&row)
-		tool := Session_Environment_Tool {
-			remote_name = row_text(&row),
-			name        = row_text(&row),
-			enabled     = false,
-		}
-		enabled, ok := row_flag(&row)
-		tool.enabled = enabled
-		if row.error != nil || !ok { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-		if _, append_error := append(&listed, tool); append_error != nil {
-			delete(tool.remote_name, allocator)
-			delete(tool.name, allocator)
-			return nil, append_error
-		}
-		if ordinal != i64(len(listed) - 1) { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	}
-	return listed[:], nil
-}
-
-@(private)
-environment_destroy :: proc(environment: Session_Environment, allocator: mem.Allocator) {
-	delete(environment.instructions, allocator)
-	for server in environment.servers { environment_server_destroy(server, allocator) }
-	delete(environment.servers, allocator)
-}
-
-@(private)
-environment_server_destroy :: proc(server: Session_Environment_Server, allocator: mem.Allocator) {
-	delete(server.id, allocator)
-	delete(server.executable, allocator)
-	delete(server.working_directory, allocator)
-	for argument in server.arguments { delete(argument, allocator) }
-	delete(server.arguments, allocator)
-	for variable in server.environment {
-		delete(variable.name, allocator)
-		delete(variable.value, allocator)
-	}
-	delete(server.environment, allocator)
-	for tool in server.tools {
-		delete(tool.remote_name, allocator)
-		delete(tool.name, allocator)
-	}
-	delete(server.tools, allocator)
-}
-
-@(private)
-batch_attachments :: proc(journal: ^Journal, source: []Attachment) -> []Attachment {
-	if len(source) == 0 || journal.failure != nil { return nil }
-	copied, error := make([]Attachment, len(source), virtual.arena_allocator(&journal.batch))
-	if error != nil {
-		latch(journal, error)
-		return nil
-	}
-	for attachment, index in source {
-		copied[index] = {
-			media_type = batch_text(journal, attachment.media_type),
-			name       = batch_text(journal, attachment.name),
-			digest     = batch_text(journal, attachment.digest),
-		}
-	}
-	return copied
-}
-
-@(private, require_results)
-enum_code :: proc(names: [$Enum]string, name: string) -> (code: i64, error: Error) {
-	value, found := enum_from_name(names, name)
-	if !found { return 0, Journal_Error.Corrupt }
-	return i64(value), nil
-}
-
-@(private, require_results)
-user_input_insert :: proc(journal: ^Journal, seq: Journal_Seq, input: User_Input) -> Error {
-	origin := enum_code(USER_ORIGIN_NAMES, input.origin) or_return
-	db.exec(&journal.connection, "INSERT INTO record_user_input (seq, origin) VALUES (?, ?)", {db.Value(i64(seq)), db.Value(origin)}) or_return
-	return attachments_insert(journal, seq, input.attachments)
-}
-
-@(private, require_results)
-user_command_insert :: proc(journal: ^Journal, seq: Journal_Seq, command: User_Command) -> Error {
-	kind := enum_code(COMMAND_KIND_NAMES, command.kind) or_return
-	return db.exec(
-		&journal.connection,
-		"INSERT INTO record_user_command (seq, kind, provider, model, level) VALUES (?, ?, ?, ?, ?)",
-		{db.Value(i64(seq)), db.Value(kind), text_or_null(command.provider), text_or_null(command.model), text_or_null(command.level)},
-	)
-}
-
-@(private, require_results)
-command_applied_insert :: proc(journal: ^Journal, seq: Journal_Seq, applied: Command_Applied) -> Error {
-	outcome := enum_code(COMMAND_OUTCOME_NAMES, applied.outcome) or_return
-	return db.exec(
-		&journal.connection,
-		"INSERT INTO record_command_applied (seq, command, outcome, reason) VALUES (?, ?, ?, ?)",
-		{db.Value(i64(seq)), db.Value(i64(applied.command)), db.Value(outcome), text_or_null(applied.reason)},
-	)
-}
-
-@(private, require_results)
-attachments_insert :: proc(journal: ^Journal, seq: Journal_Seq, attachments: []Attachment) -> Error {
-	for attachment, index in attachments {
-		digest, ok := digest_from_hex(attachment.digest)
-		if !ok { return Journal_Error.Corrupt }
-		db.exec(
-			&journal.connection,
-			"INSERT INTO record_attachment (seq, ordinal, media_type, name, digest) VALUES (?, ?, ?, ?, ?)",
-			{db.Value(i64(seq)), db.Value(i64(index)), db.Value(attachment.media_type), db.Value(attachment.name), db.Value(digest[:])},
-		) or_return
-	}
-	return nil
-}
-
-@(private, require_results)
-load_user_input :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(&journal.connection, &rows, "SELECT origin FROM record_user_input WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
-	values, has_row := db.rows_next(&rows) or_return
-	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	row := Row {
-		values    = values,
-		allocator = allocator,
-	}
-	input := User_Input {
-		version = PAYLOAD_VERSION,
-		origin  = row_enum_name(&row, USER_ORIGIN_NAMES),
-	}
-	if row.error != nil {
-		delete(input.origin, allocator)
-		return corrupt(journal, row.error, record.session, record.seq)
-	}
-	_ = db.rows_close(&rows)
-	attachments, error := attachments_load(journal, record, allocator)
-	if error != nil {
-		delete(input.origin, allocator)
-		return error
-	}
-	input.attachments = attachments
-	record.payload = input
-	return nil
-}
-
-@(private, require_results)
-load_user_command :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(&journal.connection, &rows, "SELECT kind, provider, model, level FROM record_user_command WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
-	values, has_row := db.rows_next(&rows) or_return
-	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	row := Row {
-		values    = values,
-		allocator = allocator,
-	}
-	command := User_Command {
-		version  = PAYLOAD_VERSION,
-		kind     = row_enum_name(&row, COMMAND_KIND_NAMES),
-		provider = row_text(&row),
-		model    = row_text(&row),
-		level    = row_text(&row),
-	}
-	if row.error != nil {
-		delete(command.kind, allocator)
-		delete(command.provider, allocator)
-		delete(command.model, allocator)
-		delete(command.level, allocator)
-		return corrupt(journal, row.error, record.session, record.seq)
-	}
-	record.payload = command
-	return nil
-}
-
-@(private, require_results)
-load_command_applied :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> Error {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(&journal.connection, &rows, "SELECT command, outcome, reason FROM record_command_applied WHERE seq = ?", {db.Value(i64(record.seq))}) or_return
-	values, has_row := db.rows_next(&rows) or_return
-	if !has_row { return corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	row := Row {
-		values    = values,
-		allocator = allocator,
-	}
-	applied := Command_Applied {
-		version = PAYLOAD_VERSION,
-		command = Journal_Seq(row_int(&row)),
-		outcome = row_enum_name(&row, COMMAND_OUTCOME_NAMES),
-		reason  = row_text(&row),
-	}
-	if row.error != nil {
-		delete(applied.outcome, allocator)
-		delete(applied.reason, allocator)
-		return corrupt(journal, row.error, record.session, record.seq)
-	}
-	record.payload = applied
-	return nil
-}
-
-@(private)
-row_enum_name :: proc(row: ^Row, names: [$Enum]string) -> string {
-	code := row_code(row, Enum)
-	if row.error != nil { return "" }
-	copied, error := strings.clone(names[code], row.allocator)
-	if error != nil {
-		row.error = error
-		return ""
-	}
-	return copied
-}
-
-@(private)
-row_digest :: proc(row: ^Row) -> string {
-	value, ok := row_next(row)
-	if !ok { return "" }
-	if value == nil {
-		row.error = Journal_Error.Corrupt
-		return ""
-	}
-	bytes, error := db.as_bytes(value)
-	if error != nil || len(bytes) != size_of(Digest) {
-		row.error = Journal_Error.Corrupt
-		return ""
-	}
-	digest: Digest
-	copy(digest[:], bytes)
-	hex: [DIGEST_HEX_LENGTH]u8
-	copied, clone_error := strings.clone(digest_to_hex(digest, hex[:]), row.allocator)
-	if clone_error != nil {
-		row.error = clone_error
-		return ""
-	}
-	return copied
-}
-
-@(private, require_results)
-attachments_load :: proc(journal: ^Journal, record: ^Record, allocator: mem.Allocator) -> (attachments: []Attachment, error: Error) {
-	rows: db.Rows
-	defer _ = db.rows_close(&rows)
-	db.query(
-		&journal.connection,
-		&rows,
-		"SELECT ordinal, media_type, name, digest FROM record_attachment WHERE seq = ? ORDER BY ordinal",
-		{db.Value(i64(record.seq))},
-	) or_return
-	listed := make([dynamic]Attachment, allocator) or_return
-	defer if error != nil { attachments_destroy(listed[:], allocator) }
-	for {
-		values, has_row := db.rows_next(&rows) or_return
-		if !has_row { break }
-		row := Row {
-			values    = values,
-			allocator = allocator,
-		}
-		ordinal := row_int(&row)
-		attachment := Attachment {
-			media_type = row_text(&row),
-			name       = row_text(&row),
-			digest     = row_digest(&row),
-		}
-		if row.error != nil {
-			attachments_destroy([]Attachment{attachment}, allocator)
-			return nil, corrupt(journal, row.error, record.session, record.seq)
-		}
-		if _, append_error := append(&listed, attachment); append_error != nil {
-			attachments_destroy([]Attachment{attachment}, allocator)
-			return nil, append_error
-		}
-		if ordinal != i64(len(listed) - 1) { return nil, corrupt(journal, Journal_Error.Corrupt, record.session, record.seq) }
-	}
-	return listed[:], nil
-}
-
-@(private)
-attachments_destroy :: proc(attachments: []Attachment, allocator: mem.Allocator) {
-	for attachment in attachments {
-		delete(attachment.media_type, allocator)
-		delete(attachment.name, allocator)
-		delete(attachment.digest, allocator)
-	}
-	delete(attachments, allocator)
 }

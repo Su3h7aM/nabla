@@ -120,18 +120,11 @@ session_client_selection :: proc(opened: ^Opened_Session, allocator: mem.Allocat
 	}
 	defer journal.record_destroy(&selection_record, allocator)
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-	selection: journal.Selection_Applied
-	if decode_error := journal.payload_decode(
-		selection_record.data,
-		&selection,
-		context.temp_allocator,
-		corruption_journal = opened.store,
-		session = selection_record.session,
-		seq = selection_record.seq,
-	); decode_error != nil {
-		return session_error_message("cannot read the session selection", decode_error, allocator), false
+	selected, is_selected := selection_record.payload.?.(journal.Selection_Applied)
+	if !is_selected {
+		return session_error_message("cannot read the session selection", journal.Journal_Error.Corrupt, allocator), false
 	}
-	return session_client_names(opened, selection.provider, selection.model, selection.effort, allocator)
+	return session_client_names(opened, selection_record.provider, selection_record.model, selected.effort, allocator)
 }
 
 @(require_results)
@@ -356,8 +349,14 @@ client_selection_adopt :: proc(app: ^App) -> bool {
 	record, found, read_error := journal.read_latest(store, {session = session, kinds = {.Selection_Applied}}, context.temp_allocator)
 	if read_error != nil || !found { return false }
 	defer journal.record_destroy(&record, context.temp_allocator)
-	applied: journal.Selection_Applied
-	if journal.payload_decode(record.data, &applied, context.temp_allocator) != nil { return false }
+	stored, is_applied := record.payload.?.(journal.Selection_Applied)
+	if !is_applied { return false }
+	applied := Applied_Selection {
+		api      = stored.api,
+		provider = record.provider,
+		model    = record.model,
+		effort   = stored.effort,
+	}
 	chat := &app.setup.session
 	if app.setup.provider_id == applied.provider &&
 	   app.setup.model_id == applied.model &&

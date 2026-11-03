@@ -752,7 +752,11 @@ USAGE_TOTALS_QUERY :: `WITH reported AS (SELECT
 	json_extract(data, '$.cache_read_tokens') AS cache_read,
 	json_extract(data, '$.cache_write_tokens') AS cache_write,
 	json_extract(data, '$.cost') AS cost
-	FROM records WHERE session = ? AND kind IN (?, ?, ?, ?)),
+	FROM records WHERE session = ?1 AND kind IN (?2, ?3, ?5)
+	UNION ALL
+	SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost
+	FROM records AS header JOIN record_request_interrupted AS usage ON usage.seq = header.seq
+	WHERE header.session = ?1 AND header.kind = ?4),
 paired AS (SELECT *, (input IS NOT NULL AND cache_read IS NOT NULL) AS both FROM reported)
 SELECT COUNT(*), COALESCE(SUM(both), 0),
 	COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), COALESCE(SUM(cache_read), 0), COALESCE(SUM(cache_write), 0),

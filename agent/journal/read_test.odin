@@ -105,7 +105,7 @@ test_read_records_filters_and_pages :: proc(test: ^testing.T) {
 
 	session := _create_session(test, journal, {workspace = "/tmp/project", role = .Main})
 	for turn in Turn_Id(1) ..= Turn_Id(2) {
-		append_record(journal, Record{session = session, turn = turn, kind = .Turn_Started}, _Test_Payload{detail = "turn"})
+		append_record(journal, Record{session = session, turn = turn, kind = .Turn_Started}, _turn_started())
 		for call in Call_Id(1) ..= Call_Id(2) {
 			append_record(journal, Record{session = session, turn = turn, call = call, kind = .Tool_Proposed}, _Test_Payload{detail = "call"})
 		}
@@ -399,8 +399,8 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	second_hex: [DIGEST_HEX_LENGTH]u8
 	append_record(
 		journal,
-		Record{session = session, turn = 1, kind = .Turn_Started},
-		Turn_Started{instructions = digest_to_hex(first_digest, first_hex[:]), model = "gpt-5", effort = "high"},
+		Record{session = session, turn = 1, kind = .Turn_Started, model = "gpt-5"},
+		Turn_Started{instructions = digest_to_hex(first_digest, first_hex[:]), manifest = digest_to_hex(first_digest, first_hex[:]), effort = "high"},
 	)
 	user := append_node(
 		journal,
@@ -410,8 +410,8 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	)
 	append_record(
 		journal,
-		Record{session = session, turn = 1, request = 1, kind = .Request_Sent},
-		Request_Sent{purpose = REQUEST_PURPOSE_NAMES[.Response], api = "responses", model_requested = "gpt-5"},
+		Record{session = session, turn = 1, request = 1, kind = .Request_Sent, model = "gpt-5"},
+		Request_Sent{purpose = REQUEST_PURPOSE_NAMES[.Response], api = "responses", recovery = "initial"},
 	)
 	assistant := append_node(
 		journal,
@@ -488,8 +488,8 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	// A second turn answers the first, and it reports no cache write.
 	append_record(
 		journal,
-		Record{session = session, turn = 2, kind = .Turn_Started},
-		Turn_Started{instructions = digest_to_hex(second_digest, second_hex[:]), model = "gpt-5", effort = "low"},
+		Record{session = session, turn = 2, kind = .Turn_Started, model = "gpt-5"},
+		Turn_Started{instructions = digest_to_hex(second_digest, second_hex[:]), manifest = digest_to_hex(second_digest, second_hex[:]), effort = "low"},
 	)
 	second_user := append_node(
 		journal,
@@ -499,8 +499,8 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	)
 	append_record(
 		journal,
-		Record{session = session, turn = 2, request = 2, kind = .Request_Sent},
-		Request_Sent{purpose = REQUEST_PURPOSE_NAMES[.Response], api = "responses", model_requested = "gpt-5"},
+		Record{session = session, turn = 2, request = 2, kind = .Request_Sent, model = "gpt-5"},
+		Request_Sent{purpose = REQUEST_PURPOSE_NAMES[.Response], api = "responses", recovery = "initial"},
 	)
 	second_assistant := append_node(
 		journal,
@@ -523,8 +523,8 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 
 	// Two selections: the process-wide default, then the one this session
 	// changed to.
-	append_record(journal, Record{kind = .Selection_Changed}, Selection_Changed{provider = "anthropic", model = "claude-opus"})
-	append_record(journal, Record{session = session, kind = .Selection_Changed}, Selection_Changed{provider = "openai", model = "gpt-5", effort = "high"})
+	append_record(journal, Record{kind = .Selection_Changed, provider = "anthropic", model = "claude-opus"}, Selection_Changed{})
+	append_record(journal, Record{session = session, kind = .Selection_Changed, provider = "openai", model = "gpt-5"}, Selection_Changed{effort = "high"})
 	_commit_ok(test, journal)
 
 	// An artifact reads back by the digest its record names.
@@ -697,10 +697,10 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	defer record_destroy(&latest, context.allocator)
 	testing.expect(test, latest_found, "the session changed its selection")
 	testing.expect_value(test, latest.session, session)
-	selection: Selection_Changed
-	_decode_payload(test, latest.data, &selection)
-	testing.expect_value(test, selection.provider, "openai")
-	testing.expect_value(test, selection.model, "gpt-5")
+	selection, is_selection := latest.payload.?.(Selection_Changed)
+	testing.expect(test, is_selection, "the record's payload is Selection_Changed")
+	testing.expect_value(test, latest.provider, "openai")
+	testing.expect_value(test, latest.model, "gpt-5")
 	testing.expect_value(test, selection.effort, "high")
 
 	// The instructions of the latest turn are its digest, and the artifact it
@@ -710,12 +710,12 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 	defer record_destroy(&started, context.allocator)
 	testing.expect(test, started_found, "the session started a turn")
 	testing.expect_value(test, started.turn, Turn_Id(2))
-	turn: Turn_Started
-	_decode_payload(test, started.data, &turn)
+	turn, is_turn := started.payload.?.(Turn_Started)
+	testing.expect(test, is_turn, "the record's payload is Turn_Started")
 	digest, digest_ok := digest_from_hex(turn.instructions)
 	testing.expect(test, digest_ok, "a stored instruction digest parses")
 	testing.expect_value(test, digest, second_digest)
-	testing.expect_value(test, turn.model, "gpt-5")
+	testing.expect_value(test, started.model, "gpt-5")
 	testing.expect_value(test, turn.effort, "low")
 
 	// Nothing matched is not an error, and it is not a record.

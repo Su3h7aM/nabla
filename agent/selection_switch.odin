@@ -229,7 +229,7 @@ chat_selection_record :: proc(chat: ^Chat_Session, api: ai.API_Kind, provider, m
 	chat_record(
 		chat,
 		{kind = .Selection_Applied, provider = provider, model = model},
-		journal.Selection_Applied{version = 1, api = chat_api_name(api), provider = provider, model = model, effort = effort},
+		journal.Selection_Applied{version = 1, api = chat_api_name(api), effort = effort},
 	)
 	_, commit_error := journal.commit(chat.store)
 	return commit_error

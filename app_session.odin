@@ -507,21 +507,13 @@ session_settle :: proc(opened: ^Opened_Session, workspace: string, allocator: me
 	if selection_found {
 		defer journal.record_destroy(&selection_record, allocator)
 		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
-		selection: journal.Selection_Applied
-		if decode_error := journal.payload_decode(
-			selection_record.data,
-			&selection,
-			context.temp_allocator,
-			corruption_journal = opened.store,
-			session = selection_record.session,
-			seq = selection_record.seq,
-		); decode_error != nil {
-			opened.settle_busy = journal.error_is_busy(decode_error)
-			return session_error_message("cannot read the session selection", decode_error, allocator), false
+		selected, is_selected := selection_record.payload.?.(journal.Selection_Applied)
+		if !is_selected {
+			return session_error_message("cannot read the session selection", journal.Journal_Error.Corrupt, allocator), false
 		}
-		provider, provider_error := strings.clone(selection.provider, allocator)
-		model, model_error := strings.clone(selection.model, allocator)
-		effort, effort_error := strings.clone(selection.effort, allocator)
+		provider, provider_error := strings.clone(selection_record.provider, allocator)
+		model, model_error := strings.clone(selection_record.model, allocator)
+		effort, effort_error := strings.clone(selected.effort, allocator)
 		if provider_error != nil || model_error != nil || effort_error != nil {
 			delete(provider, allocator)
 			delete(model, allocator)
@@ -718,16 +710,29 @@ report_recovery :: proc(recovery: journal.Recovery, queued: int) {
 
 // selection_latest reads the model the user last chose, owned by allocator.
 @(require_results)
-selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: journal.Selection_Applied, found: bool, error: journal.Error) {
+selection_latest :: proc(store: ^journal.Journal, allocator: mem.Allocator) -> (selection: Applied_Selection, found: bool, error: journal.Error) {
 	record: journal.Record
 	record, found = journal.read_latest(store, {kinds = {.Selection_Applied}}, allocator) or_return
 	defer journal.record_destroy(&record, allocator)
 	if !found { return }
-	journal.payload_decode(record.data, &selection, allocator, corruption_journal = store, session = record.session, seq = record.seq) or_return
+	applied, is_applied := record.payload.?.(journal.Selection_Applied)
+	if !is_applied { return {}, false, journal.Journal_Error.Corrupt }
+	selection.api = strings.clone(applied.api, allocator) or_return
+	selection.provider = strings.clone(record.provider, allocator) or_return
+	selection.model = strings.clone(record.model, allocator) or_return
+	selection.effort = strings.clone(applied.effort, allocator) or_return
 	return selection, true, nil
 }
 
-selection_destroy :: proc(selection: ^journal.Selection_Applied, allocator: mem.Allocator) {
+// Applied_Selection is the serving identity of a selection.applied record, owned by one allocator.
+Applied_Selection :: struct {
+	api:      string,
+	provider: string,
+	model:    string,
+	effort:   string,
+}
+
+selection_destroy :: proc(selection: ^Applied_Selection, allocator: mem.Allocator) {
 	delete(selection.api, allocator)
 	delete(selection.provider, allocator)
 	delete(selection.model, allocator)
