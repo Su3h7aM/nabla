@@ -1343,12 +1343,20 @@ test_agent_message_delivers_a_message_into_a_running_subagent_turn :: proc(test:
 
 	success := journal.TOOL_OUTCOME_NAMES[.Success]
 	testing.expect_value(test, subagent_test_call(test, chat, "spawn_1", TOOL_AGENT_NAME, `{"action":"start","prompt":"first task"}`), success)
-	_ = subagent_test_wait_request(test, chat)
+	child := subagent_test_wait_request(test, chat)
 	testing.expect_value(
 		test,
 		subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Also check the tests."}`),
 		success,
 	)
+	// The ACP interface appends the message as the child's second input before the held request ends.
+	deadline := time.tick_add(time.tick_now(), 5 * time.Second)
+	for time.tick_diff(time.tick_now(), deadline) > 0 {
+		seen := owner_wake_seen()
+		inputs, _, _ := journal.read_records(chat.store, {session = child, kinds = {.User_Input}}, 0, 0, context.temp_allocator)
+		if len(inputs) >= 2 { break }
+		owner_wake_wait(seen, time.tick_add(time.tick_now(), 10 * time.Millisecond))
+	}
 	sync.sema_post(&provider.release)
 	report := subagent_test_report(test, chat)
 	testing.expect(test, strings.contains(report, "second"), report)
