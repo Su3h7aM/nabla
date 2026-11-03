@@ -224,7 +224,7 @@ open_database :: proc(journal: ^Journal, directory, locks: string, run: Run_Id, 
 	sqlite.open(&journal.connection, config, allocator) or_return
 	if mode == .Read_Write {
 		enable_write_ahead_log(journal) or_return
-		db.exec(&journal.connection, "PRAGMA synchronous = FULL") or_return
+		db.exec(&journal.connection, "PRAGMA synchronous = NORMAL") or_return
 		schema_migrate(journal) or_return
 	} else {
 		version := schema_version(journal) or_return
