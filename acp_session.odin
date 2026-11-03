@@ -74,6 +74,9 @@ ACP_Session :: struct {
 	// message_seq numbers process-local live message ids. Replay uses its own ids
 	// from the durable turn and request, so it can reproduce them.
 	message_seq:       u64,
+	// turn_waiting is set while the worker waits for a turn to end. A prompt that arrives
+	// then is steering input, and the worker serves the queue between polls. Worker only.
+	turn_waiting:      bool,
 	active_message_id: string, // owned by conn.alloc; the v2 answer being streamed
 	// pending_text borrows the prompt the worker waits to see echoed. The echo is the
 	// user message the prompt's acceptance names, and accept_message carries its id,

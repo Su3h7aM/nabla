@@ -366,12 +366,29 @@ acp_server_failed :: proc(session: ^ACP_Session) -> bool {
 @(require_results)
 acp_wait_turn :: proc(session: ^ACP_Session, input: journal.Journal_Seq) -> (outcome: journal.Turn_Outcome, ok: bool) {
 	session.follow.cursor.input = input
+	session.turn_waiting = true
+	defer session.turn_waiting = false
 	for {
 		seen := agent.owner_wake_seen()
 		if acp_wait_step(session) { return {}, false }
 		if session.follow.cursor.ended { return session.follow.cursor.outcome, true }
 		if acp_server_failed(session) { return {}, false }
+		acp_work_between(session)
 		agent.owner_wake_wait(seen, nil)
+	}
+}
+
+// acp_work_between runs one request that arrived while a turn runs: a prompt becomes
+// steering input, and a model change, effort change, or compaction is appended as the
+// command it is. The server decides when each takes effect.
+acp_work_between :: proc(session: ^ACP_Session) {
+	for {
+		if session.follow.cursor.ended { return }
+		work, received := chan.try_recv(session.work)
+		if !received { return }
+		acp_run_work(session, work)
+		finished := work
+		acp_work_destroy(&finished, session.conn.alloc)
 	}
 }
 
@@ -428,6 +445,7 @@ acp_wait_applied :: proc(session: ^ACP_Session, command: journal.Journal_Seq) ->
 			return answered, answer_reason, true
 		}
 		if acp_server_failed(session) { return {}, "", false }
+		if session.turn_waiting { acp_work_between(session) }
 		agent.owner_wake_wait(seen, nil)
 	}
 }
@@ -755,6 +773,38 @@ acp_work_close_session :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: 
 	acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Empty_Result{}))
 }
 
+// acp_work_steer appends a prompt that arrived during a running turn as steering input,
+// the way the TUI sends a line typed mid-turn, and answers once its echo is committed.
+// The turn in progress is still waited for by the worker below this call. A V1 prompt is
+// refused as busy.
+acp_work_steer :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Work_Prompt) {
+	if !acp_is_v2(session.conn) {
+		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INVALID_REQUEST, "a turn is already running for this session"))
+		return
+	}
+	if _, appended := acp_append_input(session, work.text, .Steering, work.attachments); !appended {
+		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the prompt could not be recorded"))
+		return
+	}
+	session.pending_text = work.text
+	session.pending_accept = false
+	delete(session.accept_message, session.conn.alloc)
+	session.accept_message = ""
+	for !session.pending_accept {
+		seen := agent.owner_wake_seen()
+		if acp_wait_step(session) || session.follow.cursor.ended || acp_server_failed(session) { break }
+		agent.owner_wake_wait(seen, nil)
+	}
+	session.pending_text = ""
+	if !session.pending_accept || session.accept_message == "" {
+		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, "the prompt could not be accepted"))
+		return
+	}
+	acp_sent(session, acp.write_response(&session.conn.writer, id, acp.Prompt_Accepted_Result{message_id = session.accept_message}))
+	delete(session.accept_message, session.conn.alloc)
+	session.accept_message = ""
+}
+
 acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Work_Prompt) {
 	acp_selection_sync(session)
 	if session.provider_id == "" || session.model_id == "" {
@@ -767,6 +817,10 @@ acp_work_prompt :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, work: ACP_Wor
 	}
 	if message, ok := acp_selection_record_default(session); !ok {
 		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, message))
+		return
+	}
+	if session.turn_waiting {
+		acp_work_steer(session, id, work)
 		return
 	}
 	seq, appended := acp_append_input(session, work.text, .Prompt, work.attachments)
@@ -1059,6 +1113,10 @@ acp_work_set_config_option :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, wo
 				fmt.tprintf("the config option %q cannot be set to %q", work.config_id, work.config_value),
 			),
 		)
+		return
+	}
+	if message, ok := acp_selection_record_default(session); !ok {
+		acp_sent(session, acp.write_error(&session.conn.writer, id, acp.ERROR_INTERNAL, message))
 		return
 	}
 	seq, appended := acp_append_command(session, journal.Set_Effort{level = level})
@@ -1519,8 +1577,10 @@ acp_observer :: proc(session: ^ACP_Session) -> agent.Chat_Observer {
 // lines as agent chunks, and only for lines another agent wrote.
 acp_obs_user_text :: proc(user_data: rawptr, text: string, origin: journal.User_Origin) {
 	session := cast(^ACP_Session)user_data
-	if origin != .Prompt && origin != .Agent && origin != .Job { return }
-	if acp_is_v2(session.conn) && origin == .Prompt && session.pending_text != "" && text == session.pending_text {
+	awaited := session.pending_text != "" && text == session.pending_text
+	if origin == .Steering && !awaited { return }
+	if origin != .Prompt && origin != .Agent && origin != .Job && origin != .Steering { return }
+	if acp_is_v2(session.conn) && (origin == .Prompt || origin == .Steering) && awaited {
 		session.pending_text = ""
 		session.pending_accept = true
 		message_id := acp_next_message_id(session)
