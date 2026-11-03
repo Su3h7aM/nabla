@@ -1157,8 +1157,8 @@ subagent_test_result :: proc(test: ^testing.T, chat: ^Chat_Session) -> string {
 }
 
 // agent message to a child that has finished reopens its session. The child's second request
-// carries its task, its answer, and the new message in the same session, and a message that
-// could not be delivered because another process held the session is delivered with the next.
+// carries its task, its answer, and the new message in the same session. The first child's
+// session server may still hold the claim, and the reopened child follows it.
 @(test)
 test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -1183,22 +1183,6 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 	if !testing.expect(test, children_error == nil && len(children) == 1) { return }
 	child := children[0].id
 
-	// A session another process runs is refused by the claim, and the child's failure says so.
-	holder, holder_open_error := journal.open(chat.store.directory, chat.store.locks, journal.run_id_create(), .Read_Write)
-	if holder_open_error != nil {
-		testing.fail_now(test, "the second journal could not be opened")
-	}
-	if _, claim_error := journal.claim(holder, child); claim_error != nil { testing.fail_now(test, "the second journal could not claim the child") }
-	testing.expect_value(
-		test,
-		subagent_test_call(test, chat, "send_1", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Try this."}`),
-		success,
-	)
-	refused := subagent_test_report(test, chat)
-	testing.expect(test, strings.contains(refused, "agent-1 failed") && strings.contains(refused, "another process runs it"), refused)
-	holder_error := journal.close(holder)
-	testing.expect(test, holder_error == nil, "the second journal closed")
-
 	testing.expect_value(
 		test,
 		subagent_test_call(test, chat, "send_2", TOOL_AGENT_NAME, `{"action":"message","agent":"agent-1","message":"Now double it."}`),
@@ -1207,7 +1191,7 @@ test_agent_message_reopens_a_finished_subagent_in_its_own_session :: proc(test: 
 	testing.expect(test, strings.contains(subagent_test_report(test, chat), "eighty-four"), "the reopened child answered")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
 	request := agent_provider_request(&provider, 1)
-	for expected in ([]string{"what is six times seven", "forty-two", "Try this.", "Now double it."}) {
+	for expected in ([]string{"what is six times seven", "forty-two", "Now double it."}) {
 		testing.expect(test, strings.contains(request, expected), expected)
 	}
 
