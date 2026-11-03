@@ -405,6 +405,16 @@ test_record_names_lists_every_kind :: proc(test: ^testing.T) {
 		piece := fmt.tprintf("(%d, '%s')", int(kind), RECORD_KIND_NAMES[kind])
 		testing.expect(test, strings.contains(definition, piece), piece)
 	}
+	_expect_db_ok(test, db.rows_close(&rows))
+	_expect_db_ok(test, db.query(&journal.connection, &rows, "SELECT COUNT(*) FROM pragma_table_info('record_names') WHERE name = 'seq:1'", nil))
+	values, has_row, next_error = db.rows_next(&rows)
+	_expect_db_ok(test, next_error)
+	testing.expect(test, has_row, "view column count is available")
+	if has_row {
+		count, count_error := db.as_i64(values[0])
+		_expect_db_ok(test, count_error)
+		testing.expect_value(test, count, 0)
+	}
 }
 
 @(test)

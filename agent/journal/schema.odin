@@ -434,7 +434,7 @@ record_names_sql :: proc() -> (sql: string, error: mem.Allocator_Error) {
 	builder := strings.builder_make(context.temp_allocator) or_return
 	strings.write_string(
 		&builder,
-		"CREATE VIEW record_names AS SELECT records.seq, names.name, records.* FROM records JOIN (SELECT column1 AS code, column2 AS name FROM (VALUES ",
+		"CREATE VIEW record_names AS SELECT names.name, records.* FROM records JOIN (SELECT column1 AS code, column2 AS name FROM (VALUES ",
 	)
 	separator := ""
 	for kind in Record_Kind {
