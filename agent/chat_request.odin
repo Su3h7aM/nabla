@@ -328,6 +328,12 @@ Chat_Replay_Target :: struct {
 // because an endpoint's stream and its terminal array can disagree, and bytes it
 // refuses fail every request built from that history.
 //
+// Request_State is what one response of the history decides about its own replay.
+Request_State :: enum {
+	Unfaithful,
+	Verbatim,
+}
+
 // It reports how many records it refused, which is a fact about this request: the
 // projection carries the same conversation, so a refusal changes the prefix the
 // endpoint sees and nothing the model is told.
@@ -364,14 +370,13 @@ chat_append_projection :: proc(
 
 	// A response whose native output is not replayed is projected as text and calls. It is
 	// decided here, where the answer still decides what the whole request carries.
-	verbatim := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
-	unfaithful := make(map[journal.Request_Id]bool, allocator = context.temp_allocator)
+	request_states := make(map[journal.Request_Id]bit_set[Request_State], allocator = context.temp_allocator)
 	if target.api == .OpenAI_Responses {
 		for item in items {
 			call, is_call := item.payload.(Projected_Call)
 			if !is_call { continue }
 			_, project, faithful := chat_replay_call(call)
-			if !project || !faithful { unfaithful[item.request] = true }
+			if !project || !faithful { request_states[item.request] += {.Unfaithful} }
 		}
 	}
 	for item in items {
@@ -384,14 +389,14 @@ chat_append_projection :: proc(
 			// A record that cannot be read is not replayed either: the projection is the
 			// copy left.
 			calls, readable := ai.Provider_Replay_Read(response.output, context.temp_allocator)
-			if readable && !unfaithful[item.request] && chat_replay_record_agrees(calls, item.request, items) {
-				verbatim[item.request] = true
+			if readable && .Unfaithful not_in request_states[item.request] && chat_replay_record_agrees(calls, item.request, items) {
+				request_states[item.request] += {.Verbatim}
 			} else {
 				replay_refused += 1
 			}
 		case .Anthropic_Messages:
 			if response.output != "" {
-				verbatim[item.request] = true
+				request_states[item.request] += {.Verbatim}
 			} else {
 				replay_refused += 1
 			}
@@ -400,7 +405,7 @@ chat_append_projection :: proc(
 	}
 
 	for item in items {
-		covered := verbatim[item.request]
+		covered := .Verbatim in request_states[item.request]
 		// Feedback waits for the last result of the response it belongs to, so the
 		// results stay adjacent to the assistant message that asked for them.
 		if _, is_result := item.payload.(Projected_Result); !is_result { chat_flush_feedback(messages, &pending) or_return }

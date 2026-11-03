@@ -106,6 +106,12 @@ Projected_Nested_Call :: struct {
 // calls are read from.
 PROJECTION_RECORD_KINDS :: bit_set[journal.Record_Kind;u128]{.Response_Committed, .Tool_Proposed, .Tool_Admitted, .Tool_Completed}
 
+// Call_State is what the records of one call have shown so far, read from one map entry.
+Call_State :: enum {
+	Proposed,
+	Answered,
+}
+
 // projection_load reads the projection of session from head into arena, which
 // the caller releases whether or not the load succeeds. Every call a Results node
 // names must have been proposed in the ancestry.
@@ -180,13 +186,12 @@ projection_build :: proc(
 	responses := make(map[journal.Node_Id][dynamic]^journal.Record, allocator = context.temp_allocator)
 	admitted := make(map[journal.Call_Id]string, allocator = context.temp_allocator)
 	completed := make(map[journal.Call_Id]^journal.Record, allocator = context.temp_allocator)
-	answered := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
-	proposed := make(map[journal.Call_Id]bool, allocator = context.temp_allocator)
+	call_states := make(map[journal.Call_Id]bit_set[Call_State], allocator = context.temp_allocator)
 	for &record in records {
 		// The filter reads PROJECTION_RECORD_KINDS only.
 		#partial switch record.kind {
 		case .Response_Committed, .Tool_Proposed:
-			if record.kind == .Tool_Proposed { proposed[record.call] = true }
+			if record.kind == .Tool_Proposed { call_states[record.call] += {.Proposed} }
 			list := responses[record.node]
 			if list == nil { list = make([dynamic]^journal.Record, context.temp_allocator) or_return }
 			append(&list, &record) or_return
@@ -228,11 +233,11 @@ projection_build :: proc(
 			for call in results.calls {
 				record, found := completed[call]
 				if !found {
-					if strict || proposed[call] { return {}, journal.Journal_Error.Corrupt }
+					if strict || .Proposed in call_states[call] { return {}, journal.Journal_Error.Corrupt }
 					continue
 				}
 				result := projection_result(store, record, arena) or_return
-				answered[call] = true
+				call_states[call] += {.Answered}
 				append(&items, Projection_Item{node = node.id, turn = node.turn, payload = result}) or_return
 			}
 		}
@@ -244,7 +249,7 @@ projection_build :: proc(
 		call, is_call := item.payload.(Projected_Call)
 		if !is_call { continue }
 		if call.name == TOOL_CODEMODE_NAME { append(&parents, call.call) or_return }
-		if record, found := completed[call.call]; found && !answered[call.call] {
+		if record, found := completed[call.call]; found && .Answered not_in call_states[call.call] {
 			// The entry is display only, so a completion that cannot be read is left out
 			// instead of failing the projection the provider conversation comes from.
 			result, result_error := projection_result(store, record, arena)
