@@ -917,6 +917,7 @@ chat_compact_adopt :: proc(chat: ^Chat_Session, observer: Chat_Observer, job: ^C
 
 	usages: [1]Chat_Request_Usage
 	completed := journal.Response_Committed {
+		api    = chat_api_name(job.snapshot.api),
 		finish = chat_finish_reason_text(job.reason),
 	}
 	chat_send_usage(chat, chat_compact_usages(chat, job, &usages), &completed)

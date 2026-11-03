@@ -90,6 +90,8 @@ Record_Payload :: union {
 	Request_Admitted,
 	Request_Sent,
 	Request_Interrupted,
+	Response_Committed,
+	Response_Rejected,
 	Retry_Scheduled,
 	Retry_Completed,
 	Selection_Changed,

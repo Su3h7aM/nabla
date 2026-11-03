@@ -1062,9 +1062,8 @@ subagent_status_format :: proc(store: ^journal.Journal, parent: journal.Session_
 			)
 			if rejection_error != nil { return "", "the child's last provider failure could not be read" }
 			if has_rejected {
-				failure: journal.Response_Rejected
-				if journal.payload_decode(rejected.data, &failure, context.temp_allocator) !=
-				   nil { return "", "the child's last provider failure could not be decoded" }
+				failure, is_failure := journal.payload_as(rejected, journal.Response_Rejected)
+				if !is_failure { return "", "the child's last provider failure could not be decoded" }
 				fmt.sbprintf(
 					&block,
 					"last failure: %s, status %d, provider code %s: %s\n",

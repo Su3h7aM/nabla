@@ -743,16 +743,17 @@ INBOX_QUERY ::
 		AND inbound.session IN (SELECT subagent FROM records WHERE session = ?1 AND kind = ?6 AND subagent IS NOT NULL)
 ) ORDER BY seq ASC`
 
-// A count the provider did not report is JSON null, which SUM and the paired
+// A count the provider did not report is NULL, which SUM and the paired
 // test both skip, so it never enters a total as zero.
 @(private)
-USAGE_TOTALS_QUERY :: `WITH reported AS (SELECT
-	json_extract(data, '$.input_tokens') AS input,
-	json_extract(data, '$.output_tokens') AS output,
-	json_extract(data, '$.cache_read_tokens') AS cache_read,
-	json_extract(data, '$.cache_write_tokens') AS cache_write,
-	json_extract(data, '$.cost') AS cost
-	FROM records WHERE session = ?1 AND kind IN (?2, ?3, ?5)
+USAGE_TOTALS_QUERY :: `WITH reported AS (
+	SELECT input_tokens AS input, output_tokens AS output, cache_read_tokens AS cache_read, cache_write_tokens AS cache_write, cost
+	FROM records AS header JOIN record_response AS usage ON usage.seq = header.seq
+	WHERE header.session = ?1 AND header.kind IN (?2, ?5)
+	UNION ALL
+	SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost
+	FROM records AS header JOIN record_response_rejected AS usage ON usage.seq = header.seq
+	WHERE header.session = ?1 AND header.kind = ?3
 	UNION ALL
 	SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost
 	FROM records AS header JOIN record_request_interrupted AS usage ON usage.seq = header.seq

@@ -85,15 +85,16 @@ digest_value :: proc(journal: ^Journal, hex: string) -> db.Value {
 	return db.Value(batch_bytes(journal, digest[:]))
 }
 
+// usage_values is the six Attempt_Usage columns of any payload that embeds it.
 @(private)
-usage_values :: proc(usage: Attempt_Usage) -> [6]db.Value {
+usage_values :: proc(payload: $Payload) -> [6]db.Value {
 	return {
-		maybe_int(usage.input_tokens),
-		maybe_int(usage.output_tokens),
-		maybe_int(usage.reasoning_tokens),
-		maybe_int(usage.cache_read_tokens),
-		maybe_int(usage.cache_write_tokens),
-		maybe_real(usage.cost),
+		maybe_int(payload.input_tokens),
+		maybe_int(payload.output_tokens),
+		maybe_int(payload.reasoning_tokens),
+		maybe_int(payload.cache_read_tokens),
+		maybe_int(payload.cache_write_tokens),
+		maybe_real(payload.cost),
 	}
 }
 
@@ -248,20 +249,57 @@ payload_rows :: proc(journal: ^Journal, payload: Record_Payload) {
 			int_value(value.body_bytes),
 		)
 	case Request_Interrupted:
-		usage := usage_values(
-			{
-				input_tokens = value.input_tokens,
-				output_tokens = value.output_tokens,
-				reasoning_tokens = value.reasoning_tokens,
-				cache_read_tokens = value.cache_read_tokens,
-				cache_write_tokens = value.cache_write_tokens,
-				cost = value.cost,
-			},
-		)
+		usage := usage_values(value)
 		payload_row(
 			journal,
 			`INSERT INTO record_request_interrupted
 			(seq, detail, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			text_or_null(value.detail),
+			usage[0],
+			usage[1],
+			usage[2],
+			usage[3],
+			usage[4],
+			usage[5],
+		)
+	case Response_Committed:
+		usage := usage_values(value)
+		payload_row(
+			journal,
+			`INSERT INTO record_response
+			(seq, api, model_resolved, finish, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			text_or_null(value.api),
+			text_or_null(value.model_resolved),
+			name_code(journal, RESPONSE_FINISH_NAMES, value.finish),
+			usage[0],
+			usage[1],
+			usage[2],
+			usage[3],
+			usage[4],
+			usage[5],
+		)
+	case Response_Rejected:
+		usage := usage_values(value)
+		payload_row(
+			journal,
+			`INSERT INTO record_response_rejected
+			(seq, kind, failure_class, status, provider_code, provider_request_id, retry_after_ms, retry_directive, transport_cause,
+			text_exposed, completion_accepted, recovery, delay_ms, detail,
+			input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			text_or_null(value.kind),
+			text_or_null(value.failure_class),
+			int_value(value.status),
+			text_or_null(value.provider_code),
+			text_or_null(value.provider_request_id),
+			maybe_int(value.retry_after_ms),
+			text_or_null(value.retry_directive),
+			text_or_null(value.transport_cause),
+			value.text_exposed,
+			value.completion_accepted,
+			text_or_null(value.recovery),
+			value.delay_ms,
 			text_or_null(value.detail),
 			usage[0],
 			usage[1],
@@ -397,6 +435,26 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 		return payload_load(journal, record, "SELECT purpose, outcome FROM record_retry_completed WHERE seq = ?", allocator, scan_retry_completed)
 	case .Selection_Changed:
 		return payload_load(journal, record, "SELECT effort FROM record_selection_changed WHERE seq = ?", allocator, scan_selection_changed)
+	case .Response_Committed, .Compaction_Completed:
+		return payload_load(
+			journal,
+			record,
+			`SELECT api, model_resolved, finish, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost
+			FROM record_response WHERE seq = ?`,
+			allocator,
+			scan_response_committed,
+		)
+	case .Response_Rejected:
+		return payload_load(
+			journal,
+			record,
+			`SELECT kind, failure_class, status, provider_code, provider_request_id, retry_after_ms, retry_directive, transport_cause,
+			text_exposed, completion_accepted, recovery, delay_ms, detail,
+			input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost
+			FROM record_response_rejected WHERE seq = ?`,
+			allocator,
+			scan_response_rejected,
+		)
 	case .Selection_Fit:
 		return payload_load(
 			journal,
@@ -414,8 +472,6 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 	     .Branch_Created,
 	     .Branch_Selected,
 	     .Node_Committed,
-	     .Response_Committed,
-	     .Response_Rejected,
 	     .Tool_Proposed,
 	     .Tool_Admitted,
 	     .Tool_Started,
@@ -427,7 +483,6 @@ load_record_payload :: proc(journal: ^Journal, record: ^Record, allocator: mem.A
 	     .Subagent_Started,
 	     .Subagent_Completed,
 	     .Compaction_Started,
-	     .Compaction_Completed,
 	     .Checkpoint_Installed,
 	     .Runtime_Message,
 	     .Job_Abandoned,
@@ -571,14 +626,45 @@ scan_request_interrupted :: proc(row: ^Row) -> Record_Payload {
 		version = PAYLOAD_VERSION,
 		detail  = row_text(row),
 	}
-	usage := row_usage(row)
-	interrupted.input_tokens = usage.input_tokens
-	interrupted.output_tokens = usage.output_tokens
-	interrupted.reasoning_tokens = usage.reasoning_tokens
-	interrupted.cache_read_tokens = usage.cache_read_tokens
-	interrupted.cache_write_tokens = usage.cache_write_tokens
-	interrupted.cost = usage.cost
+	row_usage(row, &interrupted)
 	return interrupted
+}
+
+@(private)
+scan_response_committed :: proc(row: ^Row) -> Record_Payload {
+	committed := Response_Committed {
+		version        = PAYLOAD_VERSION,
+		api            = row_text(row),
+		model_resolved = row_text(row),
+		finish         = row_enum_name(row, RESPONSE_FINISH_NAMES),
+	}
+	row_usage(row, &committed)
+	return committed
+}
+
+@(private)
+scan_response_rejected :: proc(row: ^Row) -> Record_Payload {
+	rejected := Response_Rejected {
+		version             = PAYLOAD_VERSION,
+		kind                = row_text(row),
+		failure_class       = row_text(row),
+		status              = int(row_int(row)),
+		provider_code       = row_text(row),
+		provider_request_id = row_text(row),
+		retry_after_ms      = row_optional_int(row),
+		retry_directive     = row_text(row),
+		transport_cause     = row_text(row),
+	}
+	text_exposed, text_exposed_ok := row_flag(row)
+	completion_accepted, completion_accepted_ok := row_flag(row)
+	if (!text_exposed_ok || !completion_accepted_ok) && row.error == nil { row.error = Journal_Error.Corrupt }
+	rejected.text_exposed = text_exposed
+	rejected.completion_accepted = completion_accepted
+	rejected.recovery = row_text(row)
+	rejected.delay_ms = row_int(row)
+	rejected.detail = row_text(row)
+	row_usage(row, &rejected)
+	return rejected
 }
 
 @(private)
@@ -623,14 +709,15 @@ scan_selection_applied :: proc(row: ^Row) -> Record_Payload {
 	return Selection_Applied{version = PAYLOAD_VERSION, api = row_text(row), effort = row_text(row)}
 }
 
-// row_usage reads the six Attempt_Usage columns; NULL stays absent.
+// row_usage reads the six Attempt_Usage columns into any payload that embeds
+// them; NULL stays absent.
 @(private)
-row_usage :: proc(row: ^Row) -> (usage: Attempt_Usage) {
-	usage.input_tokens = row_optional_int(row)
-	usage.output_tokens = row_optional_int(row)
-	usage.reasoning_tokens = row_optional_int(row)
-	usage.cache_read_tokens = row_optional_int(row)
-	usage.cache_write_tokens = row_optional_int(row)
+row_usage :: proc(row: ^Row, payload: ^$Payload) {
+	payload.input_tokens = row_optional_int(row)
+	payload.output_tokens = row_optional_int(row)
+	payload.reasoning_tokens = row_optional_int(row)
+	payload.cache_read_tokens = row_optional_int(row)
+	payload.cache_write_tokens = row_optional_int(row)
 	value, ok := row_next(row)
 	if !ok || value == nil { return }
 	number, error := db.as_f64(value)
@@ -638,8 +725,7 @@ row_usage :: proc(row: ^Row) -> (usage: Attempt_Usage) {
 		row.error = Journal_Error.Corrupt
 		return
 	}
-	usage.cost = number
-	return
+	payload.cost = number
 }
 
 @(private)
@@ -690,6 +776,19 @@ payload_destroy :: proc(payload: Record_Payload, allocator: mem.Allocator) {
 		delete(value.recovery, allocator)
 		delete(value.body_digest, allocator)
 	case Request_Interrupted:
+		delete(value.detail, allocator)
+	case Response_Committed:
+		delete(value.api, allocator)
+		delete(value.model_resolved, allocator)
+		delete(value.finish, allocator)
+	case Response_Rejected:
+		delete(value.kind, allocator)
+		delete(value.failure_class, allocator)
+		delete(value.provider_code, allocator)
+		delete(value.provider_request_id, allocator)
+		delete(value.retry_directive, allocator)
+		delete(value.transport_cause, allocator)
+		delete(value.recovery, allocator)
 		delete(value.detail, allocator)
 	case Retry_Scheduled:
 		delete(value.purpose, allocator)

@@ -169,7 +169,7 @@ test_recovery_records_nothing_after_a_clean_turn :: proc(test: ^testing.T) {
 	session := _create_session(test, writer, {workspace = "/tmp/project", role = .Main})
 	append_record(writer, Record{session = session, turn = 1, kind = .Turn_Started}, _turn_started())
 	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Request_Sent}, _request_sent())
-	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Response_Committed}, _Test_Payload{detail = "answer"})
+	append_record(writer, Record{session = session, turn = 1, request = 1, kind = .Response_Committed}, _response_committed())
 	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Proposed}, _Test_Payload{detail = "call"})
 	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Admitted}, _Test_Payload{detail = "admit"})
 	append_record(writer, Record{session = session, turn = 1, call = 1, kind = .Tool_Completed}, Tool_Completed{outcome = TOOL_OUTCOME_NAMES[.Success]})

@@ -469,6 +469,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 		journal,
 		Record{session = session, turn = 1, request = 1, node = assistant, kind = .Response_Committed},
 		Response_Committed {
+			api = "responses",
 			model_resolved = "gpt-5-2026",
 			finish = RESPONSE_FINISH_NAMES[.Tool_Call],
 			input_tokens = 100,
@@ -512,6 +513,7 @@ test_a_conversation_reads_back_the_way_a_projection_walks_it :: proc(test: ^test
 		journal,
 		Record{session = session, turn = 2, request = 2, node = second_assistant, kind = .Response_Committed},
 		Response_Committed {
+			api = "responses",
 			model_resolved = "gpt-5-2026",
 			finish = RESPONSE_FINISH_NAMES[.Stop],
 			input_tokens = 200,

@@ -353,8 +353,8 @@ projection_add_assistant :: proc(
 	}
 	for record in records {
 		if record.kind != .Response_Committed || len(record.body) == 0 { continue }
-		response: journal.Response_Committed
-		journal.payload_decode(record.data, &response, arena, corruption_journal = store, session = record.session, seq = record.seq) or_return
+		response, is_response := journal.payload_as(record^, journal.Response_Committed)
+		if !is_response { return journal.Journal_Error.Corrupt }
 		item.payload = Projected_Response {
 			output   = string(record.body),
 			api      = response.api,
