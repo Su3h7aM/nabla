@@ -667,6 +667,7 @@ chat_compact_start :: proc(
 		prep.projection.summary,
 		connection,
 		CHAT_COMPACT_DIRECTIVE,
+		"",
 		virtual.arena_allocator(&arena),
 	); build_error != nil {
 		_observer_message(observer, .Warning, "the compaction request could not be built")

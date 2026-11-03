@@ -63,7 +63,10 @@ Chat_Request_Prep :: struct {
 @(private, require_results)
 chat_prepare :: proc(chat: ^Chat_Session, connection: ai.Provider_Connection, arena: mem.Allocator) -> (prep: Chat_Request_Prep, error: journal.Error) {
 	prep.projection = projection_load(chat.store, chat.session, chat.head, arena) or_return
-	chat_build_request_into(chat, &prep, prep.projection.items, prep.projection.summary, connection, "", arena) or_return
+	// Subdirectory instruction files resolve here, on the owner thread, so the
+	// dynamic suffix never touches the cached prefix or the journal history.
+	suffix := chat_consume_dynamic_instructions(chat, arena)
+	chat_build_request_into(chat, &prep, prep.projection.items, prep.projection.summary, connection, "", suffix, arena) or_return
 	return prep, nil
 }
 
@@ -146,10 +149,13 @@ chat_request_freeze :: proc(
 }
 
 // chat_build_request_into assembles a request from a span of projected items and the
-// summary that precedes them, in arena. directive, when not empty, is appended as the
+// summary that precedes them, in arena. directive, when not empty, is appended as a
 // final user message: that is how a compaction request asks for a summary while
 // carrying the same instructions, tools, and cache identity as the conversation it is
-// summarizing, so the provider prefix it reads is the warm one.
+// summarizing, so the provider prefix it reads is the warm one. suffix, when not
+// empty, is appended after it as another trailing user message: subdirectory
+// instruction files and other per-request context that must not shift the cached
+// prefix or enter the journal history.
 @(private, require_results)
 chat_build_request_into :: proc(
 	chat: ^Chat_Session,
@@ -158,6 +164,7 @@ chat_build_request_into :: proc(
 	summary: string,
 	connection: ai.Provider_Connection,
 	directive: string,
+	suffix: string,
 	arena: mem.Allocator,
 ) -> mem.Allocator_Error {
 	return chat_build_request_selection_into(
@@ -174,6 +181,7 @@ chat_build_request_into :: proc(
 		chat.refused_features,
 		chat.calibration,
 		directive,
+		suffix,
 		arena,
 	)
 }
@@ -194,12 +202,13 @@ chat_build_request_selection_into :: proc(
 	refused_features: Optional_Request_Features,
 	calibration: Chat_Calibration,
 	directive: string,
+	suffix: string,
 	arena: mem.Allocator,
 ) -> mem.Allocator_Error {
 	// The request carries one message per entry, so its list is the one table that is sized
 	// before it is filled. The other three hold nothing yet: each carries the arena its first
 	// entry grows from, and nothing here allocates before there is something to put in it.
-	prep.wire = make([dynamic]ai.Provider_Message, 0, len(items) + 3, arena) or_return
+	prep.wire = make([dynamic]ai.Provider_Message, 0, len(items) + 4, arena) or_return
 	prep.tools.allocator = arena
 	prep.calls.allocator = arena
 	prep.feedback.allocator = arena
@@ -227,6 +236,9 @@ chat_build_request_selection_into :: proc(
 	prep.replay_refused = chat_append_projection(&prep.wire, &prep.calls, &prep.feedback, replay, items, arena) or_return
 	if directive != "" {
 		append(&prep.wire, ai.Provider_Message{Role = .User, Content = directive}) or_return
+	}
+	if suffix != "" {
+		append(&prep.wire, ai.Provider_Message{Role = .User, Content = suffix}) or_return
 	}
 
 	session_text := strings.clone(chat_session_text(chat), arena) or_return

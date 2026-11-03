@@ -663,7 +663,7 @@ Deterministic order, placed by the `ai` encoder into the API's fields:
 1. Instruction snapshot: base prompt, `AGENTS.md` sources, `always` rules, model-matched rules, material catalog metadata. Stored once as an artifact by digest.
 2. Tool definitions of the turn's registry, sorted by name, schema bytes verbatim from the registry.
 3. Ancestry projection in node order.
-4. Transient suffix: hook guidance for this request, the compaction directive for compaction requests. Never part of history.
+4. Transient suffix: hook guidance for this request, the compaction directive for compaction requests, subdirectory `AGENTS.md` files for directories the agent's tools reached. A subdirectory file is delivered once and again only after it changes; the workspace root file stays in the snapshot. Never part of history.
 
 Parts 1 and 2 contain no timestamps, request ids, random ordering, or mutable lists. Tool definitions are encoded once per registry build. Unused skill and Task bodies never enter a request. The provider cache key derives from `Session_Id` only, so retries, branches, and reconnects share it. Legitimate prefix changes (snapshot adoption at a turn boundary, model or effort change, checkpoint install) are recorded with their cause in `request.prepared`.
 

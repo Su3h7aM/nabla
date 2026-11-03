@@ -87,6 +87,12 @@ Tool_Context :: struct {
 	// without one. Only the paired decoder and executor may interpret it, and it
 	// must never be freed through this struct.
 	backend:          rawptr,
+	// instructions is the session's borrowed touch record for subdirectory
+	// instruction discovery, or nil where no session owns one. Workers append
+	// lexically with no I/O; the owner resolves it when building the next
+	// request. Codemode children inherit the pointer through their copied
+	// context, so nested calls record too.
+	instructions:     ^Instruction_Touches,
 	// compact is the borrowed session compaction control for tools that ask for a
 	// context change; call names the boundary the call was made at.
 	compact:          ^Compact_Control,
@@ -550,8 +556,10 @@ tool_control_stop :: proc(control: Tool_Control, start: time.Tick, timeout: time
 
 // AGENT_SYSTEM_PROMPT states what the agent is for. What each tool does, and
 // what arguments it takes, travels with the tool definitions, so this does not
-// repeat them.
-AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each result starts with a line saying ok, or error with its kind and reason, then key: value facts, then after a blank line any raw output. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short."
+// repeat them. It states only the harness-wide routing policy: which capability
+// to reach for first. That policy lives here, in code, so it holds with no
+// user configuration at all.
+AGENT_SYSTEM_PROMPT :: "You are nabla, a coding agent working from a session workspace. The tools available to you are listed with their arguments. Each result starts with a line saying ok, or error with its kind and reason, then key: value facts, then after a blank line any raw output. Relative paths start at the workspace, while absolute paths may address the wider system. Use the tools to inspect files, make changes, and run programs. Never invent tool output. Keep chat replies short. Act with tools instead of describing what you would do, keep working until the task is done, and ask the user only when blocked on a decision only they can make. When the task matches a listed skill, load it with the skill tool before work that depends on it. Do file work with read, find, grep, write, and edit; batch independent calls with codemode instead of many separate calls; run project commands with the shell, never to read, search, or change files."
 
 // TOOL_DECLARED is the native tools written as constants, in the order they are
 // registered. tool_registry_sort fixes the advertised order after this list is

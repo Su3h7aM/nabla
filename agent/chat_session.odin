@@ -242,6 +242,17 @@ Chat_Session :: struct {
 	skill_catalog:                Maybe(skills.Catalog),
 	skill_instructions:           string, // owned; exact normal-request prefix
 	client_instructions:          string, // owned; client-supplied standing system instructions
+	// instruction_touches is the workspace paths the agent's tools reached,
+	// borrowed by workers through their Tool_Context. The owner resolves
+	// subdirectory instruction files from it when building the next request,
+	// so package instructions arrive as a trailing message instead of
+	// shifting the cached prefix.
+	instruction_touches:          Instruction_Touches,
+	// delivered_instructions tracks subdirectory instruction files already
+	// sent, with the size and modification time each had then. A request
+	// carries each file once, and again only after it changes. Owner thread
+	// only.
+	delivered_instructions:       [dynamic]Delivered_Instruction,
 	// instructions_digest and manifest_digest name the snapshot artifacts that
 	// skill_instructions and skill_catalog came from; zero until one is settled.
 	instructions_digest:          journal.Digest,
@@ -348,6 +359,9 @@ chat_session_init :: proc(
 	chat.pending_calls.allocator = allocator
 	chat.effort_levels.allocator = allocator
 	chat.abandoned.allocator = allocator
+	chat.instruction_touches.allocator = allocator
+	chat.instruction_touches.paths.allocator = allocator
+	chat.delivered_instructions.allocator = allocator
 	chat.tool_output_directory = tool_output_directory(chat_session_text(&chat), allocator)
 	chat.team = agent_team_make(os.heap_allocator())
 	if chat_journal_writable(&chat) {
@@ -526,7 +540,17 @@ chat_session_destroy :: proc(chat: ^Chat_Session) {
 			search_cache_destroy(chat.search_cache)
 			chat.search_cache = nil
 		}
+		// Workers append touches through the borrowed pointer, so the list is
+		// released only once none can still reach it.
+		for path in chat.instruction_touches.paths { delete(path, chat.instruction_touches.allocator) }
+		delete(chat.instruction_touches.paths)
+		chat.instruction_touches.paths = {}
+		chat.instruction_touches.paths.allocator = chat.instruction_touches.allocator
 	}
+	for delivered in chat.delivered_instructions { delete(delivered.path, chat.allocator) }
+	delete(chat.delivered_instructions)
+	chat.delivered_instructions = {}
+	chat.delivered_instructions.allocator = chat.allocator
 	ai.Provider_Encode_Cache_Destroy(&chat.encode_cache)
 	// An abandoned attempt took over the WebSocket it was using, so this one is unshared.
 	if chat.provider_websocket != nil {

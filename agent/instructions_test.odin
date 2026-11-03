@@ -51,6 +51,11 @@ test_instruction_roots_order_and_rendering :: proc(t: ^testing.T) {
 	testing.expect(t, len(rendered) > len(AGENT_SYSTEM_PROMPT))
 	testing.expect(t, strings.contains(rendered, "Be brief."))
 	testing.expect(t, strings.contains(rendered, "No skills are available."))
+	// The harness routes by itself, with no user configuration: the rendered
+	// instructions name the concrete skill tools and the file-work routing.
+	testing.expect(t, strings.contains(rendered, "skills tool"))
+	testing.expect(t, strings.contains(rendered, "skill tool"))
+	testing.expect(t, strings.contains(rendered, "codemode"))
 }
 
 // An absent, empty, or whitespace-only AGENTS.md carries no instructions and is
@@ -116,4 +121,138 @@ test_read_agents_file_reads_a_large_file_whole :: proc(t: ^testing.T) {
 	testing.expect_value(t, status, Agents_File_Status.Present)
 	testing.expect_value(t, detail, "")
 	testing.expect_value(t, len(body), 512 * 1024)
+}
+
+// A touch inside a subdirectory delivers its instruction file as a trailing
+// message exactly once: re-touches without a change repeat nothing, an edit
+// redelivers, and a removal is forgotten so a recreation delivers again. The
+// workspace root file is never a candidate, and touches outside the workspace
+// record nothing.
+@(test)
+test_touch_record_and_take_roundtrip :: proc(t: ^testing.T) {
+	base, base_error := os.make_directory_temp("", "nabla-touch-roundtrip-*", context.allocator)
+	if base_error != nil { testing.fail_now(t, "could not create a temporary directory") }
+	defer os.remove_all(base)
+	defer delete(base, context.allocator)
+	workspace, workspace_error := filepath.join({base, "work"}, context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "could not join workspace") }
+	defer delete(workspace, context.allocator)
+	testing.expect(t, os.make_directory_all(workspace) == nil)
+
+	chat := Chat_Session {
+		workspace = workspace,
+		allocator = context.allocator,
+	}
+	chat.instruction_touches.allocator = context.allocator
+	chat.instruction_touches.paths.allocator = context.allocator
+	defer {
+		for remaining in chat.instruction_touches.paths { delete(remaining, context.allocator) }
+		delete(chat.instruction_touches.paths)
+	}
+	ctx := Tool_Context {
+		workspace    = workspace,
+		allocator    = context.allocator,
+		instructions = &chat.instruction_touches,
+	}
+	instructions_record_touch(&ctx, "pkg/a.go")
+	testing.expect_value(t, len(chat.instruction_touches.paths), 1)
+	taken := instruction_touches_take(&chat.instruction_touches)
+	testing.expect_value(t, len(taken), 1)
+	testing.expect_value(t, len(chat.instruction_touches.paths), 0)
+	for path in taken { delete(path, context.allocator) }
+	delete(taken, context.allocator)
+}
+
+@(test)
+test_dynamic_instructions_deliver_once_and_track_changes :: proc(t: ^testing.T) {
+	base, base_error := os.make_directory_temp("", "nabla-dynamic-instructions-*", context.allocator)
+	if base_error != nil { testing.fail_now(t, "could not create a temporary directory") }
+	defer os.remove_all(base)
+	defer delete(base, context.allocator)
+	workspace, workspace_error := filepath.join({base, "work"}, context.allocator)
+	if workspace_error != nil { testing.fail_now(t, "could not join workspace") }
+	defer delete(workspace, context.allocator)
+	pkg, pkg_error := filepath.join({workspace, "pkg"}, context.allocator)
+	if pkg_error != nil { testing.fail_now(t, "could not join package") }
+	defer delete(pkg, context.allocator)
+	testing.expect(t, os.make_directory_all(pkg) == nil)
+	pkg_file, pkg_file_error := filepath.join({pkg, "AGENTS.md"}, context.allocator)
+	if pkg_file_error != nil { testing.fail_now(t, "could not join package file") }
+	defer delete(pkg_file, context.allocator)
+	root_file, root_file_error := filepath.join({workspace, "AGENTS.md"}, context.allocator)
+	if root_file_error != nil { testing.fail_now(t, "could not join root file") }
+	defer delete(root_file, context.allocator)
+	testing.expect(t, os.write_entire_file_from_string(pkg_file, "Follow the package rules.\n") == nil)
+	testing.expect(t, os.write_entire_file_from_string(root_file, "Follow the root rules.\n") == nil)
+
+	chat := Chat_Session {
+		workspace = workspace,
+		allocator = context.allocator,
+	}
+	chat.instruction_touches.allocator = context.allocator
+	chat.instruction_touches.paths.allocator = context.allocator
+	chat.delivered_instructions.allocator = context.allocator
+	defer {
+		for delivered in chat.delivered_instructions { delete(delivered.path, context.allocator) }
+		delete(chat.delivered_instructions)
+		taken := instruction_touches_take(&chat.instruction_touches)
+		if len(taken) > 0 {
+			for path in taken { delete(path, context.allocator) }
+			delete(taken, context.allocator)
+		}
+	}
+	ctx := Tool_Context {
+		workspace    = workspace,
+		allocator    = context.allocator,
+		instructions = &chat.instruction_touches,
+	}
+
+	instructions_record_touch(&ctx, "pkg/a.go")
+	first := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(first, context.allocator)
+	testing.expect(t, strings.contains(first, "Follow the package rules."))
+	testing.expect(t, strings.contains(first, pkg_file))
+	testing.expect(t, !strings.contains(first, "Follow the root rules."))
+
+	second := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(second, context.allocator)
+	testing.expect_value(t, second, "")
+
+	instructions_record_touch(&ctx, "pkg/b.go")
+	third := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(third, context.allocator)
+	testing.expect_value(t, third, "")
+
+	instructions_record_touch(&ctx, "root.go")
+	fourth := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(fourth, context.allocator)
+	testing.expect_value(t, fourth, "")
+
+	outside := Tool_Context {
+		workspace    = workspace,
+		allocator    = context.allocator,
+		instructions = &chat.instruction_touches,
+	}
+	instructions_record_touch(&outside, "/etc/hostname")
+	fifth := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(fifth, context.allocator)
+	testing.expect_value(t, fifth, "")
+
+	testing.expect(t, os.write_entire_file_from_string(pkg_file, "Follow the changed package rules.\n") == nil)
+	instructions_record_touch(&ctx, "pkg/c.go")
+	sixth := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(sixth, context.allocator)
+	testing.expect(t, strings.contains(sixth, "Follow the changed package rules."))
+
+	testing.expect(t, os.remove(pkg_file) == nil)
+	instructions_record_touch(&ctx, "pkg/d.go")
+	seventh := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(seventh, context.allocator)
+	testing.expect_value(t, seventh, "")
+
+	testing.expect(t, os.write_entire_file_from_string(pkg_file, "Follow the recreated package rules.\n") == nil)
+	instructions_record_touch(&ctx, "pkg/e.go")
+	eighth := chat_consume_dynamic_instructions(&chat, context.allocator)
+	defer delete(eighth, context.allocator)
+	testing.expect(t, strings.contains(eighth, "Follow the recreated package rules."))
 }

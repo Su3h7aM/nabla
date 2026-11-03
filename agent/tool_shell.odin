@@ -14,7 +14,9 @@ TOOL_SHELL_NAME :: "shell"
 // MiB, and the default timeout in seconds.
 TOOL_SHELL_BODY :: `The shell is the one the SHELL environment variable names, or /bin/sh when it names none or cannot be started. Write the command in that shell's syntax, which may not be POSIX sh. Each call starts a fresh non-interactive process in its own process group, with standard input closed (a command that prompts reads end of file) and this process's environment. Directory changes, variables, and background jobs do not carry over to the next call, so pass working_directory instead of relying on cd. Create or edit files with write or patch, not with a heredoc or echo redirection. This is not a terminal.
 
-The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds for a waiting call and none for a background call unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.`
+The result gives exit_code, then stdout and stderr as separate sections. A nonzero exit is outcome tool_failed and still returns its output. Output is never discarded: the result shows at most %d KiB, and when the command wrote more, the result ends with a notice naming a file that holds the whole result, which you read with read. A stream over %d MiB is written to its own file, named by stdout_complete_in or stderr_complete_in, and the result keeps only its beginning. The timeout is %d seconds for a waiting call and none for a background call unless you set timeout_ms, and there is no maximum; when it passes, the command's process group is terminated. Processes left running in that group when the command ends are terminated too, so start one that must outlive the command with setsid.
+
+Run project commands with this tool: builds, tests, formatters, package managers, and version control. Read, search, and change files with read, find, grep, write, and edit instead, and batch multi-step file work with codemode instead of shell loops or one-liners.`
 
 // TOOL_SHELL_FISH_NOTES follows the body when the shell is fish, whose syntax models most
 // often get wrong because they write bash.
@@ -384,6 +386,9 @@ tool_shell_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Res
 		missing := tool_argument_error(.Invalid_Value, "working_directory", "a directory that exists", ctx.allocator)
 		return tool_result_refused(ctx, &missing)
 	}
+	// The command runs here, so this directory's package instructions apply to
+	// whatever it does, even though the shell itself reports no file paths.
+	instructions_record_touch_dir(ctx, directory)
 
 	data: Shell_Output
 	defer {

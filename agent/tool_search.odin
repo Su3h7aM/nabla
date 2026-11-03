@@ -301,7 +301,7 @@ search_frecency_of :: proc(ctx: ^Tool_Context, root_key: string) -> ^search.Frec
 
 TOOL_FIND_NAME :: "find"
 
-TOOL_FIND_DESCRIPTION :: `Find files by path substring in the workspace or in any other directory (root). Omit root, pass null, or pass an empty string to search the session workspace; a supplied root must be a directory, and a file path is refused. To narrow to one file, keep the directory root and use glob for that file's name. Use grep to search file contents and read to view a file. Several words must all occur in the path. Hidden directories (including the VCS metadata directories .git, .jj, .hg, .svn, and .bzr), a .git file that names a submodule's or linked worktree's metadata, and node_modules, target, and __pycache__ are not searched; other hidden files are.
+TOOL_FIND_DESCRIPTION :: `Find files by path substring in the workspace or in any other directory (root). Omit root, pass null, or pass an empty string to search the session workspace; a supplied root must be a directory, and a file path is refused. To narrow to one file, keep the directory root and use glob for that file's name. Use grep to search file contents and read to view a file. Use find instead of ls or glob patterns through the shell. Several words must all occur in the path. Hidden directories (including the VCS metadata directories .git, .jj, .hg, .svn, and .bzr), a .git file that names a submodule's or linked worktree's metadata, and node_modules, target, and __pycache__ are not searched; other hidden files are.
 
 The result gives total_matches and, when rows remain, next_cursor (pass it as cursor for the next page). After a blank line come the paths, best first, under a "→ Read" header naming the top path, marked "(exact match!)" when it names the query exactly. skipped counts files that could not be read, and denylist counts the pruned directories. When no path contains the query, a typo-tolerant search runs and notice labels its rows as approximate; a query nothing resembles returns total_matches 0 with no notice.
 
@@ -334,7 +334,7 @@ TOOL_FIND_DEFINITION :: Tool_Definition {
 
 TOOL_GREP_NAME :: "grep"
 
-TOOL_GREP_DESCRIPTION :: `Search file contents line by line in the workspace or in any other directory (root). Omit root, pass null, or pass an empty string to search the session workspace; a supplied root must be a directory, and a file path is refused. To narrow to one file, keep the directory root and use glob for that file's name. Use find to locate a file by name and read to view a file. Hidden directories (including the VCS metadata directories .git, .jj, .hg, .svn, and .bzr), a .git file that names a submodule's or linked worktree's metadata, and node_modules, target, and __pycache__ are not searched; other hidden files are.
+TOOL_GREP_DESCRIPTION :: `Search file contents line by line in the workspace or in any other directory (root). Omit root, pass null, or pass an empty string to search the session workspace; a supplied root must be a directory, and a file path is refused. To narrow to one file, keep the directory root and use glob for that file's name. Use find to locate a file by name and read to view a file. Use grep instead of running rg or grep through the shell. Hidden directories (including the VCS metadata directories .git, .jj, .hg, .svn, and .bzr), a .git file that names a submodule's or linked worktree's metadata, and node_modules, target, and __pycache__ are not searched; other hidden files are.
 
 The result gives total_matches and, when rows remain, next_cursor (pass it as cursor for the next page). After a blank line come the matches grouped by file under a "→ Read" header naming the best file: an "N: text" row per hit, an " N-text" row per context line, and "--" between files. output_mode "files_with_matches" lists one path per file instead. A line longer than 180 bytes is shown cut around the hit with … marking the cuts, and full_lines_in names the file holding the full lines. skipped counts binary, oversize, and unreadable files, and denylist counts the pruned directories. When no line matches exactly, a typo-tolerant search runs and notice labels its rows as approximate; a pattern nothing resembles returns total_matches 0 with no notice. An invalid regular expression is searched literally and notice says so.
 
@@ -692,6 +692,7 @@ tool_find_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 		owned: Tool_Output = output
 		tool_output_destroy(&owned, heap)
 	}
+	instructions_record_touch_dir(ctx, args.root_key)
 	return search_result_finish(ctx, "find", start, args.timeout, output, find_summary(len(output.files), output.total_matches, output.indexed))
 }
 
@@ -776,6 +777,7 @@ tool_grep_execute :: proc(ctx: ^Tool_Context, arguments: Tool_Args) -> Tool_Resu
 
 	unit := "files" if args.output == .Files_With_Matches else "matches"
 	shown := len(output.matches) + len(output.files)
+	instructions_record_touch_dir(ctx, args.root_key)
 	return search_result_finish(ctx, "grep", start, args.timeout, output, grep_summary(shown, output.total_matches, unit))
 }
 

@@ -365,12 +365,13 @@ tool_jobs_submit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_O
 @(private)
 tool_job_admit :: proc(jobs: ^Tool_Jobs, chat: ^Chat_Session, observer: Chat_Observer, job: ^Tool_Job) {
 	job.exec = Tool_Context {
-		call_id   = job.call_id,
-		workspace = chat.workspace,
-		allocator = job.allocator,
-		search    = chat.search_cache,
-		skills    = chat_skill_catalog(chat),
-		call      = job.call.call,
+		call_id      = job.call_id,
+		workspace    = chat.workspace,
+		allocator    = job.allocator,
+		search       = chat.search_cache,
+		instructions = &chat.instruction_touches,
+		skills       = chat_skill_catalog(chat),
+		call         = job.call.call,
 	}
 	if job.call.call > 0 {
 		job.output_base = chat_tool_output_path(chat, job.call.call, "", job.allocator)

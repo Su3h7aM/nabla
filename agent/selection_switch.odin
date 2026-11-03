@@ -126,6 +126,7 @@ chat_selection_check :: proc(
 		refused_features,
 		calibration,
 		"",
+		"",
 		virtual.arena_allocator(&arena),
 	)
 	if build_error != nil { return .Refused, "the target request could not be prepared", build_error }
