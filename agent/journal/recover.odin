@@ -77,7 +77,6 @@ recover_open_work :: proc(journal: ^Journal, recovery: ^Recovery, kept_directory
 		header.turn = Turn_Id(row_int(&row))
 		header.request = Request_Id(row_int(&row))
 		header.attempt = Attempt_No(row_int(&row))
-		header.job = Job_Id(row_int(&row))
 		header.call = Call_Id(row_int(&row))
 		header.parent_call = Call_Id(row_int(&row))
 		header.subagent = Session_Id(row_id(&row))
@@ -207,7 +206,7 @@ recover_results :: proc(journal: ^Journal, recovery: ^Recovery) -> (error: Error
 // Each rule finds work whose closing record is missing, so a second recovery
 // finds nothing.
 @(private)
-RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, job, call, parent_call, subagent, data FROM (
+RECOVERY_QUERY :: `SELECT rule, branch, node, turn, request, attempt, call, parent_call, subagent, data FROM (
 	SELECT 0 AS rule, * FROM records AS open WHERE session = ?1 AND kind = 'turn.started'
 		AND (open.turn IS NULL OR open.turn NOT IN (SELECT turn FROM records WHERE session = ?1 AND kind = 'turn.completed' AND turn IS NOT NULL))
 	UNION ALL

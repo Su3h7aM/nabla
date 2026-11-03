@@ -324,7 +324,7 @@ create_session :: proc(journal: ^Journal, new_session: New_Session) -> (id: Sess
 			workspace = batch_text(journal, new_session.workspace),
 			parent_session = new_session.parent_session,
 			parent_call = new_session.parent_call,
-			role = role,
+			role = new_session.role,
 		},
 	)
 	// The initial branch is the one this call creates; a failure latches below.

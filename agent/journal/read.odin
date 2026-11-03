@@ -458,7 +458,7 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 	parent := filter.parent
 	if parent != {} { query_add(&query, " AND parent_session = ?", db.Value(parent[:])) or_return }
 	if filter.workspace != "" { query_add(&query, " AND workspace = ?", filter.workspace) or_return }
-	if role, has_role := filter.role.?; has_role { query_add(&query, " AND role = ?", SESSION_ROLE_NAMES[role]) or_return }
+	if role, has_role := filter.role.?; has_role { query_add(&query, " AND role = ?", i64(role)) or_return }
 	if filter.before != 0 { query_add(&query, " AND last_seq < ?", i64(filter.before)) or_return }
 	query_add(&query, " ORDER BY last_seq DESC, session DESC") or_return
 	if filter.limit > 0 { query_add(&query, " LIMIT ?", i64(filter.limit)) or_return }
@@ -480,7 +480,7 @@ list_sessions :: proc(journal: ^Journal, filter: Session_Filter, allocator: mem.
 		summary.id = Session_Id(row_id(&row))
 		summary.created_ms = row_int(&row)
 		summary.workspace = row_text(&row)
-		summary.role = row_enum(&row, SESSION_ROLE_NAMES)
+		summary.role = row_code(&row, Session_Role)
 		summary.parent_session = Session_Id(row_id(&row))
 		summary.parent_call = Call_Id(row_int(&row))
 		summary.title = row_text(&row)
@@ -585,7 +585,7 @@ branch_summaries_destroy :: proc(summaries: []Branch_Summary, allocator := conte
 }
 
 @(private)
-RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, job, call, parent_call, task, subagent, hook, provider, model, data, body"
+RECORD_COLUMNS :: "seq, time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body"
 
 @(private)
 NODE_COLUMNS :: "session, node, parent, branch, kind, turn, covers, seq, data, body"
@@ -742,12 +742,9 @@ scan_record :: proc(row: ^Row) -> (record: Record) {
 	record.turn = Turn_Id(row_int(row))
 	record.request = Request_Id(row_int(row))
 	record.attempt = Attempt_No(row_int(row))
-	record.job = Job_Id(row_int(row))
 	record.call = Call_Id(row_int(row))
 	record.parent_call = Call_Id(row_int(row))
-	record.task = row_text(row)
 	record.subagent = Session_Id(row_id(row))
-	record.hook = row_text(row)
 	record.provider = row_text(row)
 	record.model = row_text(row)
 	record.data = row_text(row)
@@ -982,6 +979,19 @@ row_enum :: proc(row: ^Row, names: [$Enum]string) -> Enum {
 	value, known := enum_from_name(names, name)
 	if !known { row.error = Journal_Error.Corrupt }
 	return value
+}
+
+// row_code reads an integer code of an enum whose values are 0 through max.
+// A code outside that range is corrupt. NULL reads as 0, which is a real code.
+@(private)
+row_code :: proc(row: ^Row, $T: typeid) -> T {
+	number := row_int(row)
+	if row.error != nil { return {} }
+	if number < 0 || number > i64(max(T)) {
+		row.error = Journal_Error.Corrupt
+		return {}
+	}
+	return T(u8(number))
 }
 
 // count_assistant_nodes returns how many assistant nodes session committed in

@@ -530,25 +530,27 @@ Records and nodes are journal-owned plain data (strings, integers, enums). `agen
 ```sql
 records(seq INTEGER PRIMARY KEY, time_ms INTEGER NOT NULL, mono_ns INTEGER NOT NULL,
         run BLOB NOT NULL, kind TEXT NOT NULL, session BLOB, branch INTEGER, node INTEGER,
-        turn INTEGER, request INTEGER, attempt INTEGER, job INTEGER, call INTEGER,
-        parent_call INTEGER, task TEXT, subagent BLOB, hook TEXT, provider TEXT, model TEXT,
-        data TEXT, body BLOB) STRICT
-nodes(session BLOB, node INTEGER, parent INTEGER, branch INTEGER, kind TEXT, turn INTEGER,
-      covers INTEGER, seq INTEGER NOT NULL, data TEXT, body BLOB, PRIMARY KEY(session, node)) STRICT
+        turn INTEGER, request INTEGER, attempt INTEGER, call INTEGER,
+        parent_call INTEGER, subagent BLOB, provider TEXT, model TEXT,
+        body BLOB, data TEXT NOT NULL) STRICT
+nodes(session BLOB, node INTEGER, parent INTEGER, branch INTEGER, kind TEXT NOT NULL, turn INTEGER,
+      covers INTEGER, seq INTEGER NOT NULL, data TEXT NOT NULL, body BLOB, PRIMARY KEY(session, node)) STRICT
 branches(session BLOB, branch INTEGER, base_node INTEGER, seq INTEGER NOT NULL,
          PRIMARY KEY(session, branch)) STRICT
 sessions(session BLOB PRIMARY KEY, created_ms INTEGER, workspace TEXT,
-         parent_session BLOB, parent_call INTEGER, role TEXT) STRICT
+         parent_session BLOB, parent_call INTEGER, role INTEGER) STRICT
 artifacts(digest BLOB PRIMARY KEY, kind TEXT, created_ms INTEGER, bytes BLOB) STRICT
--- the schema version is PRAGMA user_version
+-- PRAGMA user_version is 2. Version 1 and any other unknown version are refused.
+-- One empty STRICT table per remaining payload family is created and unused.
+-- records.data and nodes.data still hold the JSON payload.
 ```
 
 - Every table is append-only. Mutable facts (title, active branch, selection, ratings) are the latest record of their kind. A branch head is the highest `node` on that branch.
-- Indexes: `records(session, seq)`, `records(session, call) WHERE call IS NOT NULL`, `records(session, parent_call) WHERE parent_call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node) WHERE node IS NOT NULL`, `records(session, request) WHERE request IS NOT NULL`, `nodes(session, branch, node)`. A read with a call, parent call, request, or node filter uses the index of that column and the rowid range for `seq > ?`; a read with only kinds uses `(session, kind, seq)`. A read with a node filter orders by `+seq` and tests `+kind`, because the planner would otherwise pick `(session, seq)` or `(session, kind, seq)`, which satisfy the order and scan every record of the session; the sort is over the matching rows only. A turn or subagent filter has no index and scans the session.
+- Indexes: `records(session, seq) WHERE session IS NOT NULL`, `records(session, call, seq) WHERE call IS NOT NULL`, `records(session, parent_call, seq) WHERE parent_call IS NOT NULL`, `records(session, kind, seq)`, `records(session, node, seq) WHERE node IS NOT NULL`, `records(session, request, attempt) WHERE request IS NOT NULL`, `nodes(session, branch, node)`, `nodes(session, kind, node)`, `nodes(session, turn, kind) WHERE turn IS NOT NULL`. A read with a call, parent call, request, or node filter uses the index of that column and the rowid range for `seq > ?`; a read with only kinds uses `(session, kind, seq)`. A read with a node filter orders by `+seq` and tests `+kind`, because the planner would otherwise pick `(session, seq)` or `(session, kind, seq)`, which satisfy the order and scan every record of the session; the sort is over the matching rows only. A turn or subagent filter on `records` has no index and scans the session.
 - `data` is one JSON object per record, shaped by a versioned struct per kind (`version` field). `body` holds exact bytes. Queries use SQLite JSON functions over `data`; analysis needs no custom decoder.
 - `body` holds what the model sees: a `User` node's is the user's text, an `Assistant` node's is the model's visible text, `tool.proposed`'s is the argument document exactly as the model sent it, `tool.admitted`'s is the arguments the tool runs with, `tool.completed`'s is the rendered result, and the attachments of a `user.input` record, a `background.completed` record, a `User` node, or a `tool.completed` record are artifacts named in its `data`, and `response.committed`'s is the endpoint's native output items when it returned any. A `Checkpoint` node's body is its summary and a `Notice` node's is the feedback text. A Lua child's records carry a parent call and no node, so they never enter the projection or a `Results` node.
 - WAL, `synchronous = FULL`, `busy_timeout`, private 0700 directory and 0600 files. A writable open narrows an existing directory or file with wider modes to these. Several processes share the file, and SQLite serializes their write transactions, so no other journal mode is needed. Each session has one claim, held by the process that runs its turns (section 8.6).
-- Migrations are explicit steps stamped in the same transaction. A newer schema is refused. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
+- The schema version is stamped in the same transaction that creates the tables. This build reads only version 2. Version 1 and any other unknown version are refused, and a newer schema is refused. There is no migration. Corrupt or unreadable data is a typed error naming the session and seq; the harness never guesses.
 
 ### 8.3 Durability classes and write path
 
@@ -593,7 +595,7 @@ user.command command.applied
 
 `tool.admitted` carries `background: true` for a detached call, false otherwise.
 
-Every record fills the correlation columns that exist at that point: session, branch, node, turn, request, attempt, job, call, parent call, task, subagent, hook, provider, model. A record states one fact at the boundary that observed it, once. Summaries are computed by readers.
+Every record fills the correlation columns that exist at that point: session, branch, node, turn, request, attempt, call, parent call, subagent, provider, model. A record states one fact at the boundary that observed it, once. Summaries are computed by readers.
 
 `turn.started` carries the digests of what the turn runs with: instruction snapshot, tool schema set, active rules, hooks, config snapshot generation, model, and effort. Offline analysis joins on these.
 

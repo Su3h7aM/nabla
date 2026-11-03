@@ -42,7 +42,7 @@ Session_Row :: struct {
 	workspace:      string,
 	parent_session: Session_Id,
 	parent_call:    Call_Id,
-	role:           string,
+	role:           Session_Role,
 }
 
 @(private)
@@ -64,7 +64,7 @@ Insert :: enum {
 
 @(private)
 INSERT_SQL := [Insert]string {
-	.Record   = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, job, call, parent_call, task, subagent, hook, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+	.Record   = `INSERT INTO records (time_ms, mono_ns, run, kind, session, branch, node, turn, request, attempt, call, parent_call, subagent, provider, model, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
 	.Node     = `INSERT INTO nodes (session, node, parent, branch, kind, turn, covers, seq, data, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	.Branch   = `INSERT INTO branches (session, branch, base_node, seq) VALUES (?, ?, ?, ?)`,
 	.Session  = `INSERT INTO sessions (session, created_ms, workspace, parent_session, parent_call, role) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -179,8 +179,6 @@ record_buffer :: proc(journal: ^Journal, header: Record, data: $Payload, body: [
 	record.run = journal.run
 	record.time_ms = now_ms()
 	record.mono_ns = now_mono_ns()
-	record.task = batch_text(journal, header.task)
-	record.hook = batch_text(journal, header.hook)
 	record.provider = batch_text(journal, header.provider)
 	record.model = batch_text(journal, header.model)
 	record.data = batch_json(journal, data)
@@ -338,7 +336,7 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 				db.Value(row.workspace),
 				id_or_null(&row.parent_session),
 				int_or_null(row.parent_call),
-				db.Value(row.role),
+				db.Value(i64(row.role)),
 			}
 			db.statement_exec(&journal.inserts[.Session], arguments[:]) or_return
 		case Artifact_Row:
@@ -352,7 +350,7 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 
 @(private, require_results)
 insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, error: Error) {
-	arguments := [20]db.Value {
+	arguments := [17]db.Value {
 		db.Value(row.time_ms),
 		db.Value(row.mono_ns),
 		db.Value(row.run[:]),
@@ -363,12 +361,9 @@ insert_record :: proc(journal: ^Journal, row: ^Record) -> (seq: Journal_Seq, err
 		int_or_null(row.turn),
 		int_or_null(row.request),
 		int_or_null(row.attempt),
-		int_or_null(row.job),
 		int_or_null(row.call),
 		int_or_null(row.parent_call),
-		text_or_null(row.task),
 		id_or_null(&row.subagent),
-		text_or_null(row.hook),
 		text_or_null(row.provider),
 		text_or_null(row.model),
 		db.Value(row.data),

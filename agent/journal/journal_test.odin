@@ -354,6 +354,18 @@ test_open_refuses_a_database_this_build_does_not_read :: proc(test: ^testing.T) 
 	_expect_error(test, open_error_2, .Schema_Too_New)
 	testing.expect(test, refused_2 == nil, "a refused open returns no journal")
 
+	// Version 1 is the previous schema. This build does not read it.
+	_expect_db_ok(test, sqlite.open(&connection, {path = database_path}))
+	_expect_db_ok(test, db.exec(&connection, "PRAGMA user_version = 1"))
+	_expect_db_ok(test, db.close(&connection))
+
+	refused_old, open_error_old := open(directory, directory, _test_run_id(), .Read_Write)
+	_expect_error(test, open_error_old, .Schema_Unknown)
+	testing.expect(test, refused_old == nil, "a refused open returns no journal")
+	refused_old_reader, open_error_old_reader := open(directory, directory, _test_run_id(), .Read_Only)
+	_expect_error(test, open_error_old_reader, .Schema_Unknown)
+	testing.expect(test, refused_old_reader == nil, "a refused open returns no journal")
+
 	// A database someone else wrote holds no version this package can read.
 	foreign_directory := _temp_directory(test)
 	defer _remove_directory(foreign_directory)
