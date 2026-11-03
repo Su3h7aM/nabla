@@ -275,42 +275,86 @@ read_last_node :: proc(journal: ^Journal, session: Session_Id, kind: Node_Kind, 
 @(require_results)
 read_ancestry :: proc(journal: ^Journal, session: Session_Id, head: Node_Id, allocator: mem.Allocator) -> (nodes: []Node, error: Error) {
 	assert(journal.open)
-	list := make([dynamic]Node, allocator) or_return
-	defer if error != nil { nodes_destroy(list[:], allocator) }
+	if head == 0 { return nil, nil }
+	stop := chain_checkpoint_cover(journal, session, head) or_return
+	list := chain_nodes(journal, session, head, stop, allocator) or_return
 
-	// K is appended after the nodes before it, so one reverse gives the order.
-	checkpoint: Maybe(Node)
-	defer if error != nil {
-		if node, has := checkpoint.?; has { node_destroy(&node, allocator) }
-	}
-	stop := Node_Id(0)
-	for walk := head; walk != 0 && walk != stop; {
-		node := read_node(journal, session, walk, allocator) or_return
-		// Ids grow in commit order, so a parent at or above its child is damage
-		// that would otherwise loop.
-		if node.parent >= walk {
-			node_session := node.session
-			node_seq := node.seq
-			node_destroy(&node, allocator)
-			return nil, corrupt(journal, Journal_Error.Corrupt, node_session, node_seq)
+	// The first checkpoint on the way moves to the end of the walk, which is the
+	// front of the result after the reverse below.
+	for index in 0 ..< len(list) {
+		if list[index].kind != .Checkpoint { continue }
+		for moved in index ..< len(list) - 1 {
+			list[moved], list[moved + 1] = list[moved + 1], list[moved]
 		}
-		walk = node.parent
-		if node.kind == .Checkpoint && checkpoint == nil {
-			checkpoint = node
-			stop = node.covers
-			continue
-		}
-		if _, append_error := append(&list, node); append_error != nil {
-			node_destroy(&node, allocator)
-			return nil, append_error
-		}
-	}
-	if node, has := checkpoint.?; has {
-		append(&list, node) or_return
-		checkpoint = nil
+		break
 	}
 	slice.reverse(list[:])
 	return list[:], nil
+}
+
+// chain_checkpoint_cover returns the covers of the newest Checkpoint on the parent chain
+// of head, or 0 when the chain has none. Only ids and kinds are read.
+@(private, require_results)
+chain_checkpoint_cover :: proc(journal: ^Journal, session: Session_Id, head: Node_Id) -> (covers: Node_Id, error: Error) {
+	session := session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, CHAIN_CHECKPOINT_QUERY, {db.Value(session[:]), db.Value(i64(head)), i64(Node_Kind.Checkpoint)}) or_return
+	values, has_row := db.rows_next(&rows) or_return
+	if !has_row { return 0, nil }
+	row := Row {
+		values = values,
+	}
+	covers = Node_Id(row_int(&row))
+	if row.error != nil { return 0, corrupt(journal, row.error, session, 0) }
+	return covers, nil
+}
+
+// chain_nodes reads the parent chain of head down to stop, excluded, in one query, newest
+// first, with the children each kind carries. A parent the chain names but the session does
+// not hold is Corrupt. The result is owned by allocator.
+@(private, require_results)
+chain_nodes :: proc(journal: ^Journal, session: Session_Id, head, stop: Node_Id, allocator: mem.Allocator) -> (list: [dynamic]Node, error: Error) {
+	session := session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, CHAIN_NODES_QUERY, {db.Value(session[:]), db.Value(i64(head)), db.Value(i64(stop))}) or_return
+	list = make([dynamic]Node, allocator) or_return
+	defer if error != nil { nodes_destroy(list[:], allocator) }
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		node, failed_session, failed_seq, scanned_ok := scan_node_checked(&row, allocator)
+		if !scanned_ok { return list, corrupt(journal, row.error, failed_session, failed_seq) }
+		if _, append_error := append(&list, node); append_error != nil {
+			node_destroy(&node, allocator)
+			return list, append_error
+		}
+	}
+	if close_error := db.rows_close(&rows); close_error != nil { return list, close_error }
+
+	// A chain that ends above stop, or a head the session does not hold, names a parent
+	// that is not there. Ids grow in commit order, so a parent at or above its child is
+	// damage that would otherwise loop.
+	if len(list) == 0 {
+		if head != stop { return list, corrupt(journal, Journal_Error.Corrupt, session, 0) }
+		return list, nil
+	}
+	for node in list {
+		if node.parent >= node.id { return list, corrupt(journal, Journal_Error.Corrupt, node.session, node.seq) }
+	}
+	last := list[len(list) - 1]
+	if last.parent != 0 && last.parent != stop { return list, corrupt(journal, Journal_Error.Corrupt, last.session, last.seq) }
+	for &node in list {
+		if load_error := load_node_children(journal, &node, allocator); load_error != nil {
+			return list, corrupt(journal, load_error, node.session, node.seq)
+		}
+	}
+	return list, nil
 }
 
 // read_path returns the ids on the parent chain from head back to the root, oldest
@@ -661,6 +705,28 @@ NODE_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND node
 
 @(private)
 NODE_LAST_QUERY :: "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ? AND kind = ? ORDER BY node DESC LIMIT 1"
+
+// The newest checkpoint on the parent chain of node ?2 in session ?1 and what it covers.
+@(private)
+CHAIN_CHECKPOINT_QUERY :: `WITH RECURSIVE chain(node, parent) AS (
+	SELECT node, parent FROM nodes WHERE session = ?1 AND node = ?2
+	UNION
+	SELECT nodes.node, nodes.parent FROM nodes JOIN chain ON nodes.session = ?1 AND nodes.node = chain.parent)
+SELECT nodes.covers FROM chain JOIN nodes ON nodes.session = ?1 AND nodes.node = chain.node
+WHERE nodes.kind = ?3 ORDER BY nodes.node DESC LIMIT 1`
+
+// The nodes of the parent chain of node ?2 in session ?1 down to node ?3, which is not read.
+// The walk never passes ?3, so a checkpoint's covered history stays unread.
+@(private)
+CHAIN_NODES_QUERY ::
+	"WITH RECURSIVE chain(node, parent) AS (" +
+	"SELECT node, parent FROM nodes WHERE session = ?1 AND node = ?2 AND ?2 != ?3 " +
+	"UNION " +
+	"SELECT nodes.node, nodes.parent FROM nodes JOIN chain ON nodes.session = ?1 AND nodes.node = chain.parent " +
+	"WHERE nodes.node != ?3) " +
+	"SELECT " +
+	NODE_COLUMNS +
+	" FROM nodes WHERE session = ?1 AND node IN (SELECT node FROM chain) ORDER BY node DESC"
 
 // The parent chain of node ?2 in session ?1: UNION drops a repeated node so a damaged parent that points back cannot loop, and ids grow in commit order so
 // ordering by id is oldest first.
