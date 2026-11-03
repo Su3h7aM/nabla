@@ -349,10 +349,8 @@ chain_nodes :: proc(journal: ^Journal, session: Session_Id, head, stop: Node_Id,
 	}
 	last := list[len(list) - 1]
 	if last.parent != 0 && last.parent != stop { return list, corrupt(journal, Journal_Error.Corrupt, last.session, last.seq) }
-	for &node in list {
-		if load_error := load_node_children(journal, &node, allocator); load_error != nil {
-			return list, corrupt(journal, load_error, node.session, node.seq)
-		}
+	if load_error := load_chain_children(journal, session, head, stop, list[:], allocator); load_error != nil {
+		return list, corrupt(journal, load_error, session, 0)
 	}
 	return list, nil
 }
@@ -715,18 +713,28 @@ CHAIN_CHECKPOINT_QUERY :: `WITH RECURSIVE chain(node, parent) AS (
 SELECT nodes.covers FROM chain JOIN nodes ON nodes.session = ?1 AND nodes.node = chain.node
 WHERE nodes.kind = ?3 ORDER BY nodes.node DESC LIMIT 1`
 
-// The nodes of the parent chain of node ?2 in session ?1 down to node ?3, which is not read.
-// The walk never passes ?3, so a checkpoint's covered history stays unread.
+// CHAIN_WITH names the parent chain of node ?2 in session ?1 down to node ?3, which is not
+// read: a checkpoint's covered history stays unread. Every chain query starts with it.
 @(private)
-CHAIN_NODES_QUERY ::
+CHAIN_WITH ::
 	"WITH RECURSIVE chain(node, parent) AS (" +
 	"SELECT node, parent FROM nodes WHERE session = ?1 AND node = ?2 AND ?2 != ?3 " +
 	"UNION " +
 	"SELECT nodes.node, nodes.parent FROM nodes JOIN chain ON nodes.session = ?1 AND nodes.node = chain.parent " +
-	"WHERE nodes.node != ?3) " +
-	"SELECT " +
-	NODE_COLUMNS +
-	" FROM nodes WHERE session = ?1 AND node IN (SELECT node FROM chain) ORDER BY node DESC"
+	"WHERE nodes.node != ?3) "
+
+@(private)
+CHAIN_NODES_QUERY :: CHAIN_WITH + "SELECT " + NODE_COLUMNS + " FROM nodes WHERE session = ?1 AND node IN (SELECT node FROM chain) ORDER BY node DESC"
+
+// Attachments and result calls of the chain, newest node first, in ordinal order within a node.
+@(private)
+CHAIN_ATTACHMENTS_QUERY ::
+	CHAIN_WITH +
+	"SELECT node, media_type, name, digest FROM node_attachment WHERE session = ?1 AND node IN (SELECT node FROM chain) ORDER BY node DESC, ordinal"
+
+@(private)
+CHAIN_RESULT_CALLS_QUERY ::
+	CHAIN_WITH + "SELECT node, call FROM node_result_call WHERE session = ?1 AND node IN (SELECT node FROM chain) ORDER BY node DESC, ordinal"
 
 // The parent chain of node ?2 in session ?1: UNION drops a repeated node so a damaged parent that points back cannot loop, and ids grow in commit order so
 // ordering by id is oldest first.
@@ -1006,42 +1014,150 @@ load_user_attachments :: proc(journal: ^Journal, node: ^Node, allocator: mem.All
 			values    = values,
 			allocator = allocator,
 		}
-		attachment := Attachment {
-			media_type = row_text(&row),
-			name       = row_text(&row),
-		}
-		digest_bytes := row_bytes(&row)
-		if row.error != nil {
-			attachment_destroy(&attachment, allocator)
-			delete(digest_bytes, allocator)
-			return row.error
-		}
-		if len(digest_bytes) != size_of(Digest) || attachment.media_type == "" {
-			attachment_destroy(&attachment, allocator)
-			delete(digest_bytes, allocator)
-			return Journal_Error.Corrupt
-		}
-		digest: Digest
-		copy(digest[:], digest_bytes)
-		delete(digest_bytes, allocator)
-		hex: [DIGEST_HEX_LENGTH]u8
-		cloned, clone_error := strings.clone(digest_to_hex(digest, hex[:]), allocator)
-		if clone_error != nil {
-			attachment_destroy(&attachment, allocator)
-			return clone_error
-		}
-		attachment.digest = cloned
+		attachment := attachment_scan(&row, allocator) or_return
 		if _, append_error := append(&list, attachment); append_error != nil {
 			attachment_destroy(&attachment, allocator)
 			return append_error
 		}
 	}
 	// A dynamic array's backing is sized to its capacity, so the owned slice is an exact copy.
-	exact, clone_error := slice.clone(list[:], allocator)
-	if clone_error != nil { return clone_error }
-	delete(list)
+	exact := slice.clone(list[:], allocator) or_return
 	user.attachments = exact
 	node.payload = user
+	return nil
+}
+
+// attachment_scan reads one attachment row: media type, name, and digest. The strings are
+// owned by allocator; a row that is not an attachment is Corrupt and owns nothing.
+@(private, require_results)
+attachment_scan :: proc(row: ^Row, allocator: mem.Allocator) -> (attachment: Attachment, error: Error) {
+	attachment = Attachment {
+		media_type = row_text(row),
+		name       = row_text(row),
+	}
+	digest_bytes := row_bytes(row)
+	defer delete(digest_bytes, allocator)
+	if row.error != nil {
+		attachment_destroy(&attachment, allocator)
+		return {}, row.error
+	}
+	if len(digest_bytes) != size_of(Digest) || attachment.media_type == "" {
+		attachment_destroy(&attachment, allocator)
+		return {}, Journal_Error.Corrupt
+	}
+	digest: Digest
+	copy(digest[:], digest_bytes)
+	hex: [DIGEST_HEX_LENGTH]u8
+	attachment.digest, error = strings.clone(digest_to_hex(digest, hex[:]), allocator)
+	if error != nil {
+		attachment_destroy(&attachment, allocator)
+		return {}, error
+	}
+	return attachment, nil
+}
+
+// load_chain_children fills the attachments of the User nodes and the calls of the Results
+// nodes among nodes, the chain from head down to stop, with one query per kind. Rows come
+// newest node first, as nodes do, so a cursor over nodes meets each owner once.
+@(private, require_results)
+load_chain_children :: proc(journal: ^Journal, session: Session_Id, head, stop: Node_Id, nodes: []Node, allocator: mem.Allocator) -> Error {
+	if attachments_error := load_chain_attachments(journal, session, head, stop, nodes, allocator); attachments_error != nil {
+		return attachments_error
+	}
+	return load_chain_result_calls(journal, session, head, stop, nodes, allocator)
+}
+
+@(private, require_results)
+load_chain_attachments :: proc(journal: ^Journal, session: Session_Id, head, stop: Node_Id, nodes: []Node, allocator: mem.Allocator) -> (error: Error) {
+	session := session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, CHAIN_ATTACHMENTS_QUERY, {db.Value(session[:]), db.Value(i64(head)), db.Value(i64(stop))}) or_return
+	group: [dynamic]Attachment
+	defer {
+		for &attachment in group { attachment_destroy(&attachment, allocator) }
+		delete(group)
+	}
+	cursor := 0
+	owner := Node_Id(0)
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values    = values,
+			allocator = allocator,
+		}
+		node_id := Node_Id(row_int(&row))
+		attachment := attachment_scan(&row, allocator) or_return
+		if node_id != owner {
+			assign_chain_attachments(nodes, &cursor, owner, &group, allocator) or_return
+			owner = node_id
+		}
+		if _, append_error := append(&group, attachment); append_error != nil {
+			attachment_destroy(&attachment, allocator)
+			return append_error
+		}
+	}
+	return assign_chain_attachments(nodes, &cursor, owner, &group, allocator)
+}
+
+// assign_chain_attachments gives the attachments gathered for owner to its node and empties
+// group. Owner 0 has nothing gathered. An owner that nodes does not hold is Corrupt.
+@(private, require_results)
+assign_chain_attachments :: proc(nodes: []Node, cursor: ^int, owner: Node_Id, group: ^[dynamic]Attachment, allocator: mem.Allocator) -> Error {
+	if owner == 0 { return nil }
+	for cursor^ < len(nodes) && nodes[cursor^].id != owner { cursor^ += 1 }
+	if cursor^ == len(nodes) || nodes[cursor^].kind != .User { return Journal_Error.Corrupt }
+	node := &nodes[cursor^]
+	payload, has_payload := node.payload.?
+	user, is_user := payload.(User)
+	if !has_payload || !is_user { return Journal_Error.Corrupt }
+	exact := slice.clone(group[:], allocator) or_return
+	user.attachments = exact
+	node.payload = user
+	clear(group)
+	return nil
+}
+
+@(private, require_results)
+load_chain_result_calls :: proc(journal: ^Journal, session: Session_Id, head, stop: Node_Id, nodes: []Node, allocator: mem.Allocator) -> (error: Error) {
+	session := session
+	rows: db.Rows
+	defer _ = db.rows_close(&rows)
+	db.query(&journal.connection, &rows, CHAIN_RESULT_CALLS_QUERY, {db.Value(session[:]), db.Value(i64(head)), db.Value(i64(stop))}) or_return
+	group: [dynamic]Call_Id
+	defer delete(group)
+	cursor := 0
+	owner := Node_Id(0)
+	for {
+		values, has_row := db.rows_next(&rows) or_return
+		if !has_row { break }
+		row := Row {
+			values = values,
+		}
+		node_id := Node_Id(row_int(&row))
+		call := row_int(&row)
+		if row.error != nil { return row.error }
+		if call <= 0 { return Journal_Error.Corrupt }
+		if node_id != owner {
+			assign_chain_calls(nodes, &cursor, owner, &group, allocator) or_return
+			owner = node_id
+		}
+		append(&group, Call_Id(call)) or_return
+	}
+	return assign_chain_calls(nodes, &cursor, owner, &group, allocator)
+}
+
+@(private, require_results)
+assign_chain_calls :: proc(nodes: []Node, cursor: ^int, owner: Node_Id, group: ^[dynamic]Call_Id, allocator: mem.Allocator) -> Error {
+	if owner == 0 { return nil }
+	for cursor^ < len(nodes) && nodes[cursor^].id != owner { cursor^ += 1 }
+	if cursor^ == len(nodes) || nodes[cursor^].kind != .Results { return Journal_Error.Corrupt }
+	exact := slice.clone(group[:], allocator) or_return
+	nodes[cursor^].payload = Results {
+		calls = exact,
+	}
+	clear(group)
 	return nil
 }
 
