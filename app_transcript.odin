@@ -578,8 +578,11 @@ transcript_reduce :: proc(app: ^App) {
 	if transcript.first > 0 { first = transcript.path[transcript.first] }
 
 	sync.mutex_guard(&app.run.mu)
+	// Each live entry's coverage reads only the window, so the covered ones are
+	// released in place and the rest are compacted in one forward pass.
 	entries := &app.run.snap.entries
-	for index := len(entries) - 1; index >= 0; index -= 1 {
+	kept := 0
+	for index in 0 ..< len(entries) {
 		entry := &entries[index]
 		covered := entry.after < first && !entry.running && (entry.kind != .Assistant || entry.complete)
 		switch {
@@ -590,7 +593,11 @@ transcript_reduce :: proc(app: ^App) {
 		case entry.kind == .User || entry.kind == .Subagent || entry.kind == .Notice:
 			covered ||= transcript_has_text(transcript, entry)
 		}
-		if !covered { continue }
+		if !covered {
+			entries[kept] = entries[index]
+			kept += 1
+			continue
+		}
 		if entry.call != 0 {
 			for &stored in transcript.entries {
 				if stored.call != entry.call { continue }
@@ -601,20 +608,22 @@ transcript_reduce :: proc(app: ^App) {
 		}
 		app.run.snap.image_bytes -= entry.image.bytes
 		entry_destroy(entry)
-		ordered_remove(entries, index)
 	}
+	resize(entries, kept)
 	boxes_prune(app)
 }
 
+// The window's newest entries are searched first: a live entry is almost always the
+// continuation of the newest window entries, so the match sits at the end.
 transcript_has_call :: proc(transcript: ^Transcript, call: journal.Call_Id) -> bool {
-	for entry in transcript.entries {
+	#reverse for entry in transcript.entries {
 		if entry.call == call { return true }
 	}
 	return false
 }
 
 transcript_has_text :: proc(transcript: ^Transcript, live: ^Entry) -> bool {
-	for entry in transcript.entries {
+	#reverse for entry in transcript.entries {
 		if entry.kind == live.kind && entry.node >= live.after && string(entry.text[:]) == string(live.text[:]) { return true }
 	}
 	return false
