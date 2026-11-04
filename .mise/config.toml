@@ -4,7 +4,7 @@
 # repository root clean and is higher precedence than .config/mise/config.toml.
 
 [tools]
-odin = "dev-2026-11"
+odin = "latest"
 
 [task_config]
 # Replaces mise's default task directories (mise-tasks/, .mise/tasks/, ...) so

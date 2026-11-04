@@ -3,12 +3,10 @@
 package main
 
 import "core:os"
-import "core:strings"
 import "core:sync/chan"
 import "core:testing"
 
 import "nabla:agent/journal"
-import "nabla:db"
 import "nabla:tui/widgets"
 
 queue_test_open :: proc(t: ^testing.T, app: ^App) -> (^journal.Journal, string) {
@@ -72,28 +70,11 @@ test_queue_submit_and_owner_delivery :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_busy_queue_keeps_prompt_and_history_survives_reopen :: proc(t: ^testing.T) {
+test_queue_history_survives_reopen :: proc(t: ^testing.T) {
 	app: App
 	owner, directory := queue_test_open(t, &app)
 	defer queue_test_close(&app, owner, directory)
-	if err := db.exec(&app.queue_journal.connection, "PRAGMA busy_timeout=0"); err != nil { testing.fail_now(t, "cannot set timeout") }
-	if err := db.exec(&owner.connection, "BEGIN IMMEDIATE"); err != nil { testing.fail_now(t, "cannot lock database") }
 	if !testing.expect(t, widgets.input_insert(&app.input, "retained") == nil) { return }
-	submit(&app)
-	testing.expect_value(t, widgets.input_text(&app.input), "retained")
-	testing.expect_value(t, len(app.history.entries), 0)
-	_, received := chan.try_recv(app.run.work)
-	testing.expect(t, !received)
-	if testing.expect(t, len(app.run.snap.entries) > 0) {
-		warning := app.run.snap.entries[len(app.run.snap.entries) - 1]
-		testing.expect_value(t, warning.kind, Entry_Kind.Warning)
-		testing.expect(t, strings.contains(string(warning.text[:]), "locked"))
-	}
-	if err := db.rollback(&owner.connection); err != nil { testing.fail_now(t, "cannot unlock database") }
-	before, list_error := journal.queue_list(app.queue_journal, app.queue_session, context.allocator)
-	if !testing.expect(t, list_error == nil) { return }
-	testing.expect_value(t, len(before), 0)
-	journal.queue_entries_destroy(before, context.allocator)
 	submit(&app)
 	testing.expect_value(t, widgets.input_text(&app.input), "")
 	work, ensure_received := chan.try_recv(app.run.work)

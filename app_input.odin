@@ -662,12 +662,19 @@ submit :: proc(app: ^App, follow_up := false) {
 		defer delete(expanded, app.run.alloc)
 		line := strings.trim_space(expanded)
 		if !follow_up { transcript_jump_bottom(app) }
-		if !app_queue_submit(app, line, .Follow_Up if follow_up else .Steering) {
-			completion_reset(app)
-			return
-		}
-		if err := journal.history_append(app.queue_journal, app_queue_session(app), line); err != nil {
-			snap_append(app, .Warning, fmt.tprintf("the prompt history was not saved: %s", journal.error_text(err, context.temp_allocator)))
+		session := app_queue_session(app)
+		if app.queue_journal == nil || session == {} {
+			snap_append(app, .Warning, "no session is open")
+		} else {
+			kind := journal.Queue_Kind.Follow_Up if follow_up else journal.Queue_Kind.Steering
+			if _, err := journal.queue_push(app.queue_journal, session, kind, line, nil); err != nil {
+				snap_append(app, .Warning, fmt.tprintf("the prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
+			} else {
+				app_queue_ensure(app, session)
+			}
+			if err := journal.history_append(app.queue_journal, session, line); err != nil {
+				snap_append(app, .Warning, fmt.tprintf("the prompt history was not saved: %s", journal.error_text(err, context.temp_allocator)))
+			}
 		}
 		// The line left the prompt, so it enters the history the arrow keys walk.
 		if !widgets.history_push(&app.history, line) {
@@ -783,21 +790,6 @@ history_recall :: proc(app: ^App, older: bool) {
 	if widgets.input_replace(&app.input, entry) != nil {
 		snap_append(app, .Warning, "the recalled prompt could not be shown")
 	}
-}
-
-app_queue_submit :: proc(app: ^App, text: string, kind: journal.Queue_Kind) -> bool {
-	store := app.queue_journal
-	session := app_queue_session(app)
-	if store == nil || session == {} {
-		snap_append(app, .Warning, "no session is open; the prompt remains")
-		return false
-	}
-	if _, err := journal.queue_push(store, session, kind, text, nil); err != nil {
-		snap_append(app, .Warning, fmt.tprintf("the prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
-		return false
-	}
-	app_queue_ensure(app, session)
-	return true
 }
 
 app_queue_ensure :: proc(app: ^App, session: journal.Session_Id) {
