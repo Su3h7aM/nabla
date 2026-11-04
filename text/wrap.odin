@@ -56,7 +56,7 @@ wrap_next :: proc(iterator: ^Wrap_Iterator) -> (line: string, status: Wrap_Statu
 		fitted = cluster.end
 		// A tab cell is also " ", but a tab is not a break point: its
 		// cells may not all fit, and a break there leaves an empty row.
-		if cluster.text == " " && iterator._rest[cluster.end - 1] == ' ' {
+		if len(cluster.text) > 0 && cluster.text[0] == ' ' && iterator._rest[cluster.end - 1] == ' ' {
 			last_space = cluster.end
 		}
 	}

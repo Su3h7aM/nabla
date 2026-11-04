@@ -56,6 +56,14 @@ sanitizer_write :: proc(sanitizer: ^Sanitizer, buffer: ^[dynamic]u8, chunk: stri
 		}
 	}
 	for len(rest) > 0 {
+		if sanitizer.state == .Text {
+			run_end := sanitizer_write_run(rest)
+			if run_end > 0 {
+				sanitizer_write_run_bytes(sanitizer, buffer, rest[:run_end]) or_return
+				rest = rest[run_end:]
+				continue
+			}
+		}
 		r, size := utf8.decode_rune(rest)
 		if r == utf8.RUNE_ERROR && size == 1 {
 			if !utf8.full_rune(rest) {
@@ -68,6 +76,40 @@ sanitizer_write :: proc(sanitizer: ^Sanitizer, buffer: ^[dynamic]u8, chunk: stri
 			sanitizer_step(sanitizer, buffer, r) or_return
 		}
 		rest = rest[size:]
+	}
+	return nil
+}
+
+// sanitizer_write_run returns the length of the run of bytes at the start of
+// value that pass through unchanged in Text state: printable ASCII except ESC,
+// plus tab and newline. An empty return means the first byte needs the slow path.
+@(private = "file")
+sanitizer_write_run :: proc(value: string) -> int {
+	run_end := 0
+	for run_end < len(value) {
+		held := value[run_end]
+		if !((0x20 <= held && held <= 0x7E) || held == '\t' || held == '\n') {
+			break
+		}
+		run_end += 1
+	}
+	return run_end
+}
+
+// sanitizer_write_run_bytes appends a run from sanitizer_write_run to buffer.
+// It handles the only state the run interacts with: after_cr suppresses a
+// leading newline. The only error is an allocation failure of buffer.
+@(private = "file")
+sanitizer_write_run_bytes :: proc(sanitizer: ^Sanitizer, buffer: ^[dynamic]u8, run: string) -> runtime.Allocator_Error {
+	after_cr := sanitizer.after_cr
+	sanitizer.after_cr = false
+	start := 0
+	if after_cr && run[0] == '\n' {
+		start = 1
+	}
+	if start < len(run) {
+		_, err := append(buffer, run[start:])
+		return err
 	}
 	return nil
 }
