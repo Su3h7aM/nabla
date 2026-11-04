@@ -4,6 +4,7 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:sync"
+import "core:time"
 
 import "nabla:agent"
 import "nabla:agent/journal"
@@ -570,7 +571,7 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 			return
 		}
 		// Alt+Enter queues a follow-up while a turn runs; otherwise it is a newline.
-		if key.modifiers & {.Shift, .Alt} == {.Alt} && runtime_busy(app) && !app.steer.editing {
+		if key.modifiers & {.Shift, .Alt} == {.Alt} && !app.steer.editing {
 			submit(app, follow_up = true)
 			return
 		}
@@ -661,21 +662,13 @@ submit :: proc(app: ^App, follow_up := false) {
 		}
 		defer delete(expanded, app.run.alloc)
 		line := strings.trim_space(expanded)
-		// A follower has no turn of its own to steer: its line goes to the runner as a
-		// prompt, and the runner delivers it at its next settled point.
-		if runtime_busy(app) {
-			// A steering line is not a command: commands keep their own path, which
-			// decides what can happen while a turn is running.
-			if !follow_up { transcript_jump_bottom(app) }
-			if !agent.steer_push(&app.run.follow_ups if follow_up else &app.run.steer, line) {
-				// The prompt still holds the text rather than clearing it into a warning.
-				snap_append(app, .Warning, "the message could not be queued; it is still in the prompt")
-				completion_reset(app)
-				return
-			}
-		} else {
-			transcript_jump_bottom(app)
-			enqueue(app, .Prompt, line)
+		if !follow_up { transcript_jump_bottom(app) }
+		if !app_queue_submit(app, line, .Follow_Up if follow_up else .Steering) {
+			completion_reset(app)
+			return
+		}
+		if err := journal.history_append(app.queue_journal, app_queue_session(app), line); err != nil {
+			snap_append(app, .Warning, fmt.tprintf("the prompt history was not saved: %s", journal.error_text(err, context.temp_allocator)))
 		}
 		// The line left the prompt, so it enters the history the arrow keys walk.
 		if !widgets.history_push(&app.history, line) {
@@ -791,4 +784,82 @@ history_recall :: proc(app: ^App, older: bool) {
 	if widgets.input_replace(&app.input, entry) != nil {
 		snap_append(app, .Warning, "the recalled prompt could not be shown")
 	}
+}
+
+// QUEUE_PUSH_RETRY is the one-shot delay before retrying a busy queue insertion, not a poll or heartbeat.
+QUEUE_PUSH_RETRY :: 250 * time.Millisecond
+
+app_queue_submit :: proc(app: ^App, text: string, kind: journal.Queue_Kind) -> bool {
+	store := app.queue_journal
+	session := app_queue_session(app)
+	if store == nil || session == {} {
+		snap_append(app, .Warning, "no session is open; the prompt remains")
+		return false
+	}
+	// Preserve ordering when an earlier insert is waiting on the database.
+	if len(app.pending_prompts) == 0 {
+		_, err := journal.queue_push(store, session, kind, text, nil)
+		if err == nil {
+			app_queue_ensure(app, session)
+			return true
+		}
+		if !journal.error_is_busy(err) {
+			snap_append(app, .Warning, fmt.tprintf("the prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
+			return false
+		}
+	}
+	copy, err := strings.clone(text, app.run.alloc)
+	if err != nil { return false }
+	if _, append_error := append(&app.pending_prompts, Pending_Prompt{session, kind, copy}); append_error != nil {
+		delete(copy, app.run.alloc)
+		return false
+	}
+	app.queue_retry_at = time.tick_add(time.tick_now(), QUEUE_PUSH_RETRY)
+	app_queue_ensure(app, session)
+	return true
+}
+
+app_queue_flush :: proc(app: ^App) {
+	if len(app.pending_prompts) == 0 || time.tick_diff(time.tick_now(), app.queue_retry_at) > 0 { return }
+	for len(app.pending_prompts) > 0 {
+		prompt := app.pending_prompts[0]
+		_, err := journal.queue_push(app.queue_journal, prompt.session, prompt.kind, prompt.text, nil)
+		if err != nil {
+			app.queue_retry_at = time.tick_add(time.tick_now(), QUEUE_PUSH_RETRY)
+			if !journal.error_is_busy(err) {
+				snap_append(app, .Warning, fmt.tprintf("the pending prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
+			}
+			return
+		}
+		delete(prompt.text, app.run.alloc)
+		ordered_remove(&app.pending_prompts, 0)
+		app_queue_ensure(app, prompt.session)
+	}
+	app.queue_retry_at = {}
+}
+
+app_queue_ensure :: proc(app: ^App, session: journal.Session_Id) {
+	if !work_send(app, {kind = .Ensure_Server, session = session}) {
+		snap_append(app, .Warning, "the session server could not be requested")
+	}
+}
+
+app_history_load :: proc(app: ^App) {
+	session := app_queue_session(app)
+	if app.queue_journal == nil || session == {} || session == app.history_session { return }
+	entries, err := journal.history_list(app.queue_journal, session, app.run.alloc)
+	if err != nil {
+		snap_append(app, .Warning, fmt.tprintf("the prompt history could not be loaded: %s", journal.error_text(err, context.temp_allocator)))
+		return
+	}
+	defer journal.history_destroy(entries, app.run.alloc)
+	widgets.history_destroy(&app.history)
+	widgets.history_init(&app.history, app.run.alloc)
+	for entry in entries {
+		if !widgets.history_push(&app.history, entry) {
+			snap_append(app, .Warning, "the prompt history could not be loaded")
+			break
+		}
+	}
+	app.history_session = session
 }

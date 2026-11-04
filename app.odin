@@ -205,7 +205,7 @@ Snapshot :: struct {
 }
 
 Work_Kind :: enum u8 {
-	Prompt,
+	Ensure_Server,
 	Compact,
 	Status,
 	Effort,
@@ -221,8 +221,9 @@ Work_Kind :: enum u8 {
 	Resume_Session,
 }
 Work :: struct {
-	kind: Work_Kind,
-	text: string, // owned; prompt, effort text, or session reference, empty otherwise,
+	kind:    Work_Kind,
+	text:    string, // owned; prompt, effort text, or session reference, empty otherwise,
+	session: journal.Session_Id,
 }
 
 Work_Chan :: chan.Chan(Work)
@@ -373,14 +374,6 @@ Runtime :: struct {
 	cancel_requested:         bool,
 	// pending_target is owner-thread state retained while the target model is being fit.
 	pending_target:           Maybe(Pending_Target),
-	// steer carries lines typed while a turn is running. The front-end pushes
-	// them as they arrive and the worker drains them at request boundaries, which
-	// is why it is written from one thread and read from another.
-	steer:                    agent.Steer_Queue,
-	// follow_ups holds the messages queued with Alt+Enter, which are sent one at a time as
-	// turns end. Only the front-end's thread uses it; it is a queue to share the editing
-	// of steer.
-	follow_ups:               agent.Steer_Queue,
 	// control stops the turn the worker runs. The front-end requests; the worker clears it
 	// before each turn it starts.
 	control:                  agent.Turn_Control,
@@ -537,6 +530,15 @@ tui_run :: proc(
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
 	widgets.history_init(&app.history, app.run.alloc)
+	queue_store, queue_error := session_store_open(&app.setup)
+	if queue_error != nil {
+		fmt.eprintln("nabla: cannot open prompt queue:", journal.error_text(queue_error, context.temp_allocator))
+		app_abandoned = app_teardown(app)
+		return false
+	}
+	app.queue_journal = queue_store
+	app.queue_session = app.setup.follow_client.session
+	app_history_load(app)
 	app.storage = frame_storage_new(app.run.alloc)
 	if app.storage == nil {
 		fmt.eprintln("nabla: cannot allocate the frame budget")
@@ -561,8 +563,6 @@ tui_run :: proc(
 		return false
 	}
 	app.run.work = work
-	app.run.steer = agent.steer_queue_init(app.run.alloc)
-	app.run.follow_ups = agent.steer_queue_init(app.run.alloc)
 
 	terminal, open_err := term.open({alternate_screen = true, hide_cursor = true, bracketed_paste = true, mouse = true, input_mode = .Raw}, app.run.alloc)
 	if open_err != nil {
@@ -581,6 +581,11 @@ tui_run :: proc(
 		}
 		// The screen is restored, so the message stays on the user's terminal.
 		if app_abandoned { fmt.eprintln("nabla: a thread did not stop in time; the process exits without releasing what it still uses") }
+		for prompt in app.pending_prompts {
+			fmt.eprintfln("nabla: prompt was not queued: %s", prompt.text)
+			delete(prompt.text, app.run.alloc)
+		}
+		delete(app.pending_prompts)
 	}
 	app.terminal = terminal
 
@@ -662,6 +667,8 @@ tui_run :: proc(
 			read_failed = true
 			break
 		}
+		app_history_load(app)
+		app_queue_flush(app)
 		for event in app.raw {
 			handle_event(app, event)
 		}
@@ -740,8 +747,13 @@ tui_run :: proc(
 // change that needs a frame signals the wake, and until the next spinner frame while a
 // turn runs, because the spinner animates without any change to signal.
 tui_wait_ms :: proc(app: ^App) -> i64 {
-	if !runtime_busy(app) { return -1 }
+	if !runtime_busy(app) {
+		if len(app.pending_prompts) == 0 { return -1 }
+		remaining := time.tick_diff(time.tick_now(), app.queue_retry_at)
+		return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
+	}
 	remaining := SPINNER_INTERVAL - time.tick_diff(app.spin_lap, time.tick_now())
+	if len(app.pending_prompts) > 0 { remaining = min(remaining, time.tick_diff(time.tick_now(), app.queue_retry_at)) }
 	return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
 }
 
@@ -813,15 +825,6 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 		work_destroy(app, queued)
 	}
 	chan.destroy(&app.run.work)
-	// The worker is gone, so a line still queued was never recorded and a follow-up never sent.
-	if count := len(app.run.steer.items); count > 0 {
-		fmt.eprintf("nabla: %d line(s) typed during a turn were never recorded; they were not delivered\n", count)
-	}
-	if count := len(app.run.follow_ups.items); count > 0 {
-		fmt.eprintf("nabla: %d follow-up(s) typed during a turn were never sent\n", count)
-	}
-	agent.steer_queue_destroy(&app.run.steer)
-	agent.steer_queue_destroy(&app.run.follow_ups)
 	steer_view_destroy(app)
 	pending_selection_clear(&app.run.pending, app.run.alloc)
 	pending_target_clear(&app.run.pending_target, app.run.alloc)
@@ -829,6 +832,17 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
+	for index := 0; index < len(app.pending_prompts); {
+		prompt := app.pending_prompts[index]
+		if _, err := journal.queue_push(app.queue_journal, prompt.session, prompt.kind, prompt.text, nil); err == nil {
+			session_client_ensure_id(app, prompt.session)
+			delete(prompt.text, app.run.alloc)
+			ordered_remove(&app.pending_prompts, index)
+		} else {
+			index += 1
+		}
+	}
+	if app.queue_journal != nil { _ = session_store_close(app.queue_journal) }
 	widgets.history_destroy(&app.history)
 	delete(app.home, app.run.alloc)
 	widgets.input_destroy(&app.input)

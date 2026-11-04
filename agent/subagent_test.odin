@@ -266,11 +266,11 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 	testing.expect_value(test, len(own), 0)
 
 	chat.state = .Requesting
-	chat_steering_observe(chat, {}, nil)
+	chat_steering_observe(chat, {})
 	delivered, _ := journal.last_delivered_message(chat.store, chat.session)
 	testing.expect_value(test, delivered, journal.Journal_Seq(0))
 	chat.state = .Preparing
-	chat_steering_observe(chat, {}, nil)
+	chat_steering_observe(chat, {})
 	nodes, read_error := journal.read_ancestry(chat.store, chat.session, chat.head, context.temp_allocator)
 	if read_error != nil { testing.fail_now(test, "the session's nodes could not be read") }
 	agent_message := ""
@@ -282,7 +282,7 @@ test_agent_messages_are_recorded_first_and_delivered_at_steering_boundaries :: p
 		if user.origin == journal.USER_ORIGIN_NAMES[.Agent] { agent_message = string(node.body) }
 	}
 	testing.expect(test, strings.contains(agent_message, "The parser has a race.") && strings.contains(agent_message, "agent-1"), agent_message)
-	chat_steering_observe(chat, {}, nil)
+	chat_steering_observe(chat, {})
 	again, _ := journal.read_inbox(chat.store, chat.session, chat.delivered, context.temp_allocator)
 	testing.expect_value(test, len(again), 0)
 }

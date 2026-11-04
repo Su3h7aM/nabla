@@ -88,8 +88,19 @@ Run_Setup :: struct {
 	alloc:               mem.Allocator,
 }
 
+Pending_Prompt :: struct {
+	session: journal.Session_Id,
+	kind:    journal.Queue_Kind,
+	text:    string,
+}
+
 App :: struct {
 	setup:                      Run_Setup,
+	queue_journal:              ^journal.Journal,
+	queue_session:              journal.Session_Id,
+	history_session:            journal.Session_Id,
+	pending_prompts:            [dynamic]Pending_Prompt,
+	queue_retry_at:             time.Tick,
 	stream:                     Serve_Stream, // the session's live turn stream, owned for the server's life
 	// stop_server is set by a Stop_Server command. The server takes no new step while it
 	// is set and exits once the turn it stopped has ended.
@@ -904,17 +915,6 @@ app_selection_service :: proc(app: ^App) -> bool {
 		pending_target_clear(&app.run.pending_target, app.run.alloc)
 	}
 	return false
-}
-
-// app_steer_apply is the turn's request-boundary hook. It installs the selection the
-// user asked for since the last request and returns the connection the next request is
-// built for.
-app_steer_apply :: proc(steer: ^agent.Steer_Context) -> ai.Provider_Connection {
-	app := cast(^App)steer.apply_data
-	catalog_selection_sync(app)
-	if app_selection_service(app) { refresh_status(app) }
-	sync.mutex_guard(&app.run.mu)
-	return app.run.connection
 }
 
 // selection_target_resolve copies one selection out of the published catalog. The target

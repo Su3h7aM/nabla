@@ -320,7 +320,13 @@ serve_loop :: proc(app: ^App, idle: time.Duration) -> int {
 			if !serve_environment_sync(app) { return 1 }
 		case .Turn:
 			idle_due = nil
-			if !serve_run_turn(app) { return 1 }
+			wait_for_wake: Maybe(u32)
+			if !serve_run_turn(app, &wait_for_wake) { return 1 }
+			if wait_seen, wait := wait_for_wake.?; wait && !app.stop_server {
+				free_all(context.temp_allocator)
+				deadline := agent.chat_background_deadline(chat, agent.chat_compact_deadline(chat))
+				agent.owner_wake_wait(wait_seen, deadline)
+			}
 		case .Wait:
 			idle_due = nil
 			deadline := agent.chat_background_deadline(chat, agent.chat_compact_deadline(chat))
@@ -388,6 +394,9 @@ serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 		return .Environment, true
 	}
 	if chat.state == .Idle {
+		queued, queue_ok := agent.chat_queue_ready(chat)
+		if !queue_ok { serve_storage_exit(chat); return .None, false }
+		if _, ready := queued.?; ready { return .Turn, true }
 		if len(records) > 0 { return .Turn, true }
 		// A continuation counts as a next step here, beside the inbox records, so the
 		// idle deadline does not start while one is pending.
@@ -402,9 +411,25 @@ serve_step :: proc(app: ^App) -> (step: Serve_Step, ok: bool) {
 // serve_run_turn delivers the pending inbox and runs one turn. The text is empty
 // because each record is already committed: delivering it does not record it again.
 // False means the session can no longer be stored and the reason was printed.
+// wait_for_wake, when supplied, captures the wake sequence after busy or no-op admission and cancellation.
 @(require_results)
-serve_run_turn :: proc(app: ^App) -> bool {
+serve_run_turn :: proc(app: ^App, wait_for_wake: ^Maybe(u32) = nil) -> bool {
 	chat := &app.setup.session
+	queued, queue_ok := agent.chat_queue_ready(chat)
+	if !queue_ok { serve_storage_exit(chat); return false }
+	if kind, ready := queued.?; ready {
+		if !agent.chat_queue_deliver_ready(chat, {kind}) {
+			if wait_for_wake != nil { wait_for_wake^ = agent.owner_wake_seen() }
+			if chat.storage_failed { serve_storage_exit(chat); return false }
+			return true
+		}
+		records, read_ok := agent.chat_inbox_read(chat)
+		if !read_ok { serve_storage_exit(chat); return false }
+		if len(records) == 0 && !agent.chat_continuation_pending(chat) {
+			if wait_for_wake != nil { wait_for_wake^ = agent.owner_wake_seen() }
+			return true
+		}
+	}
 	if warning := app_tools_refresh(app); warning != "" {
 		agent.chat_runtime_message(chat, .Warning, warning)
 	}
@@ -417,7 +442,10 @@ serve_run_turn :: proc(app: ^App) -> bool {
 	case .Storage_Failed:
 		// A busy store leaves the lines pending and the session usable. Only a
 		// latched storage failure ends the process.
-		if !chat.storage_failed { return true }
+		if !chat.storage_failed {
+			if wait_for_wake != nil { wait_for_wake^ = agent.owner_wake_seen() }
+			return true
+		}
 		serve_storage_exit(chat)
 		return false
 	case .Busy:
@@ -427,6 +455,7 @@ serve_run_turn :: proc(app: ^App) -> bool {
 	steer := serve_steer_context(app)
 	if streaming { steer.observe = serve_stream_observe }
 	_ = agent.chat_run_turn_steered(chat, app.run.connection, agent.chat_retry_policy_default(), observer, &steer, &app.run.control)
+	if chat.terminal_status == .Cancelled && wait_for_wake != nil { wait_for_wake^ = agent.owner_wake_seen() }
 	serve_stream_end(&app.stream)
 	if chat.storage_failed {
 		serve_storage_exit(chat)

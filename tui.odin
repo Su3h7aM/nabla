@@ -292,6 +292,7 @@ present_frame :: proc(app: ^App, storage: ^Frame_Storage) {
 	cursor: term.Cursor
 	err: Render_Status
 	transcript_sync(app)
+	steer_view_sync(app)
 	for {
 		if sync.mutex_guard(&app.run.mu) {
 			cursor, err = render_frame(app, storage)
@@ -356,7 +357,6 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 	}
 	// The pending-steer component sits above the prompt and takes at most half of what the
 	// prompt and footer leave, so the transcript and the prompt always stay on screen.
-	steer_view_sync(app)
 	steer_body_rows: []Steer_Row
 	steer_rows := 0
 	if !app.menu_open {

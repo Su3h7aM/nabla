@@ -347,9 +347,9 @@ chat_websocket_fallback_safe :: proc(err: ai.Provider_Operation_Error) -> bool {
 	return false
 }
 
-// chat_run_turn_steered runs one turn to its terminal effect. steer is nil for a caller
-// with no input of its own, such as a headless run; otherwise the request boundary
-// consumes what the user queued while the turn ran. control is nil for a caller that
+// chat_run_turn_steered runs one turn to its terminal effect. steer supplies optional
+// owner collection and request-boundary hooks; journal steering is delivered with or
+// without those hooks. control is nil for a caller that
 // never stops a turn itself; a process interrupt stops the turn either way.
 @(require_results)
 chat_run_turn_steered :: proc(
@@ -414,7 +414,7 @@ chat_turn_drive :: proc(
 		// Input that reached the session while the turn ran is accepted and delivered
 		// before the state is read, so the selector sees a turn that still has a message
 		// to answer.
-		chat_steering_observe(chat, observer, steer)
+		chat_steering_observe(chat, observer)
 		effect := chat_session_advance_at(chat, now)
 		switch effect.kind {
 		case .Start_Request:
@@ -474,8 +474,8 @@ chat_turn_drive :: proc(
 			_ = chat_session_claim_finish(chat, effect)
 			// Input the session accepted but did not deliver stays pending in the journal,
 			// and the next turn delivers it before its prompt, so a turn that ends takes no
-			// message with it. A line still in the front-end's queue was never accepted, and
-			// the front-end returns it to the user.
+			// message with it. Undelivered prompt_queue rows stay available for the owner
+			// or for the front-end to retrieve after cancellation.
 			// A turn whose outcome did not reach the store reports the storage failure,
 			// not the status the model reached: the session has no record of it. The
 			// session's own error is what the record and the front-end read.

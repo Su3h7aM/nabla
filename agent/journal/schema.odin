@@ -10,9 +10,11 @@ import "nabla:db"
 // SCHEMA_VERSION is the schema this build writes and reads. A database stamped
 // with a higher version was written by newer code, and the columns this build
 // names may not be the columns it has, so this build refuses rather than guess.
-SCHEMA_VERSION :: 1
+SCHEMA_VERSION :: 2
 
-// Every table is append-only and STRICT. The rowid of `records` is the global
+// Every table is STRICT. prompt_queue, prompt_queue_attachment, and
+// prompt_queue_counter are mutable; all other tables, including prompt_history,
+// are append-only. The rowid of `records` is the global
 // seq. `records.kind` and `nodes.kind` are the integer codes of Record_Kind and
 // Node_Kind. A record kind with a payload writes it to its `record_*` family
 // tables, keyed by the record's seq, and a node kind with a payload writes
@@ -30,6 +32,33 @@ SCHEMA := [?]string {
 		                 REFERENCES sessions(session) DEFERRABLE INITIALLY DEFERRED,
 		parent_call    INTEGER CHECK (parent_call IS NULL OR parent_call > 0),
 		role           INTEGER NOT NULL CHECK (role IN (0, 1))
+	) STRICT`,
+	`CREATE TABLE prompt_queue_counter (
+		session BLOB PRIMARY KEY REFERENCES sessions(session),
+		last_id INTEGER NOT NULL CHECK (last_id > 0)
+	) STRICT`,
+	`CREATE TABLE prompt_queue (
+		session BLOB NOT NULL REFERENCES sessions(session),
+		id INTEGER NOT NULL CHECK (id > 0),
+		kind INTEGER NOT NULL CHECK (kind IN (0, 1)),
+		text TEXT NOT NULL,
+		held INTEGER NOT NULL CHECK (held IN (0, 1)) DEFAULT 0,
+		PRIMARY KEY (session, id)
+	) STRICT`,
+	`CREATE TABLE prompt_queue_attachment (
+		session BLOB NOT NULL,
+		id INTEGER NOT NULL,
+		ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+		path TEXT NOT NULL CHECK (length(path) > 0),
+		PRIMARY KEY (session, id, ordinal),
+		FOREIGN KEY (session, id) REFERENCES prompt_queue(session, id) ON DELETE CASCADE
+	) STRICT`,
+	`CREATE TABLE prompt_history (
+		session BLOB NOT NULL REFERENCES sessions(session),
+		ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+		text TEXT NOT NULL,
+		time_ms INTEGER NOT NULL,
+		PRIMARY KEY (session, ordinal)
 	) STRICT`,
 	`CREATE TABLE artifacts (
 		digest     BLOB PRIMARY KEY CHECK (length(digest) = 32),
@@ -414,6 +443,7 @@ schema_migrate :: proc(journal: ^Journal) -> (error: Error) {
 
 	version := schema_version(journal) or_return
 	if version > SCHEMA_VERSION { return Journal_Error.Schema_Too_New }
+	if version != 0 && version != SCHEMA_VERSION { return Journal_Error.Schema_Unknown }
 	if version == 0 {
 		// Tables without a version belong to someone else.
 		tables := query_int(journal, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", nil) or_return

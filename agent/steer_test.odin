@@ -60,13 +60,10 @@ test_a_boundary_hook_hands_the_next_request_its_connection :: proc(test: ^testin
 	}
 	defer delete(following.Endpoint, chat.allocator)
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
 	install := Boundary_Install {
 		connection = following,
 	}
 	steer := Steer_Context {
-		queue      = &queue,
 		apply      = boundary_install_connection,
 		apply_data = &install,
 	}
@@ -76,119 +73,6 @@ test_a_boundary_hook_hands_the_next_request_its_connection :: proc(test: ^testin
 	testing.expect_value(test, agent_provider_request_count(&previous), 0)
 	if !testing.expect_value(test, agent_provider_request_count(&installed), 1) { return }
 	testing.expect(test, strings.contains(agent_provider_request(&installed, 0), "say something"), "the request that followed the boundary is the turn's own")
-}
-
-@(test)
-test_steer_queue_is_fifo_and_keeps_every_line_whole :: proc(test: ^testing.T) {
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-
-	testing.expect(test, steer_push(&queue, "first"))
-	large := strings.repeat("x", 1 << 20, context.temp_allocator)
-	testing.expect(test, steer_push(&queue, large))
-	line, has_line := steer_pop(&queue)
-	testing.expect(test, has_line)
-	testing.expect_value(test, line, "first")
-	delete(line, context.temp_allocator)
-	line, has_line = steer_pop(&queue)
-	testing.expect(test, has_line)
-	testing.expect_value(test, len(line), len(large))
-	delete(line, context.temp_allocator)
-	_, has_line = steer_pop(&queue)
-	testing.expect(test, !has_line)
-}
-
-// Holding an entry marks it as being edited, and releasing it replaces its text where it is
-// queued: the count, the order, and the other entries stay. An empty text removes it, an
-// unhold leaves the text as it was, and an entry that is gone is refused.
-@(test)
-test_a_held_entry_is_replaced_in_place :: proc(test: ^testing.T) {
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	for line in ([]string{"first", "second", "third"}) { testing.expect(test, steer_push(&queue, line)) }
-	entries, entries_ok := steer_snapshot(&queue, context.temp_allocator)
-	if !testing.expect(test, entries_ok) || !testing.expect_value(test, len(entries), 3) { return }
-	second, third := entries[1].id, entries[2].id
-
-	text, held := steer_hold(&queue, second)
-	if !testing.expect(test, held, "a queued entry can be held") { return }
-	testing.expect_value(test, text, "second")
-	steer_line_free(&queue, text)
-	_, held = steer_hold(&queue, second)
-	testing.expect(test, !held, "an entry is held once")
-
-	testing.expect(test, steer_release(&queue, second, "second, edited"))
-	entries, _ = steer_snapshot(&queue, context.temp_allocator)
-	if !testing.expect_value(test, len(entries), 3) { return }
-	testing.expect_value(test, entries[0].text, "first")
-	testing.expect_value(test, entries[1].text, "second, edited")
-	testing.expect_value(test, entries[1].id, second)
-	testing.expect(test, !entries[1].held, "a released entry is not held")
-	testing.expect_value(test, entries[2].text, "third")
-
-	text, held = steer_hold(&queue, third)
-	testing.expect(test, held)
-	steer_line_free(&queue, text)
-	steer_unhold(&queue, third)
-	entries, _ = steer_snapshot(&queue, context.temp_allocator)
-	testing.expect(test, !entries[2].held && entries[2].text == "third", "an unheld entry is as it was")
-
-	testing.expect(test, steer_release(&queue, second, ""))
-	entries, _ = steer_snapshot(&queue, context.temp_allocator)
-	if !testing.expect_value(test, len(entries), 2) { return }
-	testing.expect_value(test, entries[1].text, "third")
-	_, held = steer_hold(&queue, second)
-	testing.expect(test, !held, "a removed entry cannot be held")
-	testing.expect(test, !steer_release(&queue, second, "again"), "a removed entry cannot be released")
-
-	// Taking everything includes a held entry.
-	text, held = steer_hold(&queue, third)
-	testing.expect(test, held)
-	steer_line_free(&queue, text)
-	taken, taken_ok := steer_take_all(&queue)
-	defer steer_taken_destroy(&queue, taken)
-	testing.expect(test, taken_ok)
-	testing.expect_value(test, len(taken), 2)
-	testing.expect(test, len(queue.items) == 0)
-}
-
-// Delivery stops in front of a held entry: the entries before it are recorded, it is not
-// recorded with its old text, and nothing behind it overtakes it. Once it is released the
-// edited text and the rest follow in order.
-@(test)
-test_delivery_stops_at_a_held_entry :: proc(test: ^testing.T) {
-	fixture: Chat_Test
-	chat_test_begin(test, &fixture, tool_loop_workspace(test))
-	defer chat_test_end(test, &fixture)
-	chat := &fixture.chat
-	_test_accept(test, chat, "start")
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	for line in ([]string{"first", "second", "third"}) { testing.expect(test, steer_push(&queue, line)) }
-	entries, _ := steer_snapshot(&queue, context.temp_allocator)
-	text, held := steer_hold(&queue, entries[1].id)
-	if !testing.expect(test, held) { return }
-	steer_line_free(&queue, text)
-
-	chat.state = .Preparing
-	chat_steering_observe(chat, {}, &steer)
-	recorded := _test_records(test, chat, {.User_Input})
-	if !testing.expect_value(test, len(recorded), 1) { return }
-	testing.expect_value(test, string(recorded[0].body), "first")
-	remaining, _ := steer_snapshot(&queue, context.temp_allocator)
-	testing.expect_value(test, len(remaining), 2)
-
-	testing.expect(test, steer_release(&queue, entries[1].id, "second, edited"))
-	chat.state = .Preparing
-	chat_steering_observe(chat, {}, &steer)
-	recorded = _test_records(test, chat, {.User_Input})
-	if !testing.expect_value(test, len(recorded), 3) { return }
-	testing.expect_value(test, string(recorded[1].body), "second, edited")
-	testing.expect_value(test, string(recorded[2].body), "third")
-	testing.expect(test, len(queue.items) == 0)
 }
 
 // A steering line is a message the user sent. It stays queued while a request is in flight,
@@ -203,23 +87,18 @@ test_a_steering_line_stays_queued_until_a_settled_point_delivers_it :: proc(test
 	chat := &fixture.chat
 	_test_accept(test, chat, "start")
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	testing.expect(test, steer_push(&queue, "steered"))
+	steering_test_push(test, chat, "steered")
 
 	// A request is in flight: nothing accepts the line, so it is still the user's to take back.
 	chat.state = .Requesting
-	chat_steering_observe(chat, {}, &steer)
-	testing.expect(test, len(queue.items) > 0, "the line stays queued while a request is in flight")
+	chat_steering_observe(chat, {})
+	testing.expect(test, len(steering_test_entries(test, chat)) > 0, "the line stays queued while a request is in flight")
 	testing.expect_value(test, len(_test_records(test, chat, {.User_Input})), 0)
 
 	// The request settles, which is the point a User node delivers it.
 	chat.state = .Preparing
-	chat_steering_observe(chat, {}, &steer)
-	testing.expect(test, len(queue.items) == 0, "the delivered line left the queue")
+	chat_steering_observe(chat, {})
+	testing.expect(test, len(steering_test_entries(test, chat)) == 0, "the delivered line left the queue")
 	accepted := _test_records(test, chat, {.User_Input})
 	if !testing.expect_value(test, len(accepted), 1) { return }
 	testing.expect_value(test, string(accepted[0].body), "steered")
@@ -239,7 +118,7 @@ test_a_steering_line_stays_queued_until_a_settled_point_delivers_it :: proc(test
 	// The turn keeps its budgets: steering starts nothing.
 	testing.expect_value(test, chat.requests_made, 0)
 	// Delivered once: a later look finds nothing more to deliver.
-	chat_steering_observe(chat, {}, &steer)
+	chat_steering_observe(chat, {})
 	testing.expect_value(test, len(_test_projection(test, chat, &arena).items), 2)
 }
 
@@ -247,7 +126,7 @@ test_a_steering_line_stays_queued_until_a_settled_point_delivers_it :: proc(test
 // the window the user's line arrives in: the request it interrupts is over and the turn has
 // not decided what to do next.
 Steering_Probe :: struct {
-	queue:  ^Steer_Queue,
+	chat:   ^Chat_Session,
 	line:   string,
 	pushed: bool,
 }
@@ -255,7 +134,8 @@ Steering_Probe :: struct {
 steering_probe_push :: proc(user_data: rawptr) {
 	probe := cast(^Steering_Probe)user_data
 	if probe.pushed { return }
-	probe.pushed = steer_push(probe.queue, probe.line)
+	_, error := journal.queue_push(probe.chat.store, probe.chat.session, .Steering, probe.line, nil)
+	probe.pushed = error == nil
 }
 
 steering_probe_push_on_text :: proc(user_data: rawptr, _: string) {
@@ -284,21 +164,16 @@ test_a_steering_line_starts_the_next_request_on_its_own :: proc(test: ^testing.T
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	queue := steer_queue_init(chat.allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
 	probe := Steering_Probe {
-		queue = &queue,
-		line  = "write another one",
+		chat = chat,
+		line = "write another one",
 	}
 	observer := Chat_Observer {
 		user_data        = &probe,
 		request_finished = steering_probe_push,
 	}
 
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, &steer), "the turn completed")
+	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, nil), "the turn completed")
 	testing.expect(test, probe.pushed, "the fixture pushed its line while the first request was running")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
 	testing.expect(test, !strings.contains(agent_provider_request(&provider, 0), "write another one"), "the request already in flight is not rebuilt")
@@ -326,21 +201,16 @@ test_steering_during_response_waits_for_commit_before_recording :: proc(test: ^t
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	queue := steer_queue_init(chat.allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
 	probe := Steering_Probe {
-		queue = &queue,
-		line  = "check the logs",
+		chat = chat,
+		line = "check the logs",
 	}
 	observer := Chat_Observer {
 		user_data      = &probe,
 		assistant_text = steering_probe_push_on_text,
 	}
 
-	if !testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, &steer), "the turn completed") { return }
+	if !testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), observer, nil), "the turn completed") { return }
 	if !testing.expect(test, probe.pushed, "the line was queued while the provider response was being applied") { return }
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 2) { return }
 	first_request := agent_provider_request(&provider, 0)
@@ -420,13 +290,8 @@ test_input_left_at_the_end_of_a_turn_keeps_it_running :: proc(test: ^testing.T) 
 	testing.expect(test, chat_session_feed_completion(chat, chat_session_event_source(chat)))
 	testing.expect_value(test, chat.state, Chat_State.Finalizing)
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	testing.expect(test, steer_push(&queue, "write another one"))
-	chat_steering_observe(chat, {}, &steer)
+	steering_test_push(test, chat, "write another one")
+	chat_steering_observe(chat, {})
 
 	testing.expect_value(test, chat.state, Chat_State.Preparing)
 	effect := chat_session_advance(chat)
@@ -460,13 +325,8 @@ test_input_waits_until_the_tool_batch_settles :: proc(test: ^testing.T) {
 	testing.expect_value(test, staged_notice, Chat_Notice.None)
 	testing.expect_value(test, chat.state, Chat_State.Executing_Tools)
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	testing.expect(test, steer_push(&queue, "use the other file"))
-	chat_steering_observe(chat, {}, &steer)
+	steering_test_push(test, chat, "use the other file")
+	chat_steering_observe(chat, {})
 
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
@@ -480,7 +340,7 @@ test_input_waits_until_the_tool_batch_settles :: proc(test: ^testing.T) {
 
 	// The batch settles, which is the point the line may be recorded at.
 	testing.expect(test, chat_session_tools_done(chat, chat.active_turn_id, len(chat.pending_calls)))
-	chat_steering_observe(chat, {}, &steer)
+	chat_steering_observe(chat, {})
 
 	after := _test_projection(test, chat, &arena)
 	steered := false
@@ -491,8 +351,7 @@ test_input_waits_until_the_tool_batch_settles :: proc(test: ^testing.T) {
 		}
 	}
 	testing.expect(test, steered, "the line is recorded once the batch it would read into has settled")
-	_, still_queued := steer_pop(&queue)
-	testing.expect(test, !still_queued, "the line left the queue into the record")
+	testing.expect_value(test, len(steering_test_entries(test, chat)), 0)
 }
 
 // A turn that failed has nothing left to answer with, so its input does not restart it: the
@@ -506,13 +365,8 @@ test_input_does_not_restart_a_turn_that_failed :: proc(test: ^testing.T) {
 	_test_accept(test, chat, "write a poem")
 	chat_session_fail_turn(chat, "the provider refused the request")
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	testing.expect(test, steer_push(&queue, "write another one"))
-	chat_steering_observe(chat, {}, &steer)
+	steering_test_push(test, chat, "write another one")
+	chat_steering_observe(chat, {})
 
 	testing.expect_value(test, chat.state, Chat_State.Finalizing)
 	effect := chat_session_advance(chat)
@@ -531,17 +385,12 @@ test_a_line_queued_in_a_turn_that_ends_stays_queued :: proc(test: ^testing.T) {
 	chat := &fixture.chat
 	_test_accept(test, chat, "start")
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
 	// The path stops before it can propose another request, which is what a turn that
 	// failed its own request does: the selector goes straight to the terminal effect.
 	chat_session_fail_turn(chat, "the provider refused the request")
-	testing.expect(test, steer_push(&queue, "check the logs"))
-	testing.expect(test, !chat_run_turn_steered(chat, {}, test_retry_policy(), {}, &steer), "the turn failed")
-	testing.expect(test, len(queue.items) > 0, "the line stays queued")
+	steering_test_push(test, chat, "check the logs")
+	testing.expect(test, !chat_run_turn_steered(chat, {}, test_retry_policy(), {}, nil), "the turn failed")
+	testing.expect(test, len(steering_test_entries(test, chat)) > 0, "the line stays queued")
 	testing.expect_value(test, len(_test_records(test, chat, {.User_Input})), 0)
 }
 
@@ -566,22 +415,14 @@ test_a_steering_line_reaches_the_request_that_follows_it :: proc(test: ^testing.
 	}
 	defer delete(connection.Endpoint, chat.allocator)
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	testing.expect(test, steer_push(&queue, "check the logs"))
+	steering_test_push(test, chat, "check the logs")
 
-	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, &steer), "the turn completed")
+	testing.expect(test, chat_run_turn_steered(chat, connection, test_retry_policy(), {}, nil), "the turn completed")
 	if !testing.expect_value(test, agent_provider_request_count(&provider), 1) { return }
 	testing.expect(test, strings.contains(agent_provider_request(&provider, 0), "check the logs"), "the request should carry the line the user sent")
 }
 
-// A line the store refuses was never accepted, so the turn that could not commit it does
-// not take it: it goes back to the queue, in order, with the failure reported, and the
-// front-end is never told it was queued. Nothing the user sent is dropped by a write that
-// did not happen.
+// A failed delivery leaves the durable queue unchanged and reports the storage failure.
 @(test)
 test_a_line_the_store_refuses_stays_pending :: proc(test: ^testing.T) {
 	fixture: Chat_Test
@@ -590,28 +431,18 @@ test_a_line_the_store_refuses_stays_pending :: proc(test: ^testing.T) {
 	chat := &fixture.chat
 	_test_accept(test, chat, "start")
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	testing.expect(test, steer_push(&queue, "check the logs"))
-	testing.expect(test, steer_push(&queue, "and the config"))
+	steering_test_push(test, chat, "check the logs")
+	steering_test_push(test, chat, "and the config")
 	// A store that has stopped writing refuses every line.
 	_steer_store_refuse(chat)
 
-	notices: Chat_Notice_Log
-	observer := chat_notice_log_begin(&notices)
-	defer chat_notice_log_destroy(&notices)
-	chat_steering_accept(chat, observer, &steer)
+	testing.expect(test, !chat_queue_deliver_ready(chat, {.Steering}))
 
-	for expected in ([]string{"check the logs", "and the config"}) {
-		line, queued := steer_pop(&queue)
-		if !testing.expect(test, queued, "a line the store refused should still be queued") { return }
-		testing.expect_value(test, line, expected)
-		steer_line_free(&queue, line)
-	}
-	testing.expect(test, len(notices.lines) > 0, "the refusal is reported")
+	entries := steering_test_entries(test, chat)
+	if !testing.expect_value(test, len(entries), 2) { return }
+	testing.expect_value(test, entries[0].text, "check the logs")
+	testing.expect_value(test, entries[1].text, "and the config")
+	testing.expect(test, chat.storage_failed && chat.last_error != "", "the refusal is reported")
 }
 
 @(test)
@@ -622,14 +453,9 @@ test_delivery_records_queued_lines_in_order :: proc(test: ^testing.T) {
 	chat := &fixture.chat
 	_test_accept(test, chat, "start")
 
-	queue := steer_queue_init(context.temp_allocator)
-	defer steer_queue_destroy(&queue)
-	testing.expect(test, steer_push(&queue, "check the logs"))
-	testing.expect(test, steer_push(&queue, "and the config"))
-	steer := Steer_Context {
-		queue = &queue,
-	}
-	chat_steering_observe(chat, {}, &steer)
+	steering_test_push(test, chat, "check the logs")
+	steering_test_push(test, chat, "and the config")
+	chat_steering_observe(chat, {})
 
 	arena: virtual.Arena
 	if arena_error := virtual.arena_init_growing(&arena); arena_error != nil { testing.fail_now(test, "arena initialization failed") }
@@ -654,15 +480,10 @@ test_a_line_accepted_before_a_crash_goes_with_the_next_prompt_once :: proc(test:
 	chat_test_capacity(chat, CHAT_DEFAULT_CONTEXT_WINDOW, 64)
 	_test_accept(test, chat, "first prompt")
 
-	queue := steer_queue_init(chat.allocator)
-	defer steer_queue_destroy(&queue)
-	steer := Steer_Context {
-		queue = &queue,
-	}
 	// The process ends between the commit that accepts the line and the one that delivers it.
 	line := "check the logs"
-	testing.expect(test, steer_push(&queue, line))
-	chat_steering_accept(chat, {}, &steer)
+	steering_test_push(test, chat, line)
+	testing.expect(test, chat_queue_deliver_ready(chat, {.Steering}))
 	accepted := _test_records(test, chat, {.User_Input})
 	if !testing.expect_value(test, len(accepted), 1) {
 		chat_test_end(test, &first)
@@ -748,4 +569,16 @@ test_background_completions_are_delivered_once_as_job_input :: proc(test: ^testi
 	inbox, inbox_error := journal.read_inbox(chat.store, chat.session, cursor, context.temp_allocator)
 	testing.expect_value(test, inbox_error, nil)
 	testing.expect_value(test, len(inbox), 0)
+}
+
+steering_test_push :: proc(test: ^testing.T, chat: ^Chat_Session, text: string) {
+	if _, error := journal.queue_push(chat.store, chat.session, .Steering, text, nil); error != nil {
+		testing.fail_now(test, "could not enqueue steering")
+	}
+}
+
+steering_test_entries :: proc(test: ^testing.T, chat: ^Chat_Session) -> []journal.Queue_Entry {
+	entries, error := journal.queue_list(chat.store, chat.session, context.temp_allocator)
+	if error != nil { testing.fail_now(test, "could not read prompt queue") }
+	return entries
 }

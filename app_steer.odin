@@ -14,7 +14,7 @@ package main
 import "core:fmt"
 import "core:strings"
 
-import "nabla:agent"
+import "nabla:agent/journal"
 import input "nabla:input"
 import "nabla:text"
 import "nabla:tui"
@@ -38,8 +38,7 @@ STEER_INSET :: 2
 // and a space.
 STEER_LEAD_COLUMNS :: len(STEER_MARKER) + len(STEER_KIND) + 1
 
-// Steer_Key names one queued message for as long as it is queued. Each queue numbers its own
-// entries, so the key also says which queue the id belongs to.
+// Steer_Key names a queued message and its kind.
 Steer_Key :: struct {
 	id:        u64,
 	follow_up: bool,
@@ -51,8 +50,7 @@ Steer_Line :: struct {
 	expanded: bool,
 }
 
-// Steer_View is the front-end thread's copy of the queues: the queued steering lines
-// followed by the follow-ups as of the last frame, and the user's selection and edit.
+// Steer_View is the front-end thread's copy of queued messages and the user's selection and edit.
 Steer_View :: struct {
 	lines:    [dynamic]Steer_Line, // owned by the runtime allocator
 	selected: Maybe(Steer_Key),
@@ -84,10 +82,6 @@ steer_lines_destroy :: proc(lines: [dynamic]Steer_Line) {
 	delete(lines)
 }
 
-// steer_queue_of returns the queue that holds the message key names.
-steer_queue_of :: proc(app: ^App, key: Steer_Key) -> ^agent.Steer_Queue {
-	return &app.run.follow_ups if key.follow_up else &app.run.steer
-}
 
 // steer_editing returns the message whose text the prompt holds.
 steer_editing :: proc(view: Steer_View) -> (key: Steer_Key, ok: bool) {
@@ -108,21 +102,19 @@ steer_line_index :: proc(view: Steer_View, key: Steer_Key) -> (index: int, found
 // previous view stays.
 steer_view_sync :: proc(app: ^App) {
 	view := &app.steer
-	steering, steering_ok := agent.steer_snapshot(&app.run.steer, app.run.alloc)
-	if !steering_ok { return }
-	follow_ups, follow_ups_ok := agent.steer_snapshot(&app.run.follow_ups, app.run.alloc)
-	lines, lines_error := make([dynamic]Steer_Line, 0, len(steering) + len(follow_ups), app.run.alloc)
-	if !follow_ups_ok || lines_error != nil {
-		agent.steer_snapshot_destroy(steering)
-		agent.steer_snapshot_destroy(follow_ups)
-		return
+	store := app.queue_journal
+	if store == nil { return }
+	entries, err := journal.queue_list(store, app_queue_session(app), app.run.alloc)
+	if err != nil { return }
+	defer journal.queue_entries_destroy(entries, app.run.alloc)
+	lines, lines_error := make([dynamic]Steer_Line, 0, len(entries), app.run.alloc)
+	if lines_error != nil { return }
+	for entry in entries {
+		value, clone_error := strings.clone(entry.text, app.run.alloc)
+		if clone_error != nil { steer_lines_destroy(lines); return }
+		_, _ = append(&lines, Steer_Line{key = {id = entry.id, follow_up = entry.kind == .Follow_Up}, text = value})
 	}
-	// The capacity covers every message, so these appends cannot allocate. Each text moves
-	// from its snapshot to the view.
-	for entry in steering { _, _ = append(&lines, Steer_Line{key = {id = entry.id}, text = entry.text}) }
-	for entry in follow_ups { _, _ = append(&lines, Steer_Line{key = {id = entry.id, follow_up = true}, text = entry.text}) }
-	delete(steering)
-	delete(follow_ups)
+
 	for &line in lines {
 		if index, found := steer_line_index(view^, line.key); found { line.expanded = view.lines[index].expanded }
 	}
@@ -306,18 +298,20 @@ steer_edit_begin :: proc(app: ^App) {
 	view := &app.steer
 	key, selected := view.selected.?
 	if !selected { return }
-	queue := steer_queue_of(app, key)
-	message, held := agent.steer_hold(queue, key.id)
+	store := app.queue_journal
+	if store == nil { return }
+	message, held, err := journal.queue_hold(store, app_queue_session(app), key.id, app.run.alloc)
+	if err != nil { snap_append(app, .Warning, "the message could not be held for editing"); return }
 	if !held {
 		view.selected = nil
 		snap_append(app, .Notice, "that message was already delivered to the model")
 		return
 	}
-	defer agent.steer_line_free(queue, message)
+	defer delete(message, app.run.alloc)
 	draft, draft_error := strings.clone(widgets.input_text(&app.input), app.run.alloc)
 	if draft_error != nil || widgets.input_replace(&app.input, message) != nil {
 		delete(draft, app.run.alloc)
-		agent.steer_unhold(queue, key.id)
+		_, _ = journal.queue_unhold(store, app_queue_session(app), key.id)
 		snap_append(app, .Warning, "the message could not be moved to the prompt; it stays queued")
 		return
 	}
@@ -345,9 +339,14 @@ steer_edit_commit :: proc(app: ^App, force: bool) {
 		snap_append(app, .Notice, "a command cannot be queued; it runs when sent")
 		return
 	}
-	queue := steer_queue_of(app, key)
-	saved := agent.steer_release(queue, key.id, edited)
-	if !saved { agent.steer_unhold(queue, key.id) }
+	store := app.queue_journal
+	if store == nil { return }
+	saved, err := journal.queue_release(store, app_queue_session(app), key.id, edited)
+	if err != nil {
+		snap_append(app, .Warning, "the message could not be updated; the edit remains open")
+		return
+	}
+
 	steer_edit_restore(app)
 	if saved { return }
 	if edited != "" && !steer_prepend(app, {edited}) {
@@ -361,7 +360,12 @@ steer_edit_commit :: proc(app: ^App, force: bool) {
 steer_edit_cancel :: proc(app: ^App) {
 	key, editing := steer_editing(app.steer)
 	if !editing { return }
-	agent.steer_unhold(steer_queue_of(app, key), key.id)
+	if store := app.queue_journal; store != nil {
+		if _, err := journal.queue_unhold(store, app_queue_session(app), key.id); err != nil {
+			snap_append(app, .Warning, "the message could not be released; the edit remains open")
+			return
+		}
+	}
 	steer_edit_restore(app)
 }
 
@@ -382,68 +386,39 @@ steer_edit_restore :: proc(app: ^App) {
 	widgets.history_reset(&app.history)
 }
 
-// steer_retrieve takes every message still queued, steering lines first and then follow-ups,
-// and puts them, separated by a blank line, in front of what the prompt holds, with the
-// caret after them. A line the session already accepted is no longer queued and stays where
-// it is. Nothing happens when nothing is queued.
+// steer_retrieve puts queued messages in order in front of the prompt's draft.
 steer_retrieve :: proc(app: ^App) {
-	queues := [2]^agent.Steer_Queue{&app.run.steer, &app.run.follow_ups}
-	taken: [2][dynamic]string
-	messages := make([dynamic]string, context.temp_allocator)
-	ok := true
-	for queue, index in queues {
-		taken[index], ok = agent.steer_take_all(queue)
-		if !ok { break }
-		if _, append_error := append(&messages, ..taken[index][:]); append_error != nil {
-			ok = false
-			break
+	store := app.queue_journal
+	if store == nil { return }
+	entries, err := journal.queue_list(store, app_queue_session(app), app.run.alloc)
+	if err != nil { snap_append(app, .Warning, "the queued messages could not be retrieved"); return }
+	defer journal.queue_entries_destroy(entries, app.run.alloc)
+	for index := len(entries) - 1; index >= 0; index -= 1 {
+		entry := entries[index]
+		message, held, hold_error := journal.queue_hold(store, app_queue_session(app), entry.id, app.run.alloc)
+		if hold_error != nil { snap_append(app, .Warning, "a queued message could not be retrieved"); return }
+		if !held { continue }
+		if !steer_prepend(app, {message}) {
+			delete(message, app.run.alloc)
+			_, _ = journal.queue_unhold(store, app_queue_session(app), entry.id)
+			snap_append(app, .Warning, "the queued message could not be put in the prompt")
+			return
+		}
+		delete(message, app.run.alloc)
+		if _, remove_error := journal.queue_remove(store, app_queue_session(app), entry.id); remove_error != nil {
+			_, _ = journal.queue_unhold(store, app_queue_session(app), entry.id)
+			snap_append(app, .Warning, "the retrieved message remains queued")
+			return
 		}
 	}
-	if ok && (len(messages) == 0 || steer_prepend(app, messages[:])) {
-		for queue, index in queues { agent.steer_taken_destroy(queue, taken[index]) }
-		return
-	}
-	// The prompt could not take them, so they go back to their queues in their order.
-	for queue, index in queues {
-		if !agent.steer_requeue(queue, taken[index]) { snap_append(app, .Warning, "a queued line could not be kept") }
-	}
-	snap_append(app, .Warning, "the queued lines could not be moved to the prompt; they stay queued")
 }
 
-// steer_turn_ended decides what the messages queued during a turn become when it ends. A
-// turn the user stopped sends nothing: everything queued goes back to the prompt. Otherwise
-// the steering lines the turn never accepted are sent together as the next prompt, and
-// with none of those the first follow-up is, so the rest wait for the next turn's end.
 steer_turn_ended :: proc(app: ^App) {
 	steer_edit_finish(app)
 	if app.turn_stopped {
 		app.turn_stopped = false
 		steer_retrieve(app)
-		return
 	}
-	taken, taken_ok := agent.steer_take_all(&app.run.steer)
-	if !taken_ok {
-		snap_append(app, .Warning, "input queued during that turn could not be sent")
-		return
-	}
-	if len(taken) > 0 {
-		joined, join_error := strings.join(taken[:], "\n\n", context.temp_allocator)
-		if join_error != nil {
-			if !agent.steer_requeue(&app.run.steer, taken) { snap_append(app, .Warning, "a queued line could not be kept") }
-			snap_append(app, .Warning, "input queued during that turn could not be sent; it stays queued")
-			return
-		}
-		agent.steer_taken_destroy(&app.run.steer, taken)
-		transcript_jump_bottom(app)
-		enqueue(app, .Prompt, joined)
-		return
-	}
-	delete(taken)
-	line, popped := agent.steer_pop(&app.run.follow_ups)
-	if !popped { return }
-	defer agent.steer_line_free(&app.run.follow_ups, line)
-	transcript_jump_bottom(app)
-	enqueue(app, .Prompt, line)
 }
 
 // steer_prepend inserts lines before the prompt's text, with a blank line between them

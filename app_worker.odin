@@ -194,13 +194,8 @@ run_work :: proc(app: ^App, work: Work, observer: agent.Chat_Observer) {
 	// list the /resume menu reads as needing a rebuild.
 	rows_dirty := false
 	switch work.kind {
-	case .Prompt:
-		rows_dirty = true
-		if app.setup.follow_client.store == nil {
-			snap_append(app, .Error, "no session is open; use /new or /resume")
-			return
-		}
-		app_client_prompt(app, work.text, observer)
+	case .Ensure_Server:
+		session_client_ensure_id(app, work.session)
 	case .Compact:
 		_ = app_command_send(app, journal.Compact{})
 	case .Status:

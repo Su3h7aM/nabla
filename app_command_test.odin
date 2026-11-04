@@ -21,6 +21,16 @@ import "nabla:tui/widgets"
 command_app :: proc(t: ^testing.T, app: ^App) {
 	app.run.alloc = context.allocator
 	app.setup.alloc = context.allocator
+	directory, dir_error := os.make_directory_temp("", "nabla-command-test-*", context.allocator)
+	if dir_error != nil { testing.fail_now(t, "cannot create test directory") }
+	app.setup.journal_directory = directory
+	store, open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write, context.allocator)
+	if open_error != nil { testing.fail_now(t, "cannot open journal") }
+	app.queue_journal = store
+	session, create_error := journal.create_session(store, {workspace = directory, role = .Main})
+	if create_error != nil { testing.fail_now(t, "cannot create session") }
+	if _, commit_error := journal.commit(store); commit_error != nil { testing.fail_now(t, "cannot commit session") }
+	app.queue_session = session
 	app.run.snap.entries = make([dynamic]Entry, 0, 4, app.run.alloc)
 	app.input = widgets.Input{}
 	widgets.input_init(&app.input, app.run.alloc)
@@ -29,6 +39,9 @@ command_app :: proc(t: ^testing.T, app: ^App) {
 }
 
 command_app_end :: proc(app: ^App) {
+	_ = journal.close(app.queue_journal)
+	_ = os.remove_all(app.setup.journal_directory)
+	delete(app.setup.journal_directory)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
 	for &entry in app.run.snap.entries {
@@ -247,11 +260,11 @@ test_a_leading_path_is_a_prompt_and_an_unknown_command_stays :: proc(t: ^testing
 
 	if !testing.expect(t, widgets.input_insert(&app.input, "/tmp/shot.png what is this?") == nil) { return }
 	submit(&app)
-	work, received := chan.try_recv(app.run.work)
-	if !testing.expect(t, received, "the prompt should be queued for the worker") { return }
-	testing.expect_value(t, work.kind, Work_Kind.Prompt)
-	testing.expect_value(t, work.text, "/tmp/shot.png what is this?")
-	work_destroy(&app, work)
+	entries, err := journal.queue_list(app.queue_journal, app.queue_session, app.run.alloc)
+	if !testing.expect(t, err == nil && len(entries) == 1) { return }
+	defer journal.queue_entries_destroy(entries, app.run.alloc)
+	testing.expect_value(t, entries[0].text, "/tmp/shot.png what is this?")
+	_, _ = chan.try_recv(app.run.work)
 	for entry in app.run.snap.entries {
 		testing.expect(t, entry.kind != .Notice, "a path is not an unknown command")
 	}
@@ -488,11 +501,10 @@ test_submit_sends_the_text_a_paste_marker_stands_for :: proc(t: ^testing.T) {
 	testing.expect(t, widgets.input_insert(&app.input, " done") == nil)
 	submit(&app)
 
-	work, received := chan.try_recv(app.run.work)
-	if !testing.expect(t, received, "the prompt should reach the worker") { return }
-	testing.expect_value(t, work.kind, Work_Kind.Prompt)
-	testing.expect_value(t, work.text, "one\ntwo\nthree\nfour\nfive\nsix done")
-	work_destroy(&app, work)
+	entries, err := journal.queue_list(app.queue_journal, app.queue_session, app.run.alloc)
+	if !testing.expect(t, err == nil && len(entries) == 1) { return }
+	defer journal.queue_entries_destroy(entries, app.run.alloc)
+	testing.expect_value(t, entries[0].text, "one\ntwo\nthree\nfour\nfive\nsix done")
 	testing.expect_value(t, widgets.input_text(&app.input), "")
 	recalled, found := widgets.history_previous(&app.history, "")
 	testing.expect(t, found)

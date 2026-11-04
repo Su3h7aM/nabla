@@ -27,6 +27,7 @@ Pending :: union {
 	Session_Titled_Row,
 	Payload_Row,
 	Artifact_Row,
+	Queue_Delivery_Row,
 }
 
 @(private)
@@ -383,9 +384,19 @@ write_pending :: proc(journal: ^Journal) -> (last: Journal_Seq, error: Error) {
 		case Artifact_Row:
 			arguments := [4]db.Value{db.Value(row.digest[:]), db.Value(row.kind), db.Value(row.created_ms), db.Value(row.bytes)}
 			db.statement_exec(&journal.inserts[.Artifact], arguments[:]) or_return
+		case Queue_Delivery_Row:
+			seq := queue_write_delivery(journal, &row) or_return
+			if seq != 0 { last = seq }
 		}
 	}
 	db.commit(&journal.connection) or_return
+	for &item in journal.pending {
+		#partial switch &row in item {
+		case Queue_Delivery_Row:
+			row.result.seq = row.seq
+			row.result.completed = true
+		}
+	}
 	return last, nil
 }
 

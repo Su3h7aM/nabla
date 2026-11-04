@@ -266,6 +266,7 @@ session_client_switch :: proc(app: ^App, start: Session_Start) -> bool {
 		snap_append(app, .Error, problem)
 		return false
 	}
+	if sync.mutex_guard(&app.run.mu) { app.queue_session = setup.follow_client.session }
 	selection_intent_clear(app)
 	if setup.resumed_provider != "" && setup.resumed_model != "" {
 		_ = selection_apply_direct(app, setup.resumed_provider, setup.resumed_model, setup.resumed_effort)
@@ -276,6 +277,19 @@ session_client_switch :: proc(app: ^App, start: Session_Start) -> bool {
 // session_client_ensure starts the session server when nothing holds the claim. A
 // running server is kept: closing its waiter on every prompt would abandon a waiter
 // thread per line while the server still holds the claim.
+session_client_ensure_id :: proc(app: ^App, session: journal.Session_Id) {
+	if session == app.setup.session.session {
+		session_client_ensure(app)
+		return
+	}
+	server, err := client_ensure_server(app.setup.harness_options.nabla_executable, session, app.setup.harness_options.nabla_config, os.stderr)
+	if err.kind != .None {
+		snap_append(app, .Error, "the session server could not be started")
+		return
+	}
+	client_server_close(&server)
+}
+
 session_client_ensure :: proc(app: ^App) {
 	setup := &app.setup
 	if setup.session.session == {} { return }
@@ -321,27 +335,7 @@ app_client_service :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
 	}
 	if app_client_poll(app, observer) { changed = true }
 	if app_client_refusals(app) { changed = true }
-	if app_client_steer(app, observer) { changed = true }
 	return changed
-}
-
-// app_client_prompt appends one prompt for the followed session and shows it once the
-// commit lands. A busy database keeps the record pending for the next flush.
-app_client_prompt :: proc(app: ^App, text: string, observer: agent.Chat_Observer) {
-	// The server exits after ten minutes idle, so a prompt after that must start it
-	// again on the same session before the line is committed.
-	session_client_ensure(app)
-	_, error := client_send_input(&app.setup.follow_client, text, .Prompt)
-	app.setup.follow_input_busy = error != nil && journal.error_is_busy(error)
-	if error != nil {
-		if app.setup.follow_input_busy {
-			snap_append(app, .Warning, "the session database is busy; the line is pending and has not been sent")
-		} else {
-			snap_append(app, .Error, fmt.tprintf("the line was not sent: %s", journal.error_text(error, context.temp_allocator)))
-		}
-		return
-	}
-	_ = app_client_poll(app, observer)
 }
 
 @(require_results)
@@ -496,51 +490,6 @@ app_client_refusals :: proc(app: ^App) -> bool {
 	return shown
 }
 
-// app_client_steer sends ready lines to the journal while the turn is running. The
-// session owner delivers them at its next settled boundary.
-@(require_results)
-app_client_steer :: proc(app: ^App, observer: agent.Chat_Observer) -> bool {
-	if !app.setup.follow.working { return false }
-	taken, taken_ok := agent.steer_take_ready(&app.run.steer)
-	if !taken_ok {
-		snap_append(app, .Warning, "input queued during that turn could not be sent")
-		return false
-	}
-	if len(taken) == 0 {
-		agent.steer_taken_destroy(&app.run.steer, taken)
-		return false
-	}
-	session_client_ensure(app)
-	sent := 0
-	for line in taken {
-		_, error := client_send_input(&app.setup.follow_client, line, .Steering)
-		if error == nil {
-			sent += 1
-			continue
-		}
-		app.setup.follow_input_busy = journal.error_is_busy(error)
-		detail := "the session database is busy; the line stays queued" if app.setup.follow_input_busy else journal.error_text(error, context.temp_allocator)
-		snap_append(app, .Warning, fmt.tprintf("a steering line was not sent: %s", detail))
-		break
-	}
-	if sent == len(taken) {
-		agent.steer_taken_destroy(&app.run.steer, taken)
-		_ = app_client_poll(app, observer)
-		return true
-	}
-	rest, rest_error := make([dynamic]string, len(taken) - sent, app.run.steer.allocator)
-	if rest_error != nil {
-		agent.steer_taken_destroy(&app.run.steer, taken)
-		snap_append(app, .Warning, "a steering line could not be kept")
-		return true
-	}
-	copy(rest[:], taken[sent:])
-	for line in taken[:sent] { delete(line, app.run.steer.allocator) }
-	delete(taken)
-	if !agent.steer_requeue(&app.run.steer, rest) { snap_append(app, .Warning, "a steering line could not be kept") }
-	return true
-}
-
 // app_command_send appends one command for the followed session. The server applies
 // it and records command.applied.
 @(require_results)
@@ -568,4 +517,10 @@ app_command_send :: proc(app: ^App, command: journal.Command) -> bool {
 		snap_append(app, .Error, fmt.tprintf("the command was not sent: %s", journal.error_text(error, context.temp_allocator)))
 	}
 	return false
+}
+
+// app_queue_session returns the session published by the worker.
+app_queue_session :: proc(app: ^App) -> journal.Session_Id {
+	sync.mutex_guard(&app.run.mu)
+	return app.queue_session
 }

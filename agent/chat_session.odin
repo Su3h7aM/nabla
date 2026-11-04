@@ -80,6 +80,8 @@ Chat_Accept :: enum {
 //
 // store is borrowed: the caller opens it, claims session, and keeps both for
 // the chat's life. The chat writes through it from the owner thread only.
+// A pending queue delivery borrows a result inside chat until the next successful
+// commit or journal close, so chat must stay at its address for that lifetime.
 Chat_Session :: struct {
 	store:                        ^journal.Journal,
 	session:                      journal.Session_Id,
@@ -124,6 +126,10 @@ Chat_Session :: struct {
 	// could not record its own history accepts no further work: continuing would
 	// let the conversation diverge from what was stored.
 	storage_failed:               bool,
+	// The journal retains this address across a busy commit.
+	queue_delivery:               journal.Queue_Delivery,
+	queue_delivery_pending:       bool,
+	queue_delivery_kind:          journal.Queue_Kind,
 	// recovery_pending marks a response commit that timed out while busy. Recovery
 	// closes its proposed calls before the next turn projects the history.
 	recovery_pending:             bool,
@@ -287,9 +293,6 @@ Chat_Session :: struct {
 	// is read from the journal once, when the session is claimed, and advanced as nodes
 	// are staged: the owner is the only one who delivers.
 	delivered:                    journal.Journal_Seq,
-	// unacknowledged counts accepted lines whose commit was busy: the journal holds them for
-	// its next commit, and the front-end is told of them once it lands.
-	unacknowledged:               int,
 	// claimed_at is the last seq committed when this process claimed the session. An
 	// agent's report at or below it was written before this process ran the session, so
 	// it waits for the next prompt instead of starting a turn of its own.
