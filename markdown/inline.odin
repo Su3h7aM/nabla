@@ -56,12 +56,85 @@ Inline_Bracket :: struct {
 // so far, the delimiter and bracket stacks that index them, and the line the
 // scanner works through.
 Inline_Parser :: struct {
-	tokens:       [dynamic]Inline_Token,
-	delimiters:   [dynamic]Inline_Delimiter,
-	brackets:     [dynamic]Inline_Bracket,
+	tokens:       Small_Store(Inline_Token, INLINE_TOKENS),
+	delimiters:   Small_Store(Inline_Delimiter, INLINE_DELIMITERS),
+	brackets:     Small_Store(Inline_Bracket, INLINE_BRACKETS),
 	link_matches: [dynamic]int,
 	line:         string,
 	position:     int,
+}
+
+// Inline capacities: most paragraphs hold fewer tokens, delimiters, and
+// brackets than these, so small parses never touch an allocator. Past the
+// capacity the store spills once to the heap and stays there.
+INLINE_TOKENS :: 32
+INLINE_DELIMITERS :: 16
+INLINE_BRACKETS :: 8
+
+// Small_Store is a stack-backed list with heap spillover: pushes fill the
+// inline storage first, then move to the heap once and stay there for the
+// rest of the parse. store_slice exposes the elements contiguously either
+// way, so readers treat it like the dynamic array it replaces. The zero
+// value is empty and needs no initialization; spilled memory comes from
+// allocator like the dynamic arrays did.
+Small_Store :: struct($T: typeid, $N: int) {
+	inline: [N]T,
+	count:  int,
+	heap:   [dynamic]T,
+}
+
+// store_push appends value, spilling to the heap on the push past capacity.
+// The only error is an allocation failure of allocator.
+store_push :: proc(store: ^Small_Store($T, $N), value: T, allocator := context.temp_allocator) -> mem.Allocator_Error {
+	if store.heap == nil && store.count < N {
+		store.inline[store.count] = value
+		store.count += 1
+		return nil
+	}
+	if store.heap == nil {
+		store.heap = make([dynamic]T, allocator)
+		for previous in store.inline[:store.count] {
+			append(&store.heap, previous) or_return
+		}
+	}
+	append(&store.heap, value) or_return
+	store.count += 1
+	return nil
+}
+
+// store_slice returns the stored elements contiguously, from inline storage
+// or from the heap after a spill.
+store_slice :: proc(store: ^Small_Store($T, $N)) -> []T {
+	if store.heap != nil {
+		return store.heap[:]
+	}
+	return store.inline[:store.count]
+}
+
+// store_len returns how many elements the store holds.
+store_len :: proc(store: ^Small_Store($T, $N)) -> int {
+	return store.count
+}
+
+// store_pop removes and returns the last element. The caller guards
+// non-empty, like core pop.
+store_pop :: proc(store: ^Small_Store($T, $N)) -> T {
+	store.count -= 1
+	if store.heap != nil {
+		return pop(&store.heap)
+	}
+	return store.inline[store.count]
+}
+
+// store_shrink drops the store back to length elements. Lengths at or past
+// the count are a no-op.
+store_shrink :: proc(store: ^Small_Store($T, $N), length: int) {
+	for store.count > length {
+		store.count -= 1
+		if store.heap != nil {
+			pop(&store.heap)
+		}
+	}
 }
 
 // parse_inlines parses the lines of one paragraph, heading, or table cell, which
@@ -76,19 +149,16 @@ parse_inlines :: proc(lines: []string, allocator: mem.Allocator) -> (spans: []Sp
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD(ignore = allocator == context.temp_allocator)
 
 	parser := Inline_Parser {
-		tokens       = make([dynamic]Inline_Token, context.temp_allocator),
-		delimiters   = make([dynamic]Inline_Delimiter, context.temp_allocator),
-		brackets     = make([dynamic]Inline_Bracket, context.temp_allocator),
 		link_matches = make([dynamic]int, context.temp_allocator),
 	}
 
 	for line, index in lines {
 		last := index == len(lines) - 1
-		content := strings.trim_right(line, " ")
+		content := trim_right_space(line)
 		hard_break := len(line) - len(content) >= 2
 		if last {
 			// nothing follows the last line, so no whitespace of it is text
-			content = strings.trim_right(content, SPACE_TAB)
+			content = trim_right_space_tab(content)
 		}
 		backslash_break := scan_line(&parser, content, !last) or_return
 		if last { continue }
@@ -100,10 +170,10 @@ parse_inlines :: proc(lines: []string, allocator: mem.Allocator) -> (spans: []Sp
 	}
 
 	// emphasis covers the whole paragraph, across its line breaks
-	process_emphasis(parser.tokens[:], parser.delimiters[:], 0)
+	process_emphasis(store_slice(&parser.tokens), store_slice(&parser.delimiters), 0)
 
-	spans = make([]Span, span_count(parser.tokens[:]), allocator) or_return
-	spans_from_tokens(spans, parser.tokens[:])
+	spans = make([]Span, span_count(store_slice(&parser.tokens)), allocator) or_return
+	spans_from_tokens(spans, store_slice(&parser.tokens))
 	return
 }
 
@@ -213,9 +283,9 @@ scan_delimiter :: proc(parser: ^Inline_Parser, kind: Delimiter_Kind, character: 
 		return
 	}
 	can_open, can_close := delimiter_flanking(line, position, run, kind)
-	index := len(parser.tokens)
+	index := store_len(&parser.tokens)
 	add_token(parser, line[position:position + run]) or_return
-	append(&parser.delimiters, Inline_Delimiter{token = index, kind = kind, active = true, can_open = can_open, can_close = can_close}) or_return
+	store_push(&parser.delimiters, Inline_Delimiter{token = index, kind = kind, active = true, can_open = can_open, can_close = can_close}) or_return
 	parser.position = position + run
 	return
 }
@@ -224,9 +294,9 @@ scan_delimiter :: proc(parser: ^Inline_Parser, kind: Delimiter_Kind, character: 
 // `![`, with its bracket stack entry.
 @(require_results)
 push_bracket :: proc(parser: ^Inline_Parser, text: string) -> (err: mem.Allocator_Error) {
-	index := len(parser.tokens)
+	index := store_len(&parser.tokens)
 	add_token(parser, text) or_return
-	append(&parser.brackets, Inline_Bracket{token = index, delimiters = len(parser.delimiters), active = true}) or_return
+	store_push(&parser.brackets, Inline_Bracket{token = index, delimiters = store_len(&parser.delimiters), active = true}) or_return
 	parser.position += len(text)
 	return
 }
@@ -240,11 +310,11 @@ scan_close_bracket :: proc(parser: ^Inline_Parser) -> (err: mem.Allocator_Error)
 	line := parser.line
 	position := parser.position
 	parser.position += 1
-	if len(parser.brackets) == 0 {
+	if store_len(&parser.brackets) == 0 {
 		add_token(parser, line[position:position + 1]) or_return
 		return
 	}
-	bracket := pop(&parser.brackets)
+	bracket := store_pop(&parser.brackets)
 	if !bracket.active || parser.position >= len(line) || line[parser.position] != '(' {
 		add_token(parser, line[position:position + 1]) or_return
 		return
@@ -259,12 +329,12 @@ scan_close_bracket :: proc(parser: ^Inline_Parser) -> (err: mem.Allocator_Error)
 		return
 	}
 	// emphasis inside the link text cannot match emphasis outside it
-	process_emphasis(parser.tokens[:], parser.delimiters[:], bracket.delimiters)
-	resize(&parser.delimiters, bracket.delimiters) or_return
+	process_emphasis(store_slice(&parser.tokens), store_slice(&parser.delimiters), bracket.delimiters)
+	store_shrink(&parser.delimiters, bracket.delimiters)
 	// a link cannot contain a link
-	for &earlier in parser.brackets { earlier.active = false }
-	parser.tokens[bracket.token].text = ""
-	for &token in parser.tokens[bracket.token + 1:] {
+	for &earlier in store_slice(&parser.brackets) { earlier.active = false }
+	store_slice(&parser.tokens)[bracket.token].text = ""
+	for &token in store_slice(&parser.tokens)[bracket.token + 1:] {
 		token.style |= {.Link}
 		token.url = destination
 	}
@@ -289,7 +359,7 @@ parse_code_span :: proc(line: string, position: int) -> (content: string, next: 
 			continue
 		}
 		content = line[position + opening:index]
-		if len(content) > 2 && content[0] == ' ' && content[len(content) - 1] == ' ' && strings.trim_left(content, " ") != "" {
+		if len(content) > 2 && content[0] == ' ' && content[len(content) - 1] == ' ' && trim_left_space(content) != "" {
 			content = content[1:len(content) - 1]
 		}
 		return content, index + run, true
@@ -585,7 +655,7 @@ extend_text :: proc(left, right: string) -> string {
 // add_token pushes the text with the style and url inlines give it.
 @(require_results)
 add_token :: proc(parser: ^Inline_Parser, text: string, style := Style{}, url := "") -> (err: mem.Allocator_Error) {
-	append(&parser.tokens, Inline_Token{text = text, url = url, style = style}) or_return
+	store_push(&parser.tokens, Inline_Token{text = text, url = url, style = style}) or_return
 	return
 }
 

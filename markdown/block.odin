@@ -2,7 +2,6 @@ package markdown
 
 import "base:runtime"
 import "core:mem"
-import "core:strings"
 
 // MAX_CONTAINER_DEPTH keeps recursive block walkers within the thread stack;
 // deeper quote and list markers remain text.
@@ -10,6 +9,43 @@ MAX_CONTAINER_DEPTH :: 128
 
 // SPACE_TAB is the cutset of the horizontal whitespace Markdown trims.
 SPACE_TAB :: " \t"
+
+// trim_right_space strips trailing ASCII spaces: the one-byte cutset the
+// paragraph loop used to trim through the generic cutset machinery.
+trim_right_space :: proc(value: string) -> string {
+	end := len(value)
+	for end > 0 && value[end - 1] == ' ' { end -= 1 }
+	return value[:end]
+}
+
+// trim_right_space_tab strips trailing ASCII spaces and tabs: the whitespace
+// cutset of Markdown trims, without the generic cutset loop.
+trim_right_space_tab :: proc(value: string) -> string {
+	end := len(value)
+	for end > 0 && (value[end - 1] == ' ' || value[end - 1] == '\t') { end -= 1 }
+	return value[:end]
+}
+
+// trim_left_space_tab strips leading ASCII spaces and tabs, like
+// trim_right_space_tab on the other end.
+trim_left_space_tab :: proc(value: string) -> string {
+	start := 0
+	for start < len(value) && (value[start] == ' ' || value[start] == '\t') { start += 1 }
+	return value[start:]
+}
+
+// trim_left_space strips leading ASCII spaces: the one-byte cutset the code
+// span check used to trim through the generic cutset machinery.
+trim_left_space :: proc(value: string) -> string {
+	start := 0
+	for start < len(value) && value[start] == ' ' { start += 1 }
+	return value[start:]
+}
+
+// trim_space_tab strips ASCII spaces and tabs from both ends.
+trim_space_tab :: proc(value: string) -> string {
+	return trim_right_space_tab(trim_left_space_tab(value))
+}
 
 // parse reads source as Markdown and returns its document. Every slice is
 // allocated from allocator and freed by destroy. Every string is a view into
@@ -179,7 +215,7 @@ parse_quote :: proc(lines: []string, start, depth: int, allocator: mem.Allocator
 		if is_blank(previous) || fence.character != 0 || starts_block(previous) || starts_block(line) {
 			break
 		}
-		append(&quote_lines, strings.trim_left(line, SPACE_TAB)) or_return
+		append(&quote_lines, trim_left_space_tab(line)) or_return
 		fence_update(&fence, quote_lines[len(quote_lines) - 1])
 		index += 1
 	}
@@ -252,7 +288,7 @@ parse_list :: proc(lines: []string, start, depth: int, allocator: mem.Allocator)
 			// a paragraph continues lazily only across no blank line
 			previous := item_lines[len(item_lines) - 1]
 			if pending_blanks == 0 && !is_blank(previous) && fence.character == 0 && !starts_block(line) {
-				content := strings.trim_left(line, SPACE_TAB)
+				content := trim_left_space_tab(line)
 				append(&item_lines, content) or_return
 				fence_update(&fence, content)
 				cursor += 1
@@ -307,7 +343,7 @@ parse_paragraph :: proc(lines: []string, start: int, allocator: mem.Allocator) -
 				break
 			}
 		}
-		append(&paragraph, strings.trim_left(line, SPACE_TAB)) or_return
+		append(&paragraph, trim_left_space_tab(line)) or_return
 		index += 1
 	}
 
@@ -451,7 +487,12 @@ strip_columns :: proc(line: string, columns: int) -> string {
 
 @(private)
 is_blank :: proc(line: string) -> bool {
-	return strings.trim_left(line, SPACE_TAB) == ""
+	for i in 0 ..< len(line) {
+		if line[i] != ' ' && line[i] != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 @(private)
@@ -466,7 +507,7 @@ fence_open :: proc(line: string) -> (character: u8, length: int, info: string, o
 	if length < 3 {
 		return 0, 0, "", false
 	}
-	info = strings.trim(line[length:], SPACE_TAB)
+	info = trim_space_tab(line[length:])
 	if character == '`' {
 		for value in info {
 			if value == '`' {
@@ -546,13 +587,13 @@ atx_heading :: proc(line: string) -> (level: int, content: string, ok: bool) {
 	if level == 0 || level > 6 || level < len(line) && line[level] != ' ' && line[level] != '\t' {
 		return 0, "", false
 	}
-	content = strings.trim(line[level:], SPACE_TAB)
+	content = trim_space_tab(line[level:])
 	end := len(content)
 	for end > 0 && content[end - 1] == '#' {
 		end -= 1
 	}
 	if end < len(content) && (end == 0 || content[end - 1] == ' ' || content[end - 1] == '\t') {
-		content = strings.trim(content[:end], SPACE_TAB)
+		content = trim_space_tab(content[:end])
 	}
 	return level, content, true
 }
@@ -560,7 +601,7 @@ atx_heading :: proc(line: string) -> (level: int, content: string, ok: bool) {
 @(private)
 setext_level :: proc(line: string) -> int {
 	content, indent := block_content(line)
-	content = strings.trim(content, SPACE_TAB)
+	content = trim_space_tab(content)
 	if indent > 3 || len(content) == 0 {
 		return 0
 	}
@@ -684,7 +725,7 @@ table_starts :: proc(lines: []string, index: int) -> bool {
 
 @(private)
 table_row_content :: proc(line: string) -> string {
-	content := strings.trim(line, SPACE_TAB)
+	content := trim_space_tab(line)
 	if len(content) > 0 && content[0] == '|' {
 		content = content[1:]
 	}
@@ -723,7 +764,7 @@ table_delimiter_count :: proc(line: string) -> (count: int, has_delimiter: bool)
 		if index < len(content) && (content[index] != '|' || escaped_pipe(content, index)) {
 			continue
 		}
-		if _, ok := delimiter_alignment(strings.trim(content[start:index], SPACE_TAB)); !ok {
+		if _, ok := delimiter_alignment(trim_space_tab(content[start:index])); !ok {
 			return 0, false
 		}
 		count += 1
@@ -742,7 +783,7 @@ table_delimiter_count :: proc(line: string) -> (count: int, has_delimiter: bool)
 
 @(private)
 delimiter_alignment :: proc(cell: string) -> (alignment: Alignment, ok: bool) {
-	value := strings.trim(cell, SPACE_TAB)
+	value := trim_space_tab(cell)
 	left := len(value) > 0 && value[0] == ':'
 	right := len(value) > 0 && value[len(value) - 1] == ':'
 	start, end := 0, len(value)
@@ -791,7 +832,7 @@ split_table_row :: proc(line: string) -> (cells: [dynamic]string, err: mem.Alloc
 		if index < len(content) && (content[index] != '|' || escaped_pipe(content, index)) {
 			continue
 		}
-		append(&cells, strings.trim(content[start:index], SPACE_TAB)) or_return
+		append(&cells, trim_space_tab(content[start:index])) or_return
 		start = index + 1
 	}
 	return
