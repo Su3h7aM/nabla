@@ -21,8 +21,17 @@ _hash_index :: proc "contextless" (seed, index: u64) -> u64 {
 
 @(private)
 _auto_id :: proc "contextless" (parent: Id, sibling_ordinal: u64) -> Id {
-	marker := [1]byte{0xff}
-	return _id_from_hash(_hash_index(hash.fnv64a(marker[:], u64(parent)), sibling_ordinal))
+	// One integer mix instead of two FNV-1a passes: the id only needs to be
+	// stable for one declaration position across frames, never zero, and well
+	// spread for the id table. Boost hash_combine plus the splitmix64
+	// finalizer avalanches both inputs.
+	mixed := u64(parent) + 0x9E3779B97F4A7C15 + (sibling_ordinal << 6) + (sibling_ordinal >> 2)
+	mixed = mixed ~ (mixed >> 30)
+	mixed *= 0xBF58476D1CE4E5B9
+	mixed = mixed ~ (mixed >> 27)
+	mixed *= 0x94D049BB133111EB
+	mixed = mixed ~ (mixed >> 31)
+	return _id_from_hash(mixed)
 }
 
 // id hashes `label` to a stable identifier, usable across frames and call
