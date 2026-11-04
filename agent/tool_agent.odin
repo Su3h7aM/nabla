@@ -276,7 +276,8 @@ tool_agents_models :: proc(team: ^Agent_Team) -> (text: string, err: mem.Allocat
 		if !provider_usable(&provider) { continue }
 		append(&parts, fmt.tprintf("provider: %s\n", provider.id)) or_return
 		for model in catalog.catalog.models {
-			if model.provider_id != provider.id { continue }
+			// Kept for the menu, so selection skips it.
+			if model.provider_id != provider.id || model.disabled { continue }
 			append(&parts, "  ", model.id) or_return
 			levels := model.thinking.levels.? or_else nil
 			if len(levels) > 0 {

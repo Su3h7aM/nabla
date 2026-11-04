@@ -61,8 +61,10 @@ test_catalog_resolution :: proc(t: ^testing.T) {
 	testing.expect(t, (blocked.thinking.toggle == nil))
 	testing.expect(t, (blocked.thinking.levels == nil))
 
-	// An excluded model is neither enriched nor published, by any source.
-	testing.expect(t, catalog_test_find(catalog, "exact/provider", "disabled") == nil)
+	// An excluded model stays listed as disabled, and no source enriches it.
+	disabled_model := catalog_test_find(catalog, "exact/provider", "disabled")
+	testing.expect(t, disabled_model != nil && disabled_model.disabled)
+	testing.expect(t, disabled_model != nil && disabled_model.context_window == nil)
 
 	// Discovery and the shared catalog both extend the model list.
 	testing.expect(t, catalog_test_find(catalog, "exact/provider", "remote-only") != nil)
@@ -70,17 +72,16 @@ test_catalog_resolution :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_catalog_rejects_disabled_customization :: proc(t: ^testing.T) {
+test_catalog_keeps_a_disabled_model_unenriched :: proc(t: ^testing.T) {
 	user := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", disabled = true, tools = true}}}}
-	catalog, err := resolve_catalog(user, {}, {})
-	testing.expect_value(t, err, Catalog_Error.Invalid_Disabled_Model)
-	testing.expect_value(t, len(catalog.models), 0)
-	catalog_destroy(&catalog)
-
-	api_user := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", disabled = true, api = "openai_chat_completions"}}}}
-	api_catalog, api_err := resolve_catalog(api_user, {}, {})
-	testing.expect_value(t, api_err, Catalog_Error.Invalid_Disabled_Model)
-	catalog_destroy(&api_catalog)
+	remote := []Catalog_Provider_Source{{id = "p", models = []Catalog_Model_Source{{id = "m", context_window = 100}}}}
+	catalog, err := resolve_catalog(user, remote, {})
+	defer catalog_destroy(&catalog)
+	testing.expect_value(t, err, Catalog_Error.None)
+	testing.expect_value(t, len(catalog.models), 1)
+	testing.expect(t, catalog.models[0].disabled)
+	testing.expect(t, catalog.models[0].tools == nil)
+	testing.expect(t, catalog.models[0].context_window == nil)
 }
 
 @(test)

@@ -989,6 +989,8 @@ acp_work_compact :: proc(session: ^ACP_Session, id: acp.JSONRPC_Id, command: ACP
 acp_model_identify :: proc(session: ^ACP_Session, value: string) -> (provider, model: string, found: bool) {
 	if sync.mutex_guard(&session.conn.app.catalog_mu) {
 		for candidate in session.conn.app.setup.catalog.models {
+			// Kept for the menu, so selection skips it.
+			if candidate.disabled { continue }
 			candidate_value, value_error := acp_model_value(candidate.provider_id, candidate.id)
 			if value_error != nil { return "", "", false }
 			matched := candidate_value == value
@@ -1082,6 +1084,7 @@ acp_effort_allowed :: proc(session: ^ACP_Session, provider_id, model_id, level: 
 acp_model_effort_levels :: proc(session: ^ACP_Session, provider_id, model_id: string, allocator := context.allocator) -> (levels: []string, ok: bool) {
 	if sync.mutex_guard(&session.conn.app.catalog_mu) {
 		for candidate in session.conn.app.setup.catalog.models {
+			if candidate.disabled { continue }
 			if candidate.provider_id != provider_id || candidate.id != model_id { continue }
 			if candidate.thinking.levels == nil { return nil, true }
 			cloned, clone_error := slice.clone(candidate.thinking.levels.?, allocator)
@@ -1183,7 +1186,8 @@ acp_servable_models :: proc(app: ^App, allocator: mem.Allocator) -> ([dynamic]Mo
 		if !provider_usable(&provider) { continue }
 		if !provider_configured(app, provider.id) { continue }
 		for &model in app.setup.catalog.models {
-			if model.provider_id != provider.id { continue }
+			// Kept for the menu, so selection skips it.
+			if model.provider_id != provider.id || model.disabled { continue }
 			provider_id, provider_error := strings.clone(provider.id, allocator)
 			if provider_error != nil {
 				acp_candidates_destroy(candidates, allocator)
@@ -1212,12 +1216,16 @@ acp_model_config_values :: proc(session: ^ACP_Session) -> ([]acp.Config_Value, b
 	if sync.mutex_guard(&session.conn.app.catalog_mu) {
 		models = session.conn.app.setup.catalog.models[:]
 	}
-	values, values_error := make([]acp.Config_Value, len(models), context.temp_allocator)
+	// Kept for the menu, so selection skips it.
+	servable := 0
+	for model in models { if !model.disabled { servable += 1 } }
+	values, values_error := make([]acp.Config_Value, servable, context.temp_allocator)
 	if values_error != nil { return nil, false }
 	names: [dynamic]string
 	names.allocator = context.temp_allocator
 	defer delete(names)
 	for model in models {
+		if model.disabled { continue }
 		name := model.id
 		if name_value, is_text := model.display_name.?; is_text && name_value != "" { name = name_value }
 		value, value_error := acp_model_value(model.provider_id, model.id, context.temp_allocator)
@@ -1256,7 +1264,8 @@ acp_config_option_counts :: proc(session: ^ACP_Session) -> (model_count, effort_
 	if sync.mutex_guard(&session.conn.app.catalog_mu) {
 		models = session.conn.app.setup.catalog.models[:]
 	}
-	if len(models) > 0 { model_count = 1 }
+	// Kept for the menu, so selection skips it.
+	for model in models { if !model.disabled { model_count = 1; break } }
 	levels, levels_ok := acp_model_effort_levels(session, session.provider_id, session.model_id, context.temp_allocator)
 	defer delete(levels, context.temp_allocator)
 	if levels_ok && len(levels) > 0 { effort_count = 1 }
@@ -1306,23 +1315,27 @@ acp_models_state :: proc(session: ^ACP_Session) -> (ACP_Models_State, bool) {
 	if sync.mutex_guard(&session.conn.app.catalog_mu) {
 		models = session.conn.app.setup.catalog.models[:]
 	}
-	if len(models) == 0 { return {}, true }
+	// Kept for the menu, so selection skips it.
+	servable := 0
+	for model in models { if !model.disabled { servable += 1 } }
+	if servable == 0 { return {}, true }
 	result: ACP_Models_State
 	current, current_error := acp_model_value(session.provider_id, session.model_id, context.temp_allocator)
 	if current_error != nil { return {}, false }
 	result.current_model_id = current
-	available, available_error := make([]ACP_Model_Info, len(models), context.temp_allocator)
+	available, available_error := make([]ACP_Model_Info, servable, context.temp_allocator)
 	if available_error != nil { return {}, false }
 	names: [dynamic]string
 	names.allocator = context.temp_allocator
 	defer delete(names)
-	for model, index in models {
+	for model in models {
+		if model.disabled { continue }
 		name := model.id
 		if name_value, is_text := model.display_name.?; is_text && name_value != "" { name = name_value }
 		value, value_error := acp_model_value(model.provider_id, model.id, context.temp_allocator)
 		if value_error != nil { return {}, false }
 		append(&names, name)
-		available[index] = ACP_Model_Info {
+		available[len(names) - 1] = ACP_Model_Info {
 			model_id = value,
 			name     = names[len(names) - 1],
 		}

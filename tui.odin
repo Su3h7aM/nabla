@@ -104,6 +104,21 @@ PICKED_STYLE :: term.Style {
 	modifiers = {.Bold},
 }
 
+// MENU_INDENT is the column a menu choice's label starts at: an arrow column and
+// a check column come before it.
+MENU_INDENT :: 4
+
+// MENU_PICKED_STYLE is the accent the selected choice's arrow and label take.
+MENU_PICKED_STYLE :: term.Style {
+	foreground = term.Indexed_Color(5),
+	modifiers  = {.Bold},
+}
+
+// MENU_CURRENT_STYLE marks the choice in use, the one the session is running on.
+MENU_CURRENT_STYLE :: term.Style {
+	foreground = term.Indexed_Color(2),
+}
+
 // TOOL_WINDOW_ROWS is how many content rows a tool box shows at once. A result
 // with more rows is a window the wheel scrolls, and the box's bottom border says
 // how many rows it is holding back.
@@ -117,7 +132,7 @@ FOCUS_HINT :: " ↑↓ rows/boxes · enter tool · tab prompt "
 ACTIVE_BOX_HINT :: " ↑↓ box · enter collapse · esc deactivate "
 
 // STARTUP_HINT is what an empty transcript shows under the title.
-STARTUP_HINT :: "pgup/wheel scroll | escape interrupt | ctrl+c clear/cancel/quit | /help for commands"
+STARTUP_HINT :: "pgup/wheel scroll · esc or ctrl+c clear/cancel/quit · /help"
 
 // CONVERSATION_ID names the transcript's scroll-container root inside the
 // frame, so the solved scroll range can be looked up after the solve.
@@ -348,7 +363,14 @@ render_frame :: proc(app: ^App, storage: ^Frame_Storage) -> (cursor: term.Cursor
 		steer_body_rows = steer_body(app.steer, content.width - 2 * STEER_INSET)
 		steer_rows = steer_height(len(app.steer.lines), len(steer_body_rows), (rows - (input_rows + 2) - 2) / 2)
 	}
-	heights := [5]int{-1, steer_rows, input_rows + 2, 1, 1}
+	// An open menu draws its footer on one row in place of the prompt, with one blank
+	// row under it before the working directory. The prompt's bordered height would
+	// leave more blank rows than that.
+	input_height := input_rows + 2
+	if app.menu_open {
+		input_height = 2
+	}
+	heights := [5]int{-1, steer_rows, input_height, 1, 1}
 	regions: [5]tui.Cell_Rect
 	if !tui.rows(content, heights[:], regions[:]) {
 		return {}, .Layout_Failed
@@ -1068,51 +1090,127 @@ tool_window_label :: proc(hidden_above, hidden_below: int) -> string {
 }
 
 // draw_menu renders the open choice list: the title, the last selection error
-// when there is one, and the choices below them in a list that scrolls to keep
-// the selection visible. The rows the list got are remembered for paging.
+// when there is one, and the choices under a blank row. The footer line with the
+// count and the keys is drawn by draw_input_hint. The rows the list got are
+// remembered for paging.
 draw_menu :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
+	buffer := &storage.screen.buffer
 	list_rect := rect
-	_, _ = tui.draw_text(&storage.screen.buffer, {rect.x, list_rect.y, rect.width, 1}, app.menu.title, TITLE_STYLE)
+	_, _ = tui.draw_text(buffer, {rect.x, list_rect.y, rect.width, 1}, app.menu.title, TITLE_STYLE)
 	list_rect.y += 1
 	list_rect.height -= 1
 	if setup_error := setup_error_text(app); setup_error != "" && list_rect.height > 0 {
-		_, _ = tui.draw_text(&storage.screen.buffer, {rect.x, list_rect.y, rect.width, 1}, setup_error, ERROR_TEXT)
+		_, _ = tui.draw_text(buffer, {rect.x, list_rect.y, rect.width, 1}, setup_error, ERROR_TEXT)
 		list_rect.y += 1
+		list_rect.height -= 1
+	}
+	if list_rect.height > 0 {
+		list_rect.y += 1
+		list_rect.height -= 1
+	}
+	// A blank row above the footer line keeps the choices and the keys apart.
+	if list_rect.height > 1 {
 		list_rect.height -= 1
 	}
 	app.menu.rows = max(list_rect.height, 0)
 
-	items, items_error := make([]string, len(app.menu.choices), context.temp_allocator)
-	if items_error != nil {
-		snap_report_dropped_locked(app)
+	visible := menu_visible_count(&app.menu)
+	if visible == 0 && len(app.menu.filter) > 0 {
+		empty_rect := tui.Cell_Rect {
+			x      = rect.x + MENU_INDENT,
+			y      = list_rect.y,
+			width  = max(rect.width - MENU_INDENT, 0),
+			height = 1,
+		}
+		_, _ = tui.draw_text(buffer, empty_rect, "no choice matches the filter", HINT_STYLE)
 		return
 	}
-	for choice, index in app.menu.choices {
-		marker := "> " if index == app.menu.list.selected else "  "
-		if choice.detail != "" {
-			items[index] = fmt.tprintf("%s%-24s %s", marker, choice.label, choice.detail)
-		} else {
-			items[index] = fmt.tprintf("%s%s", marker, choice.label)
-		}
-	}
-	_ = widgets.draw_list(&storage.screen.buffer, list_rect, {items = items, style = HINT_STYLE, selected_style = PICKED_STYLE}, &app.menu.list)
+	draw_menu_rows(buffer, list_rect, &app.menu)
 }
 
-// draw_input_hint replaces the prompt with the menu's keys while one is open.
-// The startup chooser cannot be escaped, so the hint names quitting there and
+// draw_menu_rows draws the visible choices into rect and scrolls the list so the
+// selection stays in view. The selected choice has an accent arrow and label, the
+// choice in use a check mark, and the detail follows the labels in dim brackets.
+draw_menu_rows :: proc(buffer: ^term.Frame_Buffer, rect: tui.Cell_Rect, menu: ^Menu) {
+	if rect.height <= 0 || rect.width <= MENU_INDENT {
+		return
+	}
+	visible := menu_visible_count(menu)
+	label_width := 0
+	for row in 0 ..< visible {
+		label_width = max(label_width, text.text_columns(menu.choices[menu_choice_index(menu, row)].label))
+	}
+	offset := clamp(menu.list.offset, 0, max(visible - rect.height, 0))
+	if menu.list.selected >= 0 {
+		offset = widgets.scroll_reveal(offset, rect.height, menu.list.selected)
+	}
+	menu.list.offset = offset
+
+	for row in 0 ..< min(rect.height, visible - offset) {
+		index := offset + row
+		choice_index := menu_choice_index(menu, index)
+		choice := menu.choices[choice_index]
+		y := rect.y + row
+		picked := index == menu.list.selected
+		if picked {
+			_, _ = tui.draw_text(buffer, {x = rect.x, y = y, width = 1, height = 1}, "→", MENU_PICKED_STYLE)
+		}
+		if current, ok := menu.current.?; ok && current == choice_index {
+			_, _ = tui.draw_text(buffer, {x = rect.x + 2, y = y, width = 1, height = 1}, "✓", MENU_CURRENT_STYLE)
+		}
+		label_style := MENU_PICKED_STYLE if picked else term.Style{}
+		// A disabled choice keeps its accent when picked, and is dimmed so its name reads as off.
+		if choice.disabled {
+			label_style.modifiers += {.Dim}
+		}
+		_, _ = tui.draw_text(buffer, {x = rect.x + MENU_INDENT, y = y, width = rect.width - MENU_INDENT, height = 1}, choice.label, label_style)
+		if choice.detail != "" {
+			detail_x := rect.x + MENU_INDENT + label_width + 2
+			detail_width := max(rect.x + rect.width - detail_x, 0)
+			_, _ = tui.draw_text(buffer, {x = detail_x, y = y, width = detail_width, height = 1}, fmt.tprintf("[%s]", choice.detail), HINT_STYLE)
+		}
+		if choice.disabled {
+			staged_x := rect.x + MENU_INDENT + label_width + 2
+			if choice.detail != "" {
+				staged_x += text.text_columns(choice.detail) + 3
+			}
+			staged_width := max(rect.x + rect.width - staged_x, 0)
+			_, _ = tui.draw_text(buffer, {x = staged_x, y = y, width = staged_width, height = 1}, "[disabled]", HINT_STYLE)
+		}
+	}
+}
+
+// draw_input_hint replaces the prompt with the menu's footer while one is open:
+// the count of choices, the filter when one is typed, and the keys, on one row.
+// The startup chooser cannot be escaped, so the keys name quitting there and
 // cancelling elsewhere.
 draw_input_hint :: proc(app: ^App, storage: ^Frame_Storage, rect: tui.Cell_Rect) {
 	if rect.height <= 0 || rect.width <= 0 {
 		return
 	}
-	hint := "up/down move | enter select | esc cancel"
-	if app.menu.required {
-		hint = "up/down move | enter select | esc quit"
+	visible := menu_visible_count(&app.menu)
+	line := fmt.tprintf("(%d/%d)", max(app.menu.list.selected + 1, 0), visible)
+	if len(app.menu.filter) > 0 {
+		line = fmt.tprintf("%s · filter: %s", line, string(app.menu.filter[:]))
 	}
-	_, _ = tui.draw_text(&storage.screen.buffer, rect, hint, HINT_STYLE)
+	keys := "enter select · esc cancel · up/down move"
+	if app.menu.required {
+		keys = "enter select · esc quit · up/down move"
+	}
+	if app.menu.kind == .Model {
+		keys = fmt.tprintf("%s · ctrl+r refresh · ctrl+d stage · ctrl+s save", keys)
+	}
+	line = fmt.tprintf("%s · %s", line, keys)
+	row := tui.Cell_Rect {
+		x      = rect.x,
+		y      = rect.y,
+		width  = rect.width,
+		height = 1,
+	}
+	_, _ = tui.draw_text(&storage.screen.buffer, row, line, HINT_STYLE)
 }
 
 entry_style :: proc(kind: Entry_Kind) -> term.Style {

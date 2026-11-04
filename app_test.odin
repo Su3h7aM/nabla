@@ -37,7 +37,6 @@ catalog_pipeline_models_dev_unreachable :: proc(_: ^bool, _: mem.Allocator) -> (
 // would have published before any refresh. catalog_pipeline_end releases it.
 Catalog_Pipeline_Fixture :: struct {
 	app:          App,
-	user:         []agent.Catalog_Provider_Source,
 	cache:        string,
 	previous:     string,
 	had_previous: bool,
@@ -51,16 +50,20 @@ catalog_pipeline_app :: proc(t: ^testing.T) -> Catalog_Pipeline_Fixture {
 	fixture.previous, fixture.had_previous = os.lookup_env("XDG_CACHE_HOME", context.allocator)
 	if os.set_env("XDG_CACHE_HOME", cache) != nil { testing.fail_now(t, "could not set the cache root") }
 
-	fixture.user = make([]agent.Catalog_Provider_Source, 1, context.allocator)
-	fixture.user[0] = agent.Catalog_Provider_Source {
-		id       = "test-provider",
-		base_url = "http://provider.test/v1",
-		api      = "openai_chat_completions",
-		api_key  = "test-key",
-	}
+	// The app owns its user sources, so the fixture hands it heap copies.
+	user := make([dynamic]agent.Catalog_Provider_Source, 0, 1, context.allocator)
+	append(
+		&user,
+		agent.Catalog_Provider_Source {
+			id = strings.clone("test-provider", context.allocator),
+			base_url = strings.clone("http://provider.test/v1", context.allocator),
+			api = strings.clone("openai_chat_completions", context.allocator),
+			api_key = strings.clone("test-key", context.allocator),
+		},
+	)
 	fixture.app.run.alloc = context.allocator
-	fixture.app.catalog_sources = fixture.user
-	initial, initial_err := agent.resolve_catalog(fixture.user, {}, {}, context.allocator)
+	fixture.app.catalog_sources = user
+	initial, initial_err := agent.resolve_catalog(user[:], {}, {}, context.allocator)
 	if initial_err != agent.Catalog_Error.None { testing.fail_now(t, "the fixture catalog did not resolve") }
 	fixture.app.setup.catalog = initial
 	return fixture
@@ -79,7 +82,6 @@ catalog_pipeline_end :: proc(fixture: ^Catalog_Pipeline_Fixture) {
 	delete(fixture.previous, context.allocator)
 	_ = os.remove_all(fixture.cache)
 	delete(fixture.cache, context.allocator)
-	delete(fixture.user)
 	fixture^ = {}
 }
 
@@ -230,6 +232,18 @@ test_ctrl_c_resolves_by_prompt_state :: proc(t: ^testing.T) {
 	interrupt(&idle)
 	testing.expect(t, idle.quit)
 	testing.expect(t, !agent.turn_control_stop_requested(&idle.run.control))
+}
+
+// Escape and ctrl+c exit the same way: an empty prompt with nothing running quits under either.
+@(test)
+test_escape_and_ctrl_c_exit_the_same_way :: proc(t: ^testing.T) {
+	keys := []input.Key_Event{{code = .Escape}, {code = .Character, character = 'c', modifiers = {.Control}}}
+	for key in keys {
+		app := ctrl_c_app(t, "", false)
+		defer widgets.input_destroy(&app.input)
+		handle_key(&app, key)
+		testing.expect(t, app.quit)
+	}
 }
 
 // A stopped runtime refuses new work at the front-end, so a command typed while

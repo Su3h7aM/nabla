@@ -104,6 +104,8 @@ acp_native_model :: proc(
 	if current_value != "" {
 		found := false
 		for candidate in catalog.models {
+			// Kept for the menu, so selection skips it.
+			if candidate.disabled { continue }
 			if !acp_model_named(candidate.provider_id, candidate.id, current_value) { continue }
 			default_provider, default_model = candidate.provider_id, candidate.id
 			found = true
@@ -113,6 +115,7 @@ acp_native_model :: proc(
 	}
 	if provider == "" && model != "" {
 		for candidate in catalog.models {
+			if candidate.disabled { continue }
 			if acp_model_named(candidate.provider_id, candidate.id, model) {
 				provider, model = candidate.provider_id, candidate.id
 				break
@@ -133,7 +136,8 @@ acp_native_model :: proc(
 	if !provider_found { return "", "", fmt.tprintf("provider not found: %s; configured providers: %s", provider, catalog_provider_names(catalog)) }
 	if !provider_usable(&catalog.providers[provider_index]) { return "", "", fmt.tprintf("provider %s needs base_url, api, and api_key", provider) }
 	selected, found := catalog_model(catalog, provider, model)
-	if !found { return "", "", fmt.tprintf("model not found for provider: %s %s", provider, model) }
+	// Kept for the menu, so selection skips it as missing.
+	if !found || selected.disabled { return "", "", fmt.tprintf("model not found for provider: %s %s", provider, model) }
 	levels := selected.thinking.levels.? or_else nil
 	for level in levels { if level == effort { resolved_effort = effort; break } }
 	if effort == "" {

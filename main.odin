@@ -298,8 +298,10 @@ chat_main :: proc() -> int {
 	}
 	if !subagent_launch_options(&harness_options, explicit_config) { return 1 }
 	defer { delete(harness_options.nabla_executable); delete(harness_options.nabla_config) }
-	defer agent.catalog_sources_destroy(&sources)
 	defer agent.mcp_servers_destroy(&mcp_servers)
+	// tui_run takes the sources once it is called; until then this releases them.
+	sources_adopted := false
+	defer if !sources_adopted { agent.catalog_sources_destroy(&sources) }
 
 	if options.list {
 		catalog, configured, catalog_ok := resolve_run_catalog(sources[:], context.allocator)
@@ -310,6 +312,8 @@ chat_main :: proc() -> int {
 		}
 		if !catalog_ok { return 1 }
 		for model in catalog.models {
+			// Kept for the menu, so selection skips it.
+			if model.disabled { continue }
 			fmt.println(model.provider_id, "/", model.id)
 		}
 		return 0
@@ -324,7 +328,8 @@ chat_main :: proc() -> int {
 
 	start := session_start_from_options(options.resume, options.resume_id)
 	process_name_set(PROCESS_NAME_TUI)
-	return tui_run(sources[:], mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
+	sources_adopted = true
+	return tui_run(sources, options.config_path, mcp_servers[:], harness_options, options.provider_id, options.model_id, start) ? 0 : 1
 }
 
 main :: proc() {

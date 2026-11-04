@@ -230,9 +230,12 @@ Work_Chan :: chan.Chan(Work)
 // Choice is one line a menu offers and what choosing it means. Every string is
 // owned by the menu's allocator and released by menu_destroy.
 Choice :: struct {
-	label:  string, // owned; the line itself
-	detail: string, // owned; a second column, "" when the choice needs none
-	action: Choice_Action,
+	label:    string, // owned; the line itself
+	detail:   string, // owned; a second column, "" when the choice needs none
+	// disabled marks a catalog-disabled model. It is shown dim with "[disabled]"
+	// and skipped by navigation; only the model menu sets it.
+	disabled: bool,
+	action:   Choice_Action,
 }
 
 Choice_Action :: union {
@@ -278,12 +281,28 @@ Menu_Kind :: enum {
 	Session,
 }
 
+// Model_Disable_Staged is one staged disabled flag in the model menu.
+// provider_id and model_id are owned; disabled is the staged value, which
+// differs from the catalog until Ctrl+S writes it.
+Model_Disable_Staged :: struct {
+	provider_id: string, // owned
+	model_id:    string, // owned
+	disabled:    bool,
+}
+
 Menu :: struct {
 	kind:     Menu_Kind,
 	title:    string, // owned
 	choices:  [dynamic]Choice, // owned
+	filter:   [dynamic]u8, // owned, the text typed while the menu is open
+	shown:    [dynamic]int, // owned, the choices the filter kept, best first; unused while the filter is empty
 	list:     widgets.List_State, // selection and scroll offset of the choices
 	rows:     int, // choice rows drawn last frame, which is how far a page moves
+	// staged holds the model's disabled flags staged with Ctrl+D, owned, until
+	// Ctrl+S writes them to the configuration and clears it.
+	staged:   [dynamic]Model_Disable_Staged,
+	// current is the choice in use, marked in the list; nil when none is.
+	current:  Maybe(int),
 	// required marks the startup chooser: no model is selected yet, so escape
 	// quits rather than returning to the prompt.
 	required: bool,
@@ -291,8 +310,15 @@ Menu :: struct {
 
 menu_destroy :: proc(menu: ^Menu, allocator: mem.Allocator) {
 	delete(menu.title, allocator)
+	for staged in menu.staged {
+		delete(staged.provider_id, allocator)
+		delete(staged.model_id, allocator)
+	}
+	delete(menu.staged)
 	for &choice in menu.choices { choice_destroy(&choice, allocator) }
 	delete(menu.choices)
+	delete(menu.filter)
+	delete(menu.shown)
 	menu^ = {}
 }
 
@@ -459,7 +485,8 @@ run_setup_destroy :: proc(setup: ^Run_Setup) {
 // drive the frame loop until quit.
 @(require_results)
 tui_run :: proc(
-	sources: []agent.Catalog_Provider_Source,
+	sources: [dynamic]agent.Catalog_Provider_Source,
+	config_path: string,
 	mcp_servers: []agent.MCP_Server_Config,
 	harness_options: agent.Harness_Options,
 	flag_provider, flag_model: string,
@@ -473,6 +500,12 @@ tui_run :: proc(
 	// An abandoned worker may still access this allocation.
 	defer if !app_abandoned { free(app) }
 	app.run.alloc = context.allocator
+	cloned_config_path, clone_error := strings.clone(config_path, app.run.alloc)
+	if clone_error != nil {
+		fmt.eprintln("nabla: cannot allocate the configuration path")
+		return false
+	}
+	app.config_path = cloned_config_path
 	// This run is the user's own, so its model choice is published to the frame and
 	// remembered for the next launch.
 	app.setup.owns_selection = true
@@ -484,7 +517,10 @@ tui_run :: proc(
 	app.setup.harness_options = harness_options
 	app.compact_on_switch = harness_options.compact_on_switch
 	app.setup.alloc = context.allocator
-	if !run_catalog(sources, mcp_servers, &app.setup, start) {
+	// The run owns the user sources from here on: the catalog worker reloads config.lua
+	// on every refresh and replaces them. The caller does not release them.
+	app.catalog_sources = sources
+	if !run_catalog(app.catalog_sources[:], mcp_servers, &app.setup, start) {
 		return false
 	}
 	// The transcript's text belongs to the run's allocator, not to whatever
@@ -604,7 +640,7 @@ tui_run :: proc(
 	worker.data = app
 	app.run.worker = worker
 	thread.start(worker)
-	if !catalog_refresh_start(app, sources) {
+	if !catalog_refresh_start(app) {
 		snap_append(app, .Warning, "the catalog refresh could not be started; the catalog stays as it is")
 	}
 
@@ -679,9 +715,7 @@ tui_run :: proc(
 			catalog_selection_refresh_request(app)
 		}
 		if catalog_updated && app.menu_open && app.menu.kind == .Model {
-			required := app.menu.required
-			menu_rebuild_model(app)
-			app.menu.required = required
+			menu_rebuild_open_model(app)
 		}
 		if sizable && (count > 0 || resized || recovered || app.frame_superseded || generation_changed(app) || advance_spinner || catalog_updated) {
 			present_frame(app, app.storage)
@@ -801,6 +835,7 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	input.parser_destroy(&app.parser)
 	input.events_destroy(&app.raw, app.run.alloc)
 	frame_storage_destroy(app.storage)
+	delete(app.config_path, app.run.alloc)
 	run_setup_destroy(&app.setup)
 	catalog_run_destroy(app)
 	return false

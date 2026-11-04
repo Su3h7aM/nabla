@@ -115,7 +115,11 @@ App :: struct {
 	// Retired connection strings are endpoints and credentials an abandoned
 	// operation may still borrow, so they stay valid until the run ends.
 	retired_connection_strings: [dynamic]string, // owned,
-	catalog_sources:            []agent.Catalog_Provider_Source, // borrowed for tui_run
+	// catalog_sources are the user sources from config.lua, owned by the run.
+	// The catalog worker reloads the file on every refresh and replaces them;
+	// it is the only reader and writer, so no lock protects them.
+	catalog_sources:            [dynamic]agent.Catalog_Provider_Source, // owned; replaced by the catalog worker
+	config_path:                string, // owned; the configuration file Ctrl+S writes
 	provider_sources:           [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
 	models_dev_sources:         [dynamic]agent.Catalog_Provider_Source, // owned refresh snapshot
 	catalog_refresh:            Catalog_Refresh_Chan,

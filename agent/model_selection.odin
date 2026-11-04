@@ -66,6 +66,8 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 	model_index, model_found := catalog_find_model(catalog, provider_id, model_id)
 	if !model_found { return {}, fmt.tprintf("model not found for provider: %s %s", provider_id, model_id) }
 	model := &catalog.models[model_index]
+	// Kept for the menu, so selection skips it as missing.
+	if model.disabled { return {}, fmt.tprintf("model not found for provider: %s %s", provider_id, model_id) }
 	// Routing is per model: a model that states its own API family is served through it,
 	// and the provider's family is what its other models use.
 	api_name := provider.api.?
@@ -110,11 +112,12 @@ model_selection_resolve :: proc(catalog: ^Catalog, provider_id, model_id: string
 // id is unknown or served by more than one provider.
 @(require_results)
 catalog_model_provider :: proc(catalog: ^Catalog, model_id, preferred: string) -> (provider_id: string, problem: string) {
-	if index, found := catalog_find_model(catalog, preferred, model_id); found { return catalog.models[index].provider_id, "" }
+	if index, found := catalog_find_model(catalog, preferred, model_id);
+	   found && !catalog.models[index].disabled { return catalog.models[index].provider_id, "" }
 	candidates, candidates_error := make([dynamic]string, 0, context.temp_allocator)
 	if candidates_error != nil { return "", "the candidate providers could not be listed" }
 	for model in catalog.models {
-		if model.id != model_id { continue }
+		if model.id != model_id || model.disabled { continue }
 		index, found := catalog_find_provider(catalog, model.provider_id)
 		if found && provider_usable(&catalog.providers[index]) { append(&candidates, model.provider_id) }
 	}
@@ -140,7 +143,8 @@ catalog_model_names :: proc(catalog: ^Catalog, provider_id: string) -> string {
 	names, names_error := make([dynamic]string, 0, context.temp_allocator)
 	if names_error != nil { return "the model list could not be listed" }
 	for model in catalog.models {
-		if model.provider_id == provider_id { append(&names, model.id) }
+		// Kept for the menu, so selection skips it.
+		if model.provider_id == provider_id && !model.disabled { append(&names, model.id) }
 	}
 	if len(names) == 0 { return "none" }
 	joined, join_error := strings.join(names[:], ", ", context.temp_allocator)

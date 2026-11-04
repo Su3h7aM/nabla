@@ -7,6 +7,7 @@ import "core:sync"
 
 import "nabla:agent"
 import "nabla:agent/journal"
+import "nabla:fuzzy"
 import input "nabla:input"
 import "nabla:layout"
 import "nabla:term"
@@ -85,14 +86,6 @@ command_shaped :: proc(text: string) -> bool {
 	return true
 }
 
-// command_prefixed reports whether the typed text is a prefix of a command,
-// ignoring case so a capital is a typo rather than a miss.
-@(require_results)
-command_prefixed :: proc(command, typed: string) -> bool {
-	if len(typed) > len(command) { return false }
-	return strings.equal_fold(command[:len(typed)], typed)
-}
-
 // complete_command advances the slash command at the prompt. Tab cycles: the first press
 // reaches the first match of what is typed and the next moves to the one after it,
 // wrapping around. A completed name whose command takes a list opens that list. Matching
@@ -137,15 +130,29 @@ complete_command :: proc(app: ^App) -> (handled: bool) {
 	return true
 }
 
-// command_next_match finds the next command after `after` whose name starts with
-// query, wrapping around. -1 starts at the beginning.
+// command_next_match finds the command after `after` in the ranked matches of the query, wrapping around. -1
+// starts at the beginning. The fuzzy library ranks the matches best first, so the first Tab reaches the
+// closest name, and the query is folded to lowercase so a capital is a typo rather than a miss.
 @(require_results)
 command_next_match :: proc(query: string, after: int) -> (int, bool) {
-	for offset in 1 ..= len(COMMANDS) {
-		index := (after + offset) % len(COMMANDS)
-		if command_prefixed(COMMANDS[index].name, query) { return index, true }
+	folded, fold_error := strings.to_lower(query, context.temp_allocator)
+	if fold_error != nil { return 0, false }
+	pattern, pattern_error := fuzzy.pattern_compile(folded, allocator = context.temp_allocator)
+	if pattern_error != nil { return 0, false }
+	defer fuzzy.pattern_destroy(&pattern, context.temp_allocator)
+
+	names: [len(COMMANDS)]string
+	for command, index in COMMANDS { names[index] = command.name }
+	hits, hits_error := fuzzy.match_list(&pattern, names[:], len(COMMANDS), context.temp_allocator)
+	if hits_error != nil || len(hits) == 0 { return 0, false }
+	position := -1
+	for hit, hit_position in hits {
+		if hit.index == after {
+			position = hit_position
+			break
+		}
 	}
-	return 0, false
+	return hits[(position + 1) % len(hits)].index, true
 }
 
 // completion_reset ends a Tab cycle. Any key other than Tab calls it, so an edit
@@ -179,7 +186,10 @@ command_help :: proc(app: ^App) {
 	}
 	snap_append(app, .Notice, "  tab completes a command and cycles through the matches")
 	snap_append(app, .Notice, "  a command that names a list opens it when given no argument")
-	snap_append(app, .Notice, "keys: escape interrupt | ctrl+c clear, cancel, then quit")
+	snap_append(app, .Notice, "  a list filters by what you type, best match first; backspace edits the filter")
+	snap_append(app, .Notice, "  ctrl+r in the model list refreshes the catalog now, past its cooldown")
+	snap_append(app, .Notice, "  shift+up/shift+down in the model list reach disabled models, so ctrl+d can reactivate them")
+	snap_append(app, .Notice, "keys: escape and ctrl+c clear, cancel, then quit")
 	snap_append(app, .Notice, "  ctrl+c, ctrl+d, end of input, and a signal detach without stopping the session server")
 	snap_append(app, .Notice, "  the wheel and page up/page down scroll the transcript")
 	snap_append(app, .Notice, "  dragging over the transcript copies the rows it covers")
@@ -583,11 +593,8 @@ handle_prompt_key :: proc(app: ^App, key: input.Key_Event) {
 		return
 	case .Escape:
 		if steer_escape(app) { return }
-		if runtime_busy(app) {
-			stop_turn(app)
-		} else {
-			prompt_clear(app)
-		}
+		// Escape and ctrl+c share one path, so they clear, cancel, and quit alike.
+		interrupt(app)
 		return
 	case .Page_Up:
 		scroll_page(app, up = true)

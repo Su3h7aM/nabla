@@ -24,8 +24,7 @@ CATALOG_REFRESH_COOLDOWN :: 10 * time.Minute
 MODELS_DEV_INGEST_COOLDOWN :: 24 * time.Hour
 
 @(require_results)
-catalog_refresh_start :: proc(app: ^App, sources: []agent.Catalog_Provider_Source) -> bool {
-	app.catalog_sources = sources
+catalog_refresh_start :: proc(app: ^App) -> bool {
 	refresh, channel_err := chan.create_buffered(Catalog_Refresh_Chan, CATALOG_REFRESH_CAPACITY, app.run.alloc)
 	if channel_err != nil { return false }
 	app.catalog_refresh = refresh
@@ -41,12 +40,25 @@ catalog_refresh_start :: proc(app: ^App, sources: []agent.Catalog_Provider_Sourc
 	return true
 }
 
+// catalog_refresh_request asks for a refresh unless one was asked for within CATALOG_REFRESH_COOLDOWN.
 catalog_refresh_request :: proc(app: ^App) {
-	if app.catalog_worker == nil { return }
 	if !catalog_refresh_due(app) { return }
-	if chan.try_send(app.catalog_refresh, true) {
-		catalog_refresh_note(app)
-	}
+	_ = catalog_refresh_send(app)
+}
+
+// catalog_refresh_force asks for a refresh now, ignoring the cooldown. False means nothing was queued: the
+// catalog thread is not running, or a refresh is already waiting to start.
+@(require_results)
+catalog_refresh_force :: proc(app: ^App) -> bool {
+	return catalog_refresh_send(app)
+}
+
+@(private, require_results)
+catalog_refresh_send :: proc(app: ^App) -> bool {
+	if app.catalog_worker == nil { return false }
+	if !chan.try_send(app.catalog_refresh, true) { return false }
+	catalog_refresh_note(app)
+	return true
 }
 
 // catalog_refresh_note records that a refresh was asked for, which is what the cooldown
@@ -98,6 +110,22 @@ catalog_refresh_with :: proc(
 	models_dev_fetch: proc(cancel: ^bool, allocator: mem.Allocator) -> ([]u8, bool),
 ) {
 	allocator := app.run.alloc
+	// The refresh starts from the file, so a disabled flag Ctrl+S wrote is
+	// visible to the next publication. Only this worker reads and replaces
+	// catalog_sources, so no lock guards them. A failed reload keeps the
+	// sources this run already holds and reports it as a warning.
+	if app.config_path != "" {
+		sources, options, reload_mcp, reload_err, reload_detail := agent.load_lua_config(app.config_path, allocator)
+		defer agent.web_search_config_destroy(options.web_search)
+		defer if reload_detail != "" { delete(reload_detail, allocator) }
+		if reload_err != .None && reload_err != .Missing {
+			snap_append(app, .Warning, "the configuration could not be reloaded")
+		} else {
+			agent.catalog_sources_destroy(&app.catalog_sources, allocator)
+			app.catalog_sources = sources
+		}
+		agent.mcp_servers_destroy(&reload_mcp, allocator)
+	}
 	names, names_error := make([]string, len(app.catalog_sources), context.temp_allocator)
 	if names_error != nil {
 		snap_append(app, .Warning, "the catalog refresh could not run: out of memory")
@@ -110,10 +138,12 @@ catalog_refresh_with :: proc(
 	// result is published: the user's configuration, then the provider listing,
 	// then models.dev. The harness keeps running on the catalog published before
 	// this refresh until it finishes.
-	providers, providers_ok := agent.provider_models_refresh(app.catalog_sources, &app.run.stopping, provider_fetch, allocator)
+	providers, providers_ok := agent.provider_models_refresh(app.catalog_sources[:], &app.run.stopping, provider_fetch, allocator)
 	if !providers_ok {
-		// The listings could not be held: the catalog already published stays.
+		// The listings could not be held. The reloaded user sources still take
+		// effect: the provider sources already held are published with them.
 		agent.catalog_sources_destroy(&providers, allocator)
+		catalog_publish(app, app.provider_sources[:], app.models_dev_sources[:])
 		return
 	}
 	catalog_sources_merge(&app.provider_sources, &providers, allocator)
@@ -171,7 +201,7 @@ catalog_sources_replace :: proc(current, incoming: ^[dynamic]agent.Catalog_Provi
 }
 
 catalog_publish :: proc(app: ^App, providers, models_dev: []agent.Catalog_Provider_Source) {
-	catalog, resolve_err := agent.resolve_catalog(app.catalog_sources, providers, models_dev, app.run.alloc)
+	catalog, resolve_err := agent.resolve_catalog(app.catalog_sources[:], providers, models_dev, app.run.alloc)
 	if resolve_err != .None {
 		// The catalog already published stays; the reason the replacement did not
 		// take effect is the one thing the user can act on.
@@ -245,6 +275,7 @@ catalog_refresh_stop :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> b
 // catalog_run_destroy releases catalog snapshots and connection strings after all
 // workers that may borrow them have retired.
 catalog_run_destroy :: proc(app: ^App) {
+	agent.catalog_sources_destroy(&app.catalog_sources, app.run.alloc)
 	agent.catalog_sources_destroy(&app.provider_sources, app.run.alloc)
 	agent.catalog_sources_destroy(&app.models_dev_sources, app.run.alloc)
 	delete(app.endpoint, app.run.alloc)

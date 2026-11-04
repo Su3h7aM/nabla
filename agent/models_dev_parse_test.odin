@@ -371,11 +371,12 @@ test_models_dev_parse_feeds_the_resolver_unchanged :: proc(t: ^testing.T) {
 	testing.expect(t, catalog_test_find(resolved, "beta", "beta/talker") != nil)
 	testing.expect(t, catalog_test_find(resolved, "acme", "acme/plain") != nil)
 
-	// A disabled model is still excluded even when the catalog reports it.
+	// A disabled model stays listed as disabled even when the catalog reports it.
 	excluding := []Catalog_Provider_Source{{id = "acme", models = []Catalog_Model_Source{{id = "acme/plain", disabled = true}}}}
 	excluded, excluded_err := resolve_catalog(excluding, {}, catalog[:])
 	testing.expect_value(t, excluded_err, Catalog_Error.None)
 	defer catalog_destroy(&excluded)
-	testing.expect(t, catalog_test_find(excluded, "acme", "acme/plain") == nil)
+	listed := catalog_test_find(excluded, "acme", "acme/plain")
+	testing.expect(t, listed != nil && listed.disabled && listed.context_window == nil)
 	testing.expect(t, catalog_test_find(excluded, "acme", "acme/thinker") != nil)
 }

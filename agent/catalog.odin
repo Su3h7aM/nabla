@@ -116,6 +116,9 @@ Catalog_Provider_Source :: struct {
 Catalog_Model :: struct {
 	provider_id:        string,
 	id:                 string,
+	// A disabled model is listed by identity and its user-given name only: it is never
+	// enriched, and its overrides stay in configuration unused.
+	disabled:           bool,
 	// The family this model is served through: its own statement where it has
 	// one, otherwise the provider's.
 	api:                Maybe(string),
@@ -142,9 +145,6 @@ Catalog_Provider :: struct {
 
 Catalog_Error :: enum {
 	None,
-	// A model was excluded and customized at once. The capability fields would
-	// be silently ignored, so the configuration is rejected instead.
-	Invalid_Disabled_Model,
 	// A resolved entry could not be built because an allocation failed.
 	Allocation,
 }
@@ -224,38 +224,6 @@ catalog_has_disabled :: proc(provider_id, model_id: string, user: []Catalog_Prov
 		}
 	}
 	return false
-}
-
-@(require_results)
-catalog_model_has_customization :: proc(model: Catalog_Model_Source) -> bool {
-	return(
-		model.api != nil ||
-		model.display_name != nil ||
-		model.context_window != nil ||
-		model.compaction_trigger != nil ||
-		model.max_output_tokens != nil ||
-		model.input_modalities != nil ||
-		model.output_modalities != nil ||
-		model.tools != nil ||
-		model.thinking.present ||
-		model.cost.input != nil ||
-		model.cost.output != nil ||
-		model.cost.cache_read != nil ||
-		model.cost.cache_write != nil \
-	)
-}
-
-// catalog_validate_user rejects configuration that could not take effect.
-@(require_results)
-catalog_validate_user :: proc(user: []Catalog_Provider_Source) -> Catalog_Error {
-	for provider in user {
-		for model in provider.models {
-			if (model.disabled.? or_else false) && catalog_model_has_customization(model) {
-				return .Invalid_Disabled_Model
-			}
-		}
-	}
-	return .None
 }
 
 // catalog_clone_strings copies a string list, and releases what it copied when an
@@ -411,6 +379,7 @@ catalog_apply_source :: proc(
 	source: []Catalog_Provider_Source,
 	user: []Catalog_Provider_Source,
 	allocator: mem.Allocator,
+	is_user: bool,
 ) -> Catalog_Error {
 	for &provider_source in source {
 		provider_index, found := catalog_find_provider(catalog, provider_source.id)
@@ -425,9 +394,6 @@ catalog_apply_source :: proc(
 		}
 		catalog_apply_provider(&catalog.providers[provider_index], &provider_source, allocator) or_return
 		for &model_source in provider_source.models {
-			// An excluded model is not enriched and does not appear in the
-			// resolved list. It is a tombstone, not a selectable placeholder.
-			if catalog_has_disabled(provider_source.id, model_source.id, user) { continue }
 			model_index, model_found := catalog_find_model(catalog, provider_source.id, model_source.id)
 			if !model_found {
 				provider_id, provider_error := strings.clone(provider_source.id, allocator)
@@ -444,7 +410,20 @@ catalog_apply_source :: proc(
 				}
 				model_index = len(catalog.models) - 1
 			}
-			catalog_apply_model(&catalog.models[model_index], &model_source, allocator) or_return
+			// A tombstone takes only the user's own name. Its provider and models.dev
+			// sources are ignored, and so are the overrides in its configuration.
+			entry := &catalog.models[model_index]
+			if catalog_has_disabled(provider_source.id, model_source.id, user) {
+				entry.disabled = true
+				if is_user && entry.display_name == nil && model_source.display_name != nil {
+					name, name_error := strings.clone(model_source.display_name.?, allocator)
+					if name_error != nil { return .Allocation }
+					entry.display_name = name
+				}
+				continue
+			}
+			if entry.disabled { continue }
+			catalog_apply_model(entry, &model_source, allocator) or_return
 		}
 	}
 	return .None
@@ -455,12 +434,11 @@ catalog_apply_source :: proc(
 // the first one to define a field keeps it.
 @(require_results)
 resolve_catalog :: proc(user, provider, models_dev: []Catalog_Provider_Source, allocator := context.allocator) -> (Catalog, Catalog_Error) {
-	if err := catalog_validate_user(user); err != .None { return {}, err }
 	result := Catalog {
 		allocator = allocator,
 	}
-	for source in ([3][]Catalog_Provider_Source{user, provider, models_dev}) {
-		if err := catalog_apply_source(&result, source, user, allocator); err != .None {
+	for source, index in ([3][]Catalog_Provider_Source{user, provider, models_dev}) {
+		if err := catalog_apply_source(&result, source, user, allocator, index == 0); err != .None {
 			// A half-merged catalog is released; the caller retries or reports.
 			catalog_destroy(&result)
 			return {}, err
