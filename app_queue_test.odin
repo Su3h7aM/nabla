@@ -3,9 +3,9 @@
 package main
 
 import "core:os"
+import "core:strings"
 import "core:sync/chan"
 import "core:testing"
-import "core:time"
 
 import "nabla:agent/journal"
 import "nabla:db"
@@ -31,8 +31,6 @@ queue_test_open :: proc(t: ^testing.T, app: ^App) -> (^journal.Journal, string) 
 }
 
 queue_test_close :: proc(app: ^App, owner: ^journal.Journal, directory: string) {
-	for prompt in app.pending_prompts { delete(prompt.text) }
-	delete(app.pending_prompts)
 	for &entry in app.run.snap.entries { entry_destroy(&entry) }
 	delete(app.run.snap.entries)
 	widgets.input_destroy(&app.input)
@@ -74,7 +72,7 @@ test_queue_submit_and_owner_delivery :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_queue_history_and_busy_retry :: proc(t: ^testing.T) {
+test_busy_queue_keeps_prompt_and_history_survives_reopen :: proc(t: ^testing.T) {
 	app: App
 	owner, directory := queue_test_open(t, &app)
 	defer queue_test_close(&app, owner, directory)
@@ -82,23 +80,29 @@ test_queue_history_and_busy_retry :: proc(t: ^testing.T) {
 	if err := db.exec(&owner.connection, "BEGIN IMMEDIATE"); err != nil { testing.fail_now(t, "cannot lock database") }
 	if !testing.expect(t, widgets.input_insert(&app.input, "retained") == nil) { return }
 	submit(&app)
-	testing.expect_value(t, len(app.pending_prompts), 1)
-	original := app.queue_session
-	app.queue_session = journal.session_id_create()
-	_, _ = chan.try_recv(app.run.work)
+	testing.expect_value(t, widgets.input_text(&app.input), "retained")
+	testing.expect_value(t, len(app.history.entries), 0)
+	_, received := chan.try_recv(app.run.work)
+	testing.expect(t, !received)
+	if testing.expect(t, len(app.run.snap.entries) > 0) {
+		warning := app.run.snap.entries[len(app.run.snap.entries) - 1]
+		testing.expect_value(t, warning.kind, Entry_Kind.Warning)
+		testing.expect(t, strings.contains(string(warning.text[:]), "locked"))
+	}
 	if err := db.rollback(&owner.connection); err != nil { testing.fail_now(t, "cannot unlock database") }
-	app.queue_retry_at = time.tick_add(time.tick_now(), -time.Second)
-	app_queue_flush(&app)
-	testing.expect_value(t, len(app.pending_prompts), 0)
-	work, received := chan.try_recv(app.run.work)
-	testing.expect(t, received)
-	testing.expect_value(t, work.session, original)
-	app.queue_session = original
+	before, list_error := journal.queue_list(app.queue_journal, app.queue_session, context.allocator)
+	if !testing.expect(t, list_error == nil) { return }
+	testing.expect_value(t, len(before), 0)
+	journal.queue_entries_destroy(before, context.allocator)
+	submit(&app)
+	testing.expect_value(t, widgets.input_text(&app.input), "")
+	work, ensure_received := chan.try_recv(app.run.work)
+	testing.expect(t, ensure_received)
+	testing.expect_value(t, work.session, app.queue_session)
 	entries, err := journal.queue_list(app.queue_journal, app.queue_session, context.allocator)
 	if !testing.expect(t, err == nil && len(entries) == 1) { return }
 	defer journal.queue_entries_destroy(entries, context.allocator)
 	testing.expect_value(t, entries[0].text, "retained")
-	if err := journal.history_append(app.queue_journal, app.queue_session, "remembered"); err != nil { testing.fail_now(t, "cannot save history") }
 	if err := journal.close(app.queue_journal); err != nil { testing.fail_now(t, "cannot close queue") }
 	store, open_error := journal.open(directory, directory, journal.run_id_create(), .Read_Write)
 	if open_error != nil { testing.fail_now(t, "cannot reopen queue") }
@@ -108,5 +112,5 @@ test_queue_history_and_busy_retry :: proc(t: ^testing.T) {
 	app_history_load(&app)
 	text, found := widgets.history_previous(&app.history, "")
 	testing.expect(t, found)
-	testing.expect_value(t, text, "remembered")
+	testing.expect_value(t, text, "retained")
 }

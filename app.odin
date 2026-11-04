@@ -581,11 +581,6 @@ tui_run :: proc(
 		}
 		// The screen is restored, so the message stays on the user's terminal.
 		if app_abandoned { fmt.eprintln("nabla: a thread did not stop in time; the process exits without releasing what it still uses") }
-		for prompt in app.pending_prompts {
-			fmt.eprintfln("nabla: prompt was not queued: %s", prompt.text)
-			delete(prompt.text, app.run.alloc)
-		}
-		delete(app.pending_prompts)
 	}
 	app.terminal = terminal
 
@@ -668,7 +663,6 @@ tui_run :: proc(
 			break
 		}
 		app_history_load(app)
-		app_queue_flush(app)
 		for event in app.raw {
 			handle_event(app, event)
 		}
@@ -747,13 +741,8 @@ tui_run :: proc(
 // change that needs a frame signals the wake, and until the next spinner frame while a
 // turn runs, because the spinner animates without any change to signal.
 tui_wait_ms :: proc(app: ^App) -> i64 {
-	if !runtime_busy(app) {
-		if len(app.pending_prompts) == 0 { return -1 }
-		remaining := time.tick_diff(time.tick_now(), app.queue_retry_at)
-		return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
-	}
+	if !runtime_busy(app) { return -1 }
 	remaining := SPINNER_INTERVAL - time.tick_diff(app.spin_lap, time.tick_now())
-	if len(app.pending_prompts) > 0 { remaining = min(remaining, time.tick_diff(time.tick_now(), app.queue_retry_at)) }
 	return max(i64(0), i64((remaining + time.Millisecond - 1) / time.Millisecond))
 }
 
@@ -832,16 +821,6 @@ app_teardown :: proc(app: ^App, patience := SHUTDOWN_JOIN_PATIENCE) -> bool {
 	snapshot_destroy(app)
 	menu_destroy(&app.menu, app.run.alloc)
 	delete(app.completion_query, app.run.alloc)
-	for index := 0; index < len(app.pending_prompts); {
-		prompt := app.pending_prompts[index]
-		if _, err := journal.queue_push(app.queue_journal, prompt.session, prompt.kind, prompt.text, nil); err == nil {
-			session_client_ensure_id(app, prompt.session)
-			delete(prompt.text, app.run.alloc)
-			ordered_remove(&app.pending_prompts, index)
-		} else {
-			index += 1
-		}
-	}
 	if app.queue_journal != nil { _ = session_store_close(app.queue_journal) }
 	widgets.history_destroy(&app.history)
 	delete(app.home, app.run.alloc)

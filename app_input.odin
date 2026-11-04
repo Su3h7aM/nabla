@@ -4,7 +4,6 @@ package main
 import "core:fmt"
 import "core:strings"
 import "core:sync"
-import "core:time"
 
 import "nabla:agent"
 import "nabla:agent/journal"
@@ -786,9 +785,6 @@ history_recall :: proc(app: ^App, older: bool) {
 	}
 }
 
-// QUEUE_PUSH_RETRY is the one-shot delay before retrying a busy queue insertion, not a poll or heartbeat.
-QUEUE_PUSH_RETRY :: 250 * time.Millisecond
-
 app_queue_submit :: proc(app: ^App, text: string, kind: journal.Queue_Kind) -> bool {
 	store := app.queue_journal
 	session := app_queue_session(app)
@@ -796,46 +792,12 @@ app_queue_submit :: proc(app: ^App, text: string, kind: journal.Queue_Kind) -> b
 		snap_append(app, .Warning, "no session is open; the prompt remains")
 		return false
 	}
-	// Preserve ordering when an earlier insert is waiting on the database.
-	if len(app.pending_prompts) == 0 {
-		_, err := journal.queue_push(store, session, kind, text, nil)
-		if err == nil {
-			app_queue_ensure(app, session)
-			return true
-		}
-		if !journal.error_is_busy(err) {
-			snap_append(app, .Warning, fmt.tprintf("the prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
-			return false
-		}
-	}
-	copy, err := strings.clone(text, app.run.alloc)
-	if err != nil { return false }
-	if _, append_error := append(&app.pending_prompts, Pending_Prompt{session, kind, copy}); append_error != nil {
-		delete(copy, app.run.alloc)
+	if _, err := journal.queue_push(store, session, kind, text, nil); err != nil {
+		snap_append(app, .Warning, fmt.tprintf("the prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
 		return false
 	}
-	app.queue_retry_at = time.tick_add(time.tick_now(), QUEUE_PUSH_RETRY)
 	app_queue_ensure(app, session)
 	return true
-}
-
-app_queue_flush :: proc(app: ^App) {
-	if len(app.pending_prompts) == 0 || time.tick_diff(time.tick_now(), app.queue_retry_at) > 0 { return }
-	for len(app.pending_prompts) > 0 {
-		prompt := app.pending_prompts[0]
-		_, err := journal.queue_push(app.queue_journal, prompt.session, prompt.kind, prompt.text, nil)
-		if err != nil {
-			app.queue_retry_at = time.tick_add(time.tick_now(), QUEUE_PUSH_RETRY)
-			if !journal.error_is_busy(err) {
-				snap_append(app, .Warning, fmt.tprintf("the pending prompt was not queued: %s", journal.error_text(err, context.temp_allocator)))
-			}
-			return
-		}
-		delete(prompt.text, app.run.alloc)
-		ordered_remove(&app.pending_prompts, 0)
-		app_queue_ensure(app, prompt.session)
-	}
-	app.queue_retry_at = {}
 }
 
 app_queue_ensure :: proc(app: ^App, session: journal.Session_Id) {

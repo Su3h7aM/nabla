@@ -88,19 +88,11 @@ Run_Setup :: struct {
 	alloc:               mem.Allocator,
 }
 
-Pending_Prompt :: struct {
-	session: journal.Session_Id,
-	kind:    journal.Queue_Kind,
-	text:    string,
-}
-
 App :: struct {
 	setup:                      Run_Setup,
 	queue_journal:              ^journal.Journal,
 	queue_session:              journal.Session_Id,
 	history_session:            journal.Session_Id,
-	pending_prompts:            [dynamic]Pending_Prompt,
-	queue_retry_at:             time.Tick,
 	stream:                     Serve_Stream, // the session's live turn stream, owned for the server's life
 	// stop_server is set by a Stop_Server command. The server takes no new step while it
 	// is set and exits once the turn it stopped has ended.
